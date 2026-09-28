@@ -1,0 +1,20 @@
+[package]
+name = "rscode_fmt"
+version = "0.1.0"
+edition = "2024"
+
+authors.workspace = true
+license.workspace = true
+
+description = ""
+categories = []
+keywords = []
+
+[dependencies]
+clap.workspace = true
+pretty-please = "0.1.0"
+proc-macro2.workspace = true
+quote.workspace = true
+rscode_sort = { path = "../rscode_sort" }
+syn.workspace = true
+thiserror.workspace = true

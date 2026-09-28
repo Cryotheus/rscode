@@ -1,0 +1,21 @@
+[package]
+name = "rscode_sort"
+version = "0.1.0"
+edition = "2024"
+
+authors.workspace = true
+license.workspace = true
+
+description = ""
+categories = []
+keywords = []
+
+[dependencies]
+clap.workspace = true
+pretty-please = "0.1.0"
+proc-macro2.workspace = true
+quote.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+syn.workspace = true
+thiserror.workspace = true

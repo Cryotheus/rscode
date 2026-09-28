@@ -1,0 +1,23 @@
+[package]
+name = "cargo-rscode"
+version = "0.1.0"
+edition = "2024"
+
+description = ""
+categories = []
+keywords = []
+
+[dependencies]
+anyhow.workspace = true
+cargo.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+rscode = { path = "../rscode" }
+serde.workspace = true
+serde_json.workspace = true
+smol_str.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["mcp"]
+mcp = []
