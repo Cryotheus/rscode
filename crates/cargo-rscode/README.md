@@ -3,12 +3,31 @@
 `cargo rscode`: view, search, format, and edit Rust source by item path, from the command line or through the Model
 Context Protocol for AI agents. It is built on the [`rscode`](../rscode) library.
 
+## Installing
+
+Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64) are attached to the
+`cargo-rscode-v*` GitHub releases, and [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall) knows how to
+find them:
+
+```sh
+cargo binstall cargo-rscode                                          # once published on crates.io
+cargo binstall --git https://github.com/Cryotheus/rscode cargo-rscode  # from the repository
+```
+
+Or build from source with a nightly toolchain:
+
 ```sh
 cargo +nightly install --path crates/cargo-rscode
 ```
 
 Building the `cargo` library it depends on takes a few minutes, and needs a C compiler, `pkg-config`, and OpenSSL
-headers.
+headers (or the `vendored-openssl` feature, which builds OpenSSL from source and links it statically).
+
+## Releasing
+
+Push a tag `cargo-rscode-v<version>` matching the `version` in `Cargo.toml`. The `release` workflow
+(`.github/workflows/release.yml`) creates the GitHub release and attaches the archives `cargo binstall` expects, as
+described by `[package.metadata.binstall]` in `Cargo.toml`.
 
 ## Commands
 

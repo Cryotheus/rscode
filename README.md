@@ -19,7 +19,14 @@ It comes as:
 
 ## Installing
 
-Requires a nightly toolchain (the workspace is developed on `1.101.0-nightly`).
+Prebuilt binaries are attached to the `cargo-rscode-v*` GitHub releases, for
+[`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
+
+```sh
+cargo binstall --git https://github.com/Cryotheus/rscode cargo-rscode
+```
+
+Building from source requires a nightly toolchain (the workspace is developed on `1.101.0-nightly`):
 
 ```sh
 cargo +nightly install --path crates/cargo-rscode

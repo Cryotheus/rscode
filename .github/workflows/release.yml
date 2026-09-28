@@ -1,0 +1,89 @@
+# Builds `cargo-rscode` for every target `cargo binstall` can install it on, and attaches the archives to a GitHub
+# release. Push a tag `cargo-rscode-v<version>` (matching `version` in crates/cargo-rscode/Cargo.toml) to release.
+#
+# The archive names and layout must match `[package.metadata.binstall]` in crates/cargo-rscode/Cargo.toml.
+
+name: release
+
+on:
+  push:
+    tags: ["cargo-rscode-v*"]
+
+permissions:
+  contents: write
+
+env:
+  # the nightly rscode is developed with; bump deliberately
+  TOOLCHAIN: nightly-2026-09-28
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+
+jobs:
+  release:
+    name: create the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check that the tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/cargo-rscode/Cargo.toml | head -n 1)
+
+          if [ "${GITHUB_REF_NAME}" != "cargo-rscode-v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match cargo-rscode ${version}"
+            exit 1
+          fi
+
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1 || gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      # OpenSSL is linked statically so the binaries do not depend on the system's (it is not used on Windows)
+      - name: build
+        run: cargo build --release --package cargo-rscode --features vendored-openssl --target ${{ matrix.target }}
+
+      - name: package
+        id: package
+        shell: bash
+        run: |
+          name="cargo-rscode-${GITHUB_REF_NAME#cargo-rscode-}-${{ matrix.target }}"
+          mkdir "${name}"
+          cp README.md LICENSE-APACHE LICENSE-MIT "${name}/"
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/cargo-rscode.exe" "${name}/"
+            7z a "${name}.zip" "${name}"
+            echo "archive=${name}.zip" >> "${GITHUB_OUTPUT}"
+          else
+            cp "target/${{ matrix.target }}/release/cargo-rscode" "${name}/"
+            tar -czf "${name}.tar.gz" "${name}"
+            echo "archive=${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "${{ steps.package.outputs.archive }}" --clobber

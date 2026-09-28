@@ -24,3 +24,15 @@ tokio = { workspace = true, optional = true }
 default = ["mcp"]
 ## `cargo rscode mcp`: serve rscode's operations over the Model Context Protocol (stdio).
 mcp = ["rscode/mcp", "dep:tokio"]
+## Build OpenSSL from source and link it statically (used for release binaries), instead of linking the system's.
+vendored-openssl = ["cargo/vendored-openssl"]
+
+# `cargo binstall cargo-rscode` downloads the archives the `release` workflow attaches to `cargo-rscode-v*` releases
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/{ name }-v{ version }/{ name }-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
