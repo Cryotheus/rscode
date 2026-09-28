@@ -28,11 +28,15 @@ use serde::de::Visitor;
 /// Default of `find_items`' `limit`.
 pub(crate) const DEFAULT_FIND_LIMIT: usize = 100;
 
-/// Which packages to load, and with which features. Accepted by every tool.
+/// What to load: an attached source instead of the server's own workspace, which of its packages, and with which
+/// features. Accepted by every tool but the tools about sources.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(default)]
 pub(crate) struct Selection {
+	/// Work on this attached source (the name given to `attach_source`) instead of the server's own workspace.
+	pub(crate) attached: Option<String>,
+
 	/// Packages to load (cargo package specs). Default: the server's selection, see `workspace_info`.
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) packages: Vec<String>,
@@ -514,6 +518,33 @@ impl FormatParams {
 			active_only: false,
 		})
 	}
+}
+
+/// Parameters of `attach_source`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct AttachParams {
+	/// Path of the `Cargo.toml` of the workspace or package (or of the directory it is in). Its directory must be
+	/// exposed by the server (see `list_sources`).
+	#[serde(alias = "manifest", alias = "path")]
+	pub(crate) manifest_path: String,
+
+	/// The name to refer to the source by: pass it as `attached` to the other tools. ASCII letters, digits, `_`, `-`,
+	/// and `.`. Attaching under a name that is taken replaces that source.
+	pub(crate) name: String,
+
+	/// Attach for writing, so that the editing tools can change its files. Refused unless its directory is exposed
+	/// for writing. Without it, the source is read-only (the editing tools can still preview changes with `dry_run`).
+	#[serde(default)]
+	pub(crate) write: bool,
+}
+
+/// Parameters of `detach_source`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct DetachParams {
+	/// The name the source was attached as.
+	pub(crate) name: String,
 }
 
 /// Lists the kinds that can be found: named items, and `impl` blocks (with qualified patterns).

@@ -13,10 +13,33 @@
 //! | `replace_item` | replaces the source of an item |
 //! | `insert_items` | inserts items into a module, `impl` block, or trait |
 //! | `format_items` | sorts and formats items with rustfmt or prettyplease |
+//! | `attach_source` | attaches another workspace or package under a name (with [`ServerOptions::exposed`]) |
+//! | `detach_source` | forgets an attached source |
+//! | `list_sources` | the attached sources, the server's own workspace, and the exposed directories |
 //!
-//! Every tool also accepts `packages`, `workspace`, `features`, `all_features`, `all_targets`, `lib`, and `bin`, which
-//! adjust the server's [`LoadOptions`] for that call. Editing tools accept `dry_run` (`check` for `format_items`), which
+//! Every tool but the ones about sources also accepts `packages`, `workspace`, `features`, `all_features`,
+//! `all_targets`, `lib`, and `bin`, which adjust the server's [`LoadOptions`] for that call (and `attached`, see
+//! [Sources](#sources)). Editing tools accept `dry_run` (`check` for `format_items`), which
 //! returns a unified diff instead of writing. With [`ServerOptions::read_only`], the editing tools are not offered.
+//!
+//! # Sources
+//!
+//! A server works on its own workspace ([`ServerOptions::load`]), and when it exposes directories
+//! ([`ServerOptions::exposed`]), on the cargo workspaces and packages in them that a client attaches: `attach_source`
+//! takes the path of a `Cargo.toml` whose directory an [`Exposure`] matches, a name, and whether the client needs to
+//! write. The tools then take that name as `attached`. A source can only be attached for writing where it is exposed
+//! for writing, and edits of attached sources are only written below directories exposed for writing, however the
+//! edit reaches them (for example through `#[path]` attributes or other workspace members); edits of the server's own
+//! workspace are not restricted. Sources attached read-only can still be previewed with `dry_run`. Without exposed
+//! directories, the tools about sources and the `attached` parameter are not offered.
+//!
+//! Reading is not confined like writing: an attached source is loaded like cargo loads it, so its other workspace
+//! members and the files its `#[path]` attributes name can be read too. With [`LoadOptions::exact_features`], cargo
+//! may update its cache of rustc's output in a source's target directory, like `cargo metadata` does.
+//!
+//! Names belong to a session (a connection): over stdio, a server has exactly one client, and clients do not see
+//! (or break) each other's names. Attaching is cheap, since it only records the name for the canonical path of the
+//! `Cargo.toml` (after checking that cargo can plan loading it); every call loads its source anyway.
 //!
 //! Every call loads the workspace from disk again, so the server never works with stale source, and runs on a
 //! fresh thread: `proc_macro2` keeps the locations of everything parsed on a thread in a thread-local map that only
@@ -29,8 +52,13 @@ mod input;
 mod params;
 mod render;
 mod server;
+mod sources;
 mod tools;
 mod worker;
+
+pub use sources::Access;
+pub use sources::Exposure;
+pub use sources::ExposureError;
 
 use crate::Error;
 use crate::workspace::LoadOptions;
@@ -56,6 +84,9 @@ pub struct ServerOptions {
 
 	/// Refuse tools that modify files.
 	pub read_only: bool,
+
+	/// Directories whose cargo workspaces and packages clients may attach as sources (see [Sources](self#sources)).
+	pub exposed: Vec<Exposure>,
 }
 
 /// Serves MCP over stdin/stdout until the client disconnects.

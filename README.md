@@ -99,9 +99,10 @@ bodies, expressions, fields, and variants are never reordered. See the [`rscode_
 ## MCP server (for AI agents)
 
 `cargo rscode mcp` serves the same operations as tools over stdio: `workspace_info`, `find_items`, `view_items`,
-`rename_item`, `remove_items`, `replace_item`, `insert_items`, and `format_items` (`--read-only` offers only the first
-three). The workspace is reloaded for every call, so edits made by other tools are always seen, and modifying tools
-support `dry_run` to return a diff instead of writing.
+`rename_item`, `remove_items`, `replace_item`, `insert_items`, and `format_items` (`--read-only` leaves out the last
+five). The workspace is reloaded for every call, so edits made by other tools are always seen, and modifying tools
+support `dry_run` to return a diff instead of writing. With `--expose`, clients can also attach other workspaces and
+packages by name (`attach_source`, `detach_source`, `list_sources`); see below.
 
 Claude Code:
 
@@ -116,6 +117,43 @@ Clients configured with JSON (`.mcp.json`, Claude Desktop, Cursor):
 ```
 
 VS Code uses `.vscode/mcp.json` with a top-level `"servers"` key instead of `"mcpServers"`.
+
+### Several workspaces from one server
+
+With `--expose ACCESS=DIRS`, clients can attach more cargo workspaces and packages while connected, by the path of
+their `Cargo.toml` (or its directory) and a name of their choice, and then pass that name as `attached` to any tool:
+
+```json
+{
+  "mcpServers": {
+    "rscode": {
+      "command": "cargo",
+      "args": [
+        "rscode", "mcp",
+        "--expose", "write=/abs/path/engine",
+        "--expose", "read=/abs/path/references/*",
+        "--expose", "read=/abs/path/references/misc/**"
+      ]
+    }
+  }
+}
+```
+
+- A `Cargo.toml` can be attached when its directory matches a pattern. `*` matches within one path component and
+  `**` any number of them: `references/*` matches `references/log` but not `references/misc/log`, and
+  `references/misc/**` matches `references/misc` and everything below it. Wildcards skip hidden directories, and
+  symbolic links are resolved before matching.
+- Clients ask for write access when attaching. Only directories matching a `write` pattern grant it, and `write`
+  patterns take precedence over `read` ones. Edits of attached sources are only ever written below directories
+  matching a `write` pattern, even when they reach elsewhere (through `#[path]` attributes or other workspace
+  members). Sources attached read-only can still be previewed with `dry_run`. Reading is not confined the same way:
+  a source is loaded like cargo loads it, including its other workspace members and `#[path]` files.
+- Names are scoped to the client that attached them. Over stdio each client has its own server process, so clients
+  never see or break each other's names. Attaching checks that cargo can plan loading the source (so it fails for
+  manifests cargo rejects), and then only records the name: every tool call loads its source from disk anyway.
+  `detach_source` forgets a name, and `list_sources` shows the attached sources and the exposed directories.
+- The server's own workspace (`--manifest-path`, or the one containing the working directory) remains the default
+  when a tool call names no `attached` source, and `--expose` does not restrict its edits, like on the command line.
 
 ## Shell completion
 

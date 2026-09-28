@@ -12,6 +12,7 @@ use super::params::ReplaceParams;
 use super::params::ViewParams;
 use super::render;
 use super::render::Page;
+use super::sources::WriteScope;
 use crate::Error;
 use crate::Find;
 use crate::FindMatch;
@@ -43,8 +44,15 @@ use std::path::Path;
 /// A tool's result: text for the client, or an error message.
 pub(crate) type Output = Result<String, String>;
 
-/// Whether the client cancelled the request. Checked right before writing, so a cancelled edit writes nothing.
-pub(crate) type Cancelled<'a> = &'a dyn Fn() -> bool;
+/// What an editing call may write, checked right before writing: a cancelled edit, or one that would change files
+/// outside of its scope, writes nothing.
+pub(crate) struct Permit<'a> {
+	/// Whether the client cancelled the request.
+	pub(crate) cancelled: &'a dyn Fn() -> bool,
+
+	/// Where the edits may be written.
+	pub(crate) scope: &'a WriteScope,
+}
 
 /// `workspace_info`
 pub(crate) fn workspace_info(load: &LoadOptions) -> Output {
@@ -208,7 +216,7 @@ pub(crate) fn view(load: &LoadOptions, params: &ViewParams) -> Output {
 }
 
 /// `rename_item`
-pub(crate) fn rename(load: &LoadOptions, params: &RenameParams, cancelled: Cancelled<'_>) -> Output {
+pub(crate) fn rename(load: &LoadOptions, params: &RenameParams, permit: &Permit<'_>) -> Output {
 	let path = parse_path(&params.path)?;
 	let workspace = self::load(load)?;
 	let resolver = Resolver::new(&workspace);
@@ -222,12 +230,12 @@ pub(crate) fn rename(load: &LoadOptions, params: &RenameParams, cancelled: Cance
 	let root = workspace.root();
 	let mut text = render::rename(root, &plan, params.new_name.trim(), params.dry_run);
 
-	finish(root, &plan.edits, params.dry_run, cancelled, &mut text)?;
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 	Ok(text)
 }
 
 /// `remove_items`
-pub(crate) fn remove(load: &LoadOptions, params: &RemoveParams, cancelled: Cancelled<'_>) -> Output {
+pub(crate) fn remove(load: &LoadOptions, params: &RemoveParams, permit: &Permit<'_>) -> Output {
 	if params.paths.is_empty() {
 		return Err("`paths` is empty: give the paths of the items to remove".to_owned());
 	}
@@ -239,12 +247,12 @@ pub(crate) fn remove(load: &LoadOptions, params: &RemoveParams, cancelled: Cance
 	let root = workspace.root();
 	let mut text = render::removal(root, &plan, params.dry_run);
 
-	finish(root, &plan.edits, params.dry_run, cancelled, &mut text)?;
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 	Ok(text)
 }
 
 /// `replace_item`
-pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, cancelled: Cancelled<'_>) -> Output {
+pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permit<'_>) -> Output {
 	let path = parse_path(&params.path)?;
 	let workspace = self::load(load)?;
 	let resolver = Resolver::new(&workspace);
@@ -268,10 +276,10 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, cancelled: Can
 		text.push_str(UNFORMATTED_DIFF);
 	}
 
-	finish(root, &plan.edits, params.dry_run, cancelled, &mut text)?;
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 
 	if params.format && !params.dry_run {
-		text.push_str(&format_written(load, &[(params.path.clone(), path)]));
+		text.push_str(&format_written(load, permit, &[(params.path.clone(), path)]));
 	}
 
 	Ok(text)
@@ -280,7 +288,7 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, cancelled: Can
 const UNFORMATTED_DIFF: &str = "note: `format` only applies when writing; the diff is not formatted\n";
 
 /// `insert_items`
-pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, cancelled: Cancelled<'_>) -> Output {
+pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<'_>) -> Output {
 	let options = params.options()?;
 	let parent = parse_path(&params.parent)?;
 	let workspace = self::load(load)?;
@@ -296,7 +304,7 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, cancelled: Cance
 		text.push_str(UNFORMATTED_DIFF);
 	}
 
-	finish(root, &plan.edits, params.dry_run, cancelled, &mut text)?;
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 
 	if params.format && !params.dry_run {
 		let targets: Vec<(String, ItemPath)> = plan
@@ -317,14 +325,14 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, cancelled: Cance
 			);
 		}
 
-		text.push_str(&format_written(load, &targets));
+		text.push_str(&format_written(load, permit, &targets));
 	}
 
 	Ok(text)
 }
 
 /// `format_items`
-pub(crate) fn format(load: &LoadOptions, params: &FormatParams, cancelled: Cancelled<'_>) -> Output {
+pub(crate) fn format(load: &LoadOptions, params: &FormatParams, permit: &Permit<'_>) -> Output {
 	let options = params.options()?;
 	let targets = params
 		.targets()
@@ -348,7 +356,7 @@ pub(crate) fn format(load: &LoadOptions, params: &FormatParams, cancelled: Cance
 		return Ok(text);
 	}
 
-	let applied = write(root, &formatting.edits, cancelled)?;
+	let applied = write(root, &formatting.edits, permit)?;
 
 	Ok(render::format_written(root, formatting.changes.len(), &applied.written, &formatting.warnings))
 }
@@ -459,7 +467,7 @@ fn finish(
 	root: &Path,
 	edits: &EditSet,
 	dry_run: bool,
-	cancelled: Cancelled<'_>,
+	permit: &Permit<'_>,
 	text: &mut String,
 ) -> Result<(), String> {
 	match dry_run {
@@ -476,7 +484,7 @@ fn finish(
 		}
 
 		false => {
-			write(root, edits, cancelled)?;
+			write(root, edits, permit)?;
 		}
 	}
 
@@ -484,13 +492,14 @@ fn finish(
 }
 
 /// Writes edits, unless an edited file changed on disk since the workspace was loaded (the edits would undo those
-/// changes) or the request was cancelled.
-fn write(root: &Path, edits: &EditSet, cancelled: Cancelled<'_>) -> Result<Applied, String> {
+/// changes), they would write outside of the call's scope, or the request was cancelled.
+fn write(root: &Path, edits: &EditSet, permit: &Permit<'_>) -> Result<Applied, String> {
 	let changes = edits.preview().map_err(|error| describe(&error))?;
 
 	ensure_unchanged(root, &changes)?;
+	permit.scope.check(root, edits)?;
 
-	if cancelled() {
+	if (permit.cancelled)() {
 		return Err("the request was cancelled; nothing was written".to_owned());
 	}
 
@@ -517,14 +526,18 @@ fn ensure_unchanged(root: &Path, changes: &[FileChange]) -> Result<(), String> {
 /// edit. `targets` pairs a label for messages with each item's path.
 ///
 /// Returns lines for the report; the edit is already written, so failing to format it is only a warning.
-fn format_written(load: &LoadOptions, targets: &[(String, ItemPath)]) -> String {
-	match try_format_written(load, targets) {
+fn format_written(load: &LoadOptions, permit: &Permit<'_>, targets: &[(String, ItemPath)]) -> String {
+	match try_format_written(load, permit, targets) {
 		Ok(report) => report,
 		Err(error) => format!("warning: the edit was written, but formatting it failed: {error}\n"),
 	}
 }
 
-fn try_format_written(load: &LoadOptions, targets: &[(String, ItemPath)]) -> Result<String, String> {
+fn try_format_written(
+	load: &LoadOptions,
+	permit: &Permit<'_>,
+	targets: &[(String, ItemPath)],
+) -> Result<String, String> {
 	if targets.is_empty() {
 		return Ok(String::new());
 	}
@@ -556,8 +569,11 @@ fn try_format_written(load: &LoadOptions, targets: &[(String, ItemPath)]) -> Res
 		active_only: false,
 	};
 	let formatting = edit::format(&resolver, &patterns, &options).map_err(|error| error.to_string())?;
-	let applied = formatting.edits.apply().map_err(|error| error.to_string())?;
 	let root = workspace.root();
+
+	permit.scope.check(root, &formatting.edits)?;
+
+	let applied = formatting.edits.apply().map_err(|error| error.to_string())?;
 
 	for warning in &formatting.warnings {
 		writeln!(report, "warning: {warning}").unwrap();
@@ -653,6 +669,9 @@ mod tests {
 		assert_eq!(UsableFrom::Viewpoint(Viewpoint::Foreign).viewpoint(item), Viewpoint::Foreign);
 	}
 
+	/// Lets an edit write anywhere.
+	const PERMIT: Permit<'static> = Permit { cancelled: &|| false, scope: &WriteScope::Anywhere };
+
 	#[test]
 	fn empty_path_lists_are_refused_before_loading() {
 		let load = LoadOptions::default();
@@ -660,7 +679,7 @@ mod tests {
 		let remove: RemoveParams = serde_json::from_value(serde_json::json!({ "paths": [] })).unwrap();
 
 		assert!(self::view(&load, &view).unwrap_err().starts_with("`paths` is empty"));
-		assert!(self::remove(&load, &remove, &|| false).unwrap_err().starts_with("`paths` is empty"));
+		assert!(self::remove(&load, &remove, &PERMIT).unwrap_err().starts_with("`paths` is empty"));
 	}
 
 	#[test]
@@ -676,8 +695,8 @@ mod tests {
 			serde_json::from_value(serde_json::json!({ "formatter": "none", "sort": false })).unwrap();
 
 		assert!(self::find(&load, &find).unwrap_err().starts_with("unknown item kind `nope`"));
-		assert!(self::insert(&load, &insert, &|| false).unwrap_err().starts_with("`anchor`"));
-		assert!(self::format(&load, &format, &|| false).unwrap_err().starts_with("nothing to do"));
+		assert!(self::insert(&load, &insert, &PERMIT).unwrap_err().starts_with("`anchor`"));
+		assert!(self::format(&load, &format, &PERMIT).unwrap_err().starts_with("nothing to do"));
 	}
 
 	#[test]

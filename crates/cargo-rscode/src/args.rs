@@ -675,6 +675,7 @@ pub(crate) fn server_options(matches: &ArgMatches) -> anyhow::Result<rscode::mcp
 	Ok(rscode::mcp::ServerOptions {
 		load: load_options(matches)?,
 		read_only: matches.flag("read-only"),
+		exposed: matches.get_many::<rscode::mcp::Exposure>("expose").into_iter().flatten().cloned().collect(),
 	})
 }
 
@@ -1325,5 +1326,23 @@ mod tests {
 		assert!(options.load.workspace);
 		assert_eq!(options.load.features, ["a", "b"]);
 		assert!(!server_options(&parse(&["cargo-rscode", "mcp"])).unwrap().read_only);
+	}
+
+	#[cfg(feature = "mcp")]
+	#[test]
+	fn maps_exposed_directories() {
+		let options =
+			server_options(&parse(&["cargo-rscode", "mcp", "--expose", "write=/abs/a", "--expose=read=/abs/refs/*"]))
+				.unwrap();
+		let exposed: Vec<String> = options.exposed.iter().map(ToString::to_string).collect();
+
+		assert_eq!(exposed, ["write=/abs/a", "read=/abs/refs/*"]);
+		assert!(server_options(&parse(&["cargo-rscode", "mcp"])).unwrap().exposed.is_empty());
+
+		for invalid in ["/abs/a", "execute=/abs/a", "read=/abs/a**"] {
+			let error = crate::cli::cli().try_get_matches_from(["cargo-rscode", "mcp", "--expose", invalid]).unwrap_err();
+
+			assert!(error.to_string().contains("--expose <ACCESS=DIRS>"), "{invalid}: {error}");
+		}
 	}
 }

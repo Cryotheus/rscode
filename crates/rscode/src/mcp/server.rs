@@ -1,6 +1,8 @@
 //! The server: tool definitions (their descriptions are what a model reads) and the protocol handler.
 
 use super::ServerOptions;
+use super::params::AttachParams;
+use super::params::DetachParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
@@ -10,9 +12,15 @@ use super::params::ReplaceParams;
 use super::params::Selection;
 use super::params::ViewParams;
 use super::render;
+use super::sources;
+use super::sources::Access;
+use super::sources::Exposure;
+use super::sources::Source;
+use super::sources::Sources;
+use super::sources::WriteScope;
 use super::tools;
-use super::tools::Cancelled;
 use super::tools::Output;
+use super::tools::Permit;
 use super::worker;
 use crate::workspace::LoadOptions;
 use rmcp::ErrorData;
@@ -28,12 +36,19 @@ use rmcp::model::ContentBlock;
 use rmcp::model::Implementation;
 use rmcp::model::ServerCapabilities;
 use rmcp::model::ServerConfig;
+use rmcp::model::Tool;
 use rmcp::service::RequestContext;
 use rmcp::tool;
 use rmcp::tool_handler;
 use rmcp::tool_router;
+use serde_json::Value;
 use std::convert::identity;
+use std::fmt::Write as _;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::MutexGuard;
+use std::sync::PoisonError;
 use tokio::sync::Mutex;
 
 /// Guidance for the client (and its model), sent when connecting.
@@ -63,11 +78,37 @@ them, then edit.";
 /// Appended to [`INSTRUCTIONS`] for read-only servers.
 const READ_ONLY_INSTRUCTIONS: &str = "\n\nThis server is read-only: the editing tools are disabled.";
 
+/// Appended to [`INSTRUCTIONS`] for servers that expose directories, followed by a list of them.
+fn sources_instructions(read_only: bool) -> String {
+	let (write, writing) = match read_only {
+		true => ("", ""),
+		false => (", and `write` if you need to edit them", ", for writing only where the pattern is marked write"),
+	};
+
+	format!(
+		"\n\nOther cargo workspaces and packages can be attached with attach_source: the path of their Cargo.toml, a \
+		 name of your choice{write}. Then pass that name as `attached` to any other tool to work on the source instead \
+		 of the server's own workspace. Names are only known in this session; list_sources lists them. Workspaces and \
+		 packages can be attached when the directory of their Cargo.toml matches one of these patterns (`*` matches \
+		 within one path component, `**` any number of components){writing}:"
+	)
+}
+
+/// The tools about sources, offered when the server exposes directories.
+const SOURCE_TOOLS: [&str; 3] = ["attach_source", "detach_source", "list_sources"];
+
 /// The rscode MCP server.
 pub(crate) struct Server {
 	options: ServerOptions,
 
-	/// Every tool; the editing tools are disabled when the server is read-only.
+	/// The exposed directories ([`ServerOptions::exposed`]), shared with the editing calls that check where they write.
+	exposed: Arc<[Exposure]>,
+
+	/// The sources this session attached. The lock is never held across an `await`.
+	sources: std::sync::Mutex<Sources>,
+
+	/// Every tool; the editing tools are disabled when the server is read-only, and the tools about sources when it
+	/// exposes no directories.
 	tool_router: ToolRouter<Self>,
 
 	/// Held by an editing call for its whole run, on its worker thread: edits never interleave, and shutdown can wait
@@ -75,9 +116,34 @@ pub(crate) struct Server {
 	edits: Arc<Mutex<()>>,
 }
 
+/// What a tool call works on.
+struct Target {
+	/// Its source's load options, with the call's selection.
+	load: LoadOptions,
+
+	/// Where its edits may be written.
+	scope: WriteScope,
+
+	/// The attached source, if the call names one (rather than using the server's own workspace).
+	source: Option<(String, Source)>,
+}
+
+impl Target {
+	/// A line naming the attached source, if any.
+	fn header(&self) -> String {
+		match &self.source {
+			None => String::new(),
+
+			Some((name, source)) => {
+				format!("source `{name}` ({}): {}\n", source.access.describe(), source.manifest.display())
+			}
+		}
+	}
+}
+
 impl Server {
 	pub(crate) fn new(options: ServerOptions) -> Self {
-		let mut tool_router = Self::query_tools() + Self::edit_tools();
+		let mut tool_router = Self::query_tools() + Self::edit_tools() + Self::source_tools();
 
 		if options.read_only {
 			for name in Self::edit_tools().map.into_keys() {
@@ -85,8 +151,21 @@ impl Server {
 			}
 		}
 
+		// nothing can be attached: hide the tools and the parameter about sources
+		if options.exposed.is_empty() {
+			for name in SOURCE_TOOLS {
+				tool_router.disable_route(name);
+			}
+
+			for route in tool_router.map.values_mut() {
+				without_attached(&mut route.attr);
+			}
+		}
+
 		Self {
+			exposed: options.exposed.clone().into(),
 			options,
+			sources: std::sync::Mutex::default(),
 			tool_router,
 			edits: Arc::default(),
 		}
@@ -103,47 +182,195 @@ impl Server {
 		self.tool_router.list_all()
 	}
 
-	/// The server's load options with a call's selection.
-	fn load_options(&self, selection: &Selection) -> LoadOptions {
-		selection.apply(&self.options.load)
+	/// The attached sources.
+	fn sources(&self) -> MutexGuard<'_, Sources> {
+		self.sources.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// Like [`Server::load_options`], also loading every other target of every workspace member, so that references
-	/// everywhere are found.
-	fn load_everything(&self, selection: &Selection) -> LoadOptions {
-		LoadOptions {
-			load_all_members: true,
-			..self.load_options(selection)
+	/// What a call with `selection` works on: the attached source it names, or the server's own workspace. With
+	/// `everything`, every other target of every workspace member is loaded too, so that references everywhere are
+	/// found.
+	fn target(&self, selection: &Selection, everything: bool) -> Result<Target, String> {
+		let name = selection.attached.as_deref().map(str::trim).filter(|name| !name.is_empty());
+		let (defaults, scope, source) = match name {
+			None => {
+				self.check_own_workspace()?;
+				(self.options.load.clone(), WriteScope::Anywhere, None)
+			}
+
+			Some(name) => {
+				let source = {
+					let attached = self.sources();
+
+					attached.get(name).cloned().ok_or_else(|| self.unknown(name, &attached))?
+				};
+
+				source.check(name)?;
+
+				let scope = match source.access {
+					Access::Write => WriteScope::Exposed {
+						source: name.to_owned(),
+						exposed: self.exposed.clone(),
+					},
+					Access::Read => WriteScope::Nowhere { source: name.to_owned() },
+				};
+
+				(sources::load_options(&self.options.load, &source.manifest), scope, Some((name.to_owned(), source)))
+			}
+		};
+		let mut load = selection.apply(&defaults);
+
+		load.load_all_members |= everything;
+		Ok(Target { load, scope, source })
+	}
+
+	/// Fails when a call uses the server's own workspace, but it has none while sources could be attached. (Without
+	/// exposed directories, loading fails with a hint for the user instead.)
+	fn check_own_workspace(&self) -> Result<(), String> {
+		if self.exposed.is_empty() || self.options.load.manifest_path.is_some() {
+			return Ok(());
+		}
+
+		match nearest_manifest() {
+			Some((_, Some(_))) => Ok(()),
+
+			Some((directory, None)) => Err(format!(
+				"the server has no workspace of its own: its working directory ({}) is not in a cargo workspace\nhint: \
+				 attach one with `attach_source`, and pass its name as `attached`",
+				directory.display()
+			)),
+
+			None => Err("the server has no workspace of its own: its working directory is unknown\nhint: attach one with \
+			             `attach_source`, and pass its name as `attached`"
+				.to_owned()),
 		}
 	}
 
 	/// Runs a read-only tool's job.
-	async fn query(&self, name: &'static str, job: impl FnOnce() -> Output + Send + 'static) -> CallToolResult {
-		respond(name, worker::run(name, job).await.and_then(identity))
+	async fn query(
+		&self,
+		name: &'static str,
+		target: Result<Target, String>,
+		job: impl FnOnce(&Target) -> Output + Send + 'static,
+	) -> CallToolResult {
+		let target = match target {
+			Ok(target) => target,
+			Err(message) => return respond(name, Err(message)),
+		};
+
+		respond(name, worker::run(name, move || job(&target)).await.and_then(identity))
 	}
 
-	/// Runs an editing tool's job, one at a time. The job is told whether the request was cancelled, to write
-	/// nothing if so.
+	/// Runs an editing tool's job, one at a time. The job gets a [`Permit`] telling whether the request was cancelled
+	/// and where it may write, which it checks right before writing. A source attached read-only is only previewed
+	/// (`dry_run`).
 	async fn edit(
 		&self,
 		name: &'static str,
 		context: RequestContext<RoleServer>,
-		job: impl FnOnce(Cancelled<'_>) -> Output + Send + 'static,
+		target: Result<Target, String>,
+		dry_run: bool,
+		job: impl FnOnce(&LoadOptions, &Permit<'_>) -> Output + Send + 'static,
 	) -> CallToolResult {
 		if self.options.read_only {
 			return read_only(name);
+		}
+
+		let target = match target {
+			Ok(target) => target,
+			Err(message) => return respond(name, Err(message)),
+		};
+
+		if !dry_run
+			&& let Some((source, attached)) = &target.source
+			&& attached.access == Access::Read
+		{
+			return respond(name, Err(self.read_only_source(name, source, attached)));
 		}
 
 		let guard = self.edits.clone().lock_owned().await;
 		let token = context.ct;
 		let result = worker::run(name, move || {
 			let _guard = guard;
+			let cancelled = || token.is_cancelled();
 
-			job(&|| token.is_cancelled())
+			job(&target.load, &Permit { cancelled: &cancelled, scope: &target.scope })
 		})
 		.await;
 
 		respond(name, result.and_then(identity))
+	}
+
+	/// Why an editing tool does not write to a source attached read-only, and what to do.
+	fn read_only_source(&self, tool: &str, name: &str, source: &Source) -> String {
+		let preview = if tool == "format_items" { "check" } else { "dry_run" };
+		let directory = source.manifest.parent().unwrap_or(Path::new(""));
+		let hint = match sources::access(&self.exposed, directory) {
+			Some(Access::Write) => {
+				format!("set `{preview}` to preview the change, or attach the source again with `write` set to true")
+			}
+			_ => format!("set `{preview}` to preview the change (its directory is only exposed for reading)"),
+		};
+
+		format!("source `{name}` is attached read-only, so `{tool}` cannot write to it; nothing was written\nhint: {hint}")
+	}
+
+	/// What `list_sources` shows.
+	fn describe_sources(&self) -> String {
+		let access = if self.options.read_only { Access::Read } else { Access::Write };
+		let mut text = "the server's own workspace (used without `attached`): ".to_owned();
+
+		match (&self.options.load.manifest_path, nearest_manifest()) {
+			(Some(manifest), _) => writeln!(text, "{} ({})", manifest.display(), access.describe()),
+
+			(None, Some((_, Some(manifest)))) => {
+				writeln!(text, "{} ({}; found from the working directory)", manifest.display(), access.describe())
+			}
+
+			(None, Some((directory, None))) => {
+				writeln!(text, "none (the working directory, {}, is not in a cargo workspace)", directory.display())
+			}
+
+			(None, None) => writeln!(text, "none (the working directory is unknown)"),
+		}
+		.unwrap();
+
+		{
+			let attached = self.sources();
+			let width = attached.keys().map(String::len).max().unwrap_or(0);
+
+			match attached.is_empty() {
+				true => text.push_str("\nno sources are attached (see `attach_source`)\n"),
+				false => text.push_str("\nattached sources (pass the name as `attached`):\n"),
+			}
+
+			for (name, source) in attached.iter() {
+				writeln!(text, "  {name:width$}  {:14}  {}", source.access.describe(), source.manifest.display()).unwrap();
+			}
+		}
+
+		text.push('\n');
+		text.push_str(&sources::exposed_list(&self.exposed, self.access_cap()));
+		text
+	}
+
+	/// The most access a source can get: none can be written on a read-only server.
+	fn access_cap(&self) -> Access {
+		match self.options.read_only {
+			true => Access::Read,
+			false => Access::Write,
+		}
+	}
+
+	/// The error for a name that no source has.
+	fn unknown(&self, name: &str, attached: &Sources) -> String {
+		match self.exposed.is_empty() {
+			true => format!(
+				"no source is attached as `{name}`: this rscode server exposes no directories to attach sources from \
+				 (it was started without `--expose`)\nhint: leave out `attached` to work on the server's own workspace"
+			),
+			false => sources::unknown(name, attached),
+		}
 	}
 }
 
@@ -159,9 +386,9 @@ impl Server {
 		open_world_hint = false
 	))]
 	async fn workspace_info(&self, Parameters(selection): Parameters<Selection>) -> CallToolResult {
-		let load = self.load_options(&selection);
+		let target = self.target(&selection, false);
 
-		self.query("workspace_info", move || tools::workspace_info(&load)).await
+		self.query("workspace_info", target, |target| Ok(target.header() + &tools::workspace_info(&target.load)?)).await
 	}
 
 	/// Find items whose paths match a glob pattern (`*` within a path segment, `**` across segments). Prints one
@@ -170,9 +397,9 @@ impl Server {
 	/// usable paths when `from` is given.
 	#[tool(annotations(title = "Find items", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
 	async fn find_items(&self, Parameters(params): Parameters<FindParams>) -> CallToolResult {
-		let load = self.load_options(&params.selection);
+		let target = self.target(&params.selection, false);
 
-		self.query("find_items", move || tools::find(&load, &params)).await
+		self.query("find_items", target, move |target| tools::find(&target.load, &params)).await
 	}
 
 	/// Show the source of items by path: in full, or outlined with bodies elided (the default for modules and
@@ -180,9 +407,9 @@ impl Server {
 	/// numbered as in the file.
 	#[tool(annotations(title = "View items", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
 	async fn view_items(&self, Parameters(params): Parameters<ViewParams>) -> CallToolResult {
-		let load = self.load_options(&params.selection);
+		let target = self.target(&params.selection, false);
 
-		self.query("view_items", move || tools::view(&load, &params)).await
+		self.query("view_items", target, move |target| tools::view(&target.load, &params)).await
 	}
 }
 
@@ -206,9 +433,10 @@ impl Server {
 		Parameters(params): Parameters<RenameParams>,
 		context: RequestContext<RoleServer>,
 	) -> CallToolResult {
-		let load = self.load_everything(&params.selection);
+		let target = self.target(&params.selection, true);
+		let dry_run = params.dry_run;
 
-		self.edit("rename_item", context, move |cancelled| tools::rename(&load, &params, cancelled)).await
+		self.edit("rename_item", context, target, dry_run, move |load, permit| tools::rename(load, &params, permit)).await
 	}
 
 	/// Remove items (every cfg variant) with their doc comments, attributes, and attached comments. Removing an
@@ -225,9 +453,10 @@ impl Server {
 		Parameters(params): Parameters<RemoveParams>,
 		context: RequestContext<RoleServer>,
 	) -> CallToolResult {
-		let load = self.load_everything(&params.selection);
+		let target = self.target(&params.selection, true);
+		let dry_run = params.dry_run;
 
-		self.edit("remove_items", context, move |cancelled| tools::remove(&load, &params, cancelled)).await
+		self.edit("remove_items", context, target, dry_run, move |load, permit| tools::remove(load, &params, permit)).await
 	}
 
 	/// Replace the whole source of an item, including its doc comments and attributes, with `source`: one item of the
@@ -244,9 +473,10 @@ impl Server {
 		Parameters(params): Parameters<ReplaceParams>,
 		context: RequestContext<RoleServer>,
 	) -> CallToolResult {
-		let load = self.load_options(&params.selection);
+		let target = self.target(&params.selection, false);
+		let dry_run = params.dry_run;
 
-		self.edit("replace_item", context, move |cancelled| tools::replace(&load, &params, cancelled)).await
+		self.edit("replace_item", context, target, dry_run, move |load, permit| tools::replace(load, &params, permit)).await
 	}
 
 	/// Insert new items into a module (`crate` for the crate root; set `lib` or `bin` to pick the library or a binary
@@ -264,9 +494,10 @@ impl Server {
 		Parameters(params): Parameters<InsertParams>,
 		context: RequestContext<RoleServer>,
 	) -> CallToolResult {
-		let load = self.load_options(&params.selection);
+		let target = self.target(&params.selection, false);
+		let dry_run = params.dry_run;
 
-		self.edit("insert_items", context, move |cancelled| tools::insert(&load, &params, cancelled)).await
+		self.edit("insert_items", context, target, dry_run, move |load, permit| tools::insert(load, &params, permit)).await
 	}
 
 	/// Sort items (Cryotheum ordering) and format them with rustfmt or prettyplease. A module target formats its
@@ -284,9 +515,92 @@ impl Server {
 		Parameters(params): Parameters<FormatParams>,
 		context: RequestContext<RoleServer>,
 	) -> CallToolResult {
-		let load = self.load_options(&params.selection);
+		let target = self.target(&params.selection, false);
+		let dry_run = params.check;
 
-		self.edit("format_items", context, move |cancelled| tools::format(&load, &params, cancelled)).await
+		self.edit("format_items", context, target, dry_run, move |load, permit| tools::format(load, &params, permit)).await
+	}
+}
+
+#[tool_router(router = source_tools)]
+impl Server {
+	/// Attach a cargo workspace or package, by the path of its Cargo.toml, under a name of your choice: afterwards,
+	/// pass that name as `attached` to any other tool to work on it instead of the server's own workspace. Only
+	/// workspaces and packages in the directories the server exposes can be attached, and only those exposed for
+	/// writing can be attached with `write` (see `list_sources`). Attaching is cheap: every call loads its source from
+	/// disk anyway. Names are only known in this session.
+	#[tool(annotations(
+		title = "Attach a source",
+		read_only_hint = false,
+		destructive_hint = false,
+		idempotent_hint = true,
+		open_world_hint = false
+	))]
+	async fn attach_source(&self, Parameters(params): Parameters<AttachParams>) -> CallToolResult {
+		const TOOL: &str = "attach_source";
+
+		let name = params.name.trim().to_owned();
+
+		if let Err(message) = sources::check_name(&name) {
+			return respond(TOOL, Err(message));
+		}
+
+		if params.write && self.options.read_only {
+			return respond(
+				TOOL,
+				Err("this rscode server is read-only (it was started with `--read-only`): sources can only be attached \
+				     without `write`"
+					.to_owned()),
+			);
+		}
+
+		let exposed = self.exposed.clone();
+		let own = self.options.load.clone();
+		let cap = self.access_cap();
+		let job = move || sources::attach(&params.manifest_path, params.write, &exposed, cap, &own);
+		let (source, summary) = match worker::run(TOOL, job).await.and_then(identity) {
+			Ok(attached) => attached,
+			Err(message) => return respond(TOOL, Err(message)),
+		};
+		let replaced = self.sources().insert(name.clone(), source.clone());
+		let mut text = format!("attached `{name}` ({}): {}", source.access.describe(), source.manifest.display());
+
+		if let Some(previous) = replaced.filter(|previous| *previous != source) {
+			write!(text, ", replacing {} ({})", previous.manifest.display(), previous.access.describe()).unwrap();
+		}
+
+		write!(text, "\n{summary}pass `\"attached\": \"{name}\"` to the other tools to work on it\n").unwrap();
+		respond(TOOL, Ok(text))
+	}
+
+	/// Detach a source attached with `attach_source`: its name is forgotten, and the other tools no longer accept it
+	/// as `attached`. Nothing on disk is touched.
+	#[tool(annotations(
+		title = "Detach a source",
+		read_only_hint = false,
+		destructive_hint = false,
+		idempotent_hint = true,
+		open_world_hint = false
+	))]
+	async fn detach_source(&self, Parameters(params): Parameters<DetachParams>) -> CallToolResult {
+		let name = params.name.trim();
+		let result = {
+			let mut attached = self.sources();
+
+			match attached.remove(name) {
+				Some(source) => Ok(format!("detached `{name}` ({})\n", source.manifest.display())),
+				None => Err(self.unknown(name, &attached)),
+			}
+		};
+
+		respond("detach_source", result)
+	}
+
+	/// List the attached sources (with their access and Cargo.toml), the server's own workspace, and the directories
+	/// whose workspaces and packages can be attached with `attach_source`.
+	#[tool(annotations(title = "List sources", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+	async fn list_sources(&self) -> CallToolResult {
+		respond("list_sources", Ok(self.describe_sources()))
 	}
 }
 
@@ -297,6 +611,16 @@ impl ServerHandler for Server {
 
 		if self.options.read_only {
 			instructions.push_str(READ_ONLY_INSTRUCTIONS);
+		}
+
+		if !self.exposed.is_empty() {
+			instructions.push_str(&sources_instructions(self.options.read_only));
+
+			for exposure in self.exposed.iter() {
+				let access = exposure.access().min(self.access_cap());
+
+				write!(instructions, "\n- {access}: {}", exposure.resolved_pattern()).unwrap();
+			}
 		}
 
 		let implementation = Implementation::new("rscode", env!("CARGO_PKG_VERSION"))
@@ -313,9 +637,15 @@ impl ServerHandler for Server {
 		request: CallToolRequestParams,
 		context: RequestContext<RoleServer>,
 	) -> Result<CallToolResponse, ErrorData> {
-		// the editing tools of a read-only server are hidden: tell why rather than "tool not found"
+		// the editing tools of a read-only server are hidden, like the tools about sources when nothing can be
+		// attached: tell why rather than "tool not found"
 		if self.tool_router.is_disabled(&request.name) {
-			return Ok(read_only(&request.name).into());
+			let result = match SOURCE_TOOLS.contains(&request.name.as_ref()) {
+				true => nothing_exposed(&request.name),
+				false => read_only(&request.name),
+			};
+
+			return Ok(result.into());
 		}
 
 		self.tool_router.call(ToolCallContext::new(self, request, context)).await
@@ -336,4 +666,30 @@ fn read_only(tool: &str) -> CallToolResult {
 	CallToolResult::error(vec![ContentBlock::text(format!(
 		"`{tool}` modifies files, but this rscode server is read-only (it was started with `--read-only`)"
 	))])
+}
+
+fn nothing_exposed(tool: &str) -> CallToolResult {
+	CallToolResult::error(vec![ContentBlock::text(format!(
+		"`{tool}` is not available: this rscode server exposes no directories to attach sources from (it was started \
+		 without `--expose`)"
+	))])
+}
+
+/// Removes the `attached` parameter from a tool's input schema.
+fn without_attached(tool: &mut Tool) {
+	let mut schema = (*tool.input_schema).clone();
+
+	if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+		properties.remove("attached");
+	}
+
+	tool.input_schema = Arc::new(schema);
+}
+
+/// The working directory, and the nearest `Cargo.toml` in it or above it (from which cargo finds the workspace).
+fn nearest_manifest() -> Option<(PathBuf, Option<PathBuf>)> {
+	let directory = std::env::current_dir().ok()?;
+	let manifest = directory.ancestors().map(|directory| directory.join("Cargo.toml")).find(|path| path.is_file());
+
+	Some((directory, manifest))
 }

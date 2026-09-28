@@ -131,7 +131,10 @@ Model Context Protocol, on stdin and stdout.
 
 The workspace options given here are the server's defaults (tools can narrow the package selection per call). The \
 workspace is loaded anew for every tool call, so changes made by other tools are always seen, and every edit is \
-validated to still parse before anything is written.";
+validated to still parse before anything is written.
+
+With --expose, clients can also attach other workspaces and packages at runtime, by the path of their Cargo.toml and \
+a name of their choice, and then work on them by that name. Names are only known to the client that attached them.";
 
 #[cfg(feature = "mcp")]
 const MCP_AFTER_HELP: &str = "\
@@ -154,7 +157,24 @@ in their PATH):
 
 Running cargo-rscode itself (\"command\": \"/home/me/.cargo/bin/cargo-rscode\", \"args\": [\"mcp\"]) skips cargo \
 and rustup. Without --manifest-path, the workspace is found from the server's working directory (for Claude Code, \
-the project directory).";
+the project directory).
+
+One server for several workspaces: the project's own, one more to edit, and references to read:
+    \"args\": [\"rscode\", \"mcp\",
+      \"--expose\", \"write=/abs/path/engine\",
+      \"--expose\", \"read=/abs/path/references/*\",
+      \"--expose\", \"read=/abs/path/references/misc/**\"]";
+
+#[cfg(feature = "mcp")]
+const EXPOSE_LONG_HELP: &str = "\
+Let clients attach the cargo workspaces and packages whose Cargo.toml is in a directory matching DIRS, a glob pattern \
+of directories, with ACCESS `read` or `write`. `*` matches within one path component and `**` any number of them: \
+`/refs/*` matches /refs/log but not /refs/misc/log, and `/refs/misc/**` matches /refs/misc and every directory below \
+it. Wildcards do not match hidden directories, and symbolic links are resolved.
+
+Sources attached for writing can be edited, but their edits are only ever written below directories matched by \
+`write` patterns (which take precedence over `read` patterns). The server's own workspace is not restricted. Can be \
+given several times.";
 
 /// The command tree (without a `bin_name`; see the module docs).
 pub(crate) fn cli() -> Command {
@@ -454,7 +474,17 @@ fn mcp() -> Command {
 		.about("Serve rscode over the Model Context Protocol (stdio)")
 		.long_about(MCP_LONG_ABOUT)
 		.after_help(MCP_AFTER_HELP)
-		.arg(flag("read-only", "Do not offer tools that modify files"));
+		.arg(flag("read-only", "Do not offer tools that modify files"))
+		.arg(
+			Arg::new("expose")
+				.long("expose")
+				.value_name("ACCESS=DIRS")
+				.action(ArgAction::Append)
+				.value_parser(|value: &str| value.parse::<rscode::mcp::Exposure>())
+				.value_hint(ValueHint::Other)
+				.help("Let clients attach the workspaces and packages in directories matching a glob (ACCESS: read or write)")
+				.long_help(EXPOSE_LONG_HELP),
+		);
 
 	load_args(command)
 }

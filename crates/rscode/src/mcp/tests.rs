@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 const QUERY_TOOLS: [&str; 3] = ["find_items", "view_items", "workspace_info"];
 const EDIT_TOOLS: [&str; 5] = ["format_items", "insert_items", "remove_items", "rename_item", "replace_item"];
+const SOURCE_TOOLS: [&str; 3] = ["attach_source", "detach_source", "list_sources"];
 
 /// Parameters every tool accepts.
 const SELECTION: [&str; 7] = ["packages", "workspace", "features", "all_features", "all_targets", "lib", "bin"];
@@ -37,6 +38,100 @@ fn sorted(names: impl IntoIterator<Item = impl ToString>) -> Vec<String> {
 
 fn all_tools() -> Vec<String> {
 	sorted(QUERY_TOOLS.iter().chain(&EDIT_TOOLS))
+}
+
+/// Options exposing a directory for reading.
+fn exposing() -> ServerOptions {
+	ServerOptions {
+		exposed: vec!["read=/nonexistent/refs/*".parse().unwrap()],
+		..ServerOptions::default()
+	}
+}
+
+#[test]
+fn exposing_directories_offers_sources() {
+	let server = Server::new(exposing());
+	let tools = server.tools();
+
+	assert_eq!(sorted(tools.iter().map(|tool| &tool.name)), sorted(all_tools().iter().chain(&sorted(SOURCE_TOOLS))));
+
+	for tool in &tools {
+		let schema = Value::Object((*tool.input_schema).clone());
+		let attached = schema["properties"].get("attached").is_some();
+
+		assert_eq!(attached, !SOURCE_TOOLS.contains(&tool.name.as_ref()), "{}: {schema}", tool.name);
+	}
+
+	// without exposed directories, neither the tools nor the parameter are offered
+	for tool in Server::new(ServerOptions::default()).tools() {
+		assert!(Value::Object((*tool.input_schema).clone())["properties"].get("attached").is_none(), "{}", tool.name);
+	}
+
+	// the parameters of every tool are complete and their own: the item code of `replace_item` and `insert_items`
+	// (`source`) is not taken over by another parameter
+	for server in [Server::new(ServerOptions::default()), Server::new(exposing())] {
+		for tool in server.tools() {
+			let schema = Value::Object((*tool.input_schema).clone());
+
+			for name in schema["required"].as_array().into_iter().flatten() {
+				let property = &schema["properties"][name.as_str().unwrap()];
+
+				assert!(property.is_object(), "{}: `{name}` is required, but not in {schema}", tool.name);
+				assert!(property["description"].as_str().unwrap_or_default().len() > 10, "{}.{name}", tool.name);
+			}
+		}
+
+		for tool in ["replace_item", "insert_items"] {
+			let schema = Value::Object((*server.get_tool(tool).unwrap().input_schema).clone());
+
+			assert_eq!(schema["properties"]["source"]["type"], "string", "{tool}: {schema}");
+		}
+	}
+
+	let read_only = Server::new(ServerOptions { read_only: true, ..exposing() });
+
+	assert_eq!(sorted(read_only.tools().iter().map(|tool| &tool.name)), sorted(QUERY_TOOLS.iter().chain(&SOURCE_TOOLS)));
+}
+
+#[test]
+fn source_tools() {
+	let server = Server::new(exposing());
+	let schema = |name: &str| Value::Object((*server.get_tool(name).unwrap().input_schema).clone());
+	let required = |name: &str| schema(name)["required"].as_array().cloned().unwrap_or_default();
+
+	assert_eq!(sorted(required("attach_source").iter().map(|name| name.as_str().unwrap())), ["manifest_path", "name"]);
+	assert_eq!(required("detach_source"), [json!("name")]);
+	assert_eq!(required("list_sources"), Vec::<Value>::new());
+	assert_eq!(schema("attach_source")["properties"]["write"]["default"], false);
+
+	for name in SOURCE_TOOLS {
+		let tool = server.get_tool(name).unwrap();
+		let annotations = tool.annotations.unwrap();
+
+		assert!(tool.description.unwrap().len() > 100, "{name} is not described");
+		assert!(annotations.title.is_some(), "{name}");
+		assert_eq!(annotations.read_only_hint, Some(name == "list_sources"), "{name}");
+		assert!(!annotations.destructive_hint.unwrap_or_default(), "{name}");
+		assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
+		assert_eq!(annotations.open_world_hint, Some(false), "{name}");
+	}
+
+	let instructions = server.get_info().instructions.unwrap();
+
+	assert!(instructions.contains("attach_source"), "{instructions}");
+	assert!(instructions.contains("pass that name as `attached`"), "{instructions}");
+	assert!(instructions.ends_with("\n- read: /nonexistent/refs/*"), "{instructions}");
+	assert!(!Server::new(ServerOptions::default()).get_info().instructions.unwrap().contains("attach_source"));
+
+	// a read-only server does not offer writing
+	let exposed = vec!["write=/nonexistent/engine".parse().unwrap()];
+	let writable = Server::new(ServerOptions { exposed: exposed.clone(), ..ServerOptions::default() });
+	let read_only = Server::new(ServerOptions { exposed, read_only: true, ..ServerOptions::default() });
+	let writable = writable.get_info().instructions.unwrap();
+	let read_only = read_only.get_info().instructions.unwrap();
+
+	assert!(writable.contains("`write` if you need to edit them") && writable.ends_with("- write: /nonexistent/engine"));
+	assert!(!read_only.contains("`write`") && read_only.ends_with("- read: /nonexistent/engine"), "{read_only}");
 }
 
 #[test]
@@ -353,6 +448,26 @@ async fn read_only_servers_refuse_edits() {
 }
 
 #[tokio::test]
+async fn servers_without_exposed_directories_explain_the_source_tools() {
+	let mut client = Client::connect(ServerOptions::default()).await;
+
+	for tool in SOURCE_TOOLS {
+		let (failed, text) = client.call(tool, json!({ "name": "a", "manifest_path": "/a/Cargo.toml" })).await;
+
+		assert!(failed, "{tool}");
+		assert!(text.contains("exposes no directories to attach sources from"), "{tool}: {text}");
+	}
+
+	// a source is never ignored, even where the parameter is not offered
+	let (failed, text) = client.call("workspace_info", json!({ "attached": "a" })).await;
+
+	assert!(failed);
+	assert!(text.starts_with("no source is attached as `a`: this rscode server exposes no directories"), "{text}");
+	assert!(!text.contains("attach_source"), "{text}");
+	client.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn hanging_up_before_initializing_is_not_an_error() {
 	let (client, server) = tokio::io::duplex(1024);
 
@@ -500,7 +615,7 @@ mod end_to_end {
 					silent: true,
 					..LoadOptions::default()
 				},
-				read_only: false,
+				..ServerOptions::default()
 			}
 		}
 
@@ -715,6 +830,216 @@ mod end_to_end {
 		assert!(failed);
 		assert_contains(&text, &["`<demo::W<u16>>::get` (assoc-fn) at src/lib.rs:10:2", "hint: use one of the candidates'"]);
 		assert!(!text.contains("all_variants"), "{text}");
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn sources() {
+		let package = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n");
+		let fixture = Fixture::with_files(
+			"sources",
+			&[
+				("own/Cargo.toml", &package("own")),
+				("own/src/lib.rs", "pub fn mine() {}\n"),
+				("project/Cargo.toml", &package("engine")),
+				(
+					"project/src/lib.rs",
+					"#[path = \"../../outside/escape.rs\"]\npub mod escape;\n\npub fn run() {}\n\npub fn go() {\n\trun();\n}\n",
+				),
+				("outside/escape.rs", "pub fn escaped() {}\n"),
+				("refs/log/Cargo.toml", &package("log")),
+				("refs/log/src/lib.rs", "pub fn info() {}\n"),
+				("secret/Cargo.toml", &package("secret")),
+				("secret/src/lib.rs", "pub fn hidden() {}\n"),
+			],
+		);
+		let root = std::fs::canonicalize(&fixture.root).unwrap();
+		let pattern = |pattern: &str| root.join(pattern).to_str().unwrap().to_owned();
+		let options = ServerOptions {
+			load: LoadOptions {
+				manifest_path: Some(root.join("own/Cargo.toml")),
+				silent: true,
+				..LoadOptions::default()
+			},
+			exposed: vec![
+				Exposure::new(Access::Write, &pattern("project")).unwrap(),
+				Exposure::new(Access::Read, &pattern("refs/*")).unwrap(),
+			],
+			..ServerOptions::default()
+		};
+		let mut client = Client::connect(options).await;
+
+		let (failed, text) = client.call("list_sources", json!({})).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&format!("the server's own workspace (used without `attached`): {}", root.join("own/Cargo.toml").display()),
+				"no sources are attached",
+				&format!("write  {}", pattern("project")),
+				&format!("read   {}", pattern("refs/*")),
+			],
+		);
+
+		// reading
+		let log = root.join("refs/log/Cargo.toml");
+		let (failed, text) =
+			client.call("attach_source", json!({ "manifest_path": log.to_str().unwrap(), "name": "log" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&format!("attached `log` (read-only): {}", log.display()),
+				"packages loaded by default: log 0.1.0",
+				"pass `\"attached\": \"log\"`",
+			],
+		);
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "info", "attached": "log" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["log::info  fn  src/lib.rs:1:1"]);
+
+		let (_, text) = client.call("workspace_info", json!({ "attached": "log" })).await;
+
+		assert!(text.starts_with(&format!("source `log` (read-only): {}\n", log.display())), "{text}");
+
+		// the server's own workspace is still the default
+		let (_, text) = client.call("find_items", json!({ "pattern": "*" })).await;
+
+		assert_contains(&text, &["own::mine  fn"]);
+		assert!(!text.contains("info"), "{text}");
+
+		// read-only sources are only previewed
+		let rename = json!({ "path": "crate::info", "new_name": "notice", "attached": "log" });
+		let (failed, text) = client.call("rename_item", rename.clone()).await;
+
+		assert!(failed);
+		assert_contains(&text, &["source `log` is attached read-only", "nothing was written", "only exposed for reading"]);
+
+		let mut preview = rename;
+
+		preview["dry_run"] = json!(true);
+
+		let (failed, text) = client.call("rename_item", preview).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["-pub fn info() {}", "+pub fn notice() {}"]);
+		assert_eq!(fixture.read("refs/log/src/lib.rs"), "pub fn info() {}\n");
+
+		// the tools taking item code (`source`) name attached sources like every other tool
+		let own = fixture.read("own/src/lib.rs");
+		let replace = json!({ "path": "crate::info", "source": "pub fn info() { todo!() }", "attached": "log" });
+		let insert = json!({ "parent": "crate", "source": "pub fn warn() {}", "attached": "log" });
+		let format = json!({ "attached": "log" });
+
+		for (tool, arguments) in [("replace_item", &replace), ("insert_items", &insert), ("format_items", &format)] {
+			let (failed, text) = client.call(tool, arguments.clone()).await;
+
+			assert!(failed, "{tool}: {text}");
+			assert_contains(&text, &["source `log` is attached read-only"]);
+		}
+
+		let (failed, text) = client.call("format_items", json!({ "attached": "log", "check": true })).await;
+
+		assert!(!failed, "{text}");
+
+		let mut preview = insert.clone();
+
+		preview["dry_run"] = json!(true);
+
+		let (failed, text) = client.call("insert_items", preview).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["+++ b/src/lib.rs", "+pub fn warn() {}"]);
+		assert_eq!(fixture.read("refs/log/src/lib.rs"), "pub fn info() {}\n");
+		assert_eq!(fixture.read("own/src/lib.rs"), own);
+
+		// what may be attached, and how
+		let attach = |path: &str, name: &str, write: bool| {
+			json!({ "manifest_path": root.join(path).to_str().unwrap(), "name": name, "write": write })
+		};
+		let (failed, text) = client.call("attach_source", attach("refs/log", "log", true)).await;
+
+		assert!(failed);
+		assert_contains(&text, &["is only exposed for reading", &format!("read={}", pattern("refs/*"))]);
+
+		let (failed, text) = client.call("attach_source", attach("secret", "secret", false)).await;
+
+		assert!(failed);
+		assert_contains(&text, &["is not in a directory exposed by this server", &pattern("refs/*")]);
+
+		let (failed, text) = client.call("attach_source", attach("project", "no good", true)).await;
+
+		assert!(failed);
+		assert_contains(&text, &["invalid name `no good`"]);
+
+		// writing, by the directory of the manifest
+		let (failed, text) = client.call("attach_source", attach("project", "engine", true)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["attached `engine` (read and write)", "packages loaded by default: engine 0.1.0"]);
+
+		let (failed, text) =
+			client.call("rename_item", json!({ "path": "crate::run", "new_name": "start", "attached": "engine" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&fixture.read("project/src/lib.rs"), &["pub fn start() {}", "\tstart();"]);
+
+		let replace = json!({ "path": "crate::start", "source": "pub fn start() {\n\tgo();\n}", "attached": "engine" });
+		let (failed, text) = client.call("replace_item", replace).await;
+
+		assert!(!failed, "{text}");
+
+		let insert = json!({ "parent": "crate", "source": "pub fn stop() {}", "attached": "engine" });
+		let (failed, text) = client.call("insert_items", insert).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&fixture.read("project/src/lib.rs"), &["pub fn start() {\n\tgo();\n}", "pub fn stop() {}"]);
+		assert_eq!(fixture.read("own/src/lib.rs"), own);
+
+		// but only below the directories exposed for writing
+		let before = fixture.read("project/src/lib.rs");
+		let (failed, text) = client
+			.call("rename_item", json!({ "path": "crate::escape::escaped", "new_name": "caught", "attached": "engine" }))
+			.await;
+
+		assert!(failed);
+		assert_contains(&text, &["the edit of source `engine` would change", "escape.rs", "nothing was written"]);
+		assert_eq!(fixture.read("outside/escape.rs"), "pub fn escaped() {}\n");
+		assert_eq!(fixture.read("project/src/lib.rs"), before);
+
+		// names
+		let (_, text) = client.call("list_sources", json!({})).await;
+
+		assert_contains(&text, &["engine  read and write", "log     read-only"]);
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "attached": "nope" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no source is attached as `nope`", "the attached sources are `engine`, `log`"]);
+
+		let (failed, text) = client.call("detach_source", json!({ "name": "log" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["detached `log`"]);
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "attached": "log" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no source is attached as `log`"]);
+
+		let (failed, _) = client.call("detach_source", json!({ "name": "log" })).await;
+
+		assert!(failed);
+
+		// attaching again under a name replaces the source
+		let (failed, text) = client.call("attach_source", attach("refs/log", "engine", false)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["attached `engine` (read-only)", "replacing", "(read and write)"]);
 		client.close().await.unwrap();
 	}
 

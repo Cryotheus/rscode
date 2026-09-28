@@ -58,7 +58,7 @@ before anything is written, and `--dry-run`/`--check` print a diff instead of wr
 ## MCP server
 
 `cargo rscode mcp` offers the tools `workspace_info`, `find_items`, `view_items`, `rename_item`, `remove_items`,
-`replace_item`, `insert_items`, and `format_items`. With `--read-only`, only the first three are offered. The workspace
+`replace_item`, `insert_items`, and `format_items`. With `--read-only`, the last five are not offered. The workspace
 is reloaded for every call, so changes made by other tools are always seen.
 
 ```sh
@@ -70,6 +70,43 @@ claude mcp add rscode -- cargo rscode mcp --manifest-path /abs/path/to/Cargo.tom
 ```
 
 The `mcp` feature (on by default) builds the server.
+
+### Several workspaces from one server
+
+With `--expose ACCESS=DIRS`, clients can attach more cargo workspaces and packages while connected, by the path of
+their `Cargo.toml` (or its directory) and a name of their choice, and then pass that name as `attached` to any tool:
+
+```json
+{
+  "mcpServers": {
+    "rscode": {
+      "command": "cargo",
+      "args": [
+        "rscode", "mcp",
+        "--expose", "write=/abs/path/engine",
+        "--expose", "read=/abs/path/references/*",
+        "--expose", "read=/abs/path/references/misc/**"
+      ]
+    }
+  }
+}
+```
+
+- A `Cargo.toml` can be attached when its directory matches a pattern. `*` matches within one path component and
+  `**` any number of them: `references/*` matches `references/log` but not `references/misc/log`, and
+  `references/misc/**` matches `references/misc` and everything below it. Wildcards skip hidden directories, and
+  symbolic links are resolved before matching.
+- Clients ask for write access when attaching. Only directories matching a `write` pattern grant it, and `write`
+  patterns take precedence over `read` ones. Edits of attached sources are only ever written below directories
+  matching a `write` pattern, even when they reach elsewhere (through `#[path]` attributes or other workspace
+  members). Sources attached read-only can still be previewed with `dry_run`. Reading is not confined the same way:
+  a source is loaded like cargo loads it, including its other workspace members and `#[path]` files.
+- Names are scoped to the client that attached them. Over stdio each client has its own server process, so clients
+  never see or break each other's names. Attaching checks that cargo can plan loading the source (so it fails for
+  manifests cargo rejects), and then only records the name: every tool call loads its source from disk anyway.
+  `detach_source` forgets a name, and `list_sources` shows the attached sources and the exposed directories.
+- The server's own workspace (`--manifest-path`, or the one containing the working directory) remains the default
+  when a tool call names no `attached` source, and `--expose` does not restrict its edits, like on the command line.
 
 ## Shell completion
 
