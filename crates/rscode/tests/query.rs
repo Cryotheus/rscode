@@ -342,6 +342,7 @@ fn filters_by_kind() {
 			"query_basic::nested::outer::TABLE",
 			"query_basic::nested::outer::SHORT",
 			"query_basic::nested::outer::GREETING",
+			"query_basic::nested::COUNTER",
 		]
 	);
 
@@ -393,8 +394,8 @@ fn finds_imports_with_their_targets() {
 	assert_eq!(
 		summary,
 		[
-			("query_basic::impls::Circle", ItemKind::Import, circle()),
-			("query_basic::Circle", ItemKind::Import, circle()),
+			("use query_basic::impls::Circle", ItemKind::Import, circle()),
+			("use query_basic::Circle", ItemKind::Import, circle()),
 			("query_basic::shapes::Circle", ItemKind::Struct, Vec::new()),
 		]
 	);
@@ -407,12 +408,12 @@ fn finds_imports_with_their_targets() {
 	assert_eq!(
 		summary,
 		[
-			("query_basic::impls::Circle", circle()),
-			("query_basic::impls::Shape", vec!["query_basic::shapes::Shape".to_owned()]),
-			("query_basic::impls::Square", vec!["query_basic::shapes::Square".to_owned()]),
-			("query_basic::*", vec!["query_basic::nested".to_owned()]),
-			("query_basic::Circle", circle()),
-			("query_basic::ShapeTrait", vec!["query_basic::shapes::Shape".to_owned()]),
+			("use query_basic::impls::Circle", circle()),
+			("use query_basic::impls::Shape", vec!["query_basic::shapes::Shape".to_owned()]),
+			("use query_basic::impls::Square", vec!["query_basic::shapes::Square".to_owned()]),
+			("use query_basic::*", vec!["query_basic::nested".to_owned()]),
+			("use query_basic::Circle", circle()),
+			("use query_basic::ShapeTrait", vec!["query_basic::shapes::Shape".to_owned()]),
 		]
 	);
 
@@ -730,7 +731,7 @@ fn outlines_modules() {
 		])
 	);
 
-	// nested inline modules are collapsed; macros and functions elided
+	// nested inline modules are collapsed; macros (but for the declarations of `thread_local!`) and functions elided
 	assert_eq!(
 		text(&resolver, "crate::nested", auto.clone()),
 		lines(&[
@@ -742,7 +743,7 @@ fn outlines_modules() {
 			"",
 			"macro_rules! square { ... }",
 			"",
-			"thread_local!( ... );",
+			"thread_local!(static COUNTER: u8 = 0);",
 			"",
 			"pub fn r#match() -> u8 { ... }",
 			"",

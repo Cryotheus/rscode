@@ -8,6 +8,7 @@ use crate::edit::Removal;
 use crate::edit::Rename;
 use crate::edit::Replacement;
 use crate::model::Crate;
+use crate::model::ItemKind;
 use crate::model::Package;
 use crate::model::Severity;
 use crate::model::Workspace;
@@ -98,7 +99,7 @@ pub(crate) fn find(root: &Path, pattern: &str, matches: &[FindMatch], page: Page
 fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
 	let mut columns = vec![
 		found.path.clone(),
-		found.kind.name().to_owned(),
+		kind_label(found.kind, found.thread_local),
 		format!("{}:{}-{}", display(root, &found.file), found.start, found.end),
 	];
 
@@ -136,7 +137,9 @@ fn find_summary(pattern: &str, shown: usize, page: Page) -> String {
 		let mut summary = format!("no items match `{pattern}`");
 
 		if !pattern.contains('*') {
-			let name = pattern.rsplit("::").next().unwrap_or(pattern).trim();
+			let name = pattern.trim();
+			let name = name.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace)).unwrap_or(name);
+			let name = name.rsplit("::").next().unwrap_or(name).trim();
 
 			write!(summary, " (without `*`, names must match exactly: try `*{name}*`, or `ignore_case`)").unwrap();
 		}
@@ -196,9 +199,18 @@ fn view_blocks(root: &Path, view: &ItemView, blocks: &mut Vec<String>) {
 	}
 }
 
+/// The name of a kind, marking statics declared by `thread_local!`.
+fn kind_label(kind: ItemKind, thread_local: bool) -> String {
+	match thread_local {
+		true => format!("{} (thread_local!)", kind.name()),
+		false => kind.name().to_owned(),
+	}
+}
+
 fn view_header(root: &Path, view: &ItemView) -> String {
 	let last = last_line(view.start, view.end);
-	let mut header = format!("// {} ({}) {}:{}", view.path, view.kind, display(root, &view.file), view.start.line);
+	let kind = kind_label(view.kind, view.thread_local);
+	let mut header = format!("// {} ({kind}) {}:{}", view.path, display(root, &view.file), view.start.line);
 
 	if last > view.start.line {
 		write!(header, "-{last}").unwrap();
@@ -735,6 +747,7 @@ mod tests {
 			active: Tristate::True,
 			usable_paths: Vec::new(),
 			import_targets: Vec::new(),
+			thread_local: false,
 		}
 	}
 
@@ -748,6 +761,7 @@ mod tests {
 			end,
 			cfg: None,
 			active: Tristate::True,
+			thread_local: false,
 			text: text.to_owned(),
 			impls: Vec::new(),
 		}

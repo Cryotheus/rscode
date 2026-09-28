@@ -24,8 +24,9 @@
 //! # Item paths
 //!
 //! Item paths are written like Rust paths: `crate::module::Item` (in the selected crates), `::crate_name::Item`,
-//! `module::Item` (presumed absolute), `Type::method`, `<Type as Trait>::method`, and `impl Trait for Type` for
-//! `impl` blocks. Every `cfg` variant of an item is addressed by its path. File paths are printed relative to the
+//! `module::Item` (presumed absolute), `Type::method`, `<Type as Trait>::method`, `impl Trait for Type` for `impl`
+//! blocks, and `'use module::Item'` for imports (other paths go through them). Every `cfg` variant of an item is
+//! addressed by its path. File paths are printed relative to the
 //! current directory when below it (`--absolute-paths` prints them absolute).
 //!
 //! # Invocation

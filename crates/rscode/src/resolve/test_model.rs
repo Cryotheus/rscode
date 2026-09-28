@@ -304,6 +304,7 @@ impl Builder<'_> {
 
 			syn::Item::Static(item) => {
 				let detail = ItemDetail::Static {
+					thread_local: false,
 					mutable: matches!(item.mutability, syn::StaticMutability::Mut(_)),
 				};
 

@@ -693,8 +693,8 @@ fn records_item_details() {
 	assert_eq!(detail(&["Alias"]), ItemDetail::Trait { is_unsafe: false, is_auto: false, body: None });
 
 	// statics
-	assert_eq!(detail(&["STATIC"]), ItemDetail::Static { mutable: false });
-	assert_eq!(detail(&["STATIC_MUT"]), ItemDetail::Static { mutable: true });
+	assert_eq!(detail(&["STATIC"]), ItemDetail::Static { mutable: false, thread_local: false });
+	assert_eq!(detail(&["STATIC_MUT"]), ItemDetail::Static { mutable: true, thread_local: false });
 
 	// macros
 	let local_macro = find(&workspace, krate, &["local_macro"]);
@@ -728,7 +728,7 @@ fn records_item_details() {
 	assert!(matches!(&workspace.item(c_block).detail, ItemDetail::ExternBlock { abi: Some(abi), is_unsafe: false, .. } if abi == "C"));
 	assert!(matches!(workspace.item(unsafe_block).detail, ItemDetail::ExternBlock { is_unsafe: true, .. }));
 	assert!(matches!(workspace.item(bare_block).detail, ItemDetail::ExternBlock { abi: None, .. }));
-	assert_eq!(workspace.item(nth(&workspace, c_block, ItemKind::ForeignStatic, 1)).detail, ItemDetail::Static { mutable: true });
+	assert_eq!(workspace.item(nth(&workspace, c_block, ItemKind::ForeignStatic, 1)).detail, ItemDetail::Static { mutable: true, thread_local: false });
 	assert!(!fn_info(nth(&workspace, unsafe_block, ItemKind::ForeignFn, 0)).is_unsafe);
 	assert_eq!(fn_info(nth(&workspace, c_block, ItemKind::ForeignFn, 0)).body, None);
 }

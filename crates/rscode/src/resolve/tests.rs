@@ -18,9 +18,14 @@ fn single(source: &str) -> Workspace {
 	workspace([TestCrate::new("t", source)])
 }
 
-/// An [`ItemPath`] from text (`crate::a`, `::dep::b`, `a::b`, `<A as B>::c`, `<A>`); `ItemPath::parse` lives elsewhere.
+/// An [`ItemPath`] from text (`crate::a`, `::dep::b`, `a::b`, `<A as B>::c`, `<A>`, `use a::b`); `ItemPath::parse`
+/// lives elsewhere.
 fn item_path(text: &str) -> ItemPath {
 	let text = text.trim();
+
+	if let Some(rest) = text.strip_prefix("use ") {
+		return ItemPath { import: true, ..item_path(rest) };
+	}
 
 	if let Some(rest) = text.strip_prefix('<') {
 		let close = rest.rfind('>').expect("unclosed qualifier");
@@ -37,6 +42,7 @@ fn item_path(text: &str) -> ItemPath {
 			}),
 			segments: segments(rest[close + 1..].trim_start_matches("::")),
 			arguments: None,
+			import: false,
 		};
 	}
 
@@ -57,6 +63,7 @@ fn item_path(text: &str) -> ItemPath {
 		qualifier: None,
 		segments: segments(rest),
 		arguments: None,
+		import: false,
 	}
 }
 
@@ -2093,14 +2100,17 @@ fn shadowed_by_variant(ws: &Workspace, resolver: &Resolver<'_>, item: ItemId) ->
 	})
 }
 
-/// Named definitions whose canonical path (as `::crate::...`) does not resolve back to them.
+/// Named definitions and imports whose canonical path (as `::crate::...`, or `use ::crate::...`) does not resolve back
+/// to them.
 fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -> Vec<String> {
 	let mut failures = Vec::new();
 
 	for krate in ws.crates() {
 		for (item, data) in krate.items() {
-			// imports and `extern crate`s resolve to what they import
-			if data.name.is_none() || !data.kind.is_nameable() || matches!(data.kind, ItemKind::Import | ItemKind::ExternCrate) {
+			// `extern crate`s resolve to what they import
+			let named = data.name.is_some() && data.kind.is_nameable() && data.kind != ItemKind::ExternCrate;
+
+			if !named && data.kind != ItemKind::Import {
 				continue;
 			}
 
@@ -2119,6 +2129,7 @@ fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -
 				qualifier: None,
 				segments,
 				arguments: None,
+				import: path.is_import,
 			};
 
 			if !resolver.resolve_item_path(&item_path).contains(&item) {

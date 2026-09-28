@@ -102,25 +102,62 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 	let targets = targets(resolver, paths, options.active_only)?;
 	let mut plan = Removal { edits: EditSet::new(), removed: Vec::new(), dangling: Vec::new(), warnings: Vec::new() };
 	let mut deletions = Deletions::default();
+	let emptied = emptied_thread_locals(ws, &targets);
+
+	// imports (the leaves of `use` items) to remove, by `use` item: pruned together, so that a `use` item all of
+	// whose imports go is removed as a whole
+	let mut pruned: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
 
 	for &item in &targets {
 		match ws.item(item).kind {
 			ItemKind::Variant => deletions.element(ws.file_of(item), ws.item(item).range),
+			ItemKind::Import => pruned.entry(ws.parent(item).unwrap_or(item)).or_default().push(item),
+			_ if ws.parent(item).is_some_and(|parent| emptied.contains(&parent)) => {}
 			_ => deletions.item(ws.file_of(item), ws.item(item).range),
 		}
 
 		push_removed(&mut plan.removed, removed_item(resolver, item));
 	}
 
+	for &invocation in &emptied {
+		deletions.item(ws.file_of(invocation), ws.item(invocation).range);
+	}
+
 	let removed = removed_items(ws, &targets, &deletions.ranges());
 
 	if options.prune_imports {
 		for (use_item, imports) in broken_imports(resolver, &removed) {
-			prune(ws, use_item, &imports, &mut deletions);
+			let leaves = pruned.entry(use_item).or_default();
 
 			for import in imports {
 				push_removed(&mut plan.removed, removed_item(resolver, import));
+
+				if !leaves.contains(&import) {
+					leaves.push(import);
+				}
 			}
+		}
+	}
+
+	for (&use_item, imports) in &pruned {
+		prune(ws, use_item, imports, &mut deletions);
+	}
+
+	// what named the imported items through them is not searched for
+	for &import in targets.iter().filter(|&&item| ws.item(item).kind == ItemKind::Import) {
+		let path = resolver.canonical_path(import);
+		let module = resolver.canonical_path(ws.module_of(import));
+		let warning = match path.name.as_deref() {
+			Some("*") => format!("code in `{module}` that uses names that `{path}` imports is not checked"),
+			Some("_") => format!("code in `{module}` that uses methods of the traits `{path}` imports is not checked"),
+			_ => format!(
+				"code in `{module}` that uses `{}` through `{path}` is not checked for dangling references",
+				path.name.as_deref().unwrap_or_default()
+			),
+		};
+
+		if !plan.warnings.contains(&warning) {
+			plan.warnings.push(warning);
 		}
 	}
 
@@ -146,6 +183,18 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 	Ok(plan)
 }
 
+/// The `thread_local!` invocations all of whose statics are removed: they are removed as a whole (with their
+/// attributes), rather than left empty.
+fn emptied_thread_locals(ws: &Workspace, targets: &[ItemId]) -> BTreeSet<ItemId> {
+	let invocations: BTreeSet<ItemId> = targets
+		.iter()
+		.filter_map(|&item| ws.parent(item))
+		.filter(|&parent| ws.item(parent).kind == ItemKind::MacroCall)
+		.collect();
+
+	invocations.into_iter().filter(|&invocation| ws.children(invocation).all(|child| targets.contains(&child))).collect()
+}
+
 /// The items to remove: what the paths name, without items inside of other items to remove.
 fn targets(resolver: &Resolver<'_>, paths: &[ItemPath], active_only: bool) -> Result<Vec<ItemId>, Error> {
 	let ws = resolver.workspace();
@@ -167,6 +216,7 @@ fn targets(resolver: &Resolver<'_>, paths: &[ItemPath], active_only: bool) -> Re
 		}
 
 		check_impl_headers(resolver, path, &items)?;
+		super::check_private_imports(resolver, path, &items)?;
 
 		for item in items {
 			if item.is_crate_root() {

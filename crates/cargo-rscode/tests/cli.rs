@@ -484,6 +484,32 @@ fn registers_completion_scripts() {
 	assert_eq!(registration("0").code, Some(2));
 }
 
+/// Imports are named by `use` paths; a plain path through a private import is ambiguous for edits.
+#[test]
+fn names_imports_by_use_paths() {
+	let view = run(&fixture(), &["view", "use demo::Circle"]).success();
+
+	assert!(view.stdout.starts_with("// use demo::Circle (import) src/lib.rs:6"), "{}", view.stdout);
+	assert!(view.stdout.contains("pub use shapes::Circle;"), "{}", view.stdout);
+
+	let removal = run(&fixture(), &["remove", "--bin", "demo", "use crate::Shape", "--dry-run"]).success();
+
+	assert!(removal.stdout.contains("-use demo::shapes::Shape;"), "{removal:#?}");
+	assert!(removal.stderr.contains("use demo::Shape (import)"), "{removal:#?}");
+
+	let ambiguous = run(&fixture(), &["remove", "--bin", "demo", "crate::Shape", "--dry-run"]);
+
+	assert_ne!(ambiguous.code, Some(0), "{ambiguous:#?}");
+	assert!(ambiguous.stderr.contains("`use demo::Shape` (import) at src/main.rs:1:5"), "{ambiguous:#?}");
+	assert!(ambiguous.stderr.contains("`demo::shapes::Shape` (trait) at src/shapes.rs"), "{ambiguous:#?}");
+	assert!(ambiguous.stderr.contains("hint: the path names an item through a private import"), "{ambiguous:#?}");
+
+	// unquoted, the shell splits the path
+	let split = run(&fixture(), &["view", "use", "demo::Circle"]);
+
+	assert!(split.stderr.contains("expected a path after `use` (quote the whole path, `use` included)"), "{split:#?}");
+}
+
 #[test]
 fn finds_items() {
 	let circle = run(&fixture(), &["find", "Circle"]).success();
@@ -493,12 +519,12 @@ fn finds_items() {
 	let imports = run(&fixture(), &["find", "Circle", "--imports", "--show", "kind"]).success();
 
 	assert!(imports.lines().contains(&"demo::shapes::Circle  struct"), "{}", imports.stdout);
-	assert!(imports.lines().contains(&"demo::Circle  import  -> demo::shapes::Circle"), "{}", imports.stdout);
+	assert!(imports.lines().contains(&"use demo::Circle  import  -> demo::shapes::Circle"), "{}", imports.stdout);
 
 	// asking for the kind is asking for imports
 	let only_imports = run(&fixture(), &["find", "*", "-k", "import", "--show", "kind"]).success();
 
-	assert!(only_imports.lines().contains(&"demo::Circle  import  -> demo::shapes::Circle"), "{}", only_imports.stdout);
+	assert!(only_imports.lines().contains(&"use demo::Circle  import  -> demo::shapes::Circle"), "{}", only_imports.stdout);
 	assert!(only_imports.lines().iter().all(|line| line.contains("  import")), "{}", only_imports.stdout);
 
 	let methods = run(&fixture(), &["find", "--starts-with", "ar", "-k", "assoc-fn", "--show", "location"]).success();

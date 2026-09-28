@@ -19,6 +19,7 @@ fn demo_paths() -> Vec<CanonicalPath> {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: false,
+			is_import: false,
 			name: name.map(Into::into),
 		}
 	}

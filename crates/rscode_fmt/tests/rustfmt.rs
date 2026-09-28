@@ -39,6 +39,27 @@ fn applies_config_overrides() {
 	assert_eq!(format(options, SOURCE).unwrap(), "fn main() {\n\tlet some_long_variable_name =\n\t\tfoo(aaaaaaa, bbbbbbbb, ccccccc);\n}\n");
 }
 
+/// rustfmt merging imports that sorting separated (around an import with attributes) changes how they sort: formatting
+/// sorts again, so that formatting the result changes nothing.
+#[test]
+fn settles_when_rustfmt_merges_imports() {
+	if !rustfmt_available() {
+		return;
+	}
+
+	for granularity in ["Crate", "Module", "One", "Item", "Preserve"] {
+		let mut options = rustfmt().sort(Some(rscode_fmt::SortOptions::new()));
+
+		options.rustfmt.config = vec![("imports_granularity".to_owned(), granularity.to_owned())];
+
+		for source in ["use a::b;\n#[cfg(unix)]\nuse a::c;\nuse a::a;\n", "use a::{c, z};\n#[cfg(unix)]\nuse a::d;\n"] {
+			let once = format(options.clone(), source).unwrap();
+
+			assert_eq!(format(options.clone(), &once).unwrap(), once, "{granularity}: {source:?}");
+		}
+	}
+}
+
 #[test]
 fn reports_invalid_config_overrides() {
 	if !rustfmt_available() {

@@ -105,7 +105,8 @@ pub(crate) struct FindParams {
 	/// Glob pattern for item paths. `*` matches within one path segment, `**` any number of segments:
 	/// `parse_*`, `*Error`, `Config::*` (associated items), `crate::config::**`, `**::tests::*`,
 	/// `<Config as Default>::default`. Patterns not starting with `crate::` or `::` match anywhere:
-	/// `Config::load` finds `my_crate::config::Config::load`.
+	/// `Config::load` finds `my_crate::config::Config::load`. `use` patterns find imports: `use crate::a::*` (every
+	/// import in `a`), `use Config`.
 	pub(crate) pattern: String,
 
 	/// Only items of these kinds: `mod`, `struct`, `enum`, `union`, `trait`, `trait-alias`, `type`, `fn`,
@@ -128,7 +129,7 @@ pub(crate) struct FindParams {
 	#[serde(default)]
 	pub(crate) from: Option<String>,
 
-	/// Also find `use` imports (with the paths of what they import).
+	/// Also find `use` imports, as `use module::Name` paths that name them (with the paths of what they import).
 	#[serde(default)]
 	pub(crate) include_imports: bool,
 
@@ -182,14 +183,14 @@ impl From<Mode> for ViewMode {
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct ViewParams {
 	/// Paths of the items to show: `crate::a::Item`, `::crate_name::Item`, `a::Item` (from each crate's root),
-	/// `Type::method`, `Trait::method`, `<Type as Trait>::method`, `impl Trait for Type`, `Enum::Variant`, or
-	/// `crate` (the crate root module).
+	/// `Type::method`, `Trait::method`, `<Type as Trait>::method`, `impl Trait for Type`, `Enum::Variant`,
+	/// `crate` (the crate root module), or `use crate::a::Item` (an import, shown as its `use` item).
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) paths: Vec<String>,
 
 	/// `auto`: an outline for modules and the full source of anything else; `full`: the exact source (for
-	/// out-of-line modules: the module's file); `outline`: function and macro bodies elided, modules as lists of
-	/// their items.
+	/// out-of-line modules: the module's file); `outline`: function and macro bodies (other than of `thread_local!`,
+	/// whose statics are items) elided, modules as lists of their items.
 	#[serde(default)]
 	pub(crate) mode: Mode,
 
@@ -279,7 +280,7 @@ impl RenameParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct RemoveParams {
-	/// Paths of the items to remove.
+	/// Paths of the items to remove; `use crate::a::Name` removes an import (not what it imports).
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) paths: Vec<String>,
 
@@ -317,7 +318,7 @@ impl RemoveParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct ReplaceParams {
-	/// Path of the item to replace.
+	/// Path of the item to replace; `use crate::a::Name` replaces an import's `use` item.
 	pub(crate) path: String,
 
 	/// The complete new source of the item, including its doc comments and attributes.
@@ -382,7 +383,8 @@ pub(crate) struct InsertParams {
 	#[serde(default)]
 	pub(crate) position: Position,
 
-	/// Path of the sibling item, for position `before` or `after` (e.g. `crate::a::b::helper`).
+	/// Path of the sibling item, for position `before` or `after` (e.g. `crate::a::b::helper`, or an import's
+	/// `use crate::a::Name`, which stands for its `use` item).
 	#[serde(default)]
 	pub(crate) anchor: Option<String>,
 

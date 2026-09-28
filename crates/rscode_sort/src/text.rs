@@ -728,12 +728,17 @@ impl<'a> TextSorter<'a> {
 	///
 	/// This never depends on how many lines a chunk spans, which rustfmt may change.
 	fn blank_line_between(&self, previous: &Placed<'_>, next: &Placed<'_>, previous_is_first: bool) -> bool {
+		let decorated =
+			next.decorated || if previous_is_first { previous.decorated_as_first } else { previous.decorated };
+
 		if previous.spacing == Spacing::Barrier && next.spacing == Spacing::Barrier {
-			// consecutive barriers were next to each other in the source (unless they come from merged blocks)
-			return match self.source.get(previous.span.end..next.span.start) {
-				Some(gap) if gap.chars().all(is_whitespace) => gap.matches('\n').count() > 1,
-				_ => true,
-			};
+			// consecutive barriers were next to each other in the source (unless they come from merged blocks), and
+			// keep whether a blank line separated them, unless one has attributes, doc comments, or comments
+			return decorated
+				|| match self.source.get(previous.span.end..next.span.start) {
+					Some(gap) if gap.chars().all(is_whitespace) => gap.matches('\n').count() > 1,
+					_ => true,
+				};
 		}
 
 		if previous.group != next.group {
@@ -741,10 +746,7 @@ impl<'a> TextSorter<'a> {
 		}
 
 		match next.spacing {
-			Spacing::Tight => false,
-			Spacing::Compact => {
-				next.decorated || if previous_is_first { previous.decorated_as_first } else { previous.decorated }
-			}
+			Spacing::Compact => decorated,
 			Spacing::Loose | Spacing::Barrier => true,
 		}
 	}
@@ -1038,20 +1040,22 @@ mod tests {
 
 	#[test]
 	fn spacing_within_groups() {
-		// imports, `mod foo;`, and `extern crate` are never separated by blank lines, like rustfmt groups them
-		assert_sorts_to("use c;\n/// Doc\nuse b;\nuse a;\n", "use a;\n/// Doc\nuse b;\nuse c;\n");
-		assert_sorts_to(
-			"use b;\nuse a::{\n    One,\n    Two,\n};\n#[cfg(unix)]\nuse c;\n",
-			"use a::{\n    One,\n    Two,\n};\nuse b;\n#[cfg(unix)]\nuse c;\n",
-		);
-
-		// other compact groups: however many lines an item spans (which rustfmt may change) ...
+		// one-line items are grouped, however many lines an item spans (which rustfmt may change) ...
 		assert_sorts_to(
 			"const B: u8 = 0;\nconst A: [u8; 2] = [\n\t0, 1,\n];\nconst C: u8 = 0;\n",
 			"const A: [u8; 2] = [\n\t0, 1,\n];\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
 		);
 
 		// ... but blank lines around items with attributes, docs, or comments
+		assert_sorts_to("use c;\n/// Doc\nuse b;\nuse a;\n", "use a;\n\n/// Doc\nuse b;\n\nuse c;\n");
+		assert_sorts_to(
+			"use b;\nuse a::{\n    One,\n    Two,\n};\n#[cfg(unix)]\nuse c;\n",
+			"use a::{\n    One,\n    Two,\n};\nuse b;\n\n#[cfg(unix)]\nuse c;\n",
+		);
+		assert_sorts_to(
+			"mod c;\n#[cfg(x)]\nmod b;\n#[cfg(x)]\nmod a;\nextern crate e;\n/// Docs\nextern crate d;\nextern crate f;\n",
+			"/// Docs\nextern crate d;\n\nextern crate e;\nextern crate f;\n\nmod c;\n\n#[cfg(x)]\nmod a;\n\n#[cfg(x)]\nmod b;\n",
+		);
 		assert_sorts_to(
 			"/// B\nconst B: u8 = 0;\nconst C: u8 = 0;\nconst D: u8 = 0;\n#[cfg(x)]\nconst A: u8 = 0;\n",
 			"#[cfg(x)]\nconst A: u8 = 0;\n\n/// B\nconst B: u8 = 0;\n\nconst C: u8 = 0;\nconst D: u8 = 0;\n",
@@ -1069,6 +1073,92 @@ mod tests {
 
 		// other groups always get blank lines
 		assert_sorts_to("fn b() {}\nfn a() {}\n", "fn a() {}\n\nfn b() {}\n");
+
+		// the same goes for the items of `impl` blocks, traits, and `extern` blocks
+		assert_sorts_to(
+			"impl X {\n\tconst B: u8 = 0;\n\t#[cfg(x)]\n\tconst A: u8 = 0;\n\tconst C: u8 = 0;\n\tconst D: u8 = 0;\n}\n",
+			"impl X {\n\t#[cfg(x)]\n\tconst A: u8 = 0;\n\n\tconst B: u8 = 0;\n\tconst C: u8 = 0;\n\tconst D: u8 = 0;\n}\n",
+		);
+		assert_sorts_to(
+			"trait T {\n\tconst C: u8;\n\t/// Doc\n\tconst B: u8;\n\tconst A: u8;\n}\n",
+			"trait T {\n\tconst A: u8;\n\n\t/// Doc\n\tconst B: u8;\n\n\tconst C: u8;\n}\n",
+		);
+		assert_sorts_to(
+			"extern \"C\" {\n\tfn c();\n\t#[link_name = \"x\"]\n\tfn b();\n\tfn a();\n\tfn d();\n}\n",
+			"extern \"C\" {\n\tfn a();\n\n\t#[link_name = \"x\"]\n\tfn b();\n\n\tfn c();\n\tfn d();\n}\n",
+		);
+	}
+
+	/// The layout a user asked for: blank lines around the imports and module declarations with attributes.
+	#[test]
+	fn separates_attributed_imports() {
+		let source = concat!(
+			"#![cfg_attr(docsrs, feature(doc_cfg))]\n",
+			"\n",
+			"mod api;\n",
+			"mod context;\n",
+			"mod plugin;\n",
+			"\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"mod commands;\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"mod hooks;\n",
+			"\n",
+			"pub use api::{\n",
+			"\tLoaderVersionInfo, MetamodApi, MetamodApiBinding, MetamodFeature, MetamodVersion,\n",
+			"\tSourceHookVersions, UnsupportedFeature,\n",
+			"};\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"#[cfg_attr(docsrs, doc(cfg(feature = \"sdk\")))]\n",
+			"pub use commands::MetamodRegistrar;\n",
+			"pub use context::{CachedContext, ContextKey, cached_context_key};\n",
+			"/// Used by the [`plugin_meta`] macro.\n",
+			"#[doc(hidden)]\n",
+			"pub use crys_bricks::env_cstr as __private_env_cstr;\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"#[cfg_attr(docsrs, doc(cfg(feature = \"sdk\")))]\n",
+			"pub use hooks::{GameFrameFn, HookError, LevelEvents, NetMessageHookError};\n",
+			"pub use plugin::{ErrorBuffer, PluginCallbacks, PluginDescriptor, PluginMetadata};\n",
+			"pub use sys;\n",
+		);
+		let expected = concat!(
+			"#![cfg_attr(docsrs, feature(doc_cfg))]\n",
+			"\n",
+			"mod api;\n",
+			"mod context;\n",
+			"mod plugin;\n",
+			"\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"mod commands;\n",
+			"\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"mod hooks;\n",
+			"\n",
+			"pub use api::{\n",
+			"\tLoaderVersionInfo, MetamodApi, MetamodApiBinding, MetamodFeature, MetamodVersion,\n",
+			"\tSourceHookVersions, UnsupportedFeature,\n",
+			"};\n",
+			"\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"#[cfg_attr(docsrs, doc(cfg(feature = \"sdk\")))]\n",
+			"pub use commands::MetamodRegistrar;\n",
+			"\n",
+			"pub use context::{CachedContext, ContextKey, cached_context_key};\n",
+			"\n",
+			"/// Used by the [`plugin_meta`] macro.\n",
+			"#[doc(hidden)]\n",
+			"pub use crys_bricks::env_cstr as __private_env_cstr;\n",
+			"\n",
+			"#[cfg(feature = \"sdk\")]\n",
+			"#[cfg_attr(docsrs, doc(cfg(feature = \"sdk\")))]\n",
+			"pub use hooks::{GameFrameFn, HookError, LevelEvents, NetMessageHookError};\n",
+			"\n",
+			"pub use plugin::{ErrorBuffer, PluginCallbacks, PluginDescriptor, PluginMetadata};\n",
+			"pub use sys;\n",
+		);
+
+		assert_sorts_to(source, expected);
+		assert_unchanged(expected);
 	}
 
 	#[test]
@@ -1422,6 +1512,12 @@ impl S {
 			"fn uses() { m!(); }\n\nm!();\nmacro_rules! m { () => {} }\n\n#[macro_use]\nmod macros;\n\nmod a;\n\nuse x;\n",
 		);
 		assert_sorts_to("a!(); b!();\n\n\nc!();\n", "a!();\nb!();\n\nc!();\n");
+
+		// ... unless one of them has attributes, doc comments, or comments
+		assert_sorts_to(
+			"#[macro_use]\nextern crate a;\n#[macro_use]\nextern crate b;\nm!();\n#[cfg(x)]\nthread_local!(static A: u8 = 0);\nn!();\n",
+			"#[macro_use]\nextern crate a;\n\n#[macro_use]\nextern crate b;\n\nm!();\n\n#[cfg(x)]\nthread_local!(static A: u8 = 0);\n\nn!();\n",
+		);
 
 		// tokio's `cfg_x! { macro_rules! .. }` pattern: the macro stays above its uses
 		assert_sorts_to(

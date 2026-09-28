@@ -117,6 +117,7 @@ pub(crate) fn find(load: &LoadOptions, params: &FindParams) -> Output {
 /// The crate a pattern starts from (`::name::…`, or `name::…`), when that segment has no wildcards.
 fn pattern_crate(pattern: &str) -> Option<&str> {
 	let pattern = pattern.trim();
+	let pattern = pattern.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace)).unwrap_or(pattern).trim();
 	let first = pattern.strip_prefix("::").unwrap_or(pattern).split("::").next()?;
 
 	(!first.is_empty() && !first.contains('*') && !pattern.starts_with('<')).then_some(first)
@@ -448,12 +449,19 @@ fn describe(error: &Error) -> String {
 		Error::NotFound(_) => {
 			"search with `find_items` (e.g. the pattern `*name*` with `ignore_case`) for the exact path"
 		}
+
+		// a path through a private import (see `edit::remove`)
+		Error::Ambiguous { candidates, .. } if candidates.iter().any(|candidate| candidate.starts_with("`use ")) => {
+			"the path names an item through a private import: pass the import's `use` path to name the import itself, or \
+			 the item's own path"
+		}
+
 		Error::Ambiguous { .. } => "use one of the candidates' paths",
 		Error::Collision { .. } => "set `force` to proceed anyway",
 
 		Error::PathParse(_) => {
 			"paths look like `crate::a::Item`, `::crate_name::Item`, `a::Item`, `Type::method`, `<Type as Trait>::method`, \
-			 or `impl Trait for Type`; patterns may use `*` and `**`"
+			 `impl Trait for Type`, or `use crate::a::Name` (an import itself); patterns may use `*` and `**`"
 		}
 
 		_ => return error.to_string(),

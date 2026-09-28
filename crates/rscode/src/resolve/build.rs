@@ -186,8 +186,9 @@ fn add_definitions(ws: &Workspace, krate: &Crate, tables: &mut Tables) {
 			continue;
 		};
 
-		// module members; extern blocks are transparent
-		if !matches!(ws.item(parent).kind, ItemKind::Module | ItemKind::ExternBlock) {
+		// module members; extern blocks and `thread_local!` invocations (the only macro calls with children) are
+		// transparent
+		if !matches!(ws.item(parent).kind, ItemKind::Module | ItemKind::ExternBlock | ItemKind::MacroCall) {
 			continue;
 		}
 

@@ -55,6 +55,9 @@ impl Target {
 	}
 }
 
+/// How often a whole file is sorted and formatted again when rustfmt changed how its items sort.
+const MAX_RESORTS: usize = 3;
+
 pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &FormatOptions) -> Result<String, FormatError> {
 	if targets.is_empty() {
 		return Ok(source.to_owned());
@@ -71,7 +74,20 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 	let text = sorted.as_deref().unwrap_or(source);
 
 	if whole_file {
-		return format_file(text, sorted.is_some(), options);
+		let mut formatted = format_file(text, sorted.is_some(), options)?;
+
+		// rustfmt may merge or split imports (`imports_granularity`), which changes how they sort: sort and format
+		// again until they settle, so that formatting the result changes nothing
+		if let (Some(sort), RsFormatter::RustFmt) = (&options.sort, options.formatter) {
+			for _ in 0..MAX_RESORTS {
+				match sort_containers(&formatted, true, &[], sort)? {
+					Some(resorted) if resorted != formatted => formatted = format_file(&resorted, true, options)?,
+					_ => break,
+				}
+			}
+		}
+
+		return Ok(formatted);
 	}
 
 	let items = outermost(items);

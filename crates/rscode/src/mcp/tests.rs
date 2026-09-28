@@ -279,6 +279,7 @@ fn server_info() {
 		"must still parse",
 		"dry_run",
 		"loaded from disk again for every call",
+		"`use module::Name`",
 	] {
 		assert!(instructions.contains(needle), "the instructions do not mention {needle}");
 	}
@@ -830,6 +831,48 @@ mod end_to_end {
 		assert!(failed);
 		assert_contains(&text, &["`<demo::W<u16>>::get` (assoc-fn) at src/lib.rs:10:2", "hint: use one of the candidates'"]);
 		assert!(!text.contains("all_variants"), "{text}");
+		client.close().await.unwrap();
+	}
+
+	/// Imports are named by `use` paths; a plain path through a private import is ambiguous for edits.
+	#[tokio::test]
+	async fn imports() {
+		let fixture = Fixture::with_files(
+			"imports",
+			&[
+				("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
+				("src/lib.rs", "pub mod shapes {\n\tpub struct Circle;\n}\n\nuse shapes::Circle;\n\npub fn make() -> Circle {\n\tCircle\n}\n"),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "use *" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["use demo::Circle  import  src/lib.rs:5:5-5:19  -> demo::shapes::Circle"]);
+
+		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Circle" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["// use demo::Circle (import) src/lib.rs:5", "use shapes::Circle;"]);
+
+		let (failed, text) = client.call("remove_items", json!({ "paths": "crate::Circle", "dry_run": true })).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&[
+				"`crate::Circle` is ambiguous",
+				"`use demo::Circle` (import) at src/lib.rs:5:5",
+				"`demo::shapes::Circle` (struct) at src/lib.rs:2:2",
+				"hint: the path names an item through a private import",
+			],
+		);
+
+		let (failed, text) = client.call("remove_items", json!({ "paths": "use crate::Circle", "dry_run": true })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["-use shapes::Circle;", "nothing was written"]);
 		client.close().await.unwrap();
 	}
 

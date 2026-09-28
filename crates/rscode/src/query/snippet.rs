@@ -6,6 +6,7 @@
 //! indentation). Line breaks (`\n` or `\r\n`) become `\n`.
 
 use crate::edit::trivia::line_indent;
+use crate::load::thread_local;
 use crate::source::ParsedFile;
 use crate::source::SourceFile;
 use crate::source::TextRange;
@@ -487,11 +488,14 @@ struct Initializers<'p, 'a> {
 }
 
 impl Initializers<'_, '_> {
-	fn add(&mut self, eq: Span, expr: &syn::Expr, semi: Span) {
+	/// Adds `= initializer;` (without a `;` for the last declaration of a `thread_local!`, which may have none).
+	fn add(&mut self, eq: Span, expr: &syn::Expr, semi: Option<Span>) {
 		let expr = self.parsed.range_of(expr);
 
 		if self.parsed.text.get(expr.as_range()).is_some_and(|text| text.contains('\n')) {
-			self.ranges.push(self.parsed.range(eq).cover(self.parsed.range(semi)));
+			let end = semi.map_or(expr, |semi| self.parsed.range(semi));
+
+			self.ranges.push(self.parsed.range(eq).cover(end));
 		}
 	}
 }
@@ -501,20 +505,27 @@ impl<'ast> Visit<'ast> for Initializers<'_, '_> {
 	fn visit_block(&mut self, _: &'ast syn::Block) {}
 
 	fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-		self.add(item.eq_token.span, &item.expr, item.semi_token.span);
+		self.add(item.eq_token.span, &item.expr, Some(item.semi_token.span));
 	}
 
 	fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-		self.add(item.eq_token.span, &item.expr, item.semi_token.span);
+		self.add(item.eq_token.span, &item.expr, Some(item.semi_token.span));
+	}
+
+	// the statics of a `thread_local!` (in modules: blocks are skipped)
+	fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+		for declaration in thread_local::declarations(&item.mac).into_iter().flatten() {
+			self.add(declaration.eq_token.span, &declaration.expr, declaration.semi_token.map(|semi| semi.span));
+		}
 	}
 
 	fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
-		self.add(item.eq_token.span, &item.expr, item.semi_token.span);
+		self.add(item.eq_token.span, &item.expr, Some(item.semi_token.span));
 	}
 
 	fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
 		if let Some((eq, expr)) = &item.default {
-			self.add(eq.span, expr, item.semi_token.span);
+			self.add(eq.span, expr, Some(item.semi_token.span));
 		}
 	}
 }
@@ -789,11 +800,30 @@ mod tests {
 			"\t\t1\n",
 			"\t};\n",
 			"}\n",
+			"thread_local! {\n",
+			"\tstatic H: u8 = {\n",
+			"\t\t1\n",
+			"\t};\n",
+			"\tstatic I: u8 = 1;\n",
+			"\tstatic J: u8 = {\n",
+			"\t\t1\n",
+			"\t}\n",
+			"}\n",
 		);
 		let syntax = Syntax::of(text);
 		let found: Vec<&str> = syntax.initializers.iter().map(|range| &text[range.as_range()]).collect();
 
-		assert_eq!(found, ["= [\n\t1,\n\t2,\n];", "= \"a\nb\";", "= {\n\t\t1\n\t};", "= 1\n\t\t+ 1;"]);
+		assert_eq!(
+			found,
+			[
+				"= [\n\t1,\n\t2,\n];",
+				"= \"a\nb\";",
+				"= {\n\t\t1\n\t};",
+				"= 1\n\t\t+ 1;",
+				"= {\n\t\t1\n\t};",
+				"= {\n\t\t1\n\t}",
+			]
+		);
 		assert_eq!(syntax.strings.len(), 1);
 	}
 

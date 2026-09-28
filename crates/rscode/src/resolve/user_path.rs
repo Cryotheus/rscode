@@ -1,5 +1,6 @@
 //! Resolving paths given by users (`crate::a::Foo`, `::dep::Bar`, `Foo::new`, `<Foo as Display>::fmt`).
 
+use super::Namespace;
 use super::PathKind;
 use super::Resolver;
 use super::walk::Found;
@@ -9,6 +10,7 @@ use crate::model::CrateId;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::PathRef;
+use crate::model::Visibility;
 use crate::path::Anchor;
 use crate::path::ItemPath;
 use crate::path::Qualifier;
@@ -19,6 +21,7 @@ use smol_str::SmolStr;
 impl Resolver<'_> {
 	pub(super) fn compute_item_path(&self, path: &ItemPath) -> Vec<ItemId> {
 		let mut items = match &path.qualifier {
+			_ if path.import => self.resolve_import(path),
 			Some(qualifier) => self.resolve_qualified(qualifier, &path.segments),
 			None => self.resolve_unqualified(path),
 		};
@@ -26,6 +29,58 @@ impl Resolver<'_> {
 		items.sort();
 		items.dedup();
 		items
+	}
+
+	/// `use m::name`: the imports of the module(s) `m` names (every `cfg` variant) that bind `name` (`*`: glob imports,
+	/// `_`: underscore imports), found in the item tree, so that imports that resolve to nothing are named too.
+	fn resolve_import(&self, path: &ItemPath) -> Vec<ItemId> {
+		let Some((name, modules)) = self.split_name(path) else {
+			return Vec::new();
+		};
+
+		(modules.into_iter())
+			.flat_map(|module| self.ws.children(module))
+			.filter(|&child| self.ws.item(child).kind == ItemKind::Use)
+			.flat_map(|use_item| self.ws.children(use_item))
+			.filter(|&import| self.ws.item(import).import_info().is_some_and(|info| info.path_name() == *name))
+			.collect()
+	}
+
+	/// The last segment of an unqualified path, and the modules its other segments name.
+	fn split_name<'p>(&self, path: &'p ItemPath) -> Option<(&'p SmolStr, Vec<ItemId>)> {
+		let (name, prefix) = path.segments.split_last()?;
+		let prefix = ItemPath { anchor: path.anchor, segments: prefix.to_vec(), ..ItemPath::default() };
+		let modules = self.compute_item_path(&prefix).into_iter().filter(|&item| self.ws.item(item).kind == ItemKind::Module);
+
+		Some((name, modules.collect()))
+	}
+
+	/// The private named imports (`use a::B;`, not `pub use`) through which the last segment of a plain path names some
+	/// of `items` in the module(s) its other segments name: the path names both what they import (`items`) and, as
+	/// `use m::name`, the imports themselves.
+	pub(crate) fn private_imports_of(&self, path: &ItemPath, items: &[ItemId]) -> Vec<ItemId> {
+		if path.import || path.qualifier.is_some() {
+			return Vec::new();
+		}
+
+		let Some((name, modules)) = self.split_name(path) else {
+			return Vec::new();
+		};
+
+		let mut imports: Vec<ItemId> = (modules.into_iter())
+			.flat_map(|module| Namespace::ALL.into_iter().flat_map(move |namespace| self.bindings(module, name, namespace)))
+			.filter(|binding| !binding.glob && matches!(binding.res, Res::Item(item) if items.contains(&item)))
+			.filter_map(|binding| binding.import)
+			.filter(|&import| {
+				let data = self.ws.item(import);
+
+				data.kind == ItemKind::Import && matches!(data.vis, Visibility::Private | Visibility::SelfModule)
+			})
+			.collect();
+
+		imports.sort();
+		imports.dedup();
+		imports
 	}
 
 	fn resolve_unqualified(&self, path: &ItemPath) -> Vec<ItemId> {

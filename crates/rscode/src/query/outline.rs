@@ -73,7 +73,14 @@ pub(super) fn item_snippet(
 
 	if outline {
 		collect_elisions(workspace, item, true, source.file.text(), &mut edits);
-		edits.extend(within(&syntax.initializers, source.region).iter().map(|&range| Edit::Replace(range, "= ...;")));
+		let text = source.file.text();
+		let initializers = within(&syntax.initializers, source.region).iter();
+
+		// the last declaration of a `thread_local!` may have no `;`
+		edits.extend(initializers.map(|&range| match text[range.as_range()].ends_with(';') {
+			true => Edit::Replace(range, "= ...;"),
+			false => Edit::Replace(range, "= ..."),
+		}));
 	}
 
 	if !docs {
@@ -97,8 +104,9 @@ fn within(ranges: &[TextRange], region: TextRange) -> &[TextRange] {
 	&ranges[start..end.max(start)]
 }
 
-/// Collects the elisions of an item and the items inside of it: bodies of functions and macros, and nested inline
-/// modules. `root`: whether the item is the one being outlined, whose own body is kept when it is a module.
+/// Collects the elisions of an item and the items inside of it: bodies of functions and macros (but not of
+/// `thread_local!`, whose declarations are items), and nested inline modules. `root`: whether the item is the one
+/// being outlined, whose own body is kept when it is a module.
 ///
 /// Out-of-line modules are not entered (except for the root): their items are in another file.
 fn collect_elisions(workspace: &Workspace, item: ItemId, root: bool, text: &str, edits: &mut Vec<Edit>) {
@@ -111,7 +119,9 @@ fn collect_elisions(workspace: &Workspace, item: ItemId, root: bool, text: &str,
 		}
 
 		// macro-like syntax that was not understood has no path
-		ItemDetail::Macro { path, body } if !path.is_empty() => edits.extend(elide_group(text, *body)),
+		ItemDetail::Macro { path, body } if !path.is_empty() && workspace.children(item).next().is_none() => {
+			edits.extend(elide_group(text, *body));
+		}
 
 		ItemDetail::Module(info) if !root => {
 			if info.inline

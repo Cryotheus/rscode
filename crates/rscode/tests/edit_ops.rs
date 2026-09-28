@@ -628,12 +628,12 @@ use self::gone as g;
 			kinds,
 			[
 				("fixture::gone", ItemKind::Module),
-				("fixture::A", ItemKind::Import),
-				("fixture::B", ItemKind::Import),
-				("fixture::C", ItemKind::Import),
-				("fixture::*", ItemKind::Import),
-				("fixture::g", ItemKind::Import),
-				("app::A", ItemKind::Import),
+				("use fixture::A", ItemKind::Import),
+				("use fixture::B", ItemKind::Import),
+				("use fixture::C", ItemKind::Import),
+				("use fixture::*", ItemKind::Import),
+				("use fixture::g", ItemKind::Import),
+				("use app::A", ItemKind::Import),
 			]
 		);
 
@@ -1903,5 +1903,443 @@ mod real {
 		}
 
 		assert!(removed > 50 && replaced > 100 && inserted > 10, "{removed} {replaced} {inserted}");
+	}
+}
+
+/// Statics declared by `thread_local!` are items of the module the invocation is in.
+mod thread_locals {
+	use super::*;
+	use rscode::edit::RenameOptions;
+
+	const LIB: &str = "\
+use std::cell::Cell;
+use std::cell::RefCell;
+
+pub mod state {
+	use super::Counter;
+
+	thread_local! {
+		/// The current depth.
+		pub static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
+		pub(crate) static COUNTER: std::cell::RefCell<Counter> = std::cell::RefCell::new(Counter::new())
+	}
+}
+
+#[cfg(any())]
+std::thread_local!(static NEVER: Cell<u8> = Cell::new(1));
+
+std::thread_local!(static ONE: Cell<u8> = Cell::new(1));
+
+#[derive(Default)]
+pub struct Counter(u8);
+
+impl Counter {
+	pub fn new() -> Self {
+		Self(0)
+	}
+}
+
+pub fn depth() -> u32 {
+	let counted = state::COUNTER.with(|counter| counter.borrow().0);
+
+	state::DEPTH.with(Cell::get) + u32::from(ONE.with(Cell::get)) + u32::from(counted)
+}
+
+pub fn unused() -> RefCell<u8> {
+	RefCell::new(0)
+}
+";
+
+	const MANIFEST: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n";
+
+	fn crate_dir(name: &str) -> TempDir {
+		TempDir::with_files(name, &[("Cargo.toml", MANIFEST), ("src/lib.rs", LIB)])
+	}
+
+	#[test]
+	fn are_found_resolved_and_viewed() {
+		let dir = crate_dir("thread-local-load");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let found = rscode::Find::new().kind(ItemKind::Static).pattern("**").unwrap().run_with(&resolver).unwrap();
+		let statics: Vec<String> = found.iter().map(|found| found.path.to_string()).collect();
+
+		assert_eq!(statics, ["fixture::state::DEPTH", "fixture::state::COUNTER", "fixture::NEVER", "fixture::ONE"]);
+
+		let depth = resolver.resolve_item_path(&path("crate::state::DEPTH"));
+
+		assert_eq!(depth.len(), 1);
+		assert_eq!(ws.item(depth[0]).detail, rscode::model::ItemDetail::Static { mutable: false, thread_local: true });
+		assert_eq!(ws.item(ws.parent(depth[0]).expect("the invocation")).kind, ItemKind::MacroCall);
+
+		let one = resolver.resolve_item_path(&path("crate::ONE"));
+
+		assert!(one.len() == 1 && ws.item(one[0]).is_thread_local());
+		assert_eq!(
+			ws.item_text(depth[0]),
+			"/// The current depth.\n\t\tpub static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };"
+		);
+
+		let counter = resolver.resolve_item_path(&path("state::COUNTER"))[0];
+
+		assert_eq!(
+			ws.item_text(counter),
+			"pub(crate) static COUNTER: std::cell::RefCell<Counter> = std::cell::RefCell::new(Counter::new())"
+		);
+
+		// the `cfg` of the invocation applies to its statics
+		let never = resolver.resolve_item_path(&path("crate::NEVER"))[0];
+
+		assert_eq!(ws.effective_cfg(never).unwrap().to_string(), "any()");
+		assert!(!ws.is_active(never).is_possible());
+	}
+
+	#[test]
+	fn rename_updates_declarations_and_the_code_inside() {
+		let dir = crate_dir("thread-local-rename");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let options = RenameOptions::default();
+		let depth = rscode::edit::rename(&resolver, &path("crate::state::DEPTH"), "LEVEL", &options).unwrap();
+		let text = edited(&dir, &depth.edits, "src/lib.rs");
+
+		assert!(text.contains("pub static LEVEL: std::cell::Cell<u32>"), "{text}");
+		assert!(text.contains("state::LEVEL.with(Cell::get)"), "{text}");
+
+		// references in the declarations are certain, not only possible (like names in other macro bodies)
+		let counter = rscode::edit::rename(&resolver, &path("crate::Counter"), "Tally", &options).unwrap();
+		let text = edited(&dir, &counter.edits, "src/lib.rs");
+
+		assert!(text.contains("std::cell::RefCell<Tally> = std::cell::RefCell::new(Tally::new())"), "{text}");
+		counter.edits.apply().unwrap();
+		cargo_check(&dir);
+	}
+
+	#[test]
+	fn removing_every_declaration_removes_the_invocation() {
+		let dir = crate_dir("thread-local-remove");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let options = RemoveOptions::default();
+		let remove = |targets: &[&str]| rscode::edit::remove(&resolver, &paths(targets), &options).unwrap();
+
+		let text = edited(&dir, &remove(&["crate::state::COUNTER"]).edits, "src/lib.rs");
+
+		assert!(
+			text.contains(
+				"\tthread_local! {\n\t\t/// The current depth.\n\t\tpub static DEPTH: std::cell::Cell<u32> = const { \
+				 std::cell::Cell::new(0) };\n\t}\n"
+			),
+			"{text}"
+		);
+
+		let text = edited(&dir, &remove(&["crate::state::DEPTH", "crate::state::COUNTER"]).edits, "src/lib.rs");
+
+		assert!(text.contains("pub mod state {\n\tuse super::Counter;\n}\n"), "{text}");
+
+		let never = remove(&["crate::NEVER"]);
+		let text = edited(&dir, &never.edits, "src/lib.rs");
+
+		assert!(!text.contains("any()") && !text.contains("NEVER"), "{text}");
+		never.edits.apply().unwrap();
+		cargo_check(&dir);
+	}
+
+	#[test]
+	fn replacements_keep_the_declarations_separated() {
+		let dir = crate_dir("thread-local-replace");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let options = ReplaceOptions::default();
+
+		// the `;` separating it from the next declaration is added
+		let depth = "pub static DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(7)";
+		let replaced = rscode::edit::replace(&resolver, &path("crate::state::DEPTH"), depth, &options).unwrap();
+		let text = edited(&dir, &replaced.edits, "src/lib.rs");
+
+		assert!(
+			text.contains("\t\tpub static DEPTH: std::cell::Cell<u32> = std::cell::Cell::new(7);\n\n\t\tpub(crate) static"),
+			"{text}"
+		);
+
+		match rscode::edit::replace(&resolver, &path("crate::state::DEPTH"), &format!("{depth} // seven"), &options) {
+			Err(Error::InvalidSource(message)) => assert!(message.contains("end the source with `;`"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+
+		// only declarations are accepted
+		assert!(matches!(
+			rscode::edit::replace(&resolver, &path("crate::ONE"), "const ONE: u8 = 1;", &options),
+			Err(Error::InvalidSource(_))
+		));
+
+		replaced.edits.apply().unwrap();
+		cargo_check(&dir);
+	}
+
+	/// A `thread_local!` in a function body declares local statics, which shadow the module's.
+	#[test]
+	fn local_declarations_shadow_module_items() {
+		let lib = "\
+use std::cell::Cell;
+
+pub static X: u8 = 0;
+
+pub fn local() -> u8 {
+	thread_local!(static X: Cell<u8> = Cell::new(1));
+
+	X.with(Cell::get)
+}
+
+pub fn global() -> u8 {
+	X
+}
+";
+		let dir = TempDir::with_files("thread-local-shadow", &[("Cargo.toml", MANIFEST), ("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let renamed = rscode::edit::rename(&resolver, &path("crate::X"), "Y", &RenameOptions::default()).unwrap();
+		let text = edited(&dir, &renamed.edits, "src/lib.rs");
+
+		assert_eq!(text, lib.replace("pub static X", "pub static Y").replace("\tX\n}", "\tY\n}"));
+		renamed.edits.apply().unwrap();
+		cargo_check(&dir);
+	}
+
+	/// Statics declared by `thread_local!` are formatted with their invocation, and only it: rustfmt re-indents a braced
+	/// body without formatting it, and leaves a parenthesized one alone.
+	#[test]
+	fn are_formatted_with_their_invocation() {
+		let dir = crate_dir("thread-local-format");
+
+		dir.write("rustfmt.toml", "hard_tabs = false\n");
+
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let options =
+			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None), ..FmtOptions::default() };
+		let targets = [pattern("crate::ONE"), pattern("crate::state::*")];
+		let formatting = rscode::edit::format(&resolver, &targets, &options).unwrap();
+
+		assert!(formatting.warnings.is_empty(), "{:?}", formatting.warnings);
+
+		// only the invocation in `state` changes (rustfmt indents it with spaces); the rest of the file keeps its tabs
+		let expected = LIB
+			.replace("\tthread_local! {\n\t\t/// The current depth.\n\t\tpub static DEPTH", "    thread_local! {\n        /// The current depth.\n        pub static DEPTH")
+			.replace("\n\t\tpub(crate) static COUNTER", "\n        pub(crate) static COUNTER")
+			.replace("Counter::new())\n\t}\n}", "Counter::new())\n    }\n}");
+
+		assert_eq!(edited(&dir, &formatting.edits, "src/lib.rs"), expected);
+	}
+}
+
+/// Imports are named by `use` paths (`use crate::Circle`); other paths go through them.
+mod imports {
+	use super::*;
+	use rscode::edit::InsertOptions;
+	use rscode::edit::RenameOptions;
+
+	const LIB: &str = "\
+pub mod shapes {
+	pub struct Circle;
+
+	pub struct Square;
+
+	pub trait Shape {
+		fn area(&self) -> f64 {
+			1.0
+		}
+	}
+
+	impl Shape for Circle {}
+
+	impl Shape for Square {}
+}
+
+pub mod util {
+	pub fn helper() -> f64 {
+		2.0
+	}
+}
+
+use shapes::Circle;
+use shapes::{Shape as _, Square};
+#[allow(unused_imports)]
+use shapes::{Circle as Round, Square as Block};
+use util::*;
+
+pub use util::helper as assist;
+
+pub fn total() -> f64 {
+	Circle.area() + Square.area() + helper() + assist()
+}
+";
+
+	const MANIFEST: &str = "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n";
+
+	fn crate_dir(name: &str) -> TempDir {
+		TempDir::with_files(name, &[("Cargo.toml", MANIFEST), ("src/lib.rs", LIB)])
+	}
+
+	fn paths_of(resolver: &Resolver<'_>, path: &str) -> Vec<String> {
+		let mut paths: Vec<String> =
+			resolver.resolve_item_path(&self::path(path)).iter().map(|&item| resolver.canonical_path(item).to_string()).collect();
+
+		paths.sort();
+		paths
+	}
+
+	#[test]
+	fn use_paths_name_imports() {
+		let dir = crate_dir("imports-resolve");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+
+		assert_eq!(paths_of(&resolver, "use crate::Circle"), ["use fixture::Circle"]);
+		assert_eq!(paths_of(&resolver, "use fixture::Round"), ["use fixture::Round"]);
+		assert_eq!(paths_of(&resolver, "use crate::*"), ["use fixture::*"]);
+		assert_eq!(paths_of(&resolver, "use crate::_"), ["use fixture::_"]);
+		assert_eq!(paths_of(&resolver, "use Square"), ["use fixture::Square"]);
+		assert_eq!(paths_of(&resolver, "use crate::assist"), ["use fixture::assist"]);
+		assert_eq!(paths_of(&resolver, "use crate::shapes::Circle"), Vec::<String>::new());
+
+		// other paths go through them
+		assert_eq!(paths_of(&resolver, "crate::Circle"), ["fixture::shapes::Circle"]);
+
+		// a view shows the whole `use` item
+		let views = rscode::View::new().path("use crate::Round").unwrap().run_with(&resolver).unwrap();
+
+		assert_eq!(views.len(), 1);
+		assert_eq!(views[0].path, "use fixture::Round");
+		assert_eq!(views[0].kind, ItemKind::Import);
+		assert_eq!(views[0].text, "#[allow(unused_imports)]\nuse shapes::{Circle as Round, Square as Block};");
+	}
+
+	#[test]
+	fn use_patterns_find_imports() {
+		let dir = crate_dir("imports-find");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let find = |pattern: &str| {
+			let found = rscode::Find::new().pattern(pattern).unwrap().run_with(&resolver).unwrap();
+			let mut paths: Vec<String> = found.iter().map(|found| found.path.clone()).collect();
+
+			paths.sort();
+			paths
+		};
+
+		assert_eq!(
+			find("use crate::*"),
+			[
+				"use fixture::*",
+				"use fixture::Block",
+				"use fixture::Circle",
+				"use fixture::Round",
+				"use fixture::Square",
+				"use fixture::_",
+				"use fixture::assist",
+			]
+		);
+		assert_eq!(find("use Circle"), ["use fixture::Circle"]);
+		assert_eq!(find("Circle"), ["fixture::shapes::Circle"]);
+	}
+
+	#[test]
+	fn paths_through_private_imports_are_ambiguous_for_edits() {
+		let dir = crate_dir("imports-ambiguous");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+
+		for result in [
+			rscode::edit::remove(&resolver, &paths(&["crate::Circle"]), &RemoveOptions::default()).map(|_| ()),
+			rscode::edit::replace(&resolver, &path("crate::Circle"), "pub struct Circle;", &ReplaceOptions::default()).map(|_| ()),
+		] {
+			match result {
+				Err(Error::Ambiguous { candidates, .. }) => {
+					assert_eq!(candidates.len(), 2, "{candidates:?}");
+					assert!(candidates[0].starts_with("`use fixture::Circle` (import) at src/lib.rs:"), "{candidates:?}");
+					assert!(candidates[1].starts_with("`fixture::shapes::Circle` (struct) at src/lib.rs:"), "{candidates:?}");
+				}
+				other => panic!("{other:?}"),
+			}
+		}
+
+		// re-exports are paths to what they export
+		let removal = rscode::edit::remove(&resolver, &paths(&["crate::assist"]), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(removal.removed[0].path, "fixture::util::helper");
+		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("crate::Circle")));
+	}
+
+	#[test]
+	fn removing_imports() {
+		let dir = crate_dir("imports-remove");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let remove = |targets: &[&str]| rscode::edit::remove(&resolver, &paths(targets), &RemoveOptions::default()).unwrap();
+
+		// a leaf of a group
+		let one = remove(&["use crate::Round"]);
+
+		assert!(edited(&dir, &one.edits, "src/lib.rs").contains("#[allow(unused_imports)]\nuse shapes::{Square as Block};\n"));
+		assert_eq!(one.removed[0].path, "use fixture::Round");
+		assert!(one.warnings.iter().any(|warning| warning.contains("uses `Round` through `use fixture::Round`")), "{:?}", one.warnings);
+
+		// every leaf: the whole `use` item goes, with its attributes
+		let both = remove(&["use crate::Round", "use crate::Block"]);
+		let text = edited(&dir, &both.edits, "src/lib.rs");
+
+		assert!(!text.contains("unused_imports") && !text.contains("Round") && !text.contains("Block"), "{text}");
+		assert!(text.contains("use shapes::{Shape as _, Square};\nuse util::*;\n"), "{text}");
+
+		both.edits.apply().unwrap();
+		cargo_check(&dir);
+	}
+
+	#[test]
+	fn replacing_inserting_formatting_and_renaming_imports() {
+		let dir = crate_dir("imports-edit");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+
+		// an import is replaced as its `use` item, which must import nothing else
+		let replaced =
+			rscode::edit::replace(&resolver, &path("use crate::Circle"), "use crate::shapes::Circle;", &ReplaceOptions::default())
+				.unwrap();
+
+		assert_eq!(replaced.replaced, ["use fixture::Circle"]);
+		assert!(edited(&dir, &replaced.edits, "src/lib.rs").contains("\nuse crate::shapes::Circle;\nuse shapes::{Shape as _, Square};"));
+
+		match rscode::edit::replace(&resolver, &path("use crate::Round"), "use shapes::Circle as Round;", &ReplaceOptions::default()) {
+			Err(Error::Unsupported(message)) => assert!(message.contains("is one of the 2 imports of the `use` item"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+
+		// an anchor that is an import stands for its `use` item
+		let options = InsertOptions { position: InsertPosition::After("use crate::Circle".to_owned()), force: false };
+		let insertion = rscode::edit::insert(&resolver, &path("crate"), "use shapes::Shape;", &options).unwrap();
+
+		let text = edited(&dir, &insertion.edits, "src/lib.rs");
+
+		assert!(text.contains("use shapes::Circle;\n\nuse shapes::Shape;\n\nuse shapes::{Shape as _"), "{text}");
+
+		// formatting an import formats its `use` item
+		let options =
+			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None), ..FmtOptions::default() };
+		let formatting = rscode::edit::format(&resolver, &[pattern("use crate::Round")], &options).unwrap();
+
+		assert!(formatting.warnings.is_empty(), "{:?}", formatting.warnings);
+
+		// imports are not renamed
+		match rscode::edit::rename(&resolver, &path("use crate::Circle"), "Disk", &RenameOptions::default()) {
+			Err(Error::Unsupported(message)) => {
+				assert!(message.starts_with("`use fixture::Circle` is an import, which cannot be renamed: rename what it imports"), "{message}");
+			}
+			other => panic!("{other:?}"),
+		}
+
+		replaced.edits.apply().unwrap();
+		cargo_check(&dir);
 	}
 }

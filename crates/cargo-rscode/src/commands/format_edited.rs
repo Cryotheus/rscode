@@ -135,6 +135,7 @@ fn child_path(container: &CanonicalPath, name: &str) -> (CanonicalPath, bool) {
 	if container.is_impl {
 		let child = CanonicalPath {
 			is_impl: false,
+			is_import: false,
 			name: Some(name.into()),
 			..container.clone()
 		};
@@ -148,6 +149,7 @@ fn child_path(container: &CanonicalPath, name: &str) -> (CanonicalPath, bool) {
 		self_ty_arguments: None,
 		unresolved_self_ty: None,
 		is_impl: false,
+		is_import: false,
 		name: Some(name.into()),
 	};
 
@@ -157,11 +159,21 @@ fn child_path(container: &CanonicalPath, name: &str) -> (CanonicalPath, bool) {
 /// A path naming exactly the item with this canonical path, anchored at its crate: `::krate::m::Item`,
 /// `<::krate::m::Type>::item` or `<::krate::m::Type as Trait>::item` for associated items of `impl`s (`in_impl`, as
 /// their canonical paths look like those of trait items), and `<::krate::m::Type as Trait>` for `impl` blocks, with
-/// the generic arguments of the type and trait.
+/// the generic arguments of the type and trait, and `use ::krate::m::Name` for imports (a plain path would name what
+/// they import).
 /// `None` for `impl`s whose type is not a loaded item, and traits whose name cannot be told.
 fn item_path(path: &CanonicalPath, in_impl: bool) -> Option<ItemPath> {
 	if path.unresolved_self_ty.is_some() {
 		return None;
+	}
+
+	if path.is_import {
+		return Some(ItemPath {
+			anchor: Anchor::Global,
+			segments: path.segments.iter().chain(&path.name).cloned().collect(),
+			import: true,
+			..ItemPath::default()
+		});
 	}
 
 	if !(path.is_impl || in_impl) {
@@ -225,6 +237,7 @@ fn exact_pattern(path: &ItemPath) -> PathPattern {
 			.map(|segment| SegmentPattern::Ident(IdentPattern::exact(segment, MatchOptions::default())))
 			.collect(),
 		arguments: path.arguments.clone(),
+		import: path.import,
 	}
 }
 
@@ -304,6 +317,7 @@ mod tests {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: false,
+			is_import: false,
 			name: name.map(Into::into),
 		}
 	}
@@ -334,6 +348,7 @@ mod tests {
 	fn inherent_impl() -> CanonicalPath {
 		CanonicalPath {
 			is_impl: true,
+			is_import: false,
 			..canonical(&["demo", "shapes", "Circle"], None)
 		}
 	}

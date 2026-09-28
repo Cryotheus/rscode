@@ -4,6 +4,7 @@ use super::Container;
 use super::ModDir;
 use super::Walker;
 use super::syntax::ident_name;
+use super::thread_local;
 use super::verbatim;
 use super::verbatim::Shape;
 use crate::CfgExpr;
@@ -154,6 +155,7 @@ impl Walker<'_, '_, '_> {
 
 				data.detail = ItemDetail::Static {
 					mutable: matches!(item.mutability, StaticMutability::Mut(_)),
+					thread_local: false,
 				};
 
 				self.push_named(parent, data, Some(&item.ident));
@@ -406,6 +408,7 @@ impl Walker<'_, '_, '_> {
 
 				data.detail = ItemDetail::Static {
 					mutable: matches!(item.mutability, StaticMutability::Mut(_)),
+					thread_local: false,
 				};
 
 				self.push_named(parent, data, Some(&item.ident));
@@ -443,7 +446,21 @@ impl Walker<'_, '_, '_> {
 			body: self.inside(mac.delimiter.span()),
 		};
 
-		self.push_named(parent, data, ident.filter(|_| rules));
+		let index = self.push_named(parent, data, ident.filter(|_| rules));
+
+		// the statics a `thread_local!` declares live in the module, like the items of `extern` blocks
+		if container == Container::Module
+			&& !rules
+			&& let Some(declarations) = thread_local::declarations(mac)
+		{
+			for declaration in &declarations {
+				let vis = self.visibility(&declaration.vis, Visibility::Private);
+				let mut data = self.new_item(ItemKind::Static, declaration, &declaration.attrs, vis);
+
+				data.detail = ItemDetail::Static { mutable: false, thread_local: true };
+				self.push_named(index, data, Some(&declaration.ident));
+			}
+		}
 	}
 
 	/// A `use` item and its leaves.
@@ -575,7 +592,7 @@ impl Walker<'_, '_, '_> {
 			},
 
 			Shape::Static { name, mutable } => match container.static_kind() {
-				Some(kind) => (kind, Some(name), ItemDetail::Static { mutable }),
+				Some(kind) => (kind, Some(name), ItemDetail::Static { mutable, thread_local: false }),
 				None => unknown(self, None),
 			},
 

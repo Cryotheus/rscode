@@ -159,6 +159,9 @@ fn matching(resolver: &Resolver<'_>, pattern: &PathPattern) -> Vec<ItemId> {
 					data.kind == ItemKind::Impl
 						|| ws.parent(item).is_some_and(|parent| ws.item(parent).kind == ItemKind::Impl)
 				}
+
+				// `use` patterns match imports, other patterns never do
+				false if pattern.is_import() => data.kind == ItemKind::Import,
 				false => data.kind.is_nameable() && data.kind != ItemKind::Import && data.name.is_some(),
 			};
 
@@ -218,11 +221,16 @@ impl<'ws> Files<'ws> {
 		match data.kind {
 			ItemKind::Module => self.add_module(resolver, item, options, warnings),
 
-			// variants are formatted with their enum
-			ItemKind::Variant => {
-				if let Some(enumeration) = ws.parent(item) {
-					self.add(ws.file_of(enumeration), edition, FormatTarget::Item(ws.item(enumeration).range.start));
-				}
+			// variants are formatted with their enum, statics declared by `thread_local!` with the invocation, and imports
+			// with their `use` item
+			ItemKind::Variant | ItemKind::Static | ItemKind::Import
+				if ws.parent(item).is_some_and(|parent| {
+					matches!(ws.item(parent).kind, ItemKind::Enum | ItemKind::MacroCall | ItemKind::Use)
+				}) =>
+			{
+				let parent = ws.parent(item).expect("checked above");
+
+				self.add(ws.file_of(parent), edition, FormatTarget::Item(ws.item(parent).range.start));
 			}
 
 			_ => self.add(ws.file_of(item), edition, FormatTarget::Item(data.range.start)),

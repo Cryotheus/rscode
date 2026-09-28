@@ -86,8 +86,11 @@ Item paths are written like Rust paths:
   Type::name             an associated item, a trait item, or a variant
   <Type as Trait>::name  an item of a trait impl (<Type>::name: inherent)
   impl Trait for Type    an impl block (also <Type as Trait>, <Type>)
+  'use m::Name'          the import binding Name in m (use m::*: glob imports, use m::_: `as _` ones)
 Generic arguments of the type and trait pick impl blocks: impl From<u8> for W, <W<u16>>::get.
-Every `cfg` variant of an item is addressed by its path.";
+Every `cfg` variant of an item is addressed by its path. Paths go through imports to what they import, except `use` \
+paths (quoted as one argument), which `find --imports` prints; `remove` and `replace` refuse a path whose last segment \
+is bound by a private import, which could mean either.";
 
 const COMPLETION_HELP: &str = "\
 Run `cargo rscode --help` for how to set up shell completion.";
@@ -116,8 +119,10 @@ Patterns are item paths with wildcards (no regex):
   **::b, a::**::b              `b` at any depth (below `a`)
   crate::a::b, ::krate::a      anchored at the selected crates, or `krate`
   <Type as Trait>::name        items of matching trait impls
+  'use a::*', 'use Foo'        imports: every import in `a`, the imports binding `Foo`
 Patterns without an anchor match anywhere: `Foo` finds every item named `Foo`, and `m::*Error` every `...Error` \
-item directly in a module `m`.";
+item directly in a module `m`. Imports are found by `use` patterns, `--imports`, or `-k import`, and printed as the \
+`use` paths that name them (`use my_crate::a::Foo`).";
 
 const FIND_AFTER_HELP: &str = "\
 `--message-format file-lines` prints rustfmt's `--file-lines` JSON, to format only the found items:
@@ -265,7 +270,7 @@ fn find() -> Command {
 				.required(true),
 		)
 		.arg(flag("active-only", "Skip items whose `cfg` is disabled"))
-		.arg(flag("imports", "Also find `use` imports (with what they import)"))
+		.arg(flag("imports", "Also find `use` imports (as `use` paths, with what they import)"))
 		.arg(
 			opt(
 				"from",
@@ -296,7 +301,8 @@ fn view() -> Command {
 		.about("Print the source (or an outline) of items")
 		.long_about(
 			"Print the source of items. Modules (and the crate root, `crate`) are shown as outlines: their items with \
-			 function and macro bodies elided. Every `cfg` variant of a path is shown.",
+			 function and macro bodies elided (but for the statics of `thread_local!`, which are items). Imports \
+			 (`'use crate::a::Name'`) are shown as their `use` items. Every `cfg` variant of a path is shown.",
 		)
 		.arg(item_paths("paths", "PATH", "Item paths to view"))
 		.arg(flag("outline", "Show outlines (bodies elided) of every item").conflicts_with("full"))
@@ -407,7 +413,9 @@ fn remove() -> Command {
 		.about("Remove items")
 		.long_about(
 			"Remove items (every `cfg` variant) with their attributes, doc comments, and attached comments. Removing an \
-			 out-of-line module also deletes its files.",
+			 out-of-line module also deletes its files. Imports are removed by their `use` paths \
+			 (`'use crate::a::Name'`), leaving the rest of their `use` items; a plain path whose last segment is bound \
+			 by a private import is refused, as it could name the import or what it imports.",
 		)
 		.arg(item_paths("paths", "PATH", "Items to remove"))
 		.arg(flag("keep-files", "Keep the files of removed out-of-line modules"))
@@ -423,7 +431,9 @@ fn replace() -> Command {
 		.about("Replace the source of an item")
 		.long_about(
 			"Replace the source of an item (including its attributes and doc comments) with new source, which must \
-			 parse as an item of the same kind. The new source is re-indented to the item's indentation.",
+			 parse as an item of the same kind. The new source is re-indented to the item's indentation. An import \
+			 (`'use crate::a::Name'`) is replaced as its `use` item, which must import nothing else; a plain path whose \
+			 last segment is bound by a private import is refused, as it could name the import or what it imports.",
 		)
 		.arg(item_path("path", "PATH", "The item to replace"))
 		.arg(source_arg("The new source: a file, or `-` for stdin"))
@@ -456,7 +466,7 @@ fn insert() -> Command {
 				.default_value("end"),
 		)
 		.arg(
-			opt("anchor", "The sibling item to insert before or after")
+			opt("anchor", "The sibling item to insert before or after (an import stands for its `use` item)")
 				.value_name("PATH")
 				.required_if_eq_any([("position", "before"), ("position", "after")])
 				.add(ArgValueCompleter::new(complete::item_paths)),

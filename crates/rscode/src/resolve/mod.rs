@@ -176,7 +176,8 @@ impl<'ws> Resolver<'ws> {
 	}
 
 	/// Items named by a user-given path, in selected crates (and, for `::name` or crate-name-first paths,
-	/// in the named crate). Imports are followed to their definitions; every `cfg` variant is returned.
+	/// in the named crate). Imports are followed to their definitions, except by `use` paths
+	/// ([`ItemPath::import`]), which name the imports themselves; every `cfg` variant is returned.
 	///
 	/// Visibility is not enforced. Segments after a type or trait name its associated items (`Type::new`), and
 	/// segments after an enum its variants (or its associated items, in namespaces without a variant of that name).

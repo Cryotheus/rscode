@@ -4,6 +4,7 @@ use super::Resolver;
 use super::names::is_macro_rules;
 use super::vis::home_module;
 use super::vis::parent_module;
+use crate::model::ImportInfo;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::path::CanonicalPath;
@@ -40,6 +41,7 @@ impl Resolver<'_> {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: false,
+			is_import: false,
 			name: data.name.clone(),
 		};
 
@@ -61,12 +63,8 @@ impl Resolver<'_> {
 
 			(ItemKind::Import, _) => {
 				path.segments = self.module_segments(home_module(self.ws, item));
-
-				path.name = data.import_info().map(|info| match info.binding_name() {
-					Some(name) => name.clone(),
-					None if info.glob => SmolStr::new_static("*"),
-					None => SmolStr::new_static("_"),
-				});
+				path.name = data.import_info().map(ImportInfo::path_name);
+				path.is_import = true;
 			}
 
 			// `#[macro_export]` macros live at the crate root

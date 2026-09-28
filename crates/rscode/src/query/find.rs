@@ -26,8 +26,8 @@ pub struct FindOptions {
 	/// An item matches when it matches any pattern (every item matches when there are none).
 	pub patterns: Vec<PathPattern>,
 
-	/// Only these kinds (all kinds when empty). [`ItemKind::Import`]s are included when asked for here or by
-	/// [`FindOptions::imports`]; `use` items, macro invocations, and `extern` blocks never match.
+	/// Only these kinds (all kinds when empty). [`ItemKind::Import`]s are included when asked for here, by
+	/// [`FindOptions::imports`], or by a `use` pattern; `use` items, macro invocations, and `extern` blocks never match.
 	pub kinds: Vec<ItemKind>,
 
 	/// Exclude items whose `cfg` is definitely disabled.
@@ -36,7 +36,8 @@ pub struct FindOptions {
 	/// Compute [`FindMatch::usable_paths`] from this viewpoint.
 	pub from: Option<Viewpoint>,
 
-	/// Include [`ItemKind::Import`]s (with their resolved targets).
+	/// Include [`ItemKind::Import`]s (with their resolved targets). Their paths are `use` paths
+	/// (`use my_crate::a::Name`), which name the imports themselves. `use` patterns search imports anyway.
 	pub imports: bool,
 
 	/// Keep only the first this many matches (in order).
@@ -47,7 +48,9 @@ impl FindOptions {
 	/// Whether items of a kind are searched.
 	fn wants_kind(&self, kind: ItemKind) -> bool {
 		match kind {
-			ItemKind::Import => self.imports || self.kinds.contains(&ItemKind::Import),
+			ItemKind::Import => {
+				self.imports || self.kinds.contains(&ItemKind::Import) || self.patterns.iter().any(PathPattern::is_import)
+			}
 			kind => self.kinds.is_empty() || self.kinds.contains(&kind),
 		}
 	}
@@ -246,6 +249,7 @@ impl Find {
 				ItemKind::Import => import_targets(resolver, item),
 				_ => Vec::new(),
 			},
+			thread_local: data.is_thread_local(),
 		}
 	}
 }
@@ -257,7 +261,8 @@ pub struct FindMatch {
 	#[serde(skip)]
 	pub item: ItemId,
 
-	/// Canonical path (see [`crate::path::CanonicalPath`]).
+	/// Canonical path (see [`crate::path::CanonicalPath`]); for imports, a `use` path (`use my_crate::a::Name`) that
+	/// names the import itself.
 	pub path: String,
 
 	/// The kind of the item.
@@ -295,6 +300,10 @@ pub struct FindMatch {
 	/// Paths usable from the requested viewpoint (empty when none was requested or none is visible).
 	#[serde(skip_serializing_if = "Vec::is_empty")]
 	pub usable_paths: Vec<String>,
+
+	/// Whether the item is a static declared by `thread_local!` (a `LocalKey` of its declared type).
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub thread_local: bool,
 
 	/// For imports: the canonical paths of what they import (for glob imports, of the modules and enums they import
 	/// from), and paths outside of the loaded crates as written.
@@ -365,6 +374,7 @@ fn searches_other_crates(pattern: &PathPattern) -> bool {
 fn candidate_name(data: &ItemData) -> Option<&str> {
 	match data.kind {
 		ItemKind::Impl => Some(""),
+		// like `ImportInfo::path_name`
 		ItemKind::Import => match &data.name {
 			Some(name) => Some(name),
 			None if data.import_info().is_some_and(|info| info.glob) => Some("*"),
@@ -383,6 +393,9 @@ fn may_match(pattern: &PathPattern, kind: ItemKind, name: &str) -> bool {
 		// `<Type as Trait>` and `impl Trait for Type` match `impl` blocks, and only those
 		None if pattern.is_qualified() => is_impl,
 		_ if is_impl => false,
+
+		// `use` patterns match imports, and only those
+		_ if pattern.is_import() && kind != ItemKind::Import => false,
 		Some(SegmentPattern::Ident(last)) => last.matches(name),
 		_ => true,
 	}

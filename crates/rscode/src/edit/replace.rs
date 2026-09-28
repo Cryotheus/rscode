@@ -8,6 +8,7 @@ mod parse;
 
 use crate::Error;
 use crate::edit::EditSet;
+use crate::edit::describe;
 use crate::edit::trivia;
 use crate::edit::trivia::Placement;
 use crate::model::ItemDetail;
@@ -82,7 +83,12 @@ pub fn replace(
 	options: &ReplaceOptions,
 ) -> Result<Replacement, Error> {
 	let ws = resolver.workspace();
-	let items = distinct_places(ws, resolver.resolve_item_path(path));
+	let resolved = resolver.resolve_item_path(path);
+
+	super::check_private_imports(resolver, path, &resolved)?;
+
+	let (items, labels) = use_items(resolver, resolved)?;
+	let items = distinct_places(ws, items);
 
 	if items.is_empty() {
 		return Err(Error::NotFound(path.to_string()));
@@ -100,7 +106,10 @@ pub fn replace(
 
 	for &item in &items {
 		let data = ws.item(item);
-		let canonical = resolver.canonical_path(item).to_string();
+		let canonical = match labels.iter().find(|(use_item, _)| *use_item == item) {
+			Some((_, import)) => import.clone(),
+			None => resolver.canonical_path(item).to_string(),
+		};
 		let container = ws
 			.parent(item)
 			.and_then(|parent| Container::of(ws.item(parent).kind))
@@ -130,6 +139,22 @@ pub fn replace(
 				.collect();
 
 			replacement.insert_str(0, &kept);
+		}
+
+		// the declarations of a `thread_local!` are separated by `;`, which only the last one may leave out (and the
+		// file still parses without it, since macro bodies are only tokens)
+		let followed = ws.parent(item).is_some_and(|parent| ws.children(parent).last() != Some(item));
+
+		if container == Container::ThreadLocal && followed && !source.ends_with_semicolon {
+			if source.trailing_comment {
+				return Err(Error::InvalidSource(format!(
+					"`{path}` is followed by more declarations of its `thread_local!`: end the source with `;`"
+				)));
+			}
+
+			let code = replacement.trim_end().len();
+
+			replacement.insert(code, ';');
 		}
 
 		// a comment ending the replacement would comment out the code after the item on its line: move that code to
@@ -408,12 +433,15 @@ fn placement(
 }
 
 /// The items of the container named by `anchor`, in source order: those with that name when it is a single
-/// identifier, else those it resolves to.
+/// identifier, else those it resolves to. An import stands for its `use` item, and an item of an `extern` block or a
+/// static of a `thread_local!` for the block or invocation.
 fn siblings(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> Vec<ItemId> {
 	let ws = resolver.workspace();
 	let children: Vec<ItemId> = ws.children(target.item).collect();
 
-	if let (Anchor::None, None, [name]) = (anchor.anchor, &anchor.qualifier, anchor.segments.as_slice()) {
+	if let (Anchor::None, None, false, [name]) =
+		(anchor.anchor, &anchor.qualifier, anchor.import, anchor.segments.as_slice())
+	{
 		let named: Vec<ItemId> =
 			children.iter().copied().filter(|&child| ws.item(child).name.as_ref() == Some(name)).collect();
 
@@ -426,6 +454,7 @@ fn siblings(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> 
 	let mut siblings: Vec<ItemId> = resolver
 		.resolve_item_path(anchor)
 		.into_iter()
+		.map(|item| item_of_container(ws, item))
 		.filter_map(|item| children.iter().copied().find(|&child| same_place(ws, child, item)))
 		.collect();
 
@@ -599,8 +628,13 @@ fn replacement_warnings(ws: &Workspace, item: ItemId, path: &str, items: &[NewIt
 			.push(format!("only the declaration of the module `{path}` is replaced; its file{file} is left as it is"));
 	}
 
+	let defines = |item: &NewItem, name: &SmolStr| {
+		item.name.as_ref() == Some(name)
+			|| item.bindings.iter().any(|binding| binding.import.is_none() && binding.name == *name)
+	};
+
 	if let Some(name) = &data.name
-		&& !items.iter().any(|item| item.name.as_ref() == Some(name))
+		&& !items.iter().any(|item| defines(item, name))
 	{
 		warnings
 			.push(format!("the replacement of `{path}` does not define `{name}`; references to it are not updated"));
@@ -628,6 +662,18 @@ fn distinct_places(ws: &Workspace, items: Vec<ItemId>) -> Vec<ItemId> {
 }
 
 /// Whether two items are the same text (of a file loaded by several crates).
+/// The item an anchor stands for among the items of its container: the item, or for an import its `use` item, and for
+/// an item of an `extern` block or a static of a `thread_local!` the block or invocation (they are transparent).
+fn item_of_container(ws: &Workspace, mut item: ItemId) -> ItemId {
+	while let Some(parent) = ws.parent(item)
+		&& matches!(ws.item(parent).kind, ItemKind::Use | ItemKind::ExternBlock | ItemKind::MacroCall)
+	{
+		item = parent;
+	}
+
+	item
+}
+
 fn same_place(ws: &Workspace, a: ItemId, b: ItemId) -> bool {
 	a == b || (ws.item(a).range == ws.item(b).range && ws.file_of(a).path() == ws.file_of(b).path())
 }
@@ -637,9 +683,57 @@ fn same_place(ws: &Workspace, a: ItemId, b: ItemId) -> bool {
 /// differ, which generic arguments in the path tell apart.
 pub fn replaces_all_variants(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 	let ws = resolver.workspace();
-	let items = distinct_places(ws, resolver.resolve_item_path(path));
+	let resolved = resolver.resolve_item_path(path);
+
+	if !resolver.private_imports_of(path, &resolved).is_empty() {
+		return false;
+	}
+
+	let Ok((items, _)) = use_items(resolver, resolved) else {
+		return false;
+	};
+	let items = distinct_places(ws, items);
 
 	items.len() > 1 && !super::impl_headers_differ(ws, &items)
+}
+
+/// The items to replace, and the `use` paths of the imports they replace by `use` item (for messages).
+type UseItems = (Vec<ItemId>, Vec<(ItemId, String)>);
+
+/// Imports are replaced as their `use` items, which must import nothing else.
+fn use_items(resolver: &Resolver<'_>, items: Vec<ItemId>) -> Result<UseItems, Error> {
+	let ws = resolver.workspace();
+	let mut replaced = Vec::with_capacity(items.len());
+	let mut labels = Vec::new();
+
+	for item in items {
+		if ws.item(item).kind != ItemKind::Import {
+			replaced.push(item);
+			continue;
+		}
+
+		let Some(use_item) = ws.parent(item) else {
+			continue;
+		};
+		let import = resolver.canonical_path(item).to_string();
+		let imports = ws.children(use_item).count();
+
+		if imports > 1 {
+			let file = ws.file_of(use_item);
+
+			return Err(Error::Unsupported(format!(
+				"`{import}` is one of the {imports} imports of the `use` item at {}:{}, which only replaces as a whole: \
+				 insert a new `use` item and remove this import instead",
+				ws.display_path(file.path()).display(),
+				file.line_col(ws.item(use_item).range.start),
+			)));
+		}
+
+		labels.push((use_item, import));
+		replaced.push(use_item);
+	}
+
+	Ok((replaced, labels))
 }
 
 fn ambiguous(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Error {
@@ -647,29 +741,6 @@ fn ambiguous(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Erro
 		path: path.to_string(),
 		candidates: items.iter().map(|&item| describe(resolver, item)).collect(),
 	}
-}
-
-/// An item for messages: its canonical path, kind (for crate roots, the kind of the crate), location, and `cfg`.
-fn describe(resolver: &Resolver<'_>, item: ItemId) -> String {
-	let ws = resolver.workspace();
-	let data = ws.item(item);
-	let file = ws.file_of(item);
-	let kind = match item.is_crate_root() {
-		true => format!("{} crate root", ws.krate(item.krate()).kind()),
-		false => data.kind.to_string(),
-	};
-	let mut text = format!(
-		"`{}` ({kind}) at {}:{}",
-		resolver.canonical_path(item).distinct(),
-		ws.display_path(file.path()).display(),
-		file.line_col(data.range.start),
-	);
-
-	if let Some(cfg) = ws.effective_cfg(item) {
-		text.push_str(&format!(" with #[cfg({cfg})]"));
-	}
-
-	text
 }
 
 /// A binding for messages: the item, or the import and what it imports.

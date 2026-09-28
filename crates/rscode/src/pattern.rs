@@ -29,6 +29,10 @@
 //! `impl TraitPattern for TypePattern` / `impl TypePattern`, they match the `impl` blocks themselves.
 //! Unqualified patterns match `impl` items through their owner (`Foo::fmt` matches `<Foo as Display>::fmt`), but
 //! never `impl` blocks.
+//!
+//! `use` patterns (`use crate::a::*`, `use Circle`) only match imports (the leaves of `use` items), whose paths are
+//! those of their modules followed by the names they bind (`*` for glob imports, `_` for underscore imports). Other
+//! patterns match imports too, when the caller searches imports.
 
 use crate::path::Anchor;
 use crate::path::CanonicalPath;
@@ -132,6 +136,11 @@ impl IdentPattern {
 	}
 
 	/// The identifier an exact, case-sensitive pattern matches, if it can name an item.
+	/// Whether the pattern is exactly `_` (the name of underscore imports).
+	fn is_exact_underscore(&self) -> bool {
+		self.is_exact() && self.parts.as_slice() == ["_"]
+	}
+
 	fn exact_ident(&self) -> Option<SmolStr> {
 		let [part] = self.parts.as_slice() else {
 			return None;
@@ -261,6 +270,9 @@ pub struct PathPattern {
 	/// The generic arguments of the last segment (of the type or trait of a qualifier), normalized like
 	/// [`ItemPath::arguments`]: only `impl` blocks whose header has them match.
 	pub arguments: Option<String>,
+
+	/// Whether the pattern is a `use` pattern, which only matches imports (see [`CanonicalPath::is_import`]).
+	pub import: bool,
 }
 
 impl PathPattern {
@@ -272,7 +284,13 @@ impl PathPattern {
 
 	/// A pattern matching items named by `name` anywhere.
 	pub fn from_ident(name: IdentPattern) -> Self {
-		Self { anchor: Anchor::None, qualifier: None, segments: vec![SegmentPattern::Ident(name)], arguments: None }
+		Self {
+			anchor: Anchor::None,
+			qualifier: None,
+			segments: vec![SegmentPattern::Ident(name)],
+			arguments: None,
+			import: false,
+		}
 	}
 
 	/// Whether the pattern has an `impl` qualifier (`<Type as Trait>`), and so only matches `impl` blocks and their
@@ -285,6 +303,11 @@ impl PathPattern {
 		self.qualifier.is_some()
 	}
 
+	/// Whether the pattern is a `use` pattern, which only matches imports.
+	pub fn is_import(&self) -> bool {
+		self.import
+	}
+
 	/// The equivalent [`ItemPath`], if the pattern has no wildcards and is case-sensitive.
 	///
 	/// Note that unanchored patterns match anywhere, while unanchored item paths are resolved from crate roots.
@@ -293,10 +316,16 @@ impl PathPattern {
 			Anchor::None | Anchor::Crate | Anchor::Global => self.anchor,
 			Anchor::SelfModule | Anchor::Super(_) => return None,
 		};
+		let last = self.segments.len().saturating_sub(1);
 		let segments = self
 			.segments
 			.iter()
-			.map(|segment| match segment {
+			.enumerate()
+			.map(|(index, segment)| match segment {
+				// the name of underscore imports (a `*` stays a wildcard: it matches any import)
+				SegmentPattern::Ident(pattern) if self.import && index == last && pattern.is_exact_underscore() => {
+					Some(SmolStr::new_static("_"))
+				}
 				SegmentPattern::Ident(pattern) => pattern.exact_ident(),
 				SegmentPattern::AnyDepth => None,
 			})
@@ -312,7 +341,7 @@ impl PathPattern {
 			}),
 		};
 
-		Some(ItemPath { anchor, qualifier, segments, arguments: self.arguments.clone() })
+		Some(ItemPath { anchor, qualifier, segments, arguments: self.arguments.clone(), import: self.import })
 	}
 
 	/// Matches a sequence of segments.
@@ -329,6 +358,10 @@ impl PathPattern {
 	/// `is_selected` tells whether the crate the path belongs to is part of the user's selection (only selected
 	/// crates match `crate::` anchors). See [`PathPattern::is_qualified`] for a limitation of qualified patterns.
 	pub fn matches(&self, path: &CanonicalPath, is_selected: bool) -> bool {
+		if self.import && !path.is_import {
+			return false;
+		}
+
 		match &self.qualifier {
 			Some((self_ty, trait_pattern)) => {
 				self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref())
@@ -421,6 +454,10 @@ impl PathPattern {
 /// Formats in the pattern syntax (`impl` sugar is written as the equivalent qualifier).
 impl std::fmt::Display for PathPattern {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		if self.import {
+			f.write_str("use ")?;
+		}
+
 		if let Some((self_ty, trait_pattern)) = &self.qualifier {
 			write!(f, "<{self_ty}")?;
 
@@ -514,6 +551,31 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 		return Err("the pattern is empty".to_owned());
 	}
 
+	if let Some(rest) = strip_word(text, "use") {
+		if nested {
+			return Err("`use` cannot appear inside of a qualifier".to_owned());
+		}
+
+		let rest = rest.trim();
+
+		if rest.is_empty() {
+			return Err("expected a pattern after `use`".to_owned());
+		}
+
+		let mut pattern = parse_path_pattern(rest, options, false)?;
+
+		if pattern.qualifier.is_some() || pattern.import {
+			return Err("`use` patterns match the imports of modules, and cannot be qualified".to_owned());
+		}
+
+		if pattern.segments.is_empty() {
+			return Err(format!("expected a pattern of the names imports bind after `use {rest}`"));
+		}
+
+		pattern.import = true;
+		return Ok(pattern);
+	}
+
 	if let Some(rest) = strip_word(text, "impl") {
 		if nested {
 			return Err("`impl` cannot appear inside of a qualifier".to_owned());
@@ -536,6 +598,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			qualifier: Some((self_ty, trait_pattern)),
 			segments: Vec::new(),
 			arguments: None,
+			import: false,
 		});
 	}
 
@@ -573,7 +636,13 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			}
 		}
 
-		return Ok(PathPattern { anchor: Anchor::None, qualifier: Some((self_ty, trait_pattern)), segments, arguments: None });
+		return Ok(PathPattern {
+			anchor: Anchor::None,
+			qualifier: Some((self_ty, trait_pattern)),
+			segments,
+			arguments: None,
+			import: false,
+		});
 	}
 
 	// the type and trait of a qualifier may end with generic arguments
@@ -626,7 +695,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 		return Err(format!("expected a pattern with at least one segment, found `{text}`"));
 	}
 
-	Ok(PathPattern { anchor, qualifier: None, segments, arguments })
+	Ok(PathPattern { anchor, qualifier: None, segments, arguments, import: false })
 }
 
 /// The error for generic arguments where patterns cannot have them.
@@ -863,6 +932,7 @@ mod tests {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: false,
+			is_import: false,
 			name: Some(name.into()),
 		}
 	}
@@ -878,6 +948,7 @@ mod tests {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: true,
+			is_import: false,
 			name: None,
 		}
 	}
@@ -889,6 +960,7 @@ mod tests {
 			self_ty_arguments: None,
 			unresolved_self_ty: Some(self_ty.to_owned()),
 			is_impl: name.is_none(),
+			is_import: false,
 			name: name.map(SmolStr::from),
 		}
 	}
@@ -1119,6 +1191,9 @@ mod tests {
 			("impl *", "<*>"),
 			("<* as ::std::fmt::*>::*", "<* as ::std::fmt::*>::*"),
 			("r#type::r#fn", "r#type::r#fn"),
+			("use crate::a::*", "use crate::a::*"),
+			("use  Foo*", "use Foo*"),
+			("use **::_", "use **::_"),
 		];
 
 		for (text, displayed) in cases {
@@ -1126,6 +1201,47 @@ mod tests {
 
 			assert_eq!(parsed.to_string(), displayed, "display of `{text}`");
 			assert_eq!(pattern(displayed), parsed, "`{displayed}` does not round-trip");
+		}
+	}
+
+	#[test]
+	fn use_patterns_match_imports_only() {
+		let import = |segments: &[&str], name: &str| CanonicalPath {
+			segments: segments.iter().copied().map(SmolStr::new).collect(),
+			impl_trait: None,
+			self_ty_arguments: None,
+			unresolved_self_ty: None,
+			is_impl: false,
+			name: Some(name.into()),
+			is_import: true,
+		};
+		let item = |segments: &[&str], name: &str| CanonicalPath { is_import: false, ..import(segments, name) };
+
+		assert!(pattern("use Foo").matches(&import(&["c", "a"], "Foo"), true));
+		assert!(!pattern("use Foo").matches(&item(&["c", "a"], "Foo"), true));
+		assert!(pattern("Foo").matches(&import(&["c", "a"], "Foo"), true));
+		assert!(pattern("use crate::a::*").matches(&import(&["c", "a"], "*"), true));
+		assert!(pattern("use crate::a::*").matches(&import(&["c", "a"], "Foo"), true));
+		assert!(!pattern("use crate::a::*").matches(&import(&["c", "a", "b"], "Foo"), true));
+
+		// exact `use` patterns are `use` paths: `_` names underscore imports, `*` stays a wildcard
+		assert!(pattern("use crate::a::Foo").to_item_path().unwrap().import);
+		assert_eq!(pattern("use crate::a::_").to_item_path().unwrap().to_string(), "use crate::a::_");
+		assert_eq!(pattern("use crate::a::*").to_item_path(), None);
+		assert_eq!(pattern("crate::a::_").to_item_path(), None);
+
+		for (text, message) in [
+			("use", "the pattern is empty"),
+			("use <A as B>", "`use` patterns match the imports of modules, and cannot be qualified"),
+			("use use a", "`use` patterns match the imports of modules, and cannot be qualified"),
+			("use crate", "expected a pattern of the names imports bind after `use crate`"),
+			("impl use a", "`use` cannot appear inside of a qualifier"),
+		] {
+			match PathPattern::parse(text, MatchOptions::default()) {
+				Ok(parsed) if text == "use" => assert!(!parsed.import, "`use` alone is a name"),
+				Ok(parsed) => panic!("`{text}` parsed as {parsed:?}"),
+				Err(error) => assert_eq!(error.message, message, "{text}"),
+			}
 		}
 	}
 
@@ -1191,6 +1307,7 @@ mod tests {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: false,
+			is_import: false,
 			name: Some("my_crate".into()),
 		};
 
@@ -1403,7 +1520,7 @@ mod tests {
 	#[test]
 	fn random_patterns_round_trip() {
 		const PIECES: &[&str] = &[
-			"::", ":", "<", ">", " as ", " for ", "impl ", "crate", "self", "super", "Self", "r#", "a", "b", "type",
+			"::", ":", "<", ">", " as ", " for ", "impl ", "use ", "crate", "self", "super", "Self", "r#", "a", "b", "type",
 			"é", "_", "1", " ", "*", "**", "***", "😀", "-", "#", "É",
 		];
 

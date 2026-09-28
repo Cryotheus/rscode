@@ -31,7 +31,8 @@ pub enum ViewMode {
 	/// The exact source text.
 	Full,
 
-	/// Function, method, and macro bodies elided as `{ ... }`; for modules, their items' outlines
+	/// Function, method, and macro bodies (other than of `thread_local!`, whose statics are items) elided as `{ ... }`;
+	/// for modules, their items' outlines
 	/// (with nested inline modules collapsed to `mod name { ... }`). See [`outline_text`](super::outline_text).
 	Outline,
 }
@@ -187,7 +188,8 @@ pub struct ItemView {
 	#[serde(skip)]
 	pub item: ItemId,
 
-	/// Canonical path (see [`crate::path::CanonicalPath`]).
+	/// Canonical path (see [`crate::path::CanonicalPath`]); for imports, a `use` path (`use my_crate::a::Name`), whose
+	/// view is that of their `use` item.
 	pub path: String,
 
 	/// The kind of the item.
@@ -208,6 +210,10 @@ pub struct ItemView {
 
 	/// Evaluation of [`ItemView::cfg`].
 	pub active: Tristate,
+
+	/// Whether the item is a static declared by `thread_local!` (a `LocalKey` of its declared type).
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub thread_local: bool,
 
 	/// The rendered text.
 	pub text: String,
@@ -253,8 +259,14 @@ impl Renderer<'_, '_> {
 	fn render(&mut self, item: ItemId, mode: ViewMode) -> ItemView {
 		let workspace = self.resolver.workspace();
 		let data = workspace.item(item);
-		let file = workspace.file_of(item);
-		let (start, end) = file.locate(data.range);
+
+		// an import is shown as its `use` item, of which its own text is only a part
+		let shown = match data.kind {
+			ItemKind::Import => workspace.parent(item).unwrap_or(item),
+			_ => item,
+		};
+		let file = workspace.file_of(shown);
+		let (start, end) = file.locate(workspace.item(shown).range);
 
 		ItemView {
 			item,
@@ -265,7 +277,8 @@ impl Renderer<'_, '_> {
 			end,
 			cfg: workspace.effective_cfg(item).map(|cfg| cfg.to_string()),
 			active: workspace.is_active(item),
-			text: self.text(item, mode),
+			thread_local: data.is_thread_local(),
+			text: self.text(shown, mode),
 			impls: Vec::new(),
 		}
 	}

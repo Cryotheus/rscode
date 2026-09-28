@@ -5,6 +5,8 @@
 //! tokenizes (`Verbatim` items such as `fn f();` or `const trait T {}`).
 
 use crate::Error;
+use crate::load::thread_local;
+use crate::load::thread_local::Declaration;
 use crate::model::ItemKind;
 use crate::path::is_keyword;
 use crate::resolve::Namespace;
@@ -43,6 +45,9 @@ pub(super) enum Container {
 	Trait,
 	Extern,
 	Enum,
+
+	/// A `thread_local!` invocation, whose declarations are statics.
+	ThreadLocal,
 }
 
 impl Container {
@@ -54,6 +59,9 @@ impl Container {
 			ItemKind::Trait => Some(Self::Trait),
 			ItemKind::ExternBlock => Some(Self::Extern),
 			ItemKind::Enum => Some(Self::Enum),
+
+			// the only macro calls with children
+			ItemKind::MacroCall => Some(Self::ThreadLocal),
 			_ => None,
 		}
 	}
@@ -66,12 +74,13 @@ impl Container {
 			Self::Trait => "trait items",
 			Self::Extern => "items of an `extern` block",
 			Self::Enum => "enum variants",
+			Self::ThreadLocal => "declarations of a `thread_local!` (`static NAME: Type = initializer;`)",
 		}
 	}
 
 	fn fn_kind(self) -> ItemKind {
 		match self {
-			Self::Module | Self::Enum => ItemKind::Fn,
+			Self::Module | Self::Enum | Self::ThreadLocal => ItemKind::Fn,
 			Self::Impl | Self::Trait => ItemKind::AssocFn,
 			Self::Extern => ItemKind::ForeignFn,
 		}
@@ -81,13 +90,13 @@ impl Container {
 		match self {
 			Self::Module => Some(ItemKind::Const),
 			Self::Impl | Self::Trait => Some(ItemKind::AssocConst),
-			Self::Extern | Self::Enum => None,
+			Self::Extern | Self::Enum | Self::ThreadLocal => None,
 		}
 	}
 
 	fn static_kind(self) -> Option<ItemKind> {
 		match self {
-			Self::Module => Some(ItemKind::Static),
+			Self::Module | Self::ThreadLocal => Some(ItemKind::Static),
 			Self::Extern => Some(ItemKind::ForeignStatic),
 			Self::Impl | Self::Trait | Self::Enum => None,
 		}
@@ -95,7 +104,7 @@ impl Container {
 
 	fn type_kind(self) -> ItemKind {
 		match self {
-			Self::Module | Self::Enum => ItemKind::TypeAlias,
+			Self::Module | Self::Enum | Self::ThreadLocal => ItemKind::TypeAlias,
 			Self::Impl | Self::Trait => ItemKind::AssocType,
 			Self::Extern => ItemKind::ForeignType,
 		}
@@ -104,7 +113,7 @@ impl Container {
 	/// The kind of a macro invocation (and of syntax that is not understood).
 	fn macro_kind(self) -> ItemKind {
 		match self {
-			Self::Module | Self::Enum => ItemKind::MacroCall,
+			Self::Module | Self::Enum | Self::ThreadLocal => ItemKind::MacroCall,
 			Self::Impl | Self::Trait => ItemKind::AssocMacro,
 			Self::Extern => ItemKind::ForeignMacro,
 		}
@@ -173,6 +182,9 @@ pub(super) struct ParsedSource {
 	/// Whether a comment follows the last token (it would comment out code following the text on its line).
 	pub(super) trailing_comment: bool,
 
+	/// Whether the last token is a `;`.
+	pub(super) ends_with_semicolon: bool,
+
 	/// Whether an item has `cfg` (or `cfg_attr`) attributes.
 	pub(super) has_cfg: bool,
 }
@@ -195,6 +207,9 @@ fn parse_source_here(source: &str, container: Container) -> Result<ParsedSource,
 		Container::Trait => parse_list(text, |item: &TraitItem| trait_item(item)),
 		Container::Extern => parse_list(text, |item: &ForeignItem| foreign_item(item)),
 		Container::Enum => parse_variants(text),
+		Container::ThreadLocal => {
+			parse_list(text, |declaration: &Declaration| NewItem::named(ItemKind::Static, &declaration.ident, VALUE))
+		}
 	};
 
 	let (items, end, trailing_comma) = parsed.map_err(|error| invalid_source(&error, text, container))?;
@@ -205,9 +220,10 @@ fn parse_source_here(source: &str, container: Container) -> Result<ParsedSource,
 	}
 
 	let trailing_comment = !text.get(end.min(text.len())..).unwrap_or_default().trim().is_empty();
+	let ends_with_semicolon = text.get(..end.min(text.len())).is_some_and(|code| code.ends_with(';'));
 	let has_cfg = has_cfg_attributes(&text);
 
-	Ok(ParsedSource { items, text, trailing_comment, has_cfg })
+	Ok(ParsedSource { items, text, trailing_comment, ends_with_semicolon, has_cfg })
 }
 
 /// Whether an outer attribute of an item of parsed source (at the top level of its tokens) is a `cfg` or `cfg_attr`.
@@ -361,7 +377,15 @@ fn module_item(item: &Item) -> NewItem {
 
 		Item::Macro(item) => match &item.ident {
 			Some(ident) if item.mac.path.is_ident("macro_rules") => NewItem::named(ItemKind::MacroRules, ident, MACRO),
-			_ => NewItem::unnamed(ItemKind::MacroCall),
+
+			// the statics of a `thread_local!` are bound in the module, like the items of an `extern` block
+			_ => NewItem {
+				kind: ItemKind::MacroCall,
+				name: None,
+				bindings: (thread_local::declarations(&item.mac).into_iter().flatten())
+					.flat_map(|declaration| NewItem::named(ItemKind::Static, &declaration.ident, VALUE).bindings)
+					.collect(),
+			},
 		},
 
 		Item::Mod(item) => NewItem::named(ItemKind::Module, &item.ident, TYPE),

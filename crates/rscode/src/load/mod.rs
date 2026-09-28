@@ -24,8 +24,10 @@
 //!
 //! # Items
 //!
-//! The items of modules, `impl` blocks, traits, and `extern` blocks, the variants of enums, and the leaves of `use`
-//! trees become [`ItemData`]; items inside function bodies and other expressions do not.
+//! The items of modules, `impl` blocks, traits, and `extern` blocks, the declarations of `thread_local!` invocations
+//! in modules (as [`ItemKind::Static`] children of the [`ItemKind::MacroCall`], see [`thread_local`]), the variants
+//! of enums, and the leaves of `use` trees become [`ItemData`]; items inside function bodies and other expressions do
+//! not.
 //!
 //! Syntax that syn only tokenizes (`Verbatim` items, e.g. `fn f();`, `const trait T {}`, `impl(crate) trait T {}`,
 //! `macro m() {}`, `static S: u8;`) is classified by its leading tokens. Traits and `impl` blocks with modifiers syn
@@ -40,6 +42,7 @@
 mod attrs;
 mod items;
 mod syntax;
+pub(crate) mod thread_local;
 mod verbatim;
 
 use crate::CfgExpr;

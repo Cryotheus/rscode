@@ -3,7 +3,8 @@
 //! rscode loads crates into a [`Workspace`]: a tree of modules and items per crate, with source locations, `cfg`
 //! predicates, and visibility. Nothing is compiled or expanded; source files are parsed with `syn` and module
 //! files are found by following `mod` declarations the same way rustc does. Items produced by macros are
-//! therefore invisible.
+//! therefore invisible, except for the statics declared by `thread_local!`, which are loaded as `static` items of the
+//! module the invocation is in.
 //!
 //! - Load: [`load_workspace`] (a cargo workspace, feature `cargo`), or [`Workspace::load_crate`] with a
 //!   [`CrateSpec`] for a standalone crate root.
@@ -16,7 +17,8 @@
 //! - Serve: the `mcp` feature exposes all of this as a Model Context Protocol server ([`mcp`]).
 //!
 //! Item paths are written like Rust paths: `crate::module::Item`, `::other_crate::Item`, `Type::method`,
-//! `<Type as Trait>::method`. See [`ItemPath`] and [`pattern`] for the exact syntax.
+//! `<Type as Trait>::method`, and `use module::Item` for the imports themselves (other paths go through imports). See
+//! [`ItemPath`] and [`pattern`] for the exact syntax.
 //!
 //! Formatting and sorting are provided by the [`rscode_fmt`] and [`rscode_sort`] crates, re-exported here.
 //!

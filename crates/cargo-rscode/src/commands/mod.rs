@@ -99,6 +99,10 @@ fn print_report(ui: &Ui, format: MessageFormat, report: &impl EditReport) -> any
 const SELECT_ONE_CRATE: &str = "the path names items of several crates (such as the library and a binary of a \
 	package, whose roots are both `crate`): select one with `--lib` or `--bin NAME`";
 
+/// How to name an import, or what it imports, when a path names both.
+const THROUGH_IMPORT: &str = "the path names an item through a private import: name the import with its `use` path \
+	(quoted as one argument, like `'use crate::a::Name'`), or the item with its own path";
+
 /// An error of an operation, with a hint naming the options that get past it (see [`hint`]).
 fn hinted(error: rscode::Error, resolver: &Resolver<'_>) -> anyhow::Error {
 	let hint = hint(&error, resolver);
@@ -113,6 +117,11 @@ fn hint(error: &rscode::Error, resolver: &Resolver<'_>) -> Option<String> {
 	match error {
 		rscode::Error::Collision { .. } => Some("pass `--force` to proceed anyway".to_owned()),
 		rscode::Error::Ambiguous { path, .. } if in_several_crates(resolver, path) => Some(SELECT_ONE_CRATE.to_owned()),
+
+		// a path through a private import (see `rscode::edit::remove`)
+		rscode::Error::Ambiguous { candidates, .. } if candidates.iter().any(|candidate| candidate.starts_with("`use ")) => {
+			Some(THROUGH_IMPORT.to_owned())
+		}
 
 		rscode::Error::NotFound(path) => {
 			let member = ItemPath::parse(path).ok().and_then(|path| workspace.unloaded_member_of(&path));

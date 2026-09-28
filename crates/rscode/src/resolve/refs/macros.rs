@@ -9,11 +9,15 @@
 //! is a function.
 
 use super::ReferenceKind;
+use super::docs::DocStyle;
 use super::format_str;
 use super::paths::Locals;
 use super::paths::PathRes;
 use super::paths::ident_name;
 use super::walker::FileWalker;
+use super::walker::statement_items;
+use crate::load::thread_local;
+use crate::load::thread_local::Declaration;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::PathRef;
@@ -70,14 +74,28 @@ impl FileWalker<'_, '_> {
 		self.code_path(None, &mac.path, Namespace::Macro);
 
 		if self.tokens_mention_target(&mac.tokens) {
+			let declarations = thread_local::declarations(mac);
+
+			// the statics a `thread_local!` declares are documented like the items around it (doc comments inside of
+			// bodies are not searched)
+			for declaration in declarations.iter().flatten() {
+				self.doc_comments(&declaration.attrs, DocStyle::Outer);
+			}
+
 			self.body_depth += 1;
-			self.macro_body(mac);
+			self.macro_body(mac, declarations.as_deref());
 			self.body_depth -= 1;
 		}
 	}
 
-	fn macro_body(&mut self, mac: &Macro) {
-		if let Ok(arguments) = mac.parse_body_with(Arguments::parse_terminated) {
+	/// A macro's body; `declarations`: those of a `thread_local!`.
+	fn macro_body(&mut self, mac: &Macro, declarations: Option<&[Declaration]>) {
+		// declarations of statics (definitions, not references)
+		if let Some(declarations) = declarations {
+			for declaration in declarations {
+				self.visit_item_static(&declaration.to_item());
+			}
+		} else if let Ok(arguments) = mac.parse_body_with(Arguments::parse_terminated) {
 			self.macro_arguments(mac, &arguments);
 		} else if let Ok(stmts) = mac.parse_body_with(Block::parse_within) {
 			self.statements(&stmts);
@@ -88,12 +106,8 @@ impl FileWalker<'_, '_> {
 
 	/// Statements parsed from a macro body, in a scope of their own.
 	fn statements(&mut self, stmts: &[Stmt]) {
-		let items = stmts.iter().filter_map(|stmt| match stmt {
-			Stmt::Item(item) => Some(item),
-			_ => None,
-		});
-
-		let scope = self.local_items(items);
+		let items = statement_items(stmts);
+		let scope = self.local_items(items.iter().map(AsRef::as_ref));
 
 		self.scopes.push(scope);
 

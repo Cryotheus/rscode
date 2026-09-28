@@ -81,6 +81,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 
 		let member = args.patterns.iter().find_map(|pattern| {
 			let pattern = pattern.trim();
+			let pattern = pattern.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace)).unwrap_or(pattern).trim();
 			let first = pattern.strip_prefix("::").unwrap_or(pattern).split("::").next()?;
 
 			workspace.unloaded_member_with_crate(first)

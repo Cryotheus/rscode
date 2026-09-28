@@ -45,13 +45,17 @@ pub struct Qualifier {
 ///   at the start;
 /// - `<Path [as Path]>(::segment)*`: segments after the qualifier name associated items of the `impl`
 ///   (with no segments, the `impl` block itself);
-/// - `impl [Trait for] Type`: sugar for `<Type as Trait>` / `<Type>`.
+/// - `impl [Trait for] Type`: sugar for `<Type as Trait>` / `<Type>`;
+/// - `use [::]segment(::segment)*`: the imports (leaves of `use` items) of the module named by all but the last
+///   segment that bind the last segment, which may be `*` (glob imports) or `_` (underscore imports). Other paths go
+///   through imports to what they import.
 ///
 /// Details:
 /// - Whitespace is allowed around `::`, `<`, `>`, `as`, and `for`, and around the whole path.
 /// - `crate` alone names the crate root. `self` and `super` may be followed by more `super`s
 ///   (`self::super::super::x` is `super::super::x`).
-/// - Keywords must be written as raw identifiers (`r#type`) to be used as segments; `Self` and `_` never name items.
+/// - Keywords must be written as raw identifiers (`r#type`) to be used as segments; `Self` and `_` never name items
+///   (except for `_` at the end of a `use` path).
 /// - The type and trait of a qualifier are plain (unqualified) paths with at least one segment, whose last segment
 ///   may have generic arguments (`<Wrapper<u8> as From<io::Error>>`), which select the `impl` blocks whose header has
 ///   the same arguments (as written, whatever the whitespace). Other paths have no generic arguments.
@@ -71,6 +75,12 @@ pub struct ItemPath {
 	/// The generic arguments of the last segment (of the type or trait of a qualifier), with their angle brackets, as
 	/// normalized by [`normalize_arguments`].
 	pub arguments: Option<String>,
+
+	/// Whether the path is a `use` path, naming imports rather than what they import: the last segment is the name
+	/// they bind (`*` for glob imports, `_` for underscore imports) in the module the other segments name. Such a path
+	/// has no qualifier and no generic arguments.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub import: bool,
 }
 
 impl ItemPath {
@@ -80,7 +90,7 @@ impl ItemPath {
 
 		let tokens = tokenize(text).map_err(error)?;
 
-		Parser { tokens, index: 0 }.parse().map_err(error)
+		Parser { tokens, index: 0, import_name: false }.parse().map_err(error)
 	}
 
 	/// A path of plain identifiers with no anchor.
@@ -107,6 +117,10 @@ impl std::str::FromStr for ItemPath {
 /// `impl` sugar is written as the equivalent qualifier: `impl Display for Foo` displays as `<Foo as Display>`.
 impl std::fmt::Display for ItemPath {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		if self.import {
+			f.write_str("use ")?;
+		}
+
 		if let Some(qualifier) = &self.qualifier {
 			write!(f, "<{}", qualifier.self_ty)?;
 
@@ -287,6 +301,11 @@ pub struct CanonicalPath {
 
 	/// The associated item's name (for `impl`/trait items), or the item's name (last segment) otherwise.
 	pub name: Option<SmolStr>,
+
+	/// Whether the path denotes an import (a leaf of a `use` item): its module's path and the name it binds (`*` for
+	/// glob imports, `_` for underscore imports). It displays with `use ` in front (`use my_crate::a::Foo`), a path that
+	/// names the import itself (see [`ItemPath::import`]).
+	pub is_import: bool,
 }
 
 impl CanonicalPath {
@@ -317,6 +336,7 @@ impl CanonicalPath {
 					self_ty_arguments: None,
 					unresolved_self_ty: None,
 					is_impl: false,
+					is_import: false,
 					name: name.cloned(),
 				};
 
@@ -340,6 +360,10 @@ impl CanonicalPath {
 
 impl std::fmt::Display for CanonicalPath {
 	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		if self.is_import {
+			f.write_str("use ")?;
+		}
+
 		if let Some(impl_segment) = self.impl_segment() {
 			write_segments(f, &self.segments)?;
 
@@ -520,6 +544,9 @@ enum Token<'a> {
 
 	/// Generic arguments after an identifier, with their angle brackets, as written.
 	Arguments(&'a str),
+
+	/// `*`, the name of glob imports at the end of a `use` path.
+	Star,
 }
 
 impl Token<'_> {
@@ -538,6 +565,7 @@ impl std::fmt::Display for Token<'_> {
 			Token::Lt => f.write_str("<"),
 			Token::Gt => f.write_str(">"),
 			Token::Arguments(text) => f.write_str(text),
+			Token::Star => f.write_str("*"),
 		}
 	}
 }
@@ -560,7 +588,7 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 			':' => return Err("expected `::`, found a single `:`".to_owned()),
 
 			// after an identifier (other than a keyword), generic arguments
-			'<' if matches!(tokens.last(), Some(Token::Ident { text, raw }) if *raw || !matches!(*text, "as" | "for" | "impl")) => {
+			'<' if matches!(tokens.last(), Some(Token::Ident { text, raw }) if *raw || !matches!(*text, "as" | "for" | "impl" | "use")) => {
 				let length = generic_arguments_len(rest).ok_or("expected `>` to close the generic arguments")?;
 
 				(Token::Arguments(&rest[..length]), length)
@@ -590,6 +618,15 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 
 				(Token::Ident { text: word, raw: false }, word.len())
 			}
+			// glob imports, named at the end of a `use` path
+			'*' if tokens.first().is_some_and(|token| token.is_word("use")) => {
+				if !matches!(tokens.last(), Some(Token::PathSep) | Some(Token::Ident { text: "use", raw: false })) {
+					return Err("`*` can only end a `use` path".to_owned());
+				}
+
+				(Token::Star, 1)
+			}
+
 			'*' => return Err("wildcards are only supported in patterns (for example by `find`)".to_owned()),
 			_ => return Err(format!("unexpected character `{c}`")),
 		};
@@ -605,6 +642,9 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 struct Parser<'a> {
 	tokens: Vec<Token<'a>>,
 	index: usize,
+
+	/// Whether a `use` path is being parsed, whose last segment may be `*` or `_`.
+	import_name: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -631,6 +671,7 @@ impl<'a> Parser<'a> {
 		let path = match self.peek() {
 			None => return Err("the path is empty".to_owned()),
 			Some(token) if token.is_word("impl") => self.parse_impl()?,
+			Some(token) if token.is_word("use") => self.parse_use()?,
 			Some(Token::Lt) => self.parse_qualified()?,
 			Some(_) => self.parse_plain()?,
 		};
@@ -645,6 +686,30 @@ impl<'a> Parser<'a> {
 
 			Some(token) => Err(format!("unexpected `{token}`")),
 		}
+	}
+
+	/// `use [::]segment(::segment)*`, whose last segment may be `*` or `_`.
+	fn parse_use(&mut self) -> Result<ItemPath, String> {
+		self.bump();
+
+		match self.peek() {
+			None => return Err("expected a path after `use` (quote the whole path, `use` included)".to_owned()),
+			Some(Token::Lt) => return Err("`use` paths name the imports of modules, and cannot be qualified".to_owned()),
+			Some(_) => {}
+		}
+
+		self.import_name = true;
+
+		let mut path = self.parse_plain()?;
+
+		match (path.anchor, path.segments.len()) {
+			(_, 0) => return Err(format!("expected the name the imports bind after `{path}`")),
+			(Anchor::Global, 1) => return Err(format!("expected the name the imports bind after `{path}`")),
+			_ => {}
+		}
+
+		path.import = true;
+		Ok(path)
 	}
 
 	/// `impl [Trait for] Type`
@@ -759,9 +824,15 @@ impl<'a> Parser<'a> {
 		Ok(path)
 	}
 
-	/// An identifier that is not an anchor keyword.
+	/// An identifier that is not an anchor keyword (or `*` or `_` ending a `use` path).
 	fn parse_segment(&mut self, expected: &str) -> Result<SmolStr, String> {
-		match self.bump() {
+		let token = self.bump();
+		let last_of_use = self.import_name && self.peek().is_none();
+
+		match token {
+			Some(Token::Star) if last_of_use => Ok("*".into()),
+			Some(Token::Star) => Err("`*` can only end a `use` path".to_owned()),
+			Some(Token::Ident { text: "_", raw: false }) if last_of_use => Ok("_".into()),
 			Some(Token::Ident { text, raw: true }) => Ok(text.into()),
 			Some(Token::Ident { text, raw: false }) => match text {
 				"crate" => Err("`crate` can only start a path".to_owned()),
@@ -909,6 +980,30 @@ mod tests {
 		assert_eq!(parse_error("a#b"), "unexpected character `#`");
 		assert_eq!(parse_error("smile😀"), "`smile😀` is not a valid identifier");
 		assert_eq!(parse_error("foo*"), "wildcards are only supported in patterns (for example by `find`)");
+
+		// `use` paths
+		assert_eq!(parse_error("use"), "expected a path after `use` (quote the whole path, `use` included)");
+		assert_eq!(parse_error("use crate"), "expected the name the imports bind after `crate`");
+		assert_eq!(parse_error("use ::dep"), "expected the name the imports bind after `::dep`");
+		assert_eq!(parse_error("use <A as B>::c"), "`use` paths name the imports of modules, and cannot be qualified");
+		assert_eq!(parse_error("use a::*::b"), "`*` can only end a `use` path");
+		assert_eq!(parse_error("use a::_::b"), "`_` does not name an item");
+		assert_eq!(parse_error("use a::**"), "`*` can only end a `use` path");
+		assert_eq!(parse_error("use use a"), "`use` is a keyword; write `r#use` for an item named `use`");
+		assert_eq!(parse_error("a::*"), "wildcards are only supported in patterns (for example by `find`)");
+		assert!(parse_error("use a::b<u8>").starts_with("generic arguments are only supported in the type and trait"));
+		assert_eq!(parse_error("impl use a"), "`use` is a keyword; write `r#use` for an item named `use`");
+	}
+
+	#[test]
+	fn parses_use_paths() {
+		let path = parse("use crate::a::B");
+
+		assert!(path.import && path.qualifier.is_none());
+		assert_eq!((path.anchor, path.segments.as_slice()), (Anchor::Crate, ["a", "B"].map(SmolStr::new).as_slice()));
+		assert_eq!(parse("use a::*").segments.last().unwrap(), "*");
+		assert_eq!(parse("use a::_").segments.last().unwrap(), "_");
+		assert!(!parse("crate::a::B").import);
 	}
 
 	#[test]
@@ -990,6 +1085,13 @@ mod tests {
 			("impl Display for crate::a::Foo", "<crate::a::Foo as Display>"),
 			("impl Foo", "<Foo>"),
 			("<Foo>::r#type", "<Foo>::r#type"),
+			("use crate::a::Foo", "use crate::a::Foo"),
+			("use  Foo", "use Foo"),
+			("use ::dep :: *", "use ::dep::*"),
+			("use a::_", "use a::_"),
+			("use *", "use *"),
+			("use r#use::r#type", "use r#use::r#type"),
+			("r#use", "r#use"),
 		];
 
 		for (input, displayed) in cases {
@@ -1052,6 +1154,7 @@ mod tests {
 			self_ty_arguments: None,
 			unresolved_self_ty: None,
 			is_impl: false,
+			is_import: false,
 			name: name.map(SmolStr::from),
 		}
 	}
@@ -1157,7 +1260,7 @@ mod tests {
 	#[test]
 	fn random_paths_round_trip() {
 		const PIECES: &[&str] = &[
-			"::", ":", "<", ">", " as ", " for ", "impl ", "crate", "self", "super", "Self", "r#", "a", "b", "type",
+			"::", ":", "<", ">", " as ", " for ", "impl ", "use ", "crate", "self", "super", "Self", "r#", "a", "b", "type",
 			"é", "_", "1", " ", "\u{200e}", "😀", "-", "#", "*",
 		];
 

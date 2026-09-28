@@ -22,6 +22,7 @@ use super::scope::LocalGlob;
 use super::scope::Scope;
 use super::scope::Scopes;
 use super::scope::trait_bounds;
+use crate::load::thread_local;
 use crate::model::CrateId;
 use crate::model::ItemId;
 use crate::model::ItemKind;
@@ -39,6 +40,7 @@ use crate::source::TextRange;
 use proc_macro2::Ident;
 use proc_macro2::TokenStream;
 use smol_str::SmolStr;
+use std::borrow::Cow;
 use syn::Arm;
 use syn::Attribute;
 use syn::Block;
@@ -924,12 +926,8 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 	fn visit_block(&mut self, block: &'ast Block) {
 		self.body_depth += 1;
 
-		let items = block.stmts.iter().filter_map(|stmt| match stmt {
-			Stmt::Item(item) => Some(item),
-			_ => None,
-		});
-
-		let scope = self.local_items(items);
+		let items = statement_items(&block.stmts);
+		let scope = self.local_items(items.iter().map(AsRef::as_ref));
 
 		self.scopes.push(scope);
 
@@ -1155,6 +1153,27 @@ pub(super) fn use_leaves(tree: &UseTree) -> Vec<UseLeaf<'_>> {
 	leaves
 }
 
+/// The items of statements, for the scope of their block: item statements, and `thread_local!` invocations in
+/// statement position (which declare statics).
+pub(super) fn statement_items(stmts: &[Stmt]) -> Vec<Cow<'_, Item>> {
+	(stmts.iter())
+		.filter_map(|stmt| match stmt {
+			Stmt::Item(item) => Some(Cow::Borrowed(item)),
+
+			Stmt::Macro(statement) if thread_local::is_thread_local(&statement.mac) => {
+				Some(Cow::Owned(Item::Macro(ItemMacro {
+					attrs: statement.attrs.clone(),
+					ident: None,
+					mac: statement.mac.clone(),
+					semi_token: statement.semi_token,
+				})))
+			}
+
+			_ => None,
+		})
+		.collect()
+}
+
 /// The names an item of a block binds, with their namespaces.
 fn local_item_names(item: &Item) -> Vec<(SmolStr, Namespace)> {
 	use Namespace::Macro;
@@ -1176,7 +1195,14 @@ fn local_item_names(item: &Item) -> Vec<(SmolStr, Namespace)> {
 		Item::Type(item) => named(&item.ident, &[Type]),
 		Item::Mod(item) => named(&item.ident, &[Type]),
 		Item::ExternCrate(item) => named(item.rename.as_ref().map_or(&item.ident, |(_, alias)| alias), &[Type]),
-		Item::Macro(item) => item.ident.as_ref().map(|ident| named(ident, &[Macro])).unwrap_or_default(),
+		Item::Macro(item) => match &item.ident {
+			Some(ident) => named(ident, &[Macro]),
+
+			// the statics a `thread_local!` declares
+			None => (thread_local::declarations(&item.mac).into_iter().flatten())
+				.map(|declaration| (ident_name(&declaration.ident), Value))
+				.collect(),
+		},
 
 		Item::ForeignMod(block) => (block.items.iter())
 			.flat_map(|item| match item {

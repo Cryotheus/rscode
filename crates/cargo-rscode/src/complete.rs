@@ -396,13 +396,15 @@ impl<'ws> WorkspaceTree<'ws> {
 		})
 	}
 
-	/// The items of a module: its nameable items, the items of its `extern` blocks, and its re-exports.
+	/// The items of a module: its nameable items, the items of its `extern` blocks and the statics of its
+	/// `thread_local!` invocations, and its re-exports.
 	fn module_children(&self, module: ItemId, children: &mut Vec<Child<ItemId>>) {
 		for id in self.workspace.children(module) {
 			let item = self.workspace.item(id);
 
 			match item.kind {
-				ItemKind::ExternBlock => self.module_children(id, children),
+				// transparent: their items live in the module (only `thread_local!` invocations have children)
+				ItemKind::ExternBlock | ItemKind::MacroCall => self.module_children(id, children),
 
 				ItemKind::Use => {
 					let reexports = self

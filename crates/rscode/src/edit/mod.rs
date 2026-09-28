@@ -34,6 +34,8 @@ use crate::Error;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::Workspace;
+use crate::path::ItemPath;
+use crate::resolve::Resolver;
 use crate::source::LineCol;
 use crate::source::SourceFile;
 use crate::source::TextRange;
@@ -51,6 +53,45 @@ use std::sync::atomic::Ordering;
 
 /// Whether items are (or are in) `impl` blocks whose headers differ, apart from `cfg`s: such as `impl From<u8> for X`
 /// and `impl From<u16> for X`, which are not `cfg` variants of each other.
+/// Refuses a plain path whose last segment names `items` through private imports of its module, like `crate::Foo`
+/// with `use shapes::Foo;` in the crate root: it could mean what they import as well as the imports themselves (named
+/// `use crate::Foo`). Re-exports (`pub use`) are paths to what they export.
+pub(crate) fn check_private_imports(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
+	let imports = resolver.private_imports_of(path, items);
+
+	if imports.is_empty() {
+		return Ok(());
+	}
+
+	let candidates = imports.iter().chain(items).map(|&item| describe(resolver, item)).collect();
+
+	Err(Error::Ambiguous { path: path.to_string(), candidates })
+}
+
+/// An item for messages: its canonical path (imports as `use` paths), kind (for crate roots, the kind of the crate),
+/// location, and `cfg`.
+pub(crate) fn describe(resolver: &Resolver<'_>, item: ItemId) -> String {
+	let ws = resolver.workspace();
+	let data = ws.item(item);
+	let file = ws.file_of(item);
+	let kind = match item.is_crate_root() {
+		true => format!("{} crate root", ws.krate(item.krate()).kind()),
+		false => data.kind.to_string(),
+	};
+	let mut text = format!(
+		"`{}` ({kind}) at {}:{}",
+		resolver.canonical_path(item).distinct(),
+		ws.display_path(file.path()).display(),
+		file.line_col(data.range.start),
+	);
+
+	if let Some(cfg) = ws.effective_cfg(item) {
+		text.push_str(&format!(" with #[cfg({cfg})]"));
+	}
+
+	text
+}
+
 pub(crate) fn impl_headers_differ(ws: &Workspace, items: &[ItemId]) -> bool {
 	let mut headers = Vec::new();
 

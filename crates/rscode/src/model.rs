@@ -577,13 +577,18 @@ pub enum ItemKind {
 
 	/// An item-position macro invocation (`foo! { ... }`).
 	/// `macro_rules!` definitions are [`ItemKind::MacroRules`] instead.
+	///
+	/// A `thread_local!` invocation in a module has the statics it declares as [`ItemKind::Static`] children
+	/// ([`ItemDetail::Static`] with `thread_local`). Like an `extern` block, it is transparent for paths: they live in
+	/// the enclosing module. Other macro invocations have no children.
 	MacroCall,
 
 	/// A whole `use` item. Its children are [`ItemKind::Import`]s.
 	Use,
 
 	/// One leaf of a `use` tree (`a::B`, `a::B as C`, `a::*`, `a::{self}`). Its range is the leaf's element of the
-	/// innermost enclosing group, see [`ItemData::range`].
+	/// innermost enclosing group, see [`ItemData::range`]. Named by `use` paths (`use crate::m::B`, see
+	/// [`ItemPath::import`](crate::path::ItemPath::import)); other paths go through imports.
 	Import,
 
 	/// `extern crate name;`
@@ -695,6 +700,7 @@ impl ItemKind {
 	}
 
 	/// Whether the item holds other items (modules, `impl` blocks, `trait`s, `extern` blocks, `enum`s, `use`s).
+	/// `thread_local!` invocations also hold the statics they declare, but most macro invocations hold nothing.
 	pub fn is_container(self) -> bool {
 		matches!(self, Self::Module | Self::Impl | Self::Trait | Self::ExternBlock | Self::Enum | Self::Use)
 	}
@@ -973,6 +979,16 @@ impl ImportInfo {
 			None => self.path.last().map(|segment| &segment.name),
 		}
 	}
+
+	/// The last segment of the import's path ([`CanonicalPath`](crate::path::CanonicalPath) and `use` paths): the
+	/// name it binds, `*` for globs, or `_` for underscore imports.
+	pub fn path_name(&self) -> SmolStr {
+		match self.binding_name() {
+			Some(name) => name.clone(),
+			None if self.glob => SmolStr::new_static("*"),
+			None => SmolStr::new_static("_"),
+		}
+	}
 }
 
 /// Details of an `impl` block.
@@ -1045,6 +1061,9 @@ pub enum ItemDetail {
 	Static {
 		/// `static mut`
 		mutable: bool,
+
+		/// Declared in a `thread_local!` invocation (the item's parent), as a `LocalKey` of its type.
+		thread_local: bool,
 	},
 
 	/// Trait (or trait alias) details.
@@ -1144,6 +1163,11 @@ pub struct ItemData {
 }
 
 impl ItemData {
+	/// Whether the item is a static declared by `thread_local!`.
+	pub fn is_thread_local(&self) -> bool {
+		matches!(self.detail, ItemDetail::Static { thread_local: true, .. })
+	}
+
 	/// The unraw'd name, if the item has one.
 	pub fn name(&self) -> Option<&str> {
 		self.name.as_deref()

@@ -248,7 +248,14 @@ fn check_supported(resolver: &Resolver<'_>, target: ItemId) -> Result<(), Error>
 		_ => return Ok(()),
 	};
 
-	Err(Error::Unsupported(format!("`{}` is {what}, which cannot be renamed", resolver.canonical_path(target))))
+	let hint = match data.kind {
+		ItemKind::Import => {
+			": rename what it imports instead, or replace its `use` item (for example with `use a::Name as NewName;`)"
+		}
+		_ => "",
+	};
+
+	Err(Error::Unsupported(format!("`{}` is {what}, which cannot be renamed{hint}", resolver.canonical_path(target))))
 }
 
 /// Drops the items of trait `impl`s shadowed by targets of inherent `impl`s of the same type with the same name

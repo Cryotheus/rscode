@@ -108,7 +108,7 @@ impl OrderingSchemaItem {
 	fn spacing(self) -> Spacing {
 		match self {
 			Self::MacroScope | Self::MacroInvocation => Spacing::Barrier,
-			Self::ExternCrate | Self::Module(_) | Self::Use | Self::ReExport => Spacing::Tight,
+			Self::ExternCrate | Self::Module(_) | Self::Use | Self::ReExport => Spacing::Compact,
 			Self::TypeAlias | Self::Const | Self::Static | Self::StaticMut => Spacing::Compact,
 			_ => Spacing::Loose,
 		}
@@ -208,9 +208,6 @@ enum OrderingSchemaModule {
 /// the items the same way.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Spacing {
-	/// A line break (like rustfmt's reordering groups of `use`, `mod foo;`, and `extern crate` items).
-	Tight,
-
 	/// A line break, or a blank line next to an item with attributes, doc comments, or comments above it.
 	Compact,
 
@@ -1289,11 +1286,11 @@ mod tests {
 			"extern crate a; mod b; use c; pub use d; type E = (); const F: () = (); static G: () = (); static mut H: () = (); struct I; fn j() {} mod k {}",
 		);
 		let plan = plan_of(&items, true);
-		let (tight, compact, loose) = (Spacing::Tight, Spacing::Compact, Spacing::Loose);
+		let (compact, loose) = (Spacing::Compact, Spacing::Loose);
 
 		assert_eq!(
 			plan.groups.iter().map(|group| group.spacing).collect::<Vec<_>>(),
-			[tight, tight, tight, tight, compact, compact, compact, compact, loose, loose, loose]
+			[compact, compact, compact, compact, compact, compact, compact, compact, loose, loose, loose]
 		);
 	}
 

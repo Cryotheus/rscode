@@ -137,11 +137,10 @@
 //!
 //! Every item of a sorted container goes on its own line (a container with a single item is left as it is). Items of
 //! different groups are separated by one blank line, except that consecutive macros keep the blank line between
-//! them, or the lack of one. Within a group:
-//! - `use` items, `mod foo;` declarations, and `extern crate` items are separated by a line break,
-//! - type aliases, constants, statics, associated types and constants, and the items of `extern` blocks are
-//!   separated by a line break, or by a blank line next to an item with attributes, doc comments, or comments above
-//!   it,
+//! them, or the lack of one, unless one of them has attributes, doc comments, or comments above it. Within a group:
+//! - `use` items, `mod foo;` declarations, `extern crate` items, type aliases, constants, statics, associated types
+//!   and constants, and the items of `extern` blocks are separated by a line break, or by a blank line next to an
+//!   item with attributes, doc comments, or comments above it,
 //! - other items are separated by a blank line.
 //!
 //! None of this depends on how many lines an item spans, so running rustfmt after sorting leaves nothing for
