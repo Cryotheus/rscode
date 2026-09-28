@@ -1,23 +1,40 @@
 [package]
 name = "rscode"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+
+description = "Viewing, searching, and editing Rust source files by item path"
+categories = ["development-tools"]
+keywords = ["rust", "refactoring", "mcp", "syn"]
 
 [dependencies]
-cargo.workspace = true
-futures.workspace = true
+cargo = { workspace = true, optional = true }
+cargo-platform = { workspace = true, optional = true }
+cargo-util-terminal = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+glob = { workspace = true, optional = true }
 proc-macro2.workspace = true
 quote.workspace = true
-rmcp = "3.5.0"
+rmcp = { version = "3.5.0", optional = true, default-features = false, features = ["server", "macros", "transport-io"] }
+rscode_fmt.workspace = true
+rscode_sort.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol_str.workspace = true
 syn.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
 
 [features]
-default = []
-mcp = []
+default = ["cargo"]
+## Load crates from a cargo workspace using the `cargo` crate.
+cargo = ["dep:cargo", "dep:cargo-platform", "dep:cargo-util-terminal", "dep:glob"]
+## Model Context Protocol server exposing rscode's operations as tools.
+mcp = ["cargo", "dep:rmcp", "dep:tokio", "dep:futures"]
+## Implements `clap::ValueEnum` for the public option enums.
+clap = ["rscode_fmt/clap", "rscode_sort/clap"]

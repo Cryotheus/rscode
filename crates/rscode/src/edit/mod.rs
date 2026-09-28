@@ -1,0 +1,906 @@
+//! Modifying operations: removing, renaming, replacing, inserting, and formatting items.
+//!
+//! Operations produce an [`EditSet`] describing every change, which can be previewed (as new file contents or a
+//! diff) or applied. Applying is all-or-nothing: every edited file must still parse before anything is written.
+
+mod format;
+mod remove;
+mod rename;
+mod replace;
+pub(crate) mod trivia;
+
+pub use format::Formatting;
+pub use format::FmtOptions;
+pub use format::format;
+pub use remove::RemoveOptions;
+pub use remove::Removal;
+pub use remove::RemovedItem;
+pub use remove::remove;
+pub use rename::Collision;
+pub use rename::Rename;
+pub use rename::RenameOptions;
+pub use rename::rename;
+pub use replace::InsertOptions;
+pub use replace::InsertPosition;
+pub use replace::Insertion;
+pub use replace::ReplaceOptions;
+pub use replace::Replacement;
+pub use replace::insert;
+pub use replace::replace;
+pub use replace::replaces_all_variants;
+pub use rscode_fmt::emit::FileChange;
+
+use crate::Error;
+use crate::model::ItemId;
+use crate::model::ItemKind;
+use crate::model::Workspace;
+use crate::source::LineCol;
+use crate::source::SourceFile;
+use crate::source::TextRange;
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::fs;
+use std::io;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+/// Whether items are (or are in) `impl` blocks whose headers differ, apart from `cfg`s: such as `impl From<u8> for X`
+/// and `impl From<u16> for X`, which are not `cfg` variants of each other.
+pub(crate) fn impl_headers_differ(ws: &Workspace, items: &[ItemId]) -> bool {
+	let mut headers = Vec::new();
+
+	for &item in items {
+		let impl_block = match ws.item(item).kind {
+			ItemKind::Impl => Some(item),
+			_ => ws.parent(item).filter(|&parent| ws.item(parent).kind == ItemKind::Impl),
+		};
+
+		let header = impl_block
+			.and_then(|impl_block| ws.item(impl_block).impl_info())
+			.map(|info| (info.negative, info.trait_text.clone(), info.self_ty_text.clone()));
+
+		if let Some(header) = header
+			&& !headers.contains(&header)
+		{
+			headers.push(header);
+		}
+	}
+
+	headers.len() > 1
+}
+
+/// A replacement of a range of text.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+pub struct TextEdit {
+	/// The replaced range of the original text (empty for insertions).
+	pub range: TextRange,
+
+	/// The new text (empty for deletions).
+	pub replacement: String,
+}
+
+/// The edits of one file.
+#[derive(Debug, Clone)]
+pub(crate) struct FileEdits {
+	/// The text the edits' ranges refer to.
+	pub(crate) original: Arc<str>,
+
+	/// Edits in the order they were added.
+	pub(crate) edits: Vec<TextEdit>,
+}
+
+impl FileEdits {
+	/// Adds an edit unless an identical one exists.
+	fn push(&mut self, edit: TextEdit) {
+		if !self.edits.contains(&edit) {
+			self.edits.push(edit);
+		}
+	}
+
+	/// The text with every edit applied.
+	///
+	/// Edits are applied in order of position; insertions at the same position in the order they were added.
+	/// Overlapping deletions are merged. Any other overlap is an error: two edits overlap if their ranges intersect,
+	/// or if one is an insertion inside of (or at the start of) the other's range.
+	fn apply(&self, path: &Path) -> Result<String, Error> {
+		let original: &str = &self.original;
+		let mut sorted: Vec<&TextEdit> = self.edits.iter().collect();
+
+		// stable, so insertions at the same position keep their order
+		sorted.sort_by_key(|edit| (edit.range.start, edit.range.end));
+
+		let mut accepted: Vec<(TextRange, &str)> = Vec::with_capacity(sorted.len());
+
+		// the last accepted replacement (non-empty range), which reaches furthest since they are disjoint and sorted
+		let mut last_replaced: Option<usize> = None;
+		let mut last_insertion: Option<usize> = None;
+
+		for edit in sorted {
+			let range = edit.range;
+
+			check_range(path, original, range)?;
+
+			let overlapped = last_replaced.filter(|&index| accepted[index].0.end > range.start);
+
+			if range.is_empty() {
+				if let Some(index) = overlapped {
+					return Err(overlap(path, accepted[index].0, range));
+				}
+
+				last_insertion = Some(range.start);
+				accepted.push((range, &edit.replacement));
+				continue;
+			}
+
+			if last_insertion == Some(range.start) {
+				return Err(overlap(path, TextRange::new(range.start, range.start), range));
+			}
+
+			match overlapped {
+				Some(index) if accepted[index].1.is_empty() && edit.replacement.is_empty() => {
+					let merged = &mut accepted[index].0;
+
+					merged.end = merged.end.max(range.end);
+				}
+				Some(index) => return Err(overlap(path, accepted[index].0, range)),
+				None => {
+					last_replaced = Some(accepted.len());
+					accepted.push((range, &edit.replacement));
+				}
+			}
+		}
+
+		let mut text = String::with_capacity(original.len());
+		let mut position = 0;
+
+		for (range, replacement) in accepted {
+			text.push_str(&original[position..range.start]);
+			text.push_str(replacement);
+			position = range.end;
+		}
+
+		text.push_str(&original[position..]);
+
+		Ok(text)
+	}
+}
+
+/// A set of changes to files.
+#[derive(Debug, Default, Clone)]
+pub struct EditSet {
+	pub(crate) files: BTreeMap<PathBuf, FileEdits>,
+
+	/// Files or directories to move, after text edits are written. Edits are keyed by the original path.
+	pub(crate) moves: Vec<(PathBuf, PathBuf)>,
+
+	/// Files or directories to delete.
+	pub(crate) deletions: Vec<PathBuf>,
+}
+
+impl EditSet {
+	/// An empty edit set.
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Adds a replacement. Identical duplicate edits (from files loaded by multiple crates) are merged.
+	///
+	/// Edits of a file are keyed by its path and refer to the text of the first [`SourceFile`] given for that path.
+	pub fn replace(&mut self, file: &SourceFile, range: TextRange, replacement: impl Into<String>) {
+		let edit = TextEdit { range, replacement: replacement.into() };
+
+		self.files
+			.entry(file.path().to_path_buf())
+			.or_insert_with(|| FileEdits { original: file.shared_text().clone(), edits: Vec::new() })
+			.push(edit);
+	}
+
+	/// Replaces a file's whole text.
+	pub fn replace_file(&mut self, file: &SourceFile, text: impl Into<String>) {
+		self.replace(file, TextRange::new(0, file.text().len()), text);
+	}
+
+	/// Moves (renames) a file or directory. Duplicate moves are ignored.
+	pub fn move_path(&mut self, from: impl Into<PathBuf>, to: impl Into<PathBuf>) {
+		let entry = (from.into(), to.into());
+
+		if !self.moves.contains(&entry) {
+			self.moves.push(entry);
+		}
+	}
+
+	/// Deletes a file or directory (recursively). Duplicate deletions are ignored.
+	pub fn delete_path(&mut self, path: impl Into<PathBuf>) {
+		let path = path.into();
+
+		if !self.deletions.contains(&path) {
+			self.deletions.push(path);
+		}
+	}
+
+	/// Merges another edit set into this one (identical edits, moves, and deletions are merged).
+	pub fn extend(&mut self, other: EditSet) {
+		for (path, file) in other.files {
+			match self.files.entry(path) {
+				Entry::Vacant(entry) => {
+					entry.insert(file);
+				}
+				Entry::Occupied(mut entry) => {
+					let target = entry.get_mut();
+
+					for edit in file.edits {
+						target.push(edit);
+					}
+				}
+			}
+		}
+
+		for (from, to) in other.moves {
+			self.move_path(from, to);
+		}
+
+		for path in other.deletions {
+			self.delete_path(path);
+		}
+	}
+
+	/// Whether there is nothing to do.
+	pub fn is_empty(&self) -> bool {
+		self.files.is_empty() && self.moves.is_empty() && self.deletions.is_empty()
+	}
+
+	/// Planned moves, in order: `(from, to)`.
+	pub fn moves(&self) -> &[(PathBuf, PathBuf)] {
+		&self.moves
+	}
+
+	/// Planned deletions.
+	pub fn deletions(&self) -> &[PathBuf] {
+		&self.deletions
+	}
+
+	/// Paths of the files with text edits.
+	pub fn edited_files(&self) -> impl Iterator<Item = &Path> {
+		self.files.keys().map(PathBuf::as_path)
+	}
+
+	/// The text edits of a file, in the order they were added (none for a file that is not edited). Their ranges refer
+	/// to the text the file was loaded with; [`EditSet::preview`] applies them.
+	pub fn edits(&self, path: &Path) -> &[TextEdit] {
+		self.files.get(path).map_or(&[], |file| &file.edits)
+	}
+
+	/// Computes the new contents of every edited file, sorted by path (including files whose edits do not change
+	/// them; see [`FileChange::is_changed`]).
+	///
+	/// Fails with [`Error::OverlappingEdits`] when edits of a file overlap (non-identical), and with
+	/// [`Error::EditBreaksSyntax`] when an edited `.rs` file no longer parses.
+	///
+	/// Edited files are parsed on a thread of their own (see [Threads](crate#threads)).
+	pub fn preview(&self) -> Result<Vec<FileChange>, Error> {
+		crate::source::isolated(|| {
+			let mut changes = Vec::with_capacity(self.files.len());
+
+			for (path, file) in &self.files {
+				let formatted = file.apply(path)?;
+
+				if formatted != *file.original && is_rust_file(path) {
+					check_syntax(path, &formatted)?;
+				}
+
+				changes.push(FileChange { path: path.clone(), original: file.original.to_string(), formatted });
+			}
+
+			Ok(changes)
+		})
+	}
+
+	/// A unified diff of all text edits, followed by lines describing moves (`rename <from> -> <to>`) and deletions
+	/// (`delete <path>`). Paths are shown as stored (absolute when loaded from a workspace); see
+	/// [`EditSet::diff_relative_to`].
+	pub fn diff(&self) -> Result<String, Error> {
+		self.render_diff(Path::to_path_buf)
+	}
+
+	/// Like [`EditSet::diff`], with paths shown relative to `base` when they are inside of it (for example
+	/// [`Workspace::root`](crate::Workspace::root)).
+	pub fn diff_relative_to(&self, base: &Path) -> Result<String, Error> {
+		self.render_diff(|path| path.strip_prefix(base).unwrap_or(path).to_path_buf())
+	}
+
+	fn render_diff(&self, display: impl Fn(&Path) -> PathBuf) -> Result<String, Error> {
+		let mut changes = self.preview()?;
+
+		for change in &mut changes {
+			change.path = display(&change.path);
+		}
+
+		let mut diff = rscode_fmt::emit::unified_diff(&changes, 3);
+
+		if !(diff.is_empty() || diff.ends_with('\n')) {
+			diff.push('\n');
+		}
+
+		for (from, to) in &self.moves {
+			diff.push_str(&format!("rename {} -> {}\n", display(from).display(), display(to).display()));
+		}
+
+		for path in &self.deletions {
+			diff.push_str(&format!("delete {}\n", display(path).display()));
+		}
+
+		Ok(diff)
+	}
+
+	/// Validates everything (like [`EditSet::preview`]), then writes files, then performs moves and deletions.
+	///
+	/// Before anything is written, this also checks that every edited file still has the contents its edits were
+	/// computed from (so changes made after loading are not overwritten), that moved and deleted paths exist, and
+	/// that no move would overwrite an existing path. Files are written atomically: every new content is written to
+	/// a temporary file next to its file first, and only when all of them are written are they renamed over the
+	/// originals (symbolic links are written through, and permissions are preserved).
+	pub fn apply(&self) -> Result<Applied, Error> {
+		let changes = self.preview()?;
+		let to_write: Vec<&FileChange> = changes.iter().filter(|change| change.is_changed()).collect();
+
+		for change in &to_write {
+			check_unmodified(change)?;
+		}
+
+		let deletions = self.effective_deletions();
+
+		self.check_moves_and_deletions(&deletions)?;
+
+		let written = write_files(&to_write)?;
+		let mut moved = Vec::with_capacity(self.moves.len());
+
+		for (from, to) in &self.moves {
+			move_path(from, to)?;
+			moved.push((from.clone(), to.clone()));
+		}
+
+		let mut deleted = Vec::with_capacity(deletions.len());
+
+		for path in deletions {
+			delete_path(path)?;
+			deleted.push(path.to_path_buf());
+		}
+
+		Ok(Applied { written, moved, deleted })
+	}
+
+	/// Deletions that are not inside of another deleted directory.
+	fn effective_deletions(&self) -> Vec<&Path> {
+		self.deletions
+			.iter()
+			.filter(|path| !self.deletions.iter().any(|other| other != *path && path.starts_with(other)))
+			.map(PathBuf::as_path)
+			.collect()
+	}
+
+	/// Checks that moves and deletions can be performed in order, tracking which paths they create and remove.
+	fn check_moves_and_deletions(&self, deletions: &[&Path]) -> Result<(), Error> {
+		// later events win: (path, whether it exists afterwards, with everything below it)
+		let mut events: Vec<(&Path, bool)> = Vec::new();
+		let exists = |events: &[(&Path, bool)], path: &Path| {
+			events
+				.iter()
+				.rev()
+				.find(|(event, _)| path.starts_with(event))
+				.map_or_else(|| fs::symlink_metadata(path).is_ok(), |&(_, exists)| exists)
+		};
+
+		for (from, to) in &self.moves {
+			if !exists(&events, from) {
+				return Err(Error::io(
+					from,
+					io::Error::new(io::ErrorKind::NotFound, "cannot move a path that does not exist"),
+				));
+			}
+
+			if exists(&events, to) {
+				let message = format!("cannot move `{}` here: the destination exists", from.display());
+
+				return Err(Error::io(to, io::Error::new(io::ErrorKind::AlreadyExists, message)));
+			}
+
+			if to.starts_with(from) {
+				return Err(Error::io(
+					to,
+					io::Error::new(io::ErrorKind::InvalidInput, "cannot move a directory into itself"),
+				));
+			}
+
+			events.push((from, false));
+			events.push((to, true));
+		}
+
+		for &path in deletions {
+			if !exists(&events, path) {
+				return Err(Error::io(
+					path,
+					io::Error::new(io::ErrorKind::NotFound, "cannot delete a path that does not exist"),
+				));
+			}
+
+			events.push((path, false));
+		}
+
+		Ok(())
+	}
+}
+
+/// What [`EditSet::apply`] did.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Applied {
+	/// Files whose contents were written (unchanged files are skipped).
+	pub written: Vec<PathBuf>,
+
+	/// Paths that were moved, in order.
+	pub moved: Vec<(PathBuf, PathBuf)>,
+
+	/// Paths that were deleted (not repeating paths inside of deleted directories).
+	pub deleted: Vec<PathBuf>,
+}
+
+fn overlap(path: &Path, first: TextRange, second: TextRange) -> Error {
+	Error::OverlappingEdits { path: path.to_path_buf(), first: first.as_range(), second: second.as_range() }
+}
+
+/// Checks that a range is within the text and on character boundaries.
+fn check_range(path: &Path, text: &str, range: TextRange) -> Result<(), Error> {
+	if range.start <= range.end && text.is_char_boundary(range.start) && text.is_char_boundary(range.end) {
+		return Ok(());
+	}
+
+	Err(Error::InvalidSource(format!(
+		"{}: edit of bytes {}..{} is outside of the text ({} bytes) or splits a character",
+		path.display(),
+		range.start,
+		range.end,
+		text.len(),
+	)))
+}
+
+fn is_rust_file(path: &Path) -> bool {
+	path.extension().is_some_and(|extension| extension == "rs")
+}
+
+/// Checks that an edited text still parses.
+fn check_syntax(path: &Path, text: &str) -> Result<(), Error> {
+	let Err(error) = syn::parse_file(text) else {
+		return Ok(());
+	};
+
+	// spans are thread-local: read the location here, on the parsing thread
+	let start = error.span().start();
+
+	Err(Error::EditBreaksSyntax {
+		path: path.to_path_buf(),
+		location: LineCol {
+			line: start.line,
+			column: start.column + 1 + usize::from(start.line == 1 && text.starts_with('\u{feff}')),
+		},
+		message: error.to_string(),
+	})
+}
+
+/// Checks that a file on disk still has the contents the edits were computed from.
+fn check_unmodified(change: &FileChange) -> Result<(), Error> {
+	let current = fs::read(&change.path).map_err(|source| Error::io(&change.path, source))?;
+
+	if current != change.original.as_bytes() {
+		let message = "the file changed since it was loaded; reload and try again";
+
+		return Err(Error::io(&change.path, io::Error::other(message)));
+	}
+
+	Ok(())
+}
+
+/// A file written next to the file it will replace.
+struct Staged<'a> {
+	/// The path the edits are keyed by.
+	path: &'a Path,
+
+	/// The file to replace (`path`, or the file a symbolic link at `path` points to).
+	target: PathBuf,
+
+	temporary: PathBuf,
+}
+
+/// Writes every change to a temporary file, then renames them all over their files.
+fn write_files(changes: &[&FileChange]) -> Result<Vec<PathBuf>, Error> {
+	let mut staged: Vec<Staged<'_>> = Vec::with_capacity(changes.len());
+
+	for change in changes {
+		match stage(change) {
+			Ok(file) => staged.push(file),
+			Err(error) => {
+				remove_temporaries(&staged);
+				return Err(error);
+			}
+		}
+	}
+
+	let mut written = Vec::with_capacity(staged.len());
+
+	for (index, file) in staged.iter().enumerate() {
+		if let Err(source) = fs::rename(&file.temporary, &file.target) {
+			remove_temporaries(&staged[index..]);
+			return Err(Error::io(file.path, source));
+		}
+
+		written.push(file.path.to_path_buf());
+	}
+
+	Ok(written)
+}
+
+fn remove_temporaries(staged: &[Staged<'_>]) {
+	for file in staged {
+		// best effort: the temporary file may not exist anymore
+		let _ = fs::remove_file(&file.temporary);
+	}
+}
+
+/// Writes a change to a new temporary file in the directory of the file it replaces, with the file's permissions.
+fn stage(change: &FileChange) -> Result<Staged<'_>, Error> {
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+	let path = change.path.as_path();
+	let io_error = |source| Error::io(path, source);
+	let is_link = fs::symlink_metadata(path).map_err(io_error)?.file_type().is_symlink();
+	let target = if is_link { fs::canonicalize(path).map_err(io_error)? } else { path.to_path_buf() };
+	let permissions = fs::metadata(&target).map_err(io_error)?.permissions();
+	let directory = target.parent().unwrap_or(Path::new("."));
+	let name = target.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy());
+
+	loop {
+		let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+		let temporary = directory.join(format!(".{name}.rscode-{}-{count}.tmp", std::process::id()));
+		let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
+			Ok(file) => file,
+			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+			Err(error) => return Err(io_error(error)),
+		};
+		let written = file
+			.write_all(change.formatted.as_bytes())
+			.and_then(|()| file.set_permissions(permissions.clone()))
+			.and_then(|()| file.sync_all());
+
+		if let Err(error) = written {
+			drop(file);
+
+			// best effort: the error that matters is the write error
+			let _ = fs::remove_file(&temporary);
+
+			return Err(io_error(error));
+		}
+
+		return Ok(Staged { path, target, temporary });
+	}
+}
+
+fn move_path(from: &Path, to: &Path) -> Result<(), Error> {
+	if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+		fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
+	}
+
+	if fs::symlink_metadata(to).is_ok() {
+		let message = format!("cannot move `{}` here: the destination exists", from.display());
+
+		return Err(Error::io(to, io::Error::new(io::ErrorKind::AlreadyExists, message)));
+	}
+
+	fs::rename(from, to).map_err(|source| Error::io(from, source))
+}
+
+fn delete_path(path: &Path) -> Result<(), Error> {
+	let metadata = fs::symlink_metadata(path).map_err(|source| Error::io(path, source))?;
+	let result = if metadata.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+
+	result.map_err(|source| Error::io(path, source))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn file(path: &str, text: &str) -> SourceFile {
+		SourceFile::new(PathBuf::from(path), text)
+	}
+
+	fn preview_text(edits: &EditSet) -> String {
+		let changes = edits.preview().unwrap();
+
+		assert_eq!(changes.len(), 1);
+		changes.into_iter().next().unwrap().formatted
+	}
+
+	fn range(start: usize, end: usize) -> TextRange {
+		TextRange::new(start, end)
+	}
+
+	#[test]
+	fn applies_edits_in_order() {
+		let source = file("/x/a.rs", "fn a() {}\nfn b() {}\n");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(13, 14), "c");
+		edits.replace(&source, range(3, 4), "z");
+		edits.replace(&source, range(0, 0), "// head\n");
+		edits.replace(&source, range(20, 20), "fn d() {}\n");
+
+		assert_eq!(preview_text(&edits), "// head\nfn z() {}\nfn c() {}\nfn d() {}\n");
+	}
+
+	#[test]
+	fn lists_the_edits_of_files() {
+		let source = file("/x/a.rs", "fn a() {}\n");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(3, 4), "z");
+		edits.replace(&source, range(0, 0), "// head\n");
+		edits.replace(&source, range(3, 4), "z");
+
+		assert_eq!(
+			edits.edits(Path::new("/x/a.rs")),
+			[
+				TextEdit { range: range(3, 4), replacement: "z".to_owned() },
+				TextEdit { range: range(0, 0), replacement: "// head\n".to_owned() }
+			]
+		);
+		assert!(edits.edits(Path::new("/x/b.rs")).is_empty());
+	}
+
+	#[test]
+	fn insertions_at_one_position_keep_their_order() {
+		let source = file("/x/a.rs", "struct A;\n");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(10, 10), "struct B;\n");
+		edits.replace(&source, range(10, 10), "struct C;\n");
+		edits.replace(&source, range(0, 9), "struct Z;");
+		edits.replace(&source, range(10, 10), "struct D;\n");
+
+		assert_eq!(preview_text(&edits), "struct Z;\nstruct B;\nstruct C;\nstruct D;\n");
+	}
+
+	#[test]
+	fn merges_identical_edits() {
+		let source = file("/x/a.rs", "fn a() {}");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(3, 4), "b");
+		edits.replace(&source, range(3, 4), "b");
+		edits.replace(&source, range(0, 0), "// x\n");
+		edits.replace(&source, range(0, 0), "// x\n");
+
+		assert_eq!(edits.files[Path::new("/x/a.rs")].edits.len(), 2);
+		assert_eq!(preview_text(&edits), "// x\nfn b() {}");
+	}
+
+	#[test]
+	fn rejects_overlapping_edits() {
+		// edits (start, end, replacement), and the ranges reported as overlapping
+		type Case<'a> = (&'a [(usize, usize, &'a str)], (usize, usize), (usize, usize));
+
+		let source = file("/x/a.rs", "fn abc() {}");
+		let cases: &[Case<'_>] = &[
+			// intersecting replacements
+			(&[(3, 5, "x"), (4, 6, "y")], (3, 5), (4, 6)),
+			// same range, different text
+			(&[(3, 6, "x"), (3, 6, "y")], (3, 6), (3, 6)),
+			// containment
+			(&[(0, 11, "x"), (3, 4, "y")], (0, 11), (3, 4)),
+			// an insertion inside of a replaced range
+			(&[(3, 6, "x"), (4, 4, "y")], (3, 6), (4, 4)),
+			// an insertion at the start of a replaced range
+			(&[(3, 6, "x"), (3, 3, "y")], (3, 3), (3, 6)),
+			// a deletion intersecting a replacement
+			(&[(3, 6, ""), (5, 8, "y")], (3, 6), (5, 8)),
+		];
+
+		for (index, (edits, first, second)) in cases.iter().enumerate() {
+			let mut set = EditSet::new();
+
+			for &(start, end, text) in *edits {
+				set.replace(&source, range(start, end), text);
+			}
+
+			match set.preview() {
+				Err(Error::OverlappingEdits { path, first: found_first, second: found_second }) => {
+					assert_eq!(path, Path::new("/x/a.rs"));
+					assert_eq!((found_first.start, found_first.end), *first, "case {index}");
+					assert_eq!((found_second.start, found_second.end), *second, "case {index}");
+				}
+				other => panic!("case {index}: expected overlapping edits, got {other:?}"),
+			}
+		}
+	}
+
+	#[test]
+	fn adjacent_edits_do_not_overlap() {
+		let source = file("/x/a.rs", "fn abc() {}");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(3, 4), "x");
+		edits.replace(&source, range(4, 5), "y");
+		edits.replace(&source, range(5, 5), "z");
+		edits.replace(&source, range(5, 6), "w");
+
+		// the insertion at 5 is at the start of the replaced 5..6
+		assert!(matches!(edits.preview(), Err(Error::OverlappingEdits { .. })));
+
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(3, 4), "x");
+		edits.replace(&source, range(4, 5), "y");
+		edits.replace(&source, range(6, 6), "_z");
+
+		assert_eq!(preview_text(&edits), "fn xyc_z() {}");
+	}
+
+	#[test]
+	fn merges_overlapping_deletions() {
+		let source = file("/x/a.rs", "struct A;\n\nstruct B;\n\nstruct C;\n");
+		let mut edits = EditSet::new();
+
+		// `A` with the blank line after it, and `B` with the blank line before it
+		edits.replace(&source, range(0, 11), "");
+		edits.replace(&source, range(10, 20), "");
+		edits.replace(&source, range(12, 15), "");
+
+		assert_eq!(preview_text(&edits), "\n\nstruct C;\n");
+
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(0, 11), "");
+		edits.replace(&source, range(5, 5), "x");
+
+		assert!(matches!(edits.preview(), Err(Error::OverlappingEdits { .. })));
+	}
+
+	#[test]
+	fn rejects_edits_outside_of_the_text() {
+		let source = file("/x/a.rs", "struct Ü;");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(8, 30), "");
+		assert!(matches!(edits.preview(), Err(Error::InvalidSource(_))));
+
+		let mut edits = EditSet::new();
+
+		// inside of the two-byte `Ü`
+		edits.replace(&source, range(8, 8), "x");
+		assert!(matches!(edits.preview(), Err(Error::InvalidSource(_))));
+
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, TextRange { start: 5, end: 3 }, "x");
+		assert!(matches!(edits.preview(), Err(Error::InvalidSource(_))));
+	}
+
+	#[test]
+	fn rejects_edits_that_break_syntax() {
+		let source = file("/x/src/a.rs", "fn a() {}\nfn b() {\n    let x = 1;\n}\n");
+		let mut edits = EditSet::new();
+
+		// `let x = ;`
+		edits.replace(&source, range(31, 32), "");
+
+		match edits.preview() {
+			Err(Error::EditBreaksSyntax { path, location, message }) => {
+				assert_eq!(path, Path::new("/x/src/a.rs"));
+				assert_eq!(location, LineCol { line: 3, column: 13 });
+				assert!(!message.is_empty());
+			}
+			other => panic!("expected a syntax error, got {other:?}"),
+		}
+
+		// with a byte order mark, columns of the first line count from after it
+		let source = file("/x/src/b.rs", "\u{feff}fn a() {}");
+		let mut edits = EditSet::new();
+
+		// `fn 1() {}`
+		edits.replace(&source, range(6, 7), "1");
+
+		match edits.preview() {
+			Err(Error::EditBreaksSyntax { location, .. }) => assert_eq!(location, LineCol { line: 1, column: 5 }),
+			other => panic!("expected a syntax error, got {other:?}"),
+		}
+
+		// other files are not parsed
+		let manifest = file("/x/Cargo.toml", "[package]\n");
+		let mut edits = EditSet::new();
+
+		edits.replace(&manifest, range(0, 0), "}{");
+		assert_eq!(preview_text(&edits), "}{[package]\n");
+	}
+
+	#[test]
+	fn unchanged_files_are_not_validated() {
+		let source = file("/x/a.rs", "fn broken( {}");
+		let mut edits = EditSet::new();
+
+		edits.replace(&source, range(3, 9), "broken");
+
+		let changes = edits.preview().unwrap();
+
+		assert!(!changes[0].is_changed());
+	}
+
+	#[test]
+	fn previews_are_sorted_by_path() {
+		let mut edits = EditSet::new();
+
+		for name in ["/x/c.rs", "/x/a.rs", "/x/b.rs"] {
+			edits.replace(&file(name, "struct S;"), range(7, 8), "T");
+		}
+
+		let paths: Vec<PathBuf> = edits.preview().unwrap().into_iter().map(|change| change.path).collect();
+
+		assert_eq!(paths, [PathBuf::from("/x/a.rs"), PathBuf::from("/x/b.rs"), PathBuf::from("/x/c.rs")]);
+		assert_eq!(edits.edited_files().count(), 3);
+	}
+
+	#[test]
+	fn replaces_whole_files() {
+		let source = file("/x/a.rs", "fn   a( ) { }");
+		let mut edits = EditSet::new();
+
+		edits.replace_file(&source, "fn a() {}\n");
+		assert_eq!(preview_text(&edits), "fn a() {}\n");
+	}
+
+	#[test]
+	fn extends_edit_sets() {
+		let a = file("/x/a.rs", "struct A;");
+		let b = file("/x/b.rs", "struct B;");
+		let mut first = EditSet::new();
+		let mut second = EditSet::new();
+
+		first.replace(&a, range(7, 8), "X");
+		first.move_path("/x/m.rs", "/x/n.rs");
+		first.delete_path("/x/old.rs");
+		second.replace(&a, range(7, 8), "X");
+		second.replace(&a, range(0, 0), "pub ");
+		second.replace(&b, range(7, 8), "Y");
+		second.move_path("/x/m.rs", "/x/n.rs");
+		second.move_path("/x/p.rs", "/x/q.rs");
+		second.delete_path("/x/old.rs");
+		second.delete_path("/x/older.rs");
+
+		first.extend(second);
+
+		assert_eq!(first.files[Path::new("/x/a.rs")].edits.len(), 2);
+		assert_eq!(first.moves().len(), 2);
+		assert_eq!(first.deletions(), [PathBuf::from("/x/old.rs"), PathBuf::from("/x/older.rs")]);
+
+		let changes = first.preview().unwrap();
+
+		assert_eq!(changes[0].formatted, "pub struct X;");
+		assert_eq!(changes[1].formatted, "struct Y;");
+		assert!(!first.is_empty());
+		assert!(EditSet::new().is_empty());
+	}
+
+	#[test]
+	fn effective_deletions_skip_nested_paths() {
+		let mut edits = EditSet::new();
+
+		edits.delete_path("/x/a/b.rs");
+		edits.delete_path("/x/a");
+		edits.delete_path("/x/ab.rs");
+		edits.delete_path("/x/a");
+
+		assert_eq!(edits.deletions().len(), 3);
+		assert_eq!(edits.effective_deletions(), [Path::new("/x/a"), Path::new("/x/ab.rs")]);
+	}
+}

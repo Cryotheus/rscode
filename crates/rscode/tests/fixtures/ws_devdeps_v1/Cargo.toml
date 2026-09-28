@@ -1,0 +1,26 @@
+# `ws_devdeps` with resolver version 1 (implied by the root package's edition), which unifies the features of the
+# dev-dependencies of the packages being built even when no example, test, or benchmark is built, and which also
+# resolves the package in the current directory (or of the manifest) as if it was built.
+[package]
+name = "top"
+version = "0.1.0"
+edition = "2018"
+
+[workspace]
+members = ["middle", "bottom"]
+
+# path dependencies, but not members
+exclude = ["outside", "helper"]
+
+[dependencies]
+middle = { path = "middle" }
+outside = { path = "outside" }
+
+[dev-dependencies]
+bottom = { path = "bottom", features = ["from-top-dev"] }
+
+# requires a feature of a path dependency that is not a member
+[[bin]]
+name = "needs-extra"
+path = "src/bin/needs_extra.rs"
+required-features = ["outside/extra"]

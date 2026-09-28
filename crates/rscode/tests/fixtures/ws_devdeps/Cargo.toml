@@ -1,0 +1,8 @@
+# Dev-dependencies of packages that are not built, whose features cargo does not unify: it only resolves the
+# dev-dependencies of the packages it builds. `ws_devdeps_v1` is the same with resolver version 1.
+[workspace]
+resolver = "2"
+members = ["top", "middle", "bottom"]
+
+# path dependencies, but not members
+exclude = ["outside", "helper"]

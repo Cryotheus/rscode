@@ -1,0 +1,1 @@
+# rustfmt defaults: tests pass this configuration so that no other configuration file is picked up.

@@ -1,20 +1,28 @@
 [package]
 name = "rscode_fmt"
 version = "0.1.0"
-edition = "2024"
-
+edition.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
 
-description = ""
-categories = []
-keywords = []
+description = "Formatting of Rust source files and individual items via rustfmt or prettyplease"
+categories = ["development-tools"]
+keywords = ["rust", "format", "rustfmt", "prettyplease"]
 
 [dependencies]
-clap.workspace = true
-pretty-please = "0.1.0"
+clap = { workspace = true, optional = true }
+prettyplease.workspace = true
 proc-macro2.workspace = true
 quote.workspace = true
-rscode_sort = { path = "../rscode_sort" }
+rscode_sort.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
 syn.workspace = true
 thiserror.workspace = true
+
+[features]
+default = []
+## Implements `clap::ValueEnum` for the public option enums.
+clap = ["dep:clap", "rscode_sort/clap"]

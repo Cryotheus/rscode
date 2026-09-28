@@ -1,0 +1,16 @@
+# Depended upon by `app` under another name (`kore`).
+[package]
+name = "real-core"
+version = "0.3.1"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+alloc = []
+serde = ["dep:extra"]
+shiny = ["extra?/shiny"]
+full = ["std", "alloc", "serde"]
+
+[dependencies]
+extra = { path = "../extra", optional = true, default-features = false }

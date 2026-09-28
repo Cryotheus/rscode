@@ -1,0 +1,13 @@
+# A registry package whose library is not named after the package.
+[package]
+name = "fancy-thing"
+version = "1.2.3"
+edition = "2021"
+
+[lib]
+name = "fancy"
+
+[features]
+default = ["std"]
+std = []
+derive = []

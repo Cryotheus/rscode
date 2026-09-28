@@ -1,54 +1,78 @@
-// rough project outline
-// 
-//  providers builders and data types for working with Rust source files
-//  needs to offer configurable methods of the following:
-//      - resolve item paths and their file path mappings
-//          - item paths
-//              - absolute path, all the way down to `::` prefixed paths or `crate::` prefixed paths
-//              - relative path resolution
-//                  - 
-//          - file paths
-//              - line-column location for start and end
-//      - finding item paths by a part of the path, or just identifiers
-//          - find by ident:
-//              - full exact ident of item, probably treat raw identifiers as equivalent to non-raw identifiers?
-//              - no regex. I'm a hater.
-//                  - maybe allow glob-pattern-like asterisk-syntax
-//              - *containing* a sub-string
-//                  - `contains foo`
-//                  - asterisk equivalent: `*foo*`
-//              - *starting* with a sub-string
-//                  - `starts-with foo`
-//                  - asterisk equivalent: `foo*`
-//              - *ending* with a sub-string
-//                  - `end-with foo`
-//                  - asterisk equivalent: `*foo`
-//              - combination asterisk-syntax?
-//                  - `foo*bar` starts with `foo`, ends with `bar`
-//                  - `foo*bar*` starts with `foo`, contains `bar`
-//                  - `*foo*bar` contains `foo`, ends with bar `bar`
-//                  - `*foo*bar*` contains `foo`, and contains `bar` after `foo`
-//                  - patterns with more than two string segments
-//              - case-sensitivity option
-//          - absolute & relative item paths and file paths
-//              - search by asterisk glob patterns
-//                  - `foo::*` / `foo*` anything immediately in the `foo` path, such as `foo::Bar` but not `foo::biz::Baz`
-//                  - `foo::**` / `foo**` anything starting with the `foo` path, such as `foo::Bar` and `foo::biz::Baz`
-//                  - opposite direction `*::Blam` / `*Blam` and `**::Blam` / `**Blam` works the same
-//          - support location info such as line-column start and end data
-//
-//  offer `Builder`/`Options` types for confuring and performing these operations
-//
-//  offer unified types for the following:
-//      fully (or partially/lazily) resolved workspace tree (of packages?)
-//      fully (or partially/lazily) resolved package module trees
-//      fully (or partially/lazily) resolved module items (gloss over `impl Type {}`, `extern "C" {}`, `mod foo {}`
-//
-//  this *must* support input and output using `proc-macro2`
-//  do not directly transfer `syn` types across crate boundaries, however
-//  they should be wrapped in another type if not already accompanied by other data
-//
-//  convenience functions for using strings should be offered so users of the crate do not need to add `proc-macro2` if they are only working with strings
+//! Viewing, searching, and editing Rust source files by item path.
+//!
+//! rscode loads crates into a [`Workspace`]: a tree of modules and items per crate, with source locations, `cfg`
+//! predicates, and visibility. Nothing is compiled or expanded; source files are parsed with `syn` and module
+//! files are found by following `mod` declarations the same way rustc does. Items produced by macros are
+//! therefore invisible.
+//!
+//! - Load: [`load_workspace`] (a cargo workspace, feature `cargo`), or [`Workspace::load_crate`] with a
+//!   [`CrateSpec`] for a standalone crate root.
+//! - Resolve: [`Resolver`] resolves `use` imports, paths, `impl` targets, visibility, and usable paths.
+//! - Search: [`Find`] with glob-like [`pattern`]s (no regex).
+//! - View: [`View`] shows full source or outlines (bodies elided).
+//! - Edit: [`edit::remove`], [`edit::rename`], [`edit::replace`], [`edit::insert`], and [`edit::format`] plan
+//!   changes as an [`EditSet`], which is previewed or applied atomically. Comments and formatting outside of the
+//!   edited ranges are always preserved.
+//! - Serve: the `mcp` feature exposes all of this as a Model Context Protocol server ([`mcp`]).
+//!
+//! Item paths are written like Rust paths: `crate::module::Item`, `::other_crate::Item`, `Type::method`,
+//! `<Type as Trait>::method`. See [`ItemPath`] and [`pattern`] for the exact syntax.
+//!
+//! Formatting and sorting are provided by the [`rscode_fmt`] and [`rscode_sort`] crates, re-exported here.
+//!
+//! # Threads
+//!
+//! `proc_macro2`, which `syn` parses with, keeps the text of everything parsed on a thread in a thread-local source
+//! map that only grows until the thread exits, and parsing recurses as deeply as the code is nested. So rscode parses
+//! on short-lived threads of its own, with large stacks: loading ([`Workspace::load_crate`], [`load_workspace`]),
+//! viewing ([`View`]), finding references (renames and removals), checking edits ([`EditSet::preview`] and
+//! [`EditSet::apply`]), parsing new source ([`edit::replace`], [`edit::insert`]), and formatting ([`edit::format`])
+//! neither grow the calling thread's source map nor need a large stack on it. Only parsing a [`CfgExpr`] from text
+//! (as [`CfgContext::enable`] does) happens on the calling thread, which keeps that (short) text.
 
+#![warn(missing_docs)]
 
+pub mod cfg;
+pub mod edit;
+mod error;
+mod load;
+#[cfg(feature = "mcp")]
+pub mod mcp;
+pub mod model;
+pub mod path;
+pub mod pattern;
+pub mod query;
+pub mod resolve;
+pub mod source;
+#[cfg(feature = "cargo")]
+pub mod workspace;
 
+pub use cfg::CfgContext;
+pub use cfg::CfgExpr;
+pub use cfg::Tristate;
+pub use edit::EditSet;
+pub use error::Error;
+pub use model::Crate;
+pub use model::CrateId;
+pub use model::CrateSpec;
+pub use model::ItemData;
+pub use model::ItemId;
+pub use model::ItemKind;
+pub use model::Workspace;
+pub use path::CanonicalPath;
+pub use path::ItemPath;
+pub use pattern::MatchOptions;
+pub use pattern::PathPattern;
+pub use query::Find;
+pub use query::FindMatch;
+pub use query::View;
+pub use query::ViewMode;
+pub use resolve::Resolver;
+pub use resolve::Viewpoint;
+pub use rscode_fmt;
+pub use rscode_fmt::Edition;
+pub use rscode_sort;
+#[cfg(feature = "cargo")]
+pub use workspace::LoadOptions;
+#[cfg(feature = "cargo")]
+pub use workspace::load_workspace;

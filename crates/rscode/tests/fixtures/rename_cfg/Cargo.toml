@@ -1,0 +1,12 @@
+[package]
+name = "rename_cfg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["a"]
+a = []
+
+# not a member of the rscode workspace
+[workspace]

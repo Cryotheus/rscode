@@ -1,0 +1,18 @@
+# Depends on `middle` and `outside`, whose dev-dependencies on `bottom` are not resolved when only `top` is built.
+[package]
+name = "top"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+middle = { path = "../middle" }
+outside = { path = "../outside" }
+
+[dev-dependencies]
+bottom = { path = "../bottom", features = ["from-top-dev"] }
+
+# requires a feature of a path dependency that is not a member
+[[bin]]
+name = "needs-extra"
+path = "src/bin/needs_extra.rs"
+required-features = ["outside/extra"]

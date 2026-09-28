@@ -1,0 +1,12 @@
+# An optional dependency of `real-core`, a dev-dependency of `app`, a Windows-only dependency of `tool`, and a
+# dependency of `weird-name` (which is not a member).
+[package]
+name = "extra"
+version = "1.0.0"
+edition = "2018"
+
+[features]
+default = ["basic"]
+basic = []
+shiny = []
+windows = []

@@ -1,0 +1,14 @@
+# Its features tell which dependencies on it were resolved.
+[package]
+name = "bottom"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+from-top-dev = []
+from-middle-dev = ["dep:helper"]
+from-outside = []
+from-outside-dev = []
+
+[dependencies]
+helper = { path = "../helper", optional = true }

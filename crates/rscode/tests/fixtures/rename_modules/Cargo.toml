@@ -1,0 +1,8 @@
+[package]
+name = "rename_modules"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# not a member of the rscode workspace
+[workspace]

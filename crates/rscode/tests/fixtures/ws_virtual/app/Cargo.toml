@@ -1,0 +1,22 @@
+# A library with binaries, an example, a test, and a benchmark.
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cli = []
+json = ["kore/serde"]
+
+[dependencies]
+kore = { package = "real-core", path = "../core", features = ["alloc"] }
+macros = { path = "../macros" }
+
+[dev-dependencies]
+extra = { path = "../extra", features = ["shiny"] }
+
+[[bin]]
+name = "app-cli"
+path = "src/bin/cli.rs"
+required-features = ["cli"]

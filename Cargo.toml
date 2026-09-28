@@ -6,20 +6,31 @@ default-members = ["crates/cargo-rscode"]
 [workspace.package]
 authors = ["Cryotheum"]
 license = "MIT OR Apache-2.0"
+edition = "2024"
+repository = "https://github.com/Cryotheus/rscode"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
 futures = "0.3.34"
+prettyplease = { version = "0.3.0", features = ["verbatim"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+similar = "3.2.0"
 smol_str = { version = "0.3.6", features = ["borsh", "serde"] }
-syn = { version = "3.0.6", features = ["full"] }
+syn = { version = "3.0.6", features = ["full", "visit", "visit-mut", "extra-traits"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "full"] }
 
 # matching dependencies to the manifest of `cargo`
 cargo = "0.99.0"
+cargo-platform = "0.3.3"
+cargo-util-terminal = "0.1.1"
 clap = "4.6.0"
 clap_complete = { version = "4.6.0", features = ["unstable-dynamic"] }
+glob = "0.3.3"
+
+rscode = { path = "crates/rscode", version = "0.1.0" }
+rscode_fmt = { path = "crates/rscode_fmt", version = "0.1.0" }
+rscode_sort = { path = "crates/rscode_sort", version = "0.1.0" }

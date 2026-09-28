@@ -1,0 +1,12 @@
+# A path dependency of `tool` outside of the workspace, whose library is not named after the package, and which
+# enables a feature of the member `extra`.
+[package]
+name = "weird-name"
+version = "0.5.0"
+edition = "2021"
+
+[lib]
+name = "oddly_named"
+
+[dependencies]
+extra = { path = "../../extra", default-features = false, features = ["shiny"] }

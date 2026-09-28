@@ -1,0 +1,19 @@
+# A workspace whose root is a package. Edition 2015 implies feature resolver version 1, which unifies the features
+# of dev-dependencies with those of normal dependencies.
+[package]
+name = "rooted"
+version = "1.0.0"
+edition = "2015"
+
+[workspace]
+members = ["member"]
+
+[features]
+default = []
+loud = ["rooted-member/loud"]
+
+[dependencies]
+rooted-member = { path = "member" }
+
+[dev-dependencies]
+rooted-member = { path = "member", features = ["testing"] }

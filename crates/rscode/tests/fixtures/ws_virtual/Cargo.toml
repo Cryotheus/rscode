@@ -1,0 +1,8 @@
+# A virtual workspace for `plan_workspace` tests (its own workspace root, not part of rscode's workspace).
+[workspace]
+resolver = "3"
+members = ["app", "core", "extra", "macros", "tool"]
+default-members = ["app", "tool"]
+
+# a path dependency, but not a member
+exclude = ["vendor"]

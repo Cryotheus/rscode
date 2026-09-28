@@ -1,0 +1,16 @@
+# A package with a registry dependency, which the tests replace with the copy in `vendor` (with `--config`), so that
+# cargo's resolvers work offline without a registry.
+[package]
+name = "vendored"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+fancy-thing = { version = "1", default-features = false }
+
+[[bin]]
+name = "needs-derive"
+path = "src/bin/needs_derive.rs"
+required-features = ["fancy-thing/derive"]

@@ -1,0 +1,13 @@
+# A crate edited by the tests of `rscode`'s edit operations, which check that it still compiles afterwards.
+[package]
+name = "edit_ops"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+extra = []
+
+# not a member of the rscode workspace
+[workspace]

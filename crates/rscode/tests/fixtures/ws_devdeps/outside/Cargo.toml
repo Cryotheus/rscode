@@ -1,0 +1,14 @@
+# Not a member, so its dev-dependencies are never resolved.
+[package]
+name = "outside"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+extra = []
+
+[dependencies]
+bottom = { path = "../bottom", features = ["from-outside"] }
+
+[dev-dependencies]
+bottom = { path = "../bottom", features = ["from-outside-dev"] }

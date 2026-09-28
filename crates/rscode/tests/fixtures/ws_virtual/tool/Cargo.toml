@@ -1,0 +1,12 @@
+# A package with a binary only.
+[package]
+name = "tool"
+version = "0.2.0"
+edition = "2018"
+
+[dependencies]
+app = { path = "../app" }
+weird-name = { path = "../vendor/weird-name" }
+
+[target.'cfg(windows)'.dependencies]
+extra = { path = "../extra", features = ["windows"] }

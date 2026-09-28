@@ -1,0 +1,9 @@
+[package]
+name = "rooted-member"
+version = "0.1.0"
+edition = "2018"
+
+[features]
+default = []
+loud = []
+testing = []
