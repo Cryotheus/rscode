@@ -56,9 +56,8 @@ mod sources;
 mod tools;
 mod worker;
 
-pub use sources::Access;
-pub use sources::Exposure;
-pub use sources::ExposureError;
+#[cfg(test)]
+mod tests;
 
 use crate::Error;
 use crate::workspace::LoadOptions;
@@ -76,6 +75,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+pub use sources::Access;
+pub use sources::Exposure;
+pub use sources::ExposureError;
+
+/// How long a server whose client is gone waits for a running edit to finish.
+const EDIT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
 /// Configuration of the server.
 #[derive(Debug, Default, Clone)]
 pub struct ServerOptions {
@@ -89,49 +95,11 @@ pub struct ServerOptions {
 	pub exposed: Vec<Exposure>,
 }
 
-/// Serves MCP over stdin/stdout until the client disconnects.
-///
-/// Lines of input that are not JSON get no answer (there is no request id to answer), and are reported on stderr.
-pub async fn serve_stdio(options: ServerOptions) -> Result<(), Error> {
-	let input = CheckedInput::new(tokio::io::stdin(), |message| eprintln!("{message}"));
-
-	serve(options, (input, tokio::io::stdout())).await
-}
-
-/// Serves MCP over any transport of `rmcp` (for example a `(reader, writer)` pair of `tokio` I/O objects) until the
-/// client disconnects.
-///
-/// A client that disconnects before initializing the session is not an error. When the client is gone, an edit
-/// that is still running gets up to half a minute to finish writing before this returns.
-pub async fn serve<T, E, A>(options: ServerOptions, transport: T) -> Result<(), Error>
-where
-	T: IntoTransport<RoleServer, E, A>,
-	E: std::error::Error + Send + Sync + 'static,
-{
-	run(Server::new(options), transport).await
-}
-
-/// How long a server whose client is gone waits for a running edit to finish.
-const EDIT_GRACE_PERIOD: Duration = Duration::from_secs(30);
-
-async fn run<T, E, A>(server: Server, transport: T) -> Result<(), Error>
-where
-	T: IntoTransport<RoleServer, E, A>,
-	E: std::error::Error + Send + Sync + 'static,
-{
-	let edits = server.edit_lock();
-	let running = match server.serve(transport).await {
-		Ok(running) => running,
-		Err(error) => return handshake_failure(error),
-	};
-	let stopped = running.waiting().await;
-
-	// an edit may still be writing on its worker thread: let it finish before the process may exit
-	edits_finished(&edits, EDIT_GRACE_PERIOD).await;
-
-	match stopped {
-		Ok(_) => Ok(()),
-		Err(error) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {error}"))),
+/// A failure of the MCP connection itself (not of a tool call).
+fn connection_error(kind: ErrorKind, message: String) -> Error {
+	Error::Io {
+		path: PathBuf::from("MCP connection"),
+		source: std::io::Error::new(kind, message),
 	}
 }
 
@@ -159,8 +127,7 @@ fn handshake_failure(error: ServerInitializeError) -> Result<(), Error> {
 		ServerInitializeError::ConnectionClosed(_) => return Ok(()),
 		ServerInitializeError::TransportError { error, .. } => io_error_kind(error.error.as_ref()),
 
-		ServerInitializeError::ExpectedInitializeRequest(_)
-		| ServerInitializeError::UnexpectedInitializeResponse(_) => ErrorKind::InvalidData,
+		ServerInitializeError::ExpectedInitializeRequest(_) | ServerInitializeError::UnexpectedInitializeResponse(_) => ErrorKind::InvalidData,
 
 		_ => ErrorKind::Other,
 	};
@@ -178,13 +145,45 @@ fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> ErrorKind {
 		.map_or(ErrorKind::Other, std::io::Error::kind)
 }
 
-/// A failure of the MCP connection itself (not of a tool call).
-fn connection_error(kind: ErrorKind, message: String) -> Error {
-	Error::Io {
-		path: PathBuf::from("MCP connection"),
-		source: std::io::Error::new(kind, message),
+async fn run<T, E, A>(server: Server, transport: T) -> Result<(), Error>
+where
+	T: IntoTransport<RoleServer, E, A>,
+	E: std::error::Error + Send + Sync + 'static,
+{
+	let edits = server.edit_lock();
+	let running = match server.serve(transport).await {
+		Ok(running) => running,
+		Err(error) => return handshake_failure(error),
+	};
+	let stopped = running.waiting().await;
+
+	// an edit may still be writing on its worker thread: let it finish before the process may exit
+	edits_finished(&edits, EDIT_GRACE_PERIOD).await;
+
+	match stopped {
+		Ok(_) => Ok(()),
+		Err(error) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {error}"))),
 	}
 }
 
-#[cfg(test)]
-mod tests;
+/// Serves MCP over any transport of `rmcp` (for example a `(reader, writer)` pair of `tokio` I/O objects) until the
+/// client disconnects.
+///
+/// A client that disconnects before initializing the session is not an error. When the client is gone, an edit
+/// that is still running gets up to half a minute to finish writing before this returns.
+pub async fn serve<T, E, A>(options: ServerOptions, transport: T) -> Result<(), Error>
+where
+	T: IntoTransport<RoleServer, E, A>,
+	E: std::error::Error + Send + Sync + 'static,
+{
+	run(Server::new(options), transport).await
+}
+
+/// Serves MCP over stdin/stdout until the client disconnects.
+///
+/// Lines of input that are not JSON get no answer (there is no request id to answer), and are reported on stderr.
+pub async fn serve_stdio(options: ServerOptions) -> Result<(), Error> {
+	let input = CheckedInput::new(tokio::io::stdin(), |message| eprintln!("{message}"));
+
+	serve(options, (input, tokio::io::stdout())).await
+}

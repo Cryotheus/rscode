@@ -16,18 +16,135 @@ use serde::Serialize;
 use std::fmt::Display;
 use std::path::Path;
 
+/// An existing name a rename collides with.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub(crate) struct CollisionRow {
+	pub(crate) scope: String,
+	pub(crate) existing: String,
+
+	#[serde(flatten)]
+	pub(crate) location: Location,
+}
+
+impl CollisionRow {
+	fn new(collision: &Collision, paths: &PathDisplay) -> Self {
+		Self {
+			scope: collision.scope.clone(),
+			existing: collision.existing.clone(),
+			location: Location::new(&collision.file, collision.start, paths),
+		}
+	}
+}
+
 /// A report of an edit operation.
 pub(crate) trait EditReport: Serialize {
-	fn dry_run(&self) -> bool;
-
 	/// The diff of a dry run.
 	fn diff(&self) -> Option<&str>;
 
-	/// What was (or would be) done, one line each.
-	fn summary(&self) -> String;
+	fn dry_run(&self) -> bool;
 
 	/// Warnings and notes.
 	fn messages(&self) -> Vec<(Level, String)>;
+
+	/// What was (or would be) done, one line each.
+	fn summary(&self) -> String;
+}
+
+/// `fmt`/`sort` writing files.
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct FormatReport {
+	/// Written files.
+	pub(crate) files: Vec<String>,
+
+	pub(crate) warnings: Vec<String>,
+
+	/// Whether files were only sorted (`sort`).
+	#[serde(skip)]
+	pub(crate) sort_only: bool,
+}
+
+impl FormatReport {
+	pub(crate) fn summary(&self) -> String {
+		let verb = if self.sort_only { "sorted" } else { "formatted" };
+
+		self.files.iter().map(|file| format!("{verb} {file}\n")).collect()
+	}
+}
+
+/// An inserted item.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub(crate) struct InsertedRow {
+	pub(crate) kind: ItemKind,
+	pub(crate) name: Option<String>,
+}
+
+/// `insert`
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct InsertionReport {
+	pub(crate) parent: String,
+	pub(crate) inserted: Vec<InsertedRow>,
+	pub(crate) file: String,
+
+	/// Files formatted afterwards (`--fmt`).
+	pub(crate) formatted: Vec<String>,
+
+	pub(crate) warnings: Vec<String>,
+	pub(crate) dry_run: bool,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) diff: Option<String>,
+}
+
+impl InsertionReport {
+	pub(crate) fn new(plan: &Insertion, parent: &str, dry_run: bool, paths: &PathDisplay) -> Self {
+		Self {
+			parent: parent.to_owned(),
+			inserted: plan
+				.inserted
+				.iter()
+				.map(|(kind, name)| InsertedRow {
+					kind: *kind,
+					name: name.clone(),
+				})
+				.collect(),
+			file: paths.display(&plan.file),
+			formatted: Vec::new(),
+			warnings: plan.warnings.clone(),
+			dry_run,
+			diff: None,
+		}
+	}
+}
+
+impl EditReport for InsertionReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
+	fn dry_run(&self) -> bool {
+		self.dry_run
+	}
+
+	fn messages(&self) -> Vec<(Level, String)> {
+		self.warnings.iter().map(|warning| (Level::Warning, warning.clone())).collect()
+	}
+
+	fn summary(&self) -> String {
+		let mut out = String::new();
+
+		for item in &self.inserted {
+			let verb = done(self.dry_run, "insert", "inserted");
+			let name = item.name.as_ref().map(|name| format!(" {name}")).unwrap_or_default();
+
+			out.push_str(&format!("{verb} {}{name} into {} ({})\n", item.kind, self.parent, self.file));
+		}
+
+		for file in &self.formatted {
+			out.push_str(&format!("formatted {file}\n"));
+		}
+
+		out
+	}
 }
 
 /// A position in a file.
@@ -54,22 +171,6 @@ impl Display for Location {
 	}
 }
 
-/// `1 item`, `2 items`
-fn count(count: usize, singular: &str, plural: &str) -> String {
-	match count {
-		1 => format!("1 {singular}"),
-		_ => format!("{count} {plural}"),
-	}
-}
-
-/// The past tense of a verb, or `would <verb>` for dry runs.
-fn done(dry_run: bool, verb: &str, past: &str) -> String {
-	match dry_run {
-		true => format!("would {verb}"),
-		false => past.to_owned(),
-	}
-}
-
 /// An occurrence of a name.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub(crate) struct Occurrence {
@@ -86,130 +187,6 @@ impl Occurrence {
 			kind: reference.kind,
 		}
 	}
-}
-
-/// An existing name a rename collides with.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub(crate) struct CollisionRow {
-	pub(crate) scope: String,
-	pub(crate) existing: String,
-
-	#[serde(flatten)]
-	pub(crate) location: Location,
-}
-
-impl CollisionRow {
-	fn new(collision: &Collision, paths: &PathDisplay) -> Self {
-		Self {
-			scope: collision.scope.clone(),
-			existing: collision.existing.clone(),
-			location: Location::new(&collision.file, collision.start, paths),
-		}
-	}
-}
-
-/// `rename`
-#[derive(Debug, Default, Serialize)]
-pub(crate) struct RenameReport {
-	pub(crate) new_name: String,
-
-	/// Canonical paths of the renamed items.
-	pub(crate) renamed: Vec<String>,
-
-	/// Every edited occurrence, definitions included.
-	pub(crate) references: Vec<Occurrence>,
-
-	/// Occurrences that might refer to the items, left untouched.
-	pub(crate) uncertain: Vec<Occurrence>,
-
-	/// Collisions with existing names (with `--force`).
-	pub(crate) collisions: Vec<CollisionRow>,
-
-	pub(crate) warnings: Vec<String>,
-
-	/// Files with text edits.
-	pub(crate) files: Vec<String>,
-
-	/// Moved module files: `[from, to]`.
-	pub(crate) moved: Vec<[String; 2]>,
-
-	pub(crate) dry_run: bool,
-
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub(crate) diff: Option<String>,
-}
-
-impl RenameReport {
-	pub(crate) fn new(plan: &Rename, new_name: &str, dry_run: bool, paths: &PathDisplay) -> Self {
-		Self {
-			new_name: new_name.to_owned(),
-			renamed: plan.renamed.clone(),
-			references: plan.references.iter().map(|reference| Occurrence::new(reference, paths)).collect(),
-			uncertain: plan.uncertain.iter().map(|reference| Occurrence::new(reference, paths)).collect(),
-			collisions: plan.collisions.iter().map(|collision| CollisionRow::new(collision, paths)).collect(),
-			warnings: plan.warnings.clone(),
-			files: plan.edits.edited_files().map(|file| paths.display(file)).collect(),
-			moved: plan.edits.moves().iter().map(|(from, to)| [paths.display(from), paths.display(to)]).collect(),
-			dry_run,
-			diff: None,
-		}
-	}
-}
-
-impl EditReport for RenameReport {
-	fn dry_run(&self) -> bool {
-		self.dry_run
-	}
-
-	fn diff(&self) -> Option<&str> {
-		self.diff.as_deref()
-	}
-
-	fn summary(&self) -> String {
-		let references = self.references.iter().filter(|reference| reference.kind != ReferenceKind::Definition).count();
-		let mut out = format!(
-			"{} {}, {} {} in {}\n",
-			done(self.dry_run, "rename", "renamed"),
-			count(self.renamed.len(), "item", "items"),
-			if self.dry_run { "update" } else { "updated" },
-			count(references, "reference", "references"),
-			count(self.files.len(), "file", "files"),
-		);
-
-		for [from, to] in &self.moved {
-			out.push_str(&format!("{} {from} -> {to}\n", done(self.dry_run, "move", "moved")));
-		}
-
-		out
-	}
-
-	fn messages(&self) -> Vec<(Level, String)> {
-		let warnings = self.warnings.iter().map(|warning| (Level::Warning, warning.clone()));
-		let collisions = self.collisions.iter().map(|collision| {
-			let message = format!(
-				"`{}` collides with `{}` in `{}` ({})",
-				self.new_name, collision.existing, collision.scope, collision.location
-			);
-
-			(Level::Warning, message)
-		});
-		let uncertain = self
-			.uncertain
-			.iter()
-			.map(|occurrence| (Level::Note, format!("possible reference not updated: {}", occurrence.location)));
-
-		warnings.chain(collisions).chain(uncertain).collect()
-	}
-}
-
-/// A removed item.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub(crate) struct RemovedRow {
-	pub(crate) path: String,
-	pub(crate) kind: ItemKind,
-
-	#[serde(flatten)]
-	pub(crate) location: Location,
 }
 
 /// `remove`
@@ -261,12 +238,22 @@ impl RemovalReport {
 }
 
 impl EditReport for RemovalReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
 	fn dry_run(&self) -> bool {
 		self.dry_run
 	}
 
-	fn diff(&self) -> Option<&str> {
-		self.diff.as_deref()
+	fn messages(&self) -> Vec<(Level, String)> {
+		let warnings = self.warnings.iter().map(|warning| (Level::Warning, warning.clone()));
+		let dangling = self
+			.dangling
+			.iter()
+			.map(|location| (Level::Warning, format!("dangling reference at {location}")));
+
+		warnings.chain(dangling).collect()
 	}
 
 	fn summary(&self) -> String {
@@ -284,13 +271,118 @@ impl EditReport for RemovalReport {
 
 		out
 	}
+}
+
+/// A removed item.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub(crate) struct RemovedRow {
+	pub(crate) path: String,
+	pub(crate) kind: ItemKind,
+
+	#[serde(flatten)]
+	pub(crate) location: Location,
+}
+
+/// `rename`
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct RenameReport {
+	pub(crate) new_name: String,
+
+	/// Canonical paths of the renamed items.
+	pub(crate) renamed: Vec<String>,
+
+	/// Every edited occurrence, definitions included.
+	pub(crate) references: Vec<Occurrence>,
+
+	/// Occurrences that might refer to the items, left untouched.
+	pub(crate) uncertain: Vec<Occurrence>,
+
+	/// Collisions with existing names (with `--force`).
+	pub(crate) collisions: Vec<CollisionRow>,
+
+	pub(crate) warnings: Vec<String>,
+
+	/// Files with text edits.
+	pub(crate) files: Vec<String>,
+
+	/// Moved module files: `[from, to]`.
+	pub(crate) moved: Vec<[String; 2]>,
+
+	pub(crate) dry_run: bool,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) diff: Option<String>,
+}
+
+impl RenameReport {
+	pub(crate) fn new(plan: &Rename, new_name: &str, dry_run: bool, paths: &PathDisplay) -> Self {
+		Self {
+			new_name: new_name.to_owned(),
+			renamed: plan.renamed.clone(),
+			references: plan.references.iter().map(|reference| Occurrence::new(reference, paths)).collect(),
+			uncertain: plan.uncertain.iter().map(|reference| Occurrence::new(reference, paths)).collect(),
+			collisions: plan.collisions.iter().map(|collision| CollisionRow::new(collision, paths)).collect(),
+			warnings: plan.warnings.clone(),
+			files: plan.edits.edited_files().map(|file| paths.display(file)).collect(),
+			moved: plan
+				.edits
+				.moves()
+				.iter()
+				.map(|(from, to)| [paths.display(from), paths.display(to)])
+				.collect(),
+			dry_run,
+			diff: None,
+		}
+	}
+}
+
+impl EditReport for RenameReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
+	fn dry_run(&self) -> bool {
+		self.dry_run
+	}
 
 	fn messages(&self) -> Vec<(Level, String)> {
 		let warnings = self.warnings.iter().map(|warning| (Level::Warning, warning.clone()));
-		let dangling =
-			self.dangling.iter().map(|location| (Level::Warning, format!("dangling reference at {location}")));
+		let collisions = self.collisions.iter().map(|collision| {
+			let message = format!(
+				"`{}` collides with `{}` in `{}` ({})",
+				self.new_name, collision.existing, collision.scope, collision.location
+			);
 
-		warnings.chain(dangling).collect()
+			(Level::Warning, message)
+		});
+		let uncertain = self
+			.uncertain
+			.iter()
+			.map(|occurrence| (Level::Note, format!("possible reference not updated: {}", occurrence.location)));
+
+		warnings.chain(collisions).chain(uncertain).collect()
+	}
+
+	fn summary(&self) -> String {
+		let references = self
+			.references
+			.iter()
+			.filter(|reference| reference.kind != ReferenceKind::Definition)
+			.count();
+		let mut out = format!(
+			"{} {}, {} {} in {}\n",
+			done(self.dry_run, "rename", "renamed"),
+			count(self.renamed.len(), "item", "items"),
+			if self.dry_run { "update" } else { "updated" },
+			count(references, "reference", "references"),
+			count(self.files.len(), "file", "files"),
+		);
+
+		for [from, to] in &self.moved {
+			out.push_str(&format!("{} {from} -> {to}\n", done(self.dry_run, "move", "moved")));
+		}
+
+		out
 	}
 }
 
@@ -326,12 +418,16 @@ impl ReplacementReport {
 }
 
 impl EditReport for ReplacementReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
 	fn dry_run(&self) -> bool {
 		self.dry_run
 	}
 
-	fn diff(&self) -> Option<&str> {
-		self.diff.as_deref()
+	fn messages(&self) -> Vec<(Level, String)> {
+		self.warnings.iter().map(|warning| (Level::Warning, warning.clone())).collect()
 	}
 
 	fn summary(&self) -> String {
@@ -347,106 +443,21 @@ impl EditReport for ReplacementReport {
 
 		out
 	}
+}
 
-	fn messages(&self) -> Vec<(Level, String)> {
-		self.warnings.iter().map(|warning| (Level::Warning, warning.clone())).collect()
+/// `1 item`, `2 items`
+fn count(count: usize, singular: &str, plural: &str) -> String {
+	match count {
+		1 => format!("1 {singular}"),
+		_ => format!("{count} {plural}"),
 	}
 }
 
-/// An inserted item.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub(crate) struct InsertedRow {
-	pub(crate) kind: ItemKind,
-	pub(crate) name: Option<String>,
-}
-
-/// `insert`
-#[derive(Debug, Default, Serialize)]
-pub(crate) struct InsertionReport {
-	pub(crate) parent: String,
-	pub(crate) inserted: Vec<InsertedRow>,
-	pub(crate) file: String,
-
-	/// Files formatted afterwards (`--fmt`).
-	pub(crate) formatted: Vec<String>,
-
-	pub(crate) warnings: Vec<String>,
-	pub(crate) dry_run: bool,
-
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub(crate) diff: Option<String>,
-}
-
-impl InsertionReport {
-	pub(crate) fn new(plan: &Insertion, parent: &str, dry_run: bool, paths: &PathDisplay) -> Self {
-		Self {
-			parent: parent.to_owned(),
-			inserted: plan
-				.inserted
-				.iter()
-				.map(|(kind, name)| InsertedRow {
-					kind: *kind,
-					name: name.clone(),
-				})
-				.collect(),
-			file: paths.display(&plan.file),
-			formatted: Vec::new(),
-			warnings: plan.warnings.clone(),
-			dry_run,
-			diff: None,
-		}
-	}
-}
-
-impl EditReport for InsertionReport {
-	fn dry_run(&self) -> bool {
-		self.dry_run
-	}
-
-	fn diff(&self) -> Option<&str> {
-		self.diff.as_deref()
-	}
-
-	fn summary(&self) -> String {
-		let mut out = String::new();
-
-		for item in &self.inserted {
-			let verb = done(self.dry_run, "insert", "inserted");
-			let name = item.name.as_ref().map(|name| format!(" {name}")).unwrap_or_default();
-
-			out.push_str(&format!("{verb} {}{name} into {} ({})\n", item.kind, self.parent, self.file));
-		}
-
-		for file in &self.formatted {
-			out.push_str(&format!("formatted {file}\n"));
-		}
-
-		out
-	}
-
-	fn messages(&self) -> Vec<(Level, String)> {
-		self.warnings.iter().map(|warning| (Level::Warning, warning.clone())).collect()
-	}
-}
-
-/// `fmt`/`sort` writing files.
-#[derive(Debug, Default, Serialize)]
-pub(crate) struct FormatReport {
-	/// Written files.
-	pub(crate) files: Vec<String>,
-
-	pub(crate) warnings: Vec<String>,
-
-	/// Whether files were only sorted (`sort`).
-	#[serde(skip)]
-	pub(crate) sort_only: bool,
-}
-
-impl FormatReport {
-	pub(crate) fn summary(&self) -> String {
-		let verb = if self.sort_only { "sorted" } else { "formatted" };
-
-		self.files.iter().map(|file| format!("{verb} {file}\n")).collect()
+/// The past tense of a verb, or `would <verb>` for dry runs.
+fn done(dry_run: bool, verb: &str, past: &str) -> String {
+	match dry_run {
+		true => format!("would {verb}"),
+		false => past.to_owned(),
 	}
 }
 
@@ -461,26 +472,67 @@ mod tests {
 		LineCol { line, column }
 	}
 
-	fn paths() -> PathDisplay {
-		PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), false)
-	}
+	#[test]
+	fn builds_insertion_reports() {
+		let plan = Insertion {
+			edits: EditSet::new(),
+			inserted: vec![(ItemKind::Fn, Some("helper".to_owned())), (ItemKind::Impl, None)],
+			imports: Vec::new(),
+			file: PathBuf::from("/ws/src/util.rs"),
+			warnings: Vec::new(),
+		};
+		let report = InsertionReport::new(&plan, "crate::util", false, &paths());
 
-	fn occurrence(file: &str, line: usize, kind: ReferenceKind) -> Occurrence {
-		Occurrence {
-			location: Location {
-				file: file.to_owned(),
-				line,
-				column: 5,
-			},
-			kind,
-		}
+		assert_eq!(
+			report.summary(),
+			"inserted fn helper into crate::util (src/util.rs)\ninserted impl into crate::util (src/util.rs)\n"
+		);
+
+		let json = serde_json::to_value(&report).unwrap();
+
+		assert_eq!(json["inserted"][0], serde_json::json!({"kind": "fn", "name": "helper"}));
+		assert_eq!(json["inserted"][1], serde_json::json!({"kind": "impl", "name": null}));
+		assert_eq!(
+			InsertionReport::new(&plan, "crate::util", true, &paths()).summary(),
+			"would insert fn helper into crate::util (src/util.rs)\nwould insert impl into crate::util (src/util.rs)\n"
+		);
 	}
 
 	#[test]
-	fn pluralizes() {
-		assert_eq!(count(0, "item", "items"), "0 items");
-		assert_eq!(count(1, "item", "items"), "1 item");
-		assert_eq!(count(2, "file", "files"), "2 files");
+	fn builds_removal_reports() {
+		let mut edits = EditSet::new();
+
+		edits.delete_path("/ws/src/gone.rs");
+
+		let plan = Removal {
+			edits,
+			removed: vec![RemovedItem {
+				path: "demo::gone".to_owned(),
+				kind: ItemKind::Module,
+				file: PathBuf::from("src/lib.rs"),
+				start: at(2, 1),
+				end: at(2, 10),
+			}],
+			dangling: Vec::new(),
+			warnings: Vec::new(),
+		};
+		let report = RemovalReport::new(&plan, false, &paths());
+
+		assert_eq!(report.summary(), "removed demo::gone (mod) src/lib.rs:2:1\ndeleted src/gone.rs\n");
+		assert!(report.messages().is_empty());
+
+		let dry = RemovalReport {
+			dry_run: true,
+			dangling: vec![Location {
+				file: "src/main.rs".to_owned(),
+				line: 3,
+				column: 9,
+			}],
+			..RemovalReport::new(&plan, true, &paths())
+		};
+
+		assert_eq!(dry.summary(), "would remove demo::gone (mod) src/lib.rs:2:1\nwould delete src/gone.rs\n");
+		assert_eq!(dry.messages(), [(Level::Warning, "dangling reference at src/main.rs:3:9".to_owned())]);
 	}
 
 	#[test]
@@ -522,71 +574,6 @@ mod tests {
 	}
 
 	#[test]
-	fn summarizes_renames() {
-		let report = RenameReport {
-			new_name: "Disc".to_owned(),
-			renamed: vec!["demo::Circle".to_owned(), "demo::Circle".to_owned()],
-			references: vec![
-				occurrence("src/shapes.rs", 4, ReferenceKind::Definition),
-				occurrence("src/lib.rs", 6, ReferenceKind::Import),
-				occurrence("src/main.rs", 2, ReferenceKind::Path),
-			],
-			uncertain: vec![occurrence("src/main.rs", 9, ReferenceKind::MethodCall)],
-			files: vec!["src/shapes.rs".to_owned(), "src/lib.rs".to_owned(), "src/main.rs".to_owned()],
-			..RenameReport::default()
-		};
-
-		assert_eq!(report.summary(), "renamed 2 items, updated 2 references in 3 files\n");
-		assert_eq!(report.messages(), [(Level::Note, "possible reference not updated: src/main.rs:9:5".to_owned())]);
-
-		let json = serde_json::to_value(&report).unwrap();
-
-		assert_eq!(
-			json["references"][1],
-			serde_json::json!({"file": "src/lib.rs", "line": 6, "column": 5, "kind": "import"})
-		);
-		assert_eq!(json["dry_run"], false);
-		assert!(json.get("diff").is_none());
-	}
-
-	#[test]
-	fn builds_removal_reports() {
-		let mut edits = EditSet::new();
-
-		edits.delete_path("/ws/src/gone.rs");
-
-		let plan = Removal {
-			edits,
-			removed: vec![RemovedItem {
-				path: "demo::gone".to_owned(),
-				kind: ItemKind::Module,
-				file: PathBuf::from("src/lib.rs"),
-				start: at(2, 1),
-				end: at(2, 10),
-			}],
-			dangling: Vec::new(),
-			warnings: Vec::new(),
-		};
-		let report = RemovalReport::new(&plan, false, &paths());
-
-		assert_eq!(report.summary(), "removed demo::gone (mod) src/lib.rs:2:1\ndeleted src/gone.rs\n");
-		assert!(report.messages().is_empty());
-
-		let dry = RemovalReport {
-			dry_run: true,
-			dangling: vec![Location {
-				file: "src/main.rs".to_owned(),
-				line: 3,
-				column: 9,
-			}],
-			..RemovalReport::new(&plan, true, &paths())
-		};
-
-		assert_eq!(dry.summary(), "would remove demo::gone (mod) src/lib.rs:2:1\nwould delete src/gone.rs\n");
-		assert_eq!(dry.messages(), [(Level::Warning, "dangling reference at src/main.rs:3:9".to_owned())]);
-	}
-
-	#[test]
 	fn builds_replacement_reports() {
 		let plan = Replacement {
 			edits: EditSet::new(),
@@ -606,30 +593,26 @@ mod tests {
 		assert_eq!(ReplacementReport::new(&plan, true, &paths()).summary(), "would replace demo::add\n");
 	}
 
+	fn occurrence(file: &str, line: usize, kind: ReferenceKind) -> Occurrence {
+		Occurrence {
+			location: Location {
+				file: file.to_owned(),
+				line,
+				column: 5,
+			},
+			kind,
+		}
+	}
+
+	fn paths() -> PathDisplay {
+		PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), false)
+	}
+
 	#[test]
-	fn builds_insertion_reports() {
-		let plan = Insertion {
-			edits: EditSet::new(),
-			inserted: vec![(ItemKind::Fn, Some("helper".to_owned())), (ItemKind::Impl, None)],
-			imports: Vec::new(),
-			file: PathBuf::from("/ws/src/util.rs"),
-			warnings: Vec::new(),
-		};
-		let report = InsertionReport::new(&plan, "crate::util", false, &paths());
-
-		assert_eq!(
-			report.summary(),
-			"inserted fn helper into crate::util (src/util.rs)\ninserted impl into crate::util (src/util.rs)\n"
-		);
-
-		let json = serde_json::to_value(&report).unwrap();
-
-		assert_eq!(json["inserted"][0], serde_json::json!({"kind": "fn", "name": "helper"}));
-		assert_eq!(json["inserted"][1], serde_json::json!({"kind": "impl", "name": null}));
-		assert_eq!(
-			InsertionReport::new(&plan, "crate::util", true, &paths()).summary(),
-			"would insert fn helper into crate::util (src/util.rs)\nwould insert impl into crate::util (src/util.rs)\n"
-		);
+	fn pluralizes() {
+		assert_eq!(count(0, "item", "items"), "0 items");
+		assert_eq!(count(1, "item", "items"), "1 item");
+		assert_eq!(count(2, "file", "files"), "2 files");
 	}
 
 	#[test]
@@ -650,5 +633,36 @@ mod tests {
 
 		assert_eq!(report.summary(), "sorted src/lib.rs\nsorted src/a.rs\n");
 		assert_eq!(FormatReport::default().summary(), "");
+	}
+
+	#[test]
+	fn summarizes_renames() {
+		let report = RenameReport {
+			new_name: "Disc".to_owned(),
+			renamed: vec!["demo::Circle".to_owned(), "demo::Circle".to_owned()],
+			references: vec![
+				occurrence("src/shapes.rs", 4, ReferenceKind::Definition),
+				occurrence("src/lib.rs", 6, ReferenceKind::Import),
+				occurrence("src/main.rs", 2, ReferenceKind::Path),
+			],
+			uncertain: vec![occurrence("src/main.rs", 9, ReferenceKind::MethodCall)],
+			files: vec!["src/shapes.rs".to_owned(), "src/lib.rs".to_owned(), "src/main.rs".to_owned()],
+			..RenameReport::default()
+		};
+
+		assert_eq!(report.summary(), "renamed 2 items, updated 2 references in 3 files\n");
+		assert_eq!(
+			report.messages(),
+			[(Level::Note, "possible reference not updated: src/main.rs:9:5".to_owned())]
+		);
+
+		let json = serde_json::to_value(&report).unwrap();
+
+		assert_eq!(
+			json["references"][1],
+			serde_json::json!({"file": "src/lib.rs", "line": 6, "column": 5, "kind": "import"})
+		);
+		assert_eq!(json["dry_run"], false);
+		assert!(json.get("diff").is_none());
 	}
 }

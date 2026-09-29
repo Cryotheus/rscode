@@ -35,9 +35,9 @@ mod paths;
 mod scope;
 mod walker;
 
-use super::Resolver;
 use super::DeadName;
 use super::LostBinding;
+use super::Resolver;
 use super::fxhash::FxHashMap;
 use super::fxhash::FxHashSet;
 use crate::model::CrateId;
@@ -63,58 +63,33 @@ use walker::FileWalker;
 /// Stack size of the threads walking syntax trees (deeply nested code recurses deeply, especially in debug builds).
 const WORKER_STACK_SIZE: usize = 64 << 20;
 
-/// What to look for besides certain references (definitions, imports, and paths).
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct ReferenceOptions {
-	/// Method call expressions (`x.name(...)`) with the target's name, when a target is a method.
-	/// These cannot be resolved without type inference, so they are reported as uncertain, and so are paths through
-	/// generic parameters (`T::name`) that the parameter's bounds do not resolve.
-	pub method_calls: bool,
+/// A reference that a local binding named like the new name of its target would capture.
+#[derive(Debug, Clone)]
+pub(super) struct Capture {
+	pub(super) reference: Reference,
 
-	/// Occurrences of the target's name inside of macro invocations that could not be parsed as expressions or
-	/// statements, and inside of `macro_rules!` transcribers, that are not in paths resolved where they are (and not
-	/// after `.`, which [`ReferenceOptions::method_calls`] covers). Reported as uncertain.
-	pub macro_tokens: bool,
+	/// The module of the code containing the reference.
+	pub(super) module: ItemId,
 
-	/// Intra-doc links (``[`Name`]``, `[Name]`, `[path::Name]`, `[text](path::Name)`) in doc comments.
-	pub doc_links: bool,
+	/// What the binding is (`local variable`, ...).
+	pub(super) binding: &'static str,
 }
 
-impl ReferenceOptions {
-	/// Everything.
-	pub fn all() -> Self {
-		Self {
-			method_calls: true,
-			macro_tokens: true,
-			doc_links: true,
-		}
-	}
+/// A file to walk, as the file of one or more modules of a crate.
+#[derive(Debug)]
+struct Job {
+	krate: CrateId,
+	file: FileId,
+	modules: Vec<ItemId>,
+	size: usize,
 }
 
-/// How a reference refers to its target.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReferenceKind {
-	/// The identifier of a definition (a target itself, or an item implementing a target trait item in an `impl` the
-	/// model does not know).
-	Definition,
-
-	/// A segment of a `use` path (or the alias of `use a::Name as Name;`).
-	Import,
-
-	/// A segment of a path in code (types, expressions, patterns, bounds, visibilities, macro paths), or an inline
-	/// argument of a format string.
-	Path,
-
-	/// A method call (`x.name()`).
-	MethodCall,
-
-	/// An identifier token inside of a macro invocation or `macro_rules!` transcriber.
-	MacroToken,
-
-	/// An intra-doc link.
-	DocLink,
+/// What walking a file found.
+#[derive(Debug, Default)]
+struct Outcome {
+	references: Vec<Reference>,
+	captures: Vec<Capture>,
+	note: Option<String>,
 }
 
 /// An occurrence of a target's name.
@@ -145,6 +120,60 @@ pub struct Reference {
 	pub certain: bool,
 }
 
+/// How a reference refers to its target.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceKind {
+	/// The identifier of a definition (a target itself, or an item implementing a target trait item in an `impl` the
+	/// model does not know).
+	Definition,
+
+	/// A segment of a `use` path (or the alias of `use a::Name as Name;`).
+	Import,
+
+	/// A segment of a path in code (types, expressions, patterns, bounds, visibilities, macro paths), or an inline
+	/// argument of a format string.
+	Path,
+
+	/// A method call (`x.name()`).
+	MethodCall,
+
+	/// An identifier token inside of a macro invocation or `macro_rules!` transcriber.
+	MacroToken,
+
+	/// An intra-doc link.
+	DocLink,
+}
+
+/// What to look for besides certain references (definitions, imports, and paths).
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct ReferenceOptions {
+	/// Method call expressions (`x.name(...)`) with the target's name, when a target is a method.
+	/// These cannot be resolved without type inference, so they are reported as uncertain, and so are paths through
+	/// generic parameters (`T::name`) that the parameter's bounds do not resolve.
+	pub method_calls: bool,
+
+	/// Occurrences of the target's name inside of macro invocations that could not be parsed as expressions or
+	/// statements, and inside of `macro_rules!` transcribers, that are not in paths resolved where they are (and not
+	/// after `.`, which [`ReferenceOptions::method_calls`] covers). Reported as uncertain.
+	pub macro_tokens: bool,
+
+	/// Intra-doc links (``[`Name`]``, `[Name]`, `[path::Name]`, `[text](path::Name)`) in doc comments.
+	pub doc_links: bool,
+}
+
+impl ReferenceOptions {
+	/// Everything.
+	pub fn all() -> Self {
+		Self {
+			method_calls: true,
+			macro_tokens: true,
+			doc_links: true,
+		}
+	}
+}
+
 /// All occurrences found.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct References {
@@ -170,65 +199,65 @@ impl References {
 		targets.shadow = Some(TargetName::new(new_name.into()));
 
 		let (references, captures) = search_targets(resolver, &targets, options);
-		let captures = captures.into_iter().map(|capture| (capture.reference, capture.module, capture.binding)).collect();
+		let captures = captures
+			.into_iter()
+			.map(|capture| (capture.reference, capture.module, capture.binding))
+			.collect();
 
 		(references, captures)
 	}
 }
 
-/// A reference that a local binding named like the new name of its target would capture.
-#[derive(Debug, Clone)]
-pub(super) struct Capture {
-	pub(super) reference: Reference,
+/// The targets with one name.
+#[derive(Debug)]
+pub(super) struct TargetName {
+	pub(super) name: SmolStr,
 
-	/// The module of the code containing the reference.
-	pub(super) module: ItemId,
+	/// `r#name`, which a raw identifier compares equal to.
+	raw: String,
 
-	/// What the binding is (`local variable`, ...).
-	pub(super) binding: &'static str,
+	/// Every target with the name, sorted.
+	pub(super) items: Vec<ItemId>,
+
+	/// Targets that are methods (associated functions with a `self` parameter).
+	pub(super) methods: Vec<ItemId>,
+
+	/// Targets that are items of traits or of trait `impl`s.
+	pub(super) trait_items: Vec<ItemId>,
 }
 
-pub(crate) fn find_references(resolver: &Resolver<'_>, targets: &[ItemId], options: &ReferenceOptions) -> References {
-	search_targets(resolver, &Targets::new(resolver.workspace(), targets), options).0
-}
-
-/// References to the targets, and references through lost bindings and to dead names (see [`Targets::lost`]), whose
-/// target is the import of the binding.
-pub(crate) fn find_references_through(
-	resolver: &Resolver<'_>,
-	targets: &[ItemId],
-	lost: &[LostBinding],
-	dead: &[DeadName],
-	options: &ReferenceOptions,
-) -> References {
-	search_targets(resolver, &Targets::new(resolver.workspace(), targets).with_lost(lost, dead), options).0
-}
-
-fn search_targets(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions) -> (References, Vec<Capture>) {
-	let ws = resolver.workspace();
-	let mut references = definitions(ws, targets);
-	let mut notes = Vec::new();
-	let mut captures = Vec::new();
-
-	for outcome in search(resolver, targets, options, &jobs(ws, targets)) {
-		references.extend(outcome.references);
-		notes.extend(outcome.note);
-		captures.extend(outcome.captures);
+impl TargetName {
+	fn new(name: SmolStr) -> Self {
+		Self {
+			raw: format!("r#{name}"),
+			name,
+			items: Vec::new(),
+			methods: Vec::new(),
+			trait_items: Vec::new(),
+		}
 	}
 
-	notes.sort();
-	notes.dedup();
+	/// Whether `item` is one of the targets.
+	pub(super) fn contains(&self, item: ItemId) -> bool {
+		self.items.binary_search(&item).is_ok()
+	}
 
-	// (files loaded by several crates are walked once per crate)
-	captures.sort_by(|a, b| (&a.reference.path, a.reference.range.start).cmp(&(&b.reference.path, b.reference.range.start)));
-	captures.dedup_by(|later, kept| later.reference.path == kept.reference.path && later.reference.range == kept.reference.range);
+	/// The first target among resolutions.
+	pub(super) fn find(&self, resolutions: &[Res]) -> Option<ItemId> {
+		resolutions.iter().find_map(|res| match res {
+			Res::Item(item) if self.contains(*item) => Some(*item),
+			_ => None,
+		})
+	}
 
-	let references = References {
-		references: sorted(references),
-		notes,
-	};
+	/// The first target (there is always one).
+	pub(super) fn first(&self) -> ItemId {
+		self.items[0]
+	}
 
-	(references, captures)
+	fn matches(&self, ident: &Ident) -> bool {
+		*ident == self.name || *ident == self.raw
+	}
 }
 
 /// The targets, grouped by name.
@@ -293,7 +322,37 @@ impl Targets {
 			target.trait_items.sort();
 		}
 
-		Self { names, shadow: None, lost: FxHashMap::default(), dead: FxHashMap::default() }
+		Self {
+			names,
+			shadow: None,
+			lost: FxHashMap::default(),
+			dead: FxHashMap::default(),
+		}
+	}
+
+	/// Whether a text contains a target's name at all.
+	pub(super) fn mentioned_in(&self, text: &str) -> bool {
+		self.names.iter().any(|target| text.contains(target.name.as_str()))
+	}
+
+	/// The targets named like an identifier (compared without `r#`).
+	pub(super) fn named(&self, ident: &Ident) -> Option<&TargetName> {
+		self.names.iter().find(|target| target.matches(ident))
+	}
+
+	/// The targets named `name` (unraw'd).
+	pub(super) fn named_str(&self, name: &str) -> Option<&TargetName> {
+		self.names.iter().find(|target| target.name == name)
+	}
+
+	pub(super) fn names(&self) -> impl Iterator<Item = &TargetName> {
+		self.names.iter()
+	}
+
+	/// Whether local bindings named like the identifier are tracked: it is named like a target, or like
+	/// [`Targets::shadow`].
+	pub(super) fn tracks(&self, ident: &Ident) -> bool {
+		self.named(ident).is_some() || self.shadow.as_ref().is_some_and(|shadow| shadow.matches(ident))
 	}
 
 	/// Also finds references through `lost` bindings, and to `dead` names.
@@ -316,100 +375,6 @@ impl Targets {
 
 		self
 	}
-
-	/// Whether local bindings named like the identifier are tracked: it is named like a target, or like
-	/// [`Targets::shadow`].
-	pub(super) fn tracks(&self, ident: &Ident) -> bool {
-		self.named(ident).is_some() || self.shadow.as_ref().is_some_and(|shadow| shadow.matches(ident))
-	}
-
-	/// The targets named like an identifier (compared without `r#`).
-	pub(super) fn named(&self, ident: &Ident) -> Option<&TargetName> {
-		self.names.iter().find(|target| target.matches(ident))
-	}
-
-	/// The targets named `name` (unraw'd).
-	pub(super) fn named_str(&self, name: &str) -> Option<&TargetName> {
-		self.names.iter().find(|target| target.name == name)
-	}
-
-	/// Whether a text contains a target's name at all.
-	pub(super) fn mentioned_in(&self, text: &str) -> bool {
-		self.names.iter().any(|target| text.contains(target.name.as_str()))
-	}
-
-	pub(super) fn names(&self) -> impl Iterator<Item = &TargetName> {
-		self.names.iter()
-	}
-}
-
-/// The targets with one name.
-#[derive(Debug)]
-pub(super) struct TargetName {
-	pub(super) name: SmolStr,
-
-	/// `r#name`, which a raw identifier compares equal to.
-	raw: String,
-
-	/// Every target with the name, sorted.
-	pub(super) items: Vec<ItemId>,
-
-	/// Targets that are methods (associated functions with a `self` parameter).
-	pub(super) methods: Vec<ItemId>,
-
-	/// Targets that are items of traits or of trait `impl`s.
-	pub(super) trait_items: Vec<ItemId>,
-}
-
-impl TargetName {
-	fn new(name: SmolStr) -> Self {
-		Self {
-			raw: format!("r#{name}"),
-			name,
-			items: Vec::new(),
-			methods: Vec::new(),
-			trait_items: Vec::new(),
-		}
-	}
-
-	fn matches(&self, ident: &Ident) -> bool {
-		*ident == self.name || *ident == self.raw
-	}
-
-	/// Whether `item` is one of the targets.
-	pub(super) fn contains(&self, item: ItemId) -> bool {
-		self.items.binary_search(&item).is_ok()
-	}
-
-	/// The first target among resolutions.
-	pub(super) fn find(&self, resolutions: &[Res]) -> Option<ItemId> {
-		resolutions.iter().find_map(|res| match res {
-			Res::Item(item) if self.contains(*item) => Some(*item),
-			_ => None,
-		})
-	}
-
-	/// The first target (there is always one).
-	pub(super) fn first(&self) -> ItemId {
-		self.items[0]
-	}
-}
-
-fn is_method(data: &ItemData) -> bool {
-	data.kind == ItemKind::AssocFn && data.fn_info().is_some_and(|info| info.receiver.is_some())
-}
-
-/// Whether an item is an item of a trait or of a trait `impl`.
-fn is_trait_item(ws: &Workspace, item: ItemId) -> bool {
-	if !ws.item(item).kind.is_associated() {
-		return false;
-	}
-
-	ws.parent(item).is_some_and(|parent| {
-		let data = ws.item(parent);
-
-		data.kind == ItemKind::Trait || data.impl_info().is_some_and(|info| info.trait_path.is_some())
-	})
 }
 
 /// The identifiers of the targets' definitions.
@@ -421,7 +386,10 @@ fn definitions(ws: &Workspace, targets: &Targets) -> Vec<Reference> {
 			let data = ws.item(item);
 			let source = ws.file_of(item);
 
-			let Some(range) = data.name_range.filter(|range| is_identifier(source.text().get(range.as_range()), &target.name)) else {
+			let Some(range) = data
+				.name_range
+				.filter(|range| is_identifier(source.text().get(range.as_range()), &target.name))
+			else {
 				continue;
 			};
 
@@ -441,18 +409,42 @@ fn definitions(ws: &Workspace, targets: &Targets) -> Vec<Reference> {
 	references
 }
 
+pub(crate) fn find_references(resolver: &Resolver<'_>, targets: &[ItemId], options: &ReferenceOptions) -> References {
+	search_targets(resolver, &Targets::new(resolver.workspace(), targets), options).0
+}
+
+/// References to the targets, and references through lost bindings and to dead names (see [`Targets::lost`]), whose
+/// target is the import of the binding.
+pub(crate) fn find_references_through(
+	resolver: &Resolver<'_>,
+	targets: &[ItemId],
+	lost: &[LostBinding],
+	dead: &[DeadName],
+	options: &ReferenceOptions,
+) -> References {
+	search_targets(resolver, &Targets::new(resolver.workspace(), targets).with_lost(lost, dead), options).0
+}
+
 /// Whether a text is the identifier `name`, possibly raw.
 pub(super) fn is_identifier(text: Option<&str>, name: &str) -> bool {
 	text.is_some_and(|text| text == name || text.strip_prefix("r#") == Some(name))
 }
 
-/// A file to walk, as the file of one or more modules of a crate.
-#[derive(Debug)]
-struct Job {
-	krate: CrateId,
-	file: FileId,
-	modules: Vec<ItemId>,
-	size: usize,
+fn is_method(data: &ItemData) -> bool {
+	data.kind == ItemKind::AssocFn && data.fn_info().is_some_and(|info| info.receiver.is_some())
+}
+
+/// Whether an item is an item of a trait or of a trait `impl`.
+fn is_trait_item(ws: &Workspace, item: ItemId) -> bool {
+	if !ws.item(item).kind.is_associated() {
+		return false;
+	}
+
+	ws.parent(item).is_some_and(|parent| {
+		let data = ws.item(parent);
+
+		data.kind == ItemKind::Trait || data.impl_info().is_some_and(|info| info.trait_path.is_some())
+	})
 }
 
 /// The files that mention a target's name (others cannot contain references), largest first.
@@ -484,14 +476,6 @@ fn jobs(ws: &Workspace, targets: &Targets) -> Vec<Job> {
 
 	jobs.sort_by_key(|job| std::cmp::Reverse(job.size));
 	jobs
-}
-
-/// What walking a file found.
-#[derive(Debug, Default)]
-struct Outcome {
-	references: Vec<Reference>,
-	captures: Vec<Capture>,
-	note: Option<String>,
 }
 
 /// Walks the files of `jobs` on worker threads.
@@ -532,6 +516,53 @@ fn search(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions
 	})
 }
 
+fn search_targets(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions) -> (References, Vec<Capture>) {
+	let ws = resolver.workspace();
+	let mut references = definitions(ws, targets);
+	let mut notes = Vec::new();
+	let mut captures = Vec::new();
+
+	for outcome in search(resolver, targets, options, &jobs(ws, targets)) {
+		references.extend(outcome.references);
+		notes.extend(outcome.note);
+		captures.extend(outcome.captures);
+	}
+
+	notes.sort();
+	notes.dedup();
+
+	// (files loaded by several crates are walked once per crate)
+	captures.sort_by(|a, b| (&a.reference.path, a.reference.range.start).cmp(&(&b.reference.path, b.reference.range.start)));
+	captures.dedup_by(|later, kept| later.reference.path == kept.reference.path && later.reference.range == kept.reference.range);
+
+	let references = References {
+		references: sorted(references),
+		notes,
+	};
+
+	(references, captures)
+}
+
+/// Sorts references by path and position, keeping one reference per range: a certain one, of the first kind.
+fn sorted(mut references: Vec<Reference>) -> Vec<Reference> {
+	references.sort_by(|a, b| {
+		let key = |reference: &Reference| {
+			(
+				reference.range.start,
+				reference.range.end,
+				!reference.certain,
+				reference.kind,
+				reference.target,
+			)
+		};
+
+		a.path.cmp(&b.path).then_with(|| key(a).cmp(&key(b)))
+	});
+
+	references.dedup_by(|later, kept| later.path == kept.path && later.range == kept.range);
+	references
+}
+
 /// Parses a file and walks it as each of its modules.
 fn walk(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions, job: &Job) -> Outcome {
 	let ws = resolver.workspace();
@@ -547,7 +578,9 @@ fn walk(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions, 
 			return Outcome {
 				references: Vec::new(),
 				captures: Vec::new(),
-				note: Some(format!("{path}:{location}: references in this file were not searched, since it does not parse: {error}")),
+				note: Some(format!(
+					"{path}:{location}: references in this file were not searched, since it does not parse: {error}"
+				)),
 			};
 		}
 	};
@@ -565,22 +598,37 @@ fn walk(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions, 
 	outcome
 }
 
-/// Sorts references by path and position, keeping one reference per range: a certain one, of the first kind.
-fn sorted(mut references: Vec<Reference>) -> Vec<Reference> {
-	references.sort_by(|a, b| {
-		let key = |reference: &Reference| (reference.range.start, reference.range.end, !reference.certain, reference.kind, reference.target);
-
-		a.path.cmp(&b.path).then_with(|| key(a).cmp(&key(b)))
-	});
-
-	references.dedup_by(|later, kept| later.path == kept.path && later.range == kept.range);
-	references
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::model::CrateSpec;
+
+	#[test]
+	fn identifiers_may_be_raw() {
+		assert!(is_identifier(Some("type"), "type"));
+		assert!(is_identifier(Some("r#type"), "type"));
+		assert!(!is_identifier(Some("r#types"), "type"));
+		assert!(!is_identifier(Some("Type"), "type"));
+		assert!(!is_identifier(None, "type"));
+	}
+
+	#[test]
+	fn no_targets_find_nothing() {
+		let mut ws = Workspace::new("/nowhere");
+
+		ws.load_crate(CrateSpec::new("missing", "/nowhere/src/lib.rs"));
+
+		let resolver = Resolver::new(&ws);
+		let found = find_references(&resolver, &[], &ReferenceOptions::all());
+
+		assert!(found.references.is_empty() && found.notes.is_empty());
+
+		// the crate root is named like its crate, but its (empty) file never mentions it
+		let root = ws.crates()[0].root_module();
+		let found = find_references(&resolver, &[root], &ReferenceOptions::all());
+
+		assert!(found.references.is_empty() && found.notes.is_empty(), "{found:?}");
+	}
 
 	fn reference(path: &str, start: usize, kind: ReferenceKind, certain: bool) -> Reference {
 		Reference {
@@ -618,32 +666,5 @@ mod tests {
 				("/b.rs", 4, ReferenceKind::Import, true),
 			]
 		);
-	}
-
-	#[test]
-	fn identifiers_may_be_raw() {
-		assert!(is_identifier(Some("type"), "type"));
-		assert!(is_identifier(Some("r#type"), "type"));
-		assert!(!is_identifier(Some("r#types"), "type"));
-		assert!(!is_identifier(Some("Type"), "type"));
-		assert!(!is_identifier(None, "type"));
-	}
-
-	#[test]
-	fn no_targets_find_nothing() {
-		let mut ws = Workspace::new("/nowhere");
-
-		ws.load_crate(CrateSpec::new("missing", "/nowhere/src/lib.rs"));
-
-		let resolver = Resolver::new(&ws);
-		let found = find_references(&resolver, &[], &ReferenceOptions::all());
-
-		assert!(found.references.is_empty() && found.notes.is_empty());
-
-		// the crate root is named like its crate, but its (empty) file never mentions it
-		let root = ws.crates()[0].root_module();
-		let found = find_references(&resolver, &[root], &ReferenceOptions::all());
-
-		assert!(found.references.is_empty() && found.notes.is_empty(), "{found:?}");
 	}
 }

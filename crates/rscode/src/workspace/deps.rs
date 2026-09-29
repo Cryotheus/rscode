@@ -22,6 +22,25 @@ pub(super) struct Prelude<'a> {
 }
 
 impl Prelude<'_> {
+	/// The crate name of a dependency's library, or `None` if it has none.
+	fn library_name(&self, package: &Package, dependency: &CargoDependency) -> Option<String> {
+		// artifact dependencies (`artifact = "bin"`) are only libraries with `lib = true`
+		if dependency.artifact().is_some_and(|artifact| !artifact.is_lib()) {
+			return None;
+		}
+
+		if let Some(local) = self.local.find(dependency) {
+			return local.library().filter(|library| library.is_linkable()).map(Target::crate_name);
+		}
+
+		match self.resolved.library(package.package_id(), dependency) {
+			Some(library) => library.map(str::to_owned),
+
+			// most libraries are named after their package
+			None => Some(dependency.package_name().replace('-', "_")),
+		}
+	}
+
 	/// The crates a crate can name, as cargo passes them with `--extern`, sorted by name:
 	/// - for binaries, examples, tests, and benchmarks, their package's library;
 	/// - the package's normal dependencies (and for examples, tests, and benchmarks, its dev-dependencies) that apply to
@@ -61,7 +80,11 @@ impl Prelude<'_> {
 			};
 
 			// renamed dependencies (`name = { package = "..." }`) are named after their key, others after their library
-			let name = SmolStr::new(dependency.explicit_name_in_toml().map_or_else(|| library.clone(), |name| name.replace('-', "_")));
+			let name = SmolStr::new(
+				dependency
+					.explicit_name_in_toml()
+					.map_or_else(|| library.clone(), |name| name.replace('-', "_")),
+			);
 
 			// a dependency may be declared more than once (as a dev-dependency too, for other platforms, ...)
 			if prelude.iter().any(|existing: &Dependency| existing.name == name) {
@@ -78,24 +101,5 @@ impl Prelude<'_> {
 
 		prelude.sort_by(|a, b| a.name.cmp(&b.name));
 		prelude
-	}
-
-	/// The crate name of a dependency's library, or `None` if it has none.
-	fn library_name(&self, package: &Package, dependency: &CargoDependency) -> Option<String> {
-		// artifact dependencies (`artifact = "bin"`) are only libraries with `lib = true`
-		if dependency.artifact().is_some_and(|artifact| !artifact.is_lib()) {
-			return None;
-		}
-
-		if let Some(local) = self.local.find(dependency) {
-			return local.library().filter(|library| library.is_linkable()).map(Target::crate_name);
-		}
-
-		match self.resolved.library(package.package_id(), dependency) {
-			Some(library) => library.map(str::to_owned),
-
-			// most libraries are named after their package
-			None => Some(dependency.package_name().replace('-', "_")),
-		}
 	}
 }

@@ -35,7 +35,12 @@ pub(crate) struct CheckedInput<R> {
 impl<R> CheckedInput<R> {
 	/// Passes `inner` through, calling `report` with a message for every line that is not JSON.
 	pub(crate) fn new(inner: R, report: impl FnMut(String) + Send + 'static) -> Self {
-		Self { inner, line: Vec::new(), too_long: false, report: Box::new(report) }
+		Self {
+			inner,
+			line: Vec::new(),
+			too_long: false,
+			report: Box::new(report),
+		}
 	}
 
 	/// Checks every line that the bytes complete.
@@ -99,7 +104,9 @@ fn check(line: &[u8]) -> Option<String> {
 		quoted.push_str("...");
 	}
 
-	Some(format!("rscode mcp: ignored a line of input that is not JSON ({error}), so nothing answers it: {quoted}"))
+	Some(format!(
+		"rscode mcp: ignored a line of input that is not JSON ({error}), so nothing answers it: {quoted}"
+	))
 }
 
 #[cfg(test)]
@@ -129,6 +136,23 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn ignores_an_unfinished_last_line() {
+		let (output, reports) = read(&[b"{\"a\":", b" 1}\n{\"b\""]).await;
+
+		assert_eq!(output, b"{\"a\": 1}\n{\"b\"");
+		assert!(reports.is_empty(), "{reports:?}");
+	}
+
+	#[tokio::test]
+	async fn quotes_long_lines_in_part() {
+		let line = format!("{}\n", "x".repeat(1000));
+		let (_, reports) = read(&[line.as_bytes()]).await;
+
+		assert_eq!(reports.len(), 1);
+		assert!(reports[0].ends_with(&format!("{}...", "x".repeat(QUOTED_CHARS))), "{}", reports[0]);
+	}
+
 	/// Reads `chunks` through a [`CheckedInput`]: what comes out, and the reports.
 	async fn read(chunks: &[&[u8]]) -> (Vec<u8>, Vec<String>) {
 		let chunks = Chunks(chunks.iter().map(|chunk| chunk.to_vec()).collect());
@@ -146,30 +170,15 @@ mod tests {
 
 	#[tokio::test]
 	async fn reports_lines_that_are_not_json() {
-		let input: &[&[u8]] =
-			&[b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n{this is not", b" json\n\n\r\n[1, 2]\r\n\xef\xbb\xbf{}\n"];
+		let input: &[&[u8]] = &[
+			b"{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}\n{this is not",
+			b" json\n\n\r\n[1, 2]\r\n\xef\xbb\xbf{}\n",
+		];
 		let (output, reports) = read(input).await;
 
 		assert_eq!(output, input.concat());
 		assert_eq!(reports.len(), 1, "{reports:?}");
 		assert!(reports[0].starts_with("rscode mcp: ignored a line of input that is not JSON (key must be a string"));
 		assert!(reports[0].ends_with("so nothing answers it: {this is not json"), "{}", reports[0]);
-	}
-
-	#[tokio::test]
-	async fn quotes_long_lines_in_part() {
-		let line = format!("{}\n", "x".repeat(1000));
-		let (_, reports) = read(&[line.as_bytes()]).await;
-
-		assert_eq!(reports.len(), 1);
-		assert!(reports[0].ends_with(&format!("{}...", "x".repeat(QUOTED_CHARS))), "{}", reports[0]);
-	}
-
-	#[tokio::test]
-	async fn ignores_an_unfinished_last_line() {
-		let (output, reports) = read(&[b"{\"a\":", b" 1}\n{\"b\""]).await;
-
-		assert_eq!(output, b"{\"a\": 1}\n{\"b\"");
-		assert!(reports.is_empty(), "{reports:?}");
 	}
 }

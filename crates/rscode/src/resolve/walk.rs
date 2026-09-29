@@ -23,33 +23,6 @@ use smol_str::SmolStr;
 /// self-referential imports (`use self::a::b as a;`) cannot grow them forever.
 const MAX_EXTERNAL_SEGMENTS: usize = 32;
 
-/// The namespaces a segment is looked up in.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(super) enum Want {
-	One(Namespace),
-
-	/// Every namespace (the last segment of an import, or of a user path).
-	All,
-}
-
-impl Want {
-	fn namespaces(self) -> &'static [Namespace] {
-		match self {
-			Self::One(Namespace::Type) => &[Namespace::Type],
-			Self::One(Namespace::Value) => &[Namespace::Value],
-			Self::One(Namespace::Macro) => &[Namespace::Macro],
-			Self::All => &Namespace::ALL,
-		}
-	}
-
-	fn admits(self, namespace: Namespace) -> bool {
-		match self {
-			Self::One(wanted) => wanted == namespace,
-			Self::All => true,
-		}
-	}
-}
-
 /// A resolution of a segment: what it names, in which namespace, and how visible the binding is.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(super) struct Found {
@@ -76,6 +49,15 @@ impl Found {
 	}
 }
 
+/// The result of looking up a name in a module's scope.
+struct Lookup {
+	/// Whether a named import may still bind the name (glob bindings of the name were then ignored).
+	pending: bool,
+
+	/// The imports that could still add bindings of the name (none when the lookup is final).
+	waits: Vec<usize>,
+}
+
 /// What a resolution made while imports are being resolved may still change on.
 #[derive(Debug, Default)]
 pub(super) struct Unsettled {
@@ -91,24 +73,15 @@ pub(super) struct Unsettled {
 }
 
 impl Unsettled {
-	/// Whether the resolution is final.
-	pub(super) fn is_settled(&self) -> bool {
-		!self.prefix && !self.last.contains(&true)
-	}
-
 	/// Whether the resolution may still change in a namespace.
 	pub(super) fn affects(&self, namespace: Namespace) -> bool {
 		self.prefix || self.last[namespace.index()]
 	}
-}
 
-/// The result of looking up a name in a module's scope.
-struct Lookup {
-	/// Whether a named import may still bind the name (glob bindings of the name were then ignored).
-	pending: bool,
-
-	/// The imports that could still add bindings of the name (none when the lookup is final).
-	waits: Vec<usize>,
+	/// Whether the resolution is final.
+	pub(super) fn is_settled(&self) -> bool {
+		!self.prefix && !self.last.contains(&true)
+	}
 }
 
 /// Resolves paths written in (or relative to) a module.
@@ -167,6 +140,183 @@ impl<'a> Walker<'a> {
 		}
 	}
 
+	fn assoc_items(&self, owner: ItemId, name: &str, want: Want, out: &mut Vec<Found>) {
+		let Some(items) = self.tables.assoc.get(&owner) else {
+			return;
+		};
+
+		for &item in items {
+			let data = self.ws.item(item);
+
+			if data.name.as_deref() != Some(name) {
+				continue;
+			}
+
+			for &namespace in names::namespaces(data) {
+				if want.admits(namespace) {
+					out.push(Found {
+						vis: declared_vis(self.ws, item),
+						..Found::public(namespace, Res::Item(item))
+					});
+				}
+			}
+		}
+	}
+
+	/// `name` as a member of the crate root: 2015 `use` paths and `::name` paths. Crates are only found there through
+	/// `extern crate` items (including the injected `extern crate std;`).
+	fn crate_relative(&mut self, name: &str, want: Want) -> Vec<Found> {
+		let mut out = Vec::new();
+
+		self.member(&Found::module(self.root()), name, want, &mut out);
+		out
+	}
+
+	/// Sorts and removes duplicate resolutions, keeping the widest visibility of each (and certainty of namespace).
+	fn dedup(&self, mut found: Vec<Found>) -> Vec<Found> {
+		found.sort_by(|a, b| (a.namespace, &a.res).cmp(&(b.namespace, &b.res)));
+		found.dedup_by(|later, kept| {
+			if later.namespace != kept.namespace || later.res != kept.res {
+				return false;
+			}
+
+			if later.vis.is_wider_than(&self.tables.tree, kept.vis) {
+				kept.vis = later.vis;
+			}
+
+			kept.guessed &= later.guessed;
+			true
+		});
+
+		found
+	}
+
+	fn edition(&self) -> Edition {
+		self.ws.krate(self.module.krate()).edition()
+	}
+
+	/// `::name` in 2018+: a crate of the extern prelude, or an external crate that was not declared.
+	fn extern_crate(&self, name: &str, want: Want) -> Vec<Found> {
+		if !want.admits(Namespace::Type) {
+			return Vec::new();
+		}
+
+		let krate = self.module.krate().index();
+
+		match self.tables.extern_preludes.get(krate).and_then(|prelude| prelude.get(name)) {
+			Some(resolutions) => resolutions.iter().map(|res| Found::public(Namespace::Type, res.clone())).collect(),
+			None => vec![Found::public(Namespace::Type, Res::External(name.into()))],
+		}
+	}
+
+	/// The modules and enums (or external paths) a glob import `path::*` imports from.
+	pub(super) fn glob_sources(&mut self, path: &PathRef) -> Vec<Found> {
+		if path.segments.is_empty() {
+			// `use *;` / `use ::*;` import from the crate root in 2015 and are errors otherwise
+			return match self.edition() {
+				Edition::E2015 => vec![Found::module(self.root())],
+				_ => Vec::new(),
+			};
+		}
+
+		self.resolve(path, Want::One(Namespace::Type))
+	}
+
+	/// A name written in the module itself: its scope (including textually scoped macros), then the preludes.
+	fn lexical(&mut self, name: &str, want: Want) -> Vec<Found> {
+		let mut out = Vec::new();
+
+		for &namespace in want.namespaces() {
+			let before = out.len();
+			let lookup = self.scope_lookup(self.module, name, namespace, true, &mut out);
+
+			if namespace == Namespace::Macro {
+				for &macro_item in self.tables.textual_macros(self.ws, self.module, name) {
+					out.push(Found {
+						vis: declared_vis(self.ws, macro_item),
+						..Found::public(namespace, Res::Item(macro_item))
+					});
+				}
+			}
+
+			// the preludes apply when no named import may still bind the name in the module (a glob import cannot: a
+			// name both glob-imported and in a prelude is ambiguous at the start of an import path)
+			if out.len() == before && !lookup.pending && self.prelude(name, namespace, &mut out) {
+				continue;
+			}
+
+			self.unsettle(namespace, lookup.waits);
+		}
+
+		self.dedup(out)
+	}
+
+	/// Looks up `name` as a member of what `container` resolved to.
+	fn member(&mut self, container: &Found, name: &str, want: Want, out: &mut Vec<Found>) {
+		match &container.res {
+			Res::Item(id) => match self.ws.item(*id).kind {
+				ItemKind::Module => {
+					for &namespace in want.namespaces() {
+						let lookup = self.scope_lookup(*id, name, namespace, false, out);
+
+						self.unsettle(namespace, lookup.waits);
+					}
+				}
+
+				ItemKind::Enum => {
+					let before = out.len();
+
+					self.variants(*id, name, want, out);
+
+					// variants shadow associated items of the same name in their namespaces
+					if self.assoc {
+						let shadowed: Vec<Namespace> = out[before..].iter().map(|found| found.namespace).collect();
+
+						for &namespace in want.namespaces().iter().filter(|namespace| !shadowed.contains(namespace)) {
+							self.assoc_items(*id, name, Want::One(namespace), out);
+						}
+					}
+				}
+
+				ItemKind::Struct | ItemKind::Union | ItemKind::TypeAlias | ItemKind::ForeignType | ItemKind::Trait if self.assoc => {
+					self.assoc_items(*id, name, want, out);
+				}
+
+				_ => {}
+			},
+
+			Res::External(path) => extend_external(path, name, want, out),
+
+			// `u8::MAX`, `str::from_utf8`
+			Res::Builtin(ty) if self.kind == PathKind::Code => extend_external(ty, name, want, out),
+			Res::Builtin(_) => {}
+		}
+	}
+
+	/// Continues from `start` through member segments `names` (the last one looked up in `want`).
+	pub(super) fn members(&mut self, start: Vec<Found>, names: &[SmolStr], want: Want) -> Vec<Found> {
+		let mut current = start;
+
+		for (index, name) in names.iter().enumerate() {
+			self.last_segment = index + 1 == names.len();
+
+			let want_here = if self.last_segment { want } else { Want::One(Namespace::Type) };
+			let mut next = Vec::new();
+
+			for container in &current {
+				self.member(container, name, want_here, &mut next);
+			}
+
+			current = self.dedup(next);
+
+			if current.is_empty() {
+				break;
+			}
+		}
+
+		current
+	}
+
 	/// The resolution of every prefix of `path`: element `i` resolves `path.segments[..=i]`, in the type namespace
 	/// except for the last segment, which is looked up in `want`.
 	pub(super) fn prefixes(&mut self, path: &PathRef, want: Want) -> Vec<Vec<Found>> {
@@ -196,54 +346,84 @@ impl<'a> Walker<'a> {
 		out
 	}
 
+	/// The preludes, in rustc's order: `#[macro_use]` macros, the extern prelude, the standard library prelude, and
+	/// built-in types and macros. Returns whether one of them has the name.
+	fn prelude(&self, name: &str, namespace: Namespace, out: &mut Vec<Found>) -> bool {
+		let krate = self.module.krate().index();
+
+		let from_table = match namespace {
+			Namespace::Type => self.tables.extern_preludes.get(krate).and_then(|prelude| prelude.get(name)),
+			Namespace::Macro => self.tables.macro_preludes.get(krate).and_then(|prelude| prelude.get(name)),
+			Namespace::Value => None,
+		};
+
+		if let Some(resolutions) = from_table {
+			out.extend(resolutions.iter().map(|res| Found::public(namespace, res.clone())));
+			return true;
+		}
+
+		let res = match names::fallback(name, namespace) {
+			Some(Fallback::External) => Res::External(name.into()),
+			Some(Fallback::Builtin) => Res::Builtin(name.into()),
+			None => return false,
+		};
+
+		out.push(Found::public(namespace, res));
+		true
+	}
+
 	/// What `path` names (its last segment looked up in `want`).
 	pub(super) fn resolve(&mut self, path: &PathRef, want: Want) -> Vec<Found> {
 		self.prefixes(path, want).pop().unwrap_or_default()
 	}
 
-	/// The modules and enums (or external paths) a glob import `path::*` imports from.
-	pub(super) fn glob_sources(&mut self, path: &PathRef) -> Vec<Found> {
-		if path.segments.is_empty() {
-			// `use *;` / `use ::*;` import from the crate root in 2015 and are errors otherwise
-			return match self.edition() {
-				Edition::E2015 => vec![Found::module(self.root())],
-				_ => Vec::new(),
-			};
-		}
-
-		self.resolve(path, Want::One(Namespace::Type))
-	}
-
-	/// Continues from `start` through member segments `names` (the last one looked up in `want`).
-	pub(super) fn members(&mut self, start: Vec<Found>, names: &[SmolStr], want: Want) -> Vec<Found> {
-		let mut current = start;
-
-		for (index, name) in names.iter().enumerate() {
-			self.last_segment = index + 1 == names.len();
-
-			let want_here = if self.last_segment { want } else { Want::One(Namespace::Type) };
-			let mut next = Vec::new();
-
-			for container in &current {
-				self.member(container, name, want_here, &mut next);
-			}
-
-			current = self.dedup(next);
-
-			if current.is_empty() {
-				break;
-			}
-		}
-
-		current
-	}
-
-	fn edition(&self) -> Edition {
-		self.ws.krate(self.module.krate()).edition()
-	}
-
 	fn root(&self) -> ItemId {
 		ItemId::crate_root(self.module.krate())
+	}
+
+	/// Looks up a name in a module's scope, adding the bindings found to `out`.
+	///
+	/// While imports are being resolved, glob bindings that a named import may still shadow are ignored, and the
+	/// imports that could still add bindings are returned.
+	fn scope_lookup(&self, module: ItemId, name: &str, namespace: Namespace, lexical: bool, out: &mut Vec<Found>) -> Lookup {
+		let own = self.own.map(|(_, index)| index);
+		let slot = self.tables.scopes.get(&module).and_then(|scope| scope.slot(name, namespace));
+		let pending = self
+			.imports
+			.is_some_and(|imports| imports.pending(module, name, namespace, own).next().is_some());
+
+		for entry in slot.map(Slot::entries).unwrap_or_default() {
+			// an import cannot see its own bindings
+			if self.own.is_some_and(|(import, _)| entry.import == Some(import)) {
+				continue;
+			}
+
+			// everything in a module's own scope is visible inside of it
+			if self.enforce_vis && !lexical && !entry.vis.is_visible_from(&self.tables.tree, self.module) {
+				continue;
+			}
+
+			if pending && entry.origin == Origin::Glob {
+				continue;
+			}
+
+			out.push(Found {
+				namespace,
+				res: entry.res.clone(),
+				vis: entry.vis,
+				guessed: entry.guessed,
+			});
+		}
+
+		let waits = match self.imports {
+			None => Vec::new(),
+
+			// only named imports of the module can add to bindings that shadow glob imports
+			Some(imports) if slot.is_some_and(Slot::shadows_globs) => imports.pending(module, name, namespace, own).collect(),
+			Some(imports) => imports.unsettling(module, name, namespace, own),
+		};
+
+		Lookup { pending, waits }
 	}
 
 	/// Resolves the first segment(s), pushing their results, and returns the index of the next segment
@@ -257,7 +437,11 @@ impl<'a> Walker<'a> {
 		let want_first = if self.last_segment { want } else { Want::One(Namespace::Type) };
 
 		if path.leading_colon {
-			let found = if edition_2015 { self.crate_relative(&first.name, want_first) } else { self.extern_crate(&first.name, want_first) };
+			let found = if edition_2015 {
+				self.crate_relative(&first.name, want_first)
+			} else {
+				self.extern_crate(&first.name, want_first)
+			};
 
 			out.push(found);
 			return Some(1);
@@ -317,169 +501,6 @@ impl<'a> Walker<'a> {
 		Some(index)
 	}
 
-	/// A name written in the module itself: its scope (including textually scoped macros), then the preludes.
-	fn lexical(&mut self, name: &str, want: Want) -> Vec<Found> {
-		let mut out = Vec::new();
-
-		for &namespace in want.namespaces() {
-			let before = out.len();
-			let lookup = self.scope_lookup(self.module, name, namespace, true, &mut out);
-
-			if namespace == Namespace::Macro {
-				for &macro_item in self.tables.textual_macros(self.ws, self.module, name) {
-					out.push(Found {
-						vis: declared_vis(self.ws, macro_item),
-						..Found::public(namespace, Res::Item(macro_item))
-					});
-				}
-			}
-
-			// the preludes apply when no named import may still bind the name in the module (a glob import cannot: a
-			// name both glob-imported and in a prelude is ambiguous at the start of an import path)
-			if out.len() == before && !lookup.pending && self.prelude(name, namespace, &mut out) {
-				continue;
-			}
-
-			self.unsettle(namespace, lookup.waits);
-		}
-
-		self.dedup(out)
-	}
-
-	/// The preludes, in rustc's order: `#[macro_use]` macros, the extern prelude, the standard library prelude, and
-	/// built-in types and macros. Returns whether one of them has the name.
-	fn prelude(&self, name: &str, namespace: Namespace, out: &mut Vec<Found>) -> bool {
-		let krate = self.module.krate().index();
-
-		let from_table = match namespace {
-			Namespace::Type => self.tables.extern_preludes.get(krate).and_then(|prelude| prelude.get(name)),
-			Namespace::Macro => self.tables.macro_preludes.get(krate).and_then(|prelude| prelude.get(name)),
-			Namespace::Value => None,
-		};
-
-		if let Some(resolutions) = from_table {
-			out.extend(resolutions.iter().map(|res| Found::public(namespace, res.clone())));
-			return true;
-		}
-
-		let res = match names::fallback(name, namespace) {
-			Some(Fallback::External) => Res::External(name.into()),
-			Some(Fallback::Builtin) => Res::Builtin(name.into()),
-			None => return false,
-		};
-
-		out.push(Found::public(namespace, res));
-		true
-	}
-
-	/// `name` as a member of the crate root: 2015 `use` paths and `::name` paths. Crates are only found there through
-	/// `extern crate` items (including the injected `extern crate std;`).
-	fn crate_relative(&mut self, name: &str, want: Want) -> Vec<Found> {
-		let mut out = Vec::new();
-
-		self.member(&Found::module(self.root()), name, want, &mut out);
-		out
-	}
-
-	/// `::name` in 2018+: a crate of the extern prelude, or an external crate that was not declared.
-	fn extern_crate(&self, name: &str, want: Want) -> Vec<Found> {
-		if !want.admits(Namespace::Type) {
-			return Vec::new();
-		}
-
-		let krate = self.module.krate().index();
-
-		match self.tables.extern_preludes.get(krate).and_then(|prelude| prelude.get(name)) {
-			Some(resolutions) => resolutions.iter().map(|res| Found::public(Namespace::Type, res.clone())).collect(),
-			None => vec![Found::public(Namespace::Type, Res::External(name.into()))],
-		}
-	}
-
-	/// Looks up `name` as a member of what `container` resolved to.
-	fn member(&mut self, container: &Found, name: &str, want: Want, out: &mut Vec<Found>) {
-		match &container.res {
-			Res::Item(id) => match self.ws.item(*id).kind {
-				ItemKind::Module => {
-					for &namespace in want.namespaces() {
-						let lookup = self.scope_lookup(*id, name, namespace, false, out);
-
-						self.unsettle(namespace, lookup.waits);
-					}
-				}
-
-				ItemKind::Enum => {
-					let before = out.len();
-
-					self.variants(*id, name, want, out);
-
-					// variants shadow associated items of the same name in their namespaces
-					if self.assoc {
-						let shadowed: Vec<Namespace> = out[before..].iter().map(|found| found.namespace).collect();
-
-						for &namespace in want.namespaces().iter().filter(|namespace| !shadowed.contains(namespace)) {
-							self.assoc_items(*id, name, Want::One(namespace), out);
-						}
-					}
-				}
-
-				ItemKind::Struct | ItemKind::Union | ItemKind::TypeAlias | ItemKind::ForeignType | ItemKind::Trait if self.assoc => {
-					self.assoc_items(*id, name, want, out);
-				}
-
-				_ => {}
-			},
-
-			Res::External(path) => extend_external(path, name, want, out),
-
-			// `u8::MAX`, `str::from_utf8`
-			Res::Builtin(ty) if self.kind == PathKind::Code => extend_external(ty, name, want, out),
-			Res::Builtin(_) => {}
-		}
-	}
-
-	/// Looks up a name in a module's scope, adding the bindings found to `out`.
-	///
-	/// While imports are being resolved, glob bindings that a named import may still shadow are ignored, and the
-	/// imports that could still add bindings are returned.
-	fn scope_lookup(&self, module: ItemId, name: &str, namespace: Namespace, lexical: bool, out: &mut Vec<Found>) -> Lookup {
-		let own = self.own.map(|(_, index)| index);
-		let slot = self.tables.scopes.get(&module).and_then(|scope| scope.slot(name, namespace));
-		let pending = self.imports.is_some_and(|imports| imports.pending(module, name, namespace, own).next().is_some());
-
-		for entry in slot.map(Slot::entries).unwrap_or_default() {
-			// an import cannot see its own bindings
-			if self.own.is_some_and(|(import, _)| entry.import == Some(import)) {
-				continue;
-			}
-
-			// everything in a module's own scope is visible inside of it
-			if self.enforce_vis && !lexical && !entry.vis.is_visible_from(&self.tables.tree, self.module) {
-				continue;
-			}
-
-			if pending && entry.origin == Origin::Glob {
-				continue;
-			}
-
-			out.push(Found {
-				namespace,
-				res: entry.res.clone(),
-				vis: entry.vis,
-				guessed: entry.guessed,
-			});
-		}
-
-		let waits = match self.imports {
-			None => Vec::new(),
-
-			// only named imports of the module can add to bindings that shadow glob imports
-			Some(imports) if slot.is_some_and(Slot::shadows_globs) => imports.pending(module, name, namespace, own).collect(),
-			Some(imports) => imports.unsettling(module, name, namespace, own),
-		};
-
-		Lookup { pending, waits }
-	}
-
 	/// Records that the resolution may still change in `namespace`, until one of `waits` makes progress.
 	fn unsettle(&mut self, namespace: Namespace, waits: Vec<usize>) {
 		if waits.is_empty() {
@@ -519,47 +540,32 @@ impl<'a> Walker<'a> {
 			}
 		}
 	}
+}
 
-	fn assoc_items(&self, owner: ItemId, name: &str, want: Want, out: &mut Vec<Found>) {
-		let Some(items) = self.tables.assoc.get(&owner) else {
-			return;
-		};
+/// The namespaces a segment is looked up in.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(super) enum Want {
+	One(Namespace),
 
-		for &item in items {
-			let data = self.ws.item(item);
+	/// Every namespace (the last segment of an import, or of a user path).
+	All,
+}
 
-			if data.name.as_deref() != Some(name) {
-				continue;
-			}
-
-			for &namespace in names::namespaces(data) {
-				if want.admits(namespace) {
-					out.push(Found {
-						vis: declared_vis(self.ws, item),
-						..Found::public(namespace, Res::Item(item))
-					});
-				}
-			}
+impl Want {
+	fn admits(self, namespace: Namespace) -> bool {
+		match self {
+			Self::One(wanted) => wanted == namespace,
+			Self::All => true,
 		}
 	}
 
-	/// Sorts and removes duplicate resolutions, keeping the widest visibility of each (and certainty of namespace).
-	fn dedup(&self, mut found: Vec<Found>) -> Vec<Found> {
-		found.sort_by(|a, b| (a.namespace, &a.res).cmp(&(b.namespace, &b.res)));
-		found.dedup_by(|later, kept| {
-			if later.namespace != kept.namespace || later.res != kept.res {
-				return false;
-			}
-
-			if later.vis.is_wider_than(&self.tables.tree, kept.vis) {
-				kept.vis = later.vis;
-			}
-
-			kept.guessed &= later.guessed;
-			true
-		});
-
-		found
+	fn namespaces(self) -> &'static [Namespace] {
+		match self {
+			Self::One(Namespace::Type) => &[Namespace::Type],
+			Self::One(Namespace::Value) => &[Namespace::Value],
+			Self::One(Namespace::Macro) => &[Namespace::Macro],
+			Self::All => &Namespace::ALL,
+		}
 	}
 }
 

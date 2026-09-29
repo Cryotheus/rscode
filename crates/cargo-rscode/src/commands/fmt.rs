@@ -22,6 +22,26 @@ use rscode::edit::FileChange;
 use rscode::rscode_fmt::emit;
 use std::process::ExitCode;
 
+/// The warning for `--message-format json` with an `--emit` mode that prints something else: only `--emit files` has
+/// a JSON report of rscode's own, and `--emit json` is rustfmt's JSON.
+fn json_warning(format: MessageFormat, emit: Emit) -> Option<String> {
+	(format == MessageFormat::Json && matches!(emit, Emit::Stdout | Emit::Diff | Emit::Checkstyle)).then(|| {
+		format!(
+			"`--message-format json` does not apply to `--emit {}` (`--emit json` prints rustfmt's JSON)",
+			emit.name()
+		)
+	})
+}
+
+/// Ends non-empty text with a line break.
+fn line(mut text: String) -> String {
+	if !text.is_empty() && !text.ends_with('\n') {
+		text.push('\n');
+	}
+
+	text
+}
+
 /// `sort_only`: run `sort` rather than `fmt`.
 pub(super) fn run(matches: &ArgMatches, ui: &Ui, sort_only: bool) -> anyhow::Result<ExitCode> {
 	let args = FmtArgs::from_matches(matches, sort_only)?;
@@ -83,26 +103,6 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui, sort_only: bool) -> anyhow::Res
 	}
 
 	Ok(code)
-}
-
-/// The warning for `--message-format json` with an `--emit` mode that prints something else: only `--emit files` has
-/// a JSON report of rscode's own, and `--emit json` is rustfmt's JSON.
-fn json_warning(format: MessageFormat, emit: Emit) -> Option<String> {
-	(format == MessageFormat::Json && matches!(emit, Emit::Stdout | Emit::Diff | Emit::Checkstyle)).then(|| {
-		format!(
-			"`--message-format json` does not apply to `--emit {}` (`--emit json` prints rustfmt's JSON)",
-			emit.name()
-		)
-	})
-}
-
-/// Ends non-empty text with a line break.
-fn line(mut text: String) -> String {
-	if !text.is_empty() && !text.ends_with('\n') {
-		text.push('\n');
-	}
-
-	text
 }
 
 #[cfg(test)]

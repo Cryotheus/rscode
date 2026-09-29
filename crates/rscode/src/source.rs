@@ -20,72 +20,6 @@ impl FileId {
 	}
 }
 
-/// A half-open range of byte offsets into a source file.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub struct TextRange {
-	/// The offset of the first byte.
-	pub start: usize,
-
-	/// The offset just past the last byte.
-	pub end: usize,
-}
-
-impl TextRange {
-	/// The range `start..end` (`start` must not be after `end`).
-	pub fn new(start: usize, end: usize) -> Self {
-		debug_assert!(start <= end, "inverted text range {start}..{end}");
-
-		Self { start, end }
-	}
-
-	/// The number of bytes.
-	pub fn len(self) -> usize {
-		self.end - self.start
-	}
-
-	/// Whether the range has no bytes.
-	pub fn is_empty(self) -> bool {
-		self.start == self.end
-	}
-
-	/// Whether the byte at `offset` is in the range.
-	pub fn contains(self, offset: usize) -> bool {
-		self.start <= offset && offset < self.end
-	}
-
-	/// Whether `other` lies within this range.
-	pub fn contains_range(self, other: TextRange) -> bool {
-		self.start <= other.start && other.end <= self.end
-	}
-
-	/// Whether the ranges have bytes in common.
-	pub fn overlaps(self, other: TextRange) -> bool {
-		self.start < other.end && other.start < self.end
-	}
-
-	/// The smallest range covering both ranges.
-	pub fn cover(self, other: TextRange) -> TextRange {
-		TextRange::new(self.start.min(other.start), self.end.max(other.end))
-	}
-
-	/// The range as a [`Range`] (to slice text with).
-	pub fn as_range(self) -> Range<usize> {
-		self.start..self.end
-	}
-}
-
-impl From<Range<usize>> for TextRange {
-	fn from(range: Range<usize>) -> Self {
-		Self::new(range.start, range.end)
-	}
-}
-
-impl From<TextRange> for Range<usize> {
-	fn from(range: TextRange) -> Self {
-		range.as_range()
-	}
-}
-
 /// A 1-based line and 1-based column (counted in `char`s), like rustc diagnostics.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct LineCol {
@@ -123,17 +57,26 @@ impl LineIndex {
 		}
 	}
 
+	/// The line-column location of a byte offset. Offsets inside a multi-byte `char` round down.
+	pub fn line_col(&self, text: &str, offset: usize) -> LineCol {
+		let offset = offset.min(self.len);
+		let line_index = self.line_starts.partition_point(|&start| start <= offset) - 1;
+		let line_start = self.line_starts[line_index];
+		let mut column_end = offset;
+
+		while !text.is_char_boundary(column_end) {
+			column_end -= 1;
+		}
+
+		LineCol {
+			line: line_index + 1,
+			column: text[line_start..column_end].chars().count() + 1,
+		}
+	}
+
 	/// Number of lines (a trailing newline starts an empty last line).
 	pub fn line_count(&self) -> usize {
 		self.line_starts.len()
-	}
-
-	/// Byte offset of the start of a 1-based line, clamped to the end of the text.
-	pub fn line_start(&self, line: usize) -> usize {
-		match line.checked_sub(1) {
-			Some(index) => self.line_starts.get(index).copied().unwrap_or(self.len),
-			None => 0,
-		}
 	}
 
 	/// Byte offset of the end of a 1-based line, excluding the line break (`\n` or `\r\n`).
@@ -153,21 +96,17 @@ impl LineIndex {
 		end
 	}
 
-	/// The line-column location of a byte offset. Offsets inside a multi-byte `char` round down.
-	pub fn line_col(&self, text: &str, offset: usize) -> LineCol {
-		let offset = offset.min(self.len);
-		let line_index = self.line_starts.partition_point(|&start| start <= offset) - 1;
-		let line_start = self.line_starts[line_index];
-		let mut column_end = offset;
-
-		while !text.is_char_boundary(column_end) {
-			column_end -= 1;
+	/// Byte offset of the start of a 1-based line, clamped to the end of the text.
+	pub fn line_start(&self, line: usize) -> usize {
+		match line.checked_sub(1) {
+			Some(index) => self.line_starts.get(index).copied().unwrap_or(self.len),
+			None => 0,
 		}
+	}
 
-		LineCol {
-			line: line_index + 1,
-			column: text[line_start..column_end].chars().count() + 1,
-		}
+	/// The byte offset of a [`LineCol`] (1-based line and 1-based column).
+	pub fn offset(&self, text: &str, location: LineCol) -> usize {
+		self.offset_of_line_column0(text, location.line, location.column.saturating_sub(1))
 	}
 
 	/// The byte offset of a 1-based line and 0-based `char` column,
@@ -184,103 +123,6 @@ impl LineIndex {
 			None => end,
 		}
 	}
-
-	/// The byte offset of a [`LineCol`] (1-based line and 1-based column).
-	pub fn offset(&self, text: &str, location: LineCol) -> usize {
-		self.offset_of_line_column0(text, location.line, location.column.saturating_sub(1))
-	}
-}
-
-/// A loaded Rust source file.
-#[derive(Debug, Clone)]
-pub struct SourceFile {
-	pub(crate) path: PathBuf,
-	pub(crate) text: Arc<str>,
-	pub(crate) line_index: Arc<LineIndex>,
-}
-
-impl SourceFile {
-	/// A file loaded from `path`, with its text.
-	pub fn new(path: PathBuf, text: impl Into<Arc<str>>) -> Self {
-		let text = text.into();
-		let line_index = Arc::new(LineIndex::new(&text));
-
-		Self { path, text, line_index }
-	}
-
-	/// The path the file was loaded from.
-	pub fn path(&self) -> &Path {
-		&self.path
-	}
-
-	/// The text of the file, as loaded.
-	pub fn text(&self) -> &str {
-		&self.text
-	}
-
-	/// The text of the file, to share without copying it.
-	pub fn shared_text(&self) -> &Arc<str> {
-		&self.text
-	}
-
-	/// The index of the file's lines.
-	pub fn line_index(&self) -> &LineIndex {
-		&self.line_index
-	}
-
-	/// The line-column location of a byte offset (see [`LineIndex::line_col`]).
-	pub fn line_col(&self, offset: usize) -> LineCol {
-		self.line_index.line_col(&self.text, offset)
-	}
-
-	/// Start and end locations of a range. The end location is exclusive (points just past the last `char`).
-	pub fn locate(&self, range: TextRange) -> (LineCol, LineCol) {
-		(self.line_col(range.start), self.line_col(range.end))
-	}
-
-	/// The text of a range (which must be within the text, at character boundaries).
-	pub fn slice(&self, range: TextRange) -> &str {
-		&self.text[range.as_range()]
-	}
-
-	/// Parses the file with `syn`.
-	///
-	/// Must be called on the thread that uses the result: spans live in a thread-local source map.
-	pub(crate) fn parse(&self) -> Result<ParsedFile<'_>, syn::Error> {
-		ParsedFile::parse(&self.text)
-	}
-
-	/// The location of a `syn` parse error of this file's text (must be called on the parsing thread).
-	pub(crate) fn error_location(&self, error: &syn::Error) -> LineCol {
-		let start = error.span().start();
-
-		LineCol {
-			line: start.line,
-			column: start.column + 1 + usize::from(start.line == 1 && self.text.starts_with('\u{feff}')),
-		}
-	}
-}
-
-/// Runs `job`, which parses, on a short-lived thread with a large stack, and returns its result.
-///
-/// `proc_macro2` (which `syn` parses with) keeps the text of everything parsed on a thread in a thread-local source
-/// map that only grows until the thread exits: parsing on the caller's thread would make a long-running caller grow
-/// with every file it loads. Parsing also recurses as deeply as the code is nested, which can exhaust a small stack.
-/// When no thread can be started, the job runs on the calling thread.
-pub(crate) fn isolated<T: Send>(job: impl FnOnce() -> T + Send) -> T {
-	let job = Mutex::new(Some(job));
-	let run = || job.lock().unwrap_or_else(PoisonError::into_inner).take().map(|job| job());
-
-	let ran = std::thread::scope(|scope| {
-		let thread = std::thread::Builder::new().stack_size(rscode_fmt::RECOMMENDED_STACK_SIZE);
-
-		match thread.spawn_scoped(scope, run) {
-			Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-			Err(_) => None,
-		}
-	});
-
-	ran.or_else(run).expect("the job runs exactly once, on the new thread or else here")
 }
 
 /// A parsed source text, able to map `proc_macro2` spans back to byte ranges of the original text.
@@ -319,9 +161,195 @@ impl<'a> ParsedFile<'a> {
 	}
 }
 
+/// A loaded Rust source file.
+#[derive(Debug, Clone)]
+pub struct SourceFile {
+	pub(crate) path: PathBuf,
+	pub(crate) text: Arc<str>,
+	pub(crate) line_index: Arc<LineIndex>,
+}
+
+impl SourceFile {
+	/// A file loaded from `path`, with its text.
+	pub fn new(path: PathBuf, text: impl Into<Arc<str>>) -> Self {
+		let text = text.into();
+		let line_index = Arc::new(LineIndex::new(&text));
+
+		Self { path, text, line_index }
+	}
+
+	/// The location of a `syn` parse error of this file's text (must be called on the parsing thread).
+	pub(crate) fn error_location(&self, error: &syn::Error) -> LineCol {
+		let start = error.span().start();
+
+		LineCol {
+			line: start.line,
+			column: start.column + 1 + usize::from(start.line == 1 && self.text.starts_with('\u{feff}')),
+		}
+	}
+
+	/// The line-column location of a byte offset (see [`LineIndex::line_col`]).
+	pub fn line_col(&self, offset: usize) -> LineCol {
+		self.line_index.line_col(&self.text, offset)
+	}
+
+	/// The index of the file's lines.
+	pub fn line_index(&self) -> &LineIndex {
+		&self.line_index
+	}
+
+	/// Start and end locations of a range. The end location is exclusive (points just past the last `char`).
+	pub fn locate(&self, range: TextRange) -> (LineCol, LineCol) {
+		(self.line_col(range.start), self.line_col(range.end))
+	}
+
+	/// Parses the file with `syn`.
+	///
+	/// Must be called on the thread that uses the result: spans live in a thread-local source map.
+	pub(crate) fn parse(&self) -> Result<ParsedFile<'_>, syn::Error> {
+		ParsedFile::parse(&self.text)
+	}
+
+	/// The path the file was loaded from.
+	pub fn path(&self) -> &Path {
+		&self.path
+	}
+
+	/// The text of the file, to share without copying it.
+	pub fn shared_text(&self) -> &Arc<str> {
+		&self.text
+	}
+
+	/// The text of a range (which must be within the text, at character boundaries).
+	pub fn slice(&self, range: TextRange) -> &str {
+		&self.text[range.as_range()]
+	}
+
+	/// The text of the file, as loaded.
+	pub fn text(&self) -> &str {
+		&self.text
+	}
+}
+
+/// A half-open range of byte offsets into a source file.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct TextRange {
+	/// The offset of the first byte.
+	pub start: usize,
+
+	/// The offset just past the last byte.
+	pub end: usize,
+}
+
+impl TextRange {
+	/// The range `start..end` (`start` must not be after `end`).
+	pub fn new(start: usize, end: usize) -> Self {
+		debug_assert!(start <= end, "inverted text range {start}..{end}");
+
+		Self { start, end }
+	}
+
+	/// The range as a [`Range`] (to slice text with).
+	pub fn as_range(self) -> Range<usize> {
+		self.start..self.end
+	}
+
+	/// Whether the byte at `offset` is in the range.
+	pub fn contains(self, offset: usize) -> bool {
+		self.start <= offset && offset < self.end
+	}
+
+	/// Whether `other` lies within this range.
+	pub fn contains_range(self, other: TextRange) -> bool {
+		self.start <= other.start && other.end <= self.end
+	}
+
+	/// The smallest range covering both ranges.
+	pub fn cover(self, other: TextRange) -> TextRange {
+		TextRange::new(self.start.min(other.start), self.end.max(other.end))
+	}
+
+	/// Whether the range has no bytes.
+	pub fn is_empty(self) -> bool {
+		self.start == self.end
+	}
+
+	/// The number of bytes.
+	pub fn len(self) -> usize {
+		self.end - self.start
+	}
+
+	/// Whether the ranges have bytes in common.
+	pub fn overlaps(self, other: TextRange) -> bool {
+		self.start < other.end && other.start < self.end
+	}
+}
+
+impl From<Range<usize>> for TextRange {
+	fn from(range: Range<usize>) -> Self {
+		Self::new(range.start, range.end)
+	}
+}
+
+impl From<TextRange> for Range<usize> {
+	fn from(range: TextRange) -> Self {
+		range.as_range()
+	}
+}
+
+/// Runs `job`, which parses, on a short-lived thread with a large stack, and returns its result.
+///
+/// `proc_macro2` (which `syn` parses with) keeps the text of everything parsed on a thread in a thread-local source
+/// map that only grows until the thread exits: parsing on the caller's thread would make a long-running caller grow
+/// with every file it loads. Parsing also recurses as deeply as the code is nested, which can exhaust a small stack.
+/// When no thread can be started, the job runs on the calling thread.
+pub(crate) fn isolated<T: Send>(job: impl FnOnce() -> T + Send) -> T {
+	let job = Mutex::new(Some(job));
+	let run = || job.lock().unwrap_or_else(PoisonError::into_inner).take().map(|job| job());
+
+	let ran = std::thread::scope(|scope| {
+		let thread = std::thread::Builder::new().stack_size(rscode_fmt::RECOMMENDED_STACK_SIZE);
+
+		match thread.spawn_scoped(scope, run) {
+			Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+			Err(_) => None,
+		}
+	});
+
+	ran.or_else(run).expect("the job runs exactly once, on the new thread or else here")
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn clamps_columns_to_the_end_of_the_line() {
+		let text = "ab\r\ncd\n";
+		let index = LineIndex::new(text);
+
+		assert_eq!(index.offset(text, LineCol { line: 1, column: 10 }), 2);
+		assert_eq!(index.offset(text, LineCol { line: 1, column: 3 }), 2);
+		assert_eq!(index.offset(text, LineCol { line: 1, column: 4 }), 2);
+		assert_eq!(index.offset(text, LineCol { line: 2, column: 2 }), 5);
+		assert_eq!(index.offset_of_line_column0(text, 2, 7), 6);
+		assert_eq!(index.offset_of_line_column0(text, 3, 1), text.len());
+		assert_eq!(index.offset_of_line_column0(text, 9, 0), text.len());
+	}
+
+	#[test]
+	fn isolates_jobs_on_threads_of_their_own() {
+		let caller = std::thread::current().id();
+		let text = "fn a() {}";
+		let (thread, parsed) = isolated(|| (std::thread::current().id(), ParsedFile::parse(text).is_ok()));
+
+		assert_ne!(thread, caller);
+		assert!(parsed);
+
+		let panicked = std::panic::catch_unwind(|| isolated(|| panic!("boom")));
+
+		assert!(panicked.is_err());
+	}
 
 	#[test]
 	fn line_index_round_trips() {
@@ -341,33 +369,5 @@ mod tests {
 		assert_eq!(index.line_end(text, 1), 9);
 		assert_eq!(index.line_end(text, 3), index.line_start(3));
 		assert_eq!(index.line_end(text, 4), text.len());
-	}
-
-	#[test]
-	fn isolates_jobs_on_threads_of_their_own() {
-		let caller = std::thread::current().id();
-		let text = "fn a() {}";
-		let (thread, parsed) = isolated(|| (std::thread::current().id(), ParsedFile::parse(text).is_ok()));
-
-		assert_ne!(thread, caller);
-		assert!(parsed);
-
-		let panicked = std::panic::catch_unwind(|| isolated(|| panic!("boom")));
-
-		assert!(panicked.is_err());
-	}
-
-	#[test]
-	fn clamps_columns_to_the_end_of_the_line() {
-		let text = "ab\r\ncd\n";
-		let index = LineIndex::new(text);
-
-		assert_eq!(index.offset(text, LineCol { line: 1, column: 10 }), 2);
-		assert_eq!(index.offset(text, LineCol { line: 1, column: 3 }), 2);
-		assert_eq!(index.offset(text, LineCol { line: 1, column: 4 }), 2);
-		assert_eq!(index.offset(text, LineCol { line: 2, column: 2 }), 5);
-		assert_eq!(index.offset_of_line_column0(text, 2, 7), 6);
-		assert_eq!(index.offset_of_line_column0(text, 3, 1), text.len());
-		assert_eq!(index.offset_of_line_column0(text, 9, 0), text.len());
 	}
 }

@@ -46,103 +46,14 @@ impl<'a> Candidate<'a> {
 		candidates
 	}
 
+	pub fn edition(&self) -> Edition {
+		edition(self.target.edition())
+	}
+
 	/// Whether both are the same target of the same package.
 	pub fn same(&self, other: &Candidate<'_>) -> bool {
 		self.package.package_id() == other.package.package_id() && self.target == other.target
 	}
-
-	pub fn edition(&self) -> Edition {
-		edition(self.target.edition())
-	}
-}
-
-/// A target chosen by the target selection flags.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Proposal<'a> {
-	pub candidate: Candidate<'a>,
-
-	/// Chosen by name (`--bin <NAME>`) rather than in bulk (by default, `--bins`, `--all-targets`, ...). Like cargo,
-	/// bulk-chosen targets are skipped when their `required-features` are not enabled.
-	pub named: bool,
-}
-
-/// Chooses the targets of the selected packages, in workspace member order and then [`Candidate::of`] order.
-///
-/// Fails like cargo when a named target does not exist, or `--lib` finds no library.
-pub(super) fn propose<'a>(
-	selection: &Selection<'a>,
-	local: &LocalPackages<'a>,
-	targets: &TargetSelection,
-) -> Result<Vec<Proposal<'a>>, Error> {
-	let chooser = Chooser { selection, local };
-	let mut proposals = Vec::new();
-
-	if targets.all_targets {
-		proposals.extend(chooser.all(|kind| kind != TargetKind::BuildScript));
-	} else if targets.is_default() {
-		proposals.extend(chooser.all(|kind| kind.is_lib() || kind == TargetKind::Bin));
-	} else {
-		if targets.lib {
-			proposals.extend(chooser.libraries()?);
-		}
-
-		let rules = [
-			(targets.all_bins, &targets.bins, TargetKind::Bin),
-			(targets.all_examples, &targets.examples, TargetKind::Example),
-			(targets.all_tests, &targets.tests, TargetKind::Test),
-			(targets.all_benches, &targets.benches, TargetKind::Bench),
-		];
-
-		for (all, names, kind) in rules {
-			if all {
-				proposals.extend(chooser.all(|other| other == kind));
-			} else {
-				for name in names {
-					proposals.extend(chooser.named(name, kind)?);
-				}
-			}
-		}
-	}
-
-	let order = |proposal: &Proposal<'_>| {
-		let candidate = &proposal.candidate;
-
-		(local.position(candidate.package.package_id()), candidate.kind, candidate.target.name().to_owned())
-	};
-
-	proposals.sort_by_cached_key(order);
-	proposals.dedup_by(|later, kept| {
-		let same = later.candidate.same(&kept.candidate);
-
-		if same {
-			kept.named |= later.named;
-		}
-
-		same
-	});
-
-	Ok(proposals)
-}
-
-/// The warning cargo gives when bulk filters (`--bins`, `--examples`, ...) chose no target.
-pub(super) fn unmatched_filters_warning(targets: &TargetSelection) -> Option<String> {
-	let filters: Vec<&str> = if targets.all_targets {
-		vec!["`all-targets`"]
-	} else {
-		[
-			(targets.all_bins, "`bins`"),
-			(targets.all_tests, "`tests`"),
-			(targets.all_examples, "`examples`"),
-			(targets.all_benches, "`benches`"),
-		]
-		.into_iter()
-		.filter_map(|(all, name)| all.then_some(name))
-		.collect()
-	};
-
-	let plural = if filters.len() > 1 { "filters" } else { "filter" };
-
-	(!filters.is_empty()).then(|| format!("target {plural} {} specified, but no targets matched; this is a no-op", filters.join(", ")))
 }
 
 /// Finds the targets of the selected packages.
@@ -152,17 +63,17 @@ struct Chooser<'s, 'a> {
 }
 
 impl<'a> Chooser<'_, 'a> {
-	/// The targets of every selected package.
-	fn candidates(&self) -> impl Iterator<Item = Candidate<'a>> + '_ {
-		self.selection.members.iter().copied().flat_map(Candidate::of)
-	}
-
 	/// The targets of the kinds, chosen in bulk.
 	fn all(&self, kinds: impl Fn(TargetKind) -> bool) -> Vec<Proposal<'a>> {
 		self.candidates()
 			.filter(|candidate| kinds(candidate.kind))
 			.map(|candidate| Proposal { candidate, named: false })
 			.collect()
+	}
+
+	/// The targets of every selected package.
+	fn candidates(&self) -> impl Iterator<Item = Candidate<'a>> + '_ {
+		self.selection.members.iter().copied().flat_map(Candidate::of)
 	}
 
 	/// `--lib`: the libraries of the selected packages, of which there must be at least one.
@@ -217,7 +128,10 @@ impl<'a> Chooser<'_, 'a> {
 		let mut available: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
 
 		for candidate in self.candidates().filter(|candidate| candidate.kind == kind) {
-			available.entry(candidate.target.name()).or_default().push(candidate.package.name().as_str());
+			available
+				.entry(candidate.target.name())
+				.or_default()
+				.push(candidate.package.name().as_str());
 		}
 
 		let in_packages = match &self.selection.packages {
@@ -238,7 +152,10 @@ impl<'a> Chooser<'_, 'a> {
 			let mut by_package: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
 
 			for candidate in elsewhere {
-				by_package.entry(candidate.package.name().as_str()).or_default().push(candidate.target.name());
+				by_package
+					.entry(candidate.package.name().as_str())
+					.or_default()
+					.push(candidate.target.name());
 			}
 
 			for (package, mut names) in by_package {
@@ -255,13 +172,106 @@ impl<'a> Chooser<'_, 'a> {
 			for (name, packages) in available {
 				match packages.as_slice() {
 					[_] => message.push_str(&format!("\n    {name}")),
-					_ => packages.iter().for_each(|package| message.push_str(&format!("\n    {name} in package {package}"))),
+					_ => packages
+						.iter()
+						.for_each(|package| message.push_str(&format!("\n    {name} in package {package}"))),
 				}
 			}
 		}
 
 		Error::Cargo(message)
 	}
+}
+
+/// A target chosen by the target selection flags.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Proposal<'a> {
+	pub candidate: Candidate<'a>,
+
+	/// Chosen by name (`--bin <NAME>`) rather than in bulk (by default, `--bins`, `--all-targets`, ...). Like cargo,
+	/// bulk-chosen targets are skipped when their `required-features` are not enabled.
+	pub named: bool,
+}
+
+fn edition(edition: CargoEdition) -> Edition {
+	match edition {
+		CargoEdition::Edition2015 => Edition::E2015,
+		CargoEdition::Edition2018 => Edition::E2018,
+		CargoEdition::Edition2021 => Edition::E2021,
+
+		// the permanently unstable future edition is closest to the latest one
+		CargoEdition::Edition2024 | CargoEdition::EditionFuture => Edition::E2024,
+	}
+}
+
+/// How cargo's messages call targets of a kind.
+fn kind_description(kind: TargetKind) -> &'static str {
+	match kind {
+		TargetKind::Lib | TargetKind::ProcMacro => "lib",
+		TargetKind::Bin => "bin",
+		TargetKind::Example => "example",
+		TargetKind::Test => "test",
+		TargetKind::Bench => "bench",
+		TargetKind::BuildScript => "build script",
+	}
+}
+
+/// Chooses the targets of the selected packages, in workspace member order and then [`Candidate::of`] order.
+///
+/// Fails like cargo when a named target does not exist, or `--lib` finds no library.
+pub(super) fn propose<'a>(selection: &Selection<'a>, local: &LocalPackages<'a>, targets: &TargetSelection) -> Result<Vec<Proposal<'a>>, Error> {
+	let chooser = Chooser { selection, local };
+	let mut proposals = Vec::new();
+
+	if targets.all_targets {
+		proposals.extend(chooser.all(|kind| kind != TargetKind::BuildScript));
+	} else if targets.is_default() {
+		proposals.extend(chooser.all(|kind| kind.is_lib() || kind == TargetKind::Bin));
+	} else {
+		if targets.lib {
+			proposals.extend(chooser.libraries()?);
+		}
+
+		let rules = [
+			(targets.all_bins, &targets.bins, TargetKind::Bin),
+			(targets.all_examples, &targets.examples, TargetKind::Example),
+			(targets.all_tests, &targets.tests, TargetKind::Test),
+			(targets.all_benches, &targets.benches, TargetKind::Bench),
+		];
+
+		for (all, names, kind) in rules {
+			if all {
+				proposals.extend(chooser.all(|other| other == kind));
+			} else {
+				for name in names {
+					proposals.extend(chooser.named(name, kind)?);
+				}
+			}
+		}
+	}
+
+	let order = |proposal: &Proposal<'_>| {
+		let candidate = &proposal.candidate;
+
+		(
+			local.position(candidate.package.package_id()),
+			candidate.kind,
+			candidate.target.name().to_owned(),
+		)
+	};
+
+	proposals.sort_by_cached_key(order);
+	proposals.dedup_by(|later, kept| {
+		let same = later.candidate.same(&kept.candidate);
+
+		if same {
+			kept.named |= later.named;
+		}
+
+		same
+	});
+
+	Ok(proposals)
 }
 
 /// The kind of a cargo target, or `None` for build scripts.
@@ -277,32 +287,44 @@ fn target_kind(target: &Target) -> Option<TargetKind> {
 	})
 }
 
-/// How cargo's messages call targets of a kind.
-fn kind_description(kind: TargetKind) -> &'static str {
-	match kind {
-		TargetKind::Lib | TargetKind::ProcMacro => "lib",
-		TargetKind::Bin => "bin",
-		TargetKind::Example => "example",
-		TargetKind::Test => "test",
-		TargetKind::Bench => "bench",
-		TargetKind::BuildScript => "build script",
-	}
-}
+/// The warning cargo gives when bulk filters (`--bins`, `--examples`, ...) chose no target.
+pub(super) fn unmatched_filters_warning(targets: &TargetSelection) -> Option<String> {
+	let filters: Vec<&str> = if targets.all_targets {
+		vec!["`all-targets`"]
+	} else {
+		[
+			(targets.all_bins, "`bins`"),
+			(targets.all_tests, "`tests`"),
+			(targets.all_examples, "`examples`"),
+			(targets.all_benches, "`benches`"),
+		]
+		.into_iter()
+		.filter_map(|(all, name)| all.then_some(name))
+		.collect()
+	};
 
-fn edition(edition: CargoEdition) -> Edition {
-	match edition {
-		CargoEdition::Edition2015 => Edition::E2015,
-		CargoEdition::Edition2018 => Edition::E2018,
-		CargoEdition::Edition2021 => Edition::E2021,
+	let plural = if filters.len() > 1 { "filters" } else { "filter" };
 
-		// the permanently unstable future edition is closest to the latest one
-		CargoEdition::Edition2024 | CargoEdition::EditionFuture => Edition::E2024,
-	}
+	(!filters.is_empty()).then(|| {
+		format!(
+			"target {plural} {} specified, but no targets matched; this is a no-op",
+			filters.join(", ")
+		)
+	})
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn maps_editions() {
+		assert_eq!(edition(CargoEdition::Edition2015), Edition::E2015);
+		assert_eq!(edition(CargoEdition::Edition2018), Edition::E2018);
+		assert_eq!(edition(CargoEdition::Edition2021), Edition::E2021);
+		assert_eq!(edition(CargoEdition::Edition2024), Edition::E2024);
+		assert_eq!(edition(CargoEdition::EditionFuture), Edition::E2024);
+	}
 
 	#[test]
 	fn warns_about_unmatched_bulk_filters() {
@@ -331,14 +353,5 @@ mod tests {
 			targets(|targets| targets.all_targets = true).as_deref(),
 			Some("target filter `all-targets` specified, but no targets matched; this is a no-op")
 		);
-	}
-
-	#[test]
-	fn maps_editions() {
-		assert_eq!(edition(CargoEdition::Edition2015), Edition::E2015);
-		assert_eq!(edition(CargoEdition::Edition2018), Edition::E2018);
-		assert_eq!(edition(CargoEdition::Edition2021), Edition::E2021);
-		assert_eq!(edition(CargoEdition::Edition2024), Edition::E2024);
-		assert_eq!(edition(CargoEdition::EditionFuture), Edition::E2024);
 	}
 }

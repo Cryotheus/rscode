@@ -28,6 +28,69 @@ const PRESERVE_ITEMS: &[(&str, &str)] = &[
 	("group_imports", "Preserve"),
 ];
 
+/// Runs the command, writing `input` to its stdin and collecting its output.
+///
+/// Stdin is written on a separate thread, as rustfmt may fill its stdout pipe before it has read all of its input.
+fn communicate(mut command: Command, input: &str) -> io::Result<Output> {
+	let mut child = command.spawn()?;
+	let stdin = child.stdin.take();
+
+	let (output, written) = thread::scope(|scope| {
+		let writer = scope.spawn(move || match stdin {
+			// dropping stdin closes it, signaling the end of the input
+			Some(mut stdin) => stdin.write_all(input.as_bytes()),
+			None => Ok(()),
+		});
+
+		let output = child.wait_with_output();
+		let written = writer.join().unwrap_or_else(|_| Err(io::Error::other("writing to stdin panicked")));
+
+		(output, written)
+	});
+
+	let output = output?;
+
+	// a failing rustfmt may exit before reading its input: report its error rather than the broken pipe
+	if output.status.success() {
+		written?;
+	}
+
+	Ok(output)
+}
+
+/// Joins the `--config` overrides into one argument, validating them.
+///
+/// Overrides of the `forced` keys are dropped, and the forced values are appended.
+fn config_arg(overrides: &[(String, String)], forced: &[(&str, &str)]) -> Result<Option<String>, FormatError> {
+	let mut pairs = Vec::with_capacity(overrides.len() + forced.len());
+
+	for (key, value) in overrides {
+		// rustfmt splits the argument at commas, and each pair at its first `=`
+		if key.is_empty() || key.contains(['=', ',']) || value.contains(',') {
+			return Err(FormatError::InvalidRustFmtConfig(format!("{key}={value}")));
+		}
+
+		if !forced.iter().any(|&(forced_key, _)| forced_key == key) {
+			pairs.push(format!("{key}={value}"));
+		}
+	}
+
+	pairs.extend(forced.iter().map(|(key, value)| format!("{key}={value}")));
+
+	Ok((!pairs.is_empty()).then(|| pairs.join(",")))
+}
+
+fn failure_message(output: &Output) -> String {
+	let stderr = String::from_utf8_lossy(&output.stderr);
+	let stderr = stderr.trim();
+
+	if stderr.is_empty() {
+		format!("rustfmt exited with {}", output.status)
+	} else {
+		stderr.to_owned()
+	}
+}
+
 /// Formats a whole file's worth of source text with rustfmt (source passed over stdin). A byte order mark is kept.
 pub(crate) fn format(source: &str, options: &RustFmtOptions) -> Result<String, FormatError> {
 	run(source, options, &[])
@@ -37,6 +100,11 @@ pub(crate) fn format(source: &str, options: &RustFmtOptions) -> Result<String, F
 /// them or reorders other items.
 pub(crate) fn format_preserving_items(source: &str, options: &RustFmtOptions) -> Result<String, FormatError> {
 	run(source, options, PRESERVE_ITEMS)
+}
+
+/// Whether a program path is relative and has a directory component (so it is not looked up in `PATH`).
+fn is_relative_path(program: &Path) -> bool {
+	program.is_relative() && program.parent().is_some_and(|parent| !parent.as_os_str().is_empty())
 }
 
 /// The rustfmt executable: [`RustFmtOptions::program`], else `$RUSTFMT`, else `rustfmt` from `PATH`.
@@ -64,7 +132,9 @@ fn run(source: &str, options: &RustFmtOptions, forced: &[(&str, &str)]) -> Resul
 			working_directory = Some(config_path);
 
 			// a relative program path would be resolved against the new working directory
-			if is_relative_path(&program) && let Ok(absolute) = std::path::absolute(&program) {
+			if is_relative_path(&program)
+				&& let Ok(absolute) = std::path::absolute(&program)
+			{
 				program = absolute;
 			}
 		} else {
@@ -130,118 +200,25 @@ fn run(source: &str, options: &RustFmtOptions, forced: &[(&str, &str)]) -> Resul
 	Ok(formatted)
 }
 
-/// Runs the command, writing `input` to its stdin and collecting its output.
-///
-/// Stdin is written on a separate thread, as rustfmt may fill its stdout pipe before it has read all of its input.
-fn communicate(mut command: Command, input: &str) -> io::Result<Output> {
-	let mut child = command.spawn()?;
-	let stdin = child.stdin.take();
-
-	let (output, written) = thread::scope(|scope| {
-		let writer = scope.spawn(move || match stdin {
-			// dropping stdin closes it, signaling the end of the input
-			Some(mut stdin) => stdin.write_all(input.as_bytes()),
-			None => Ok(()),
-		});
-
-		let output = child.wait_with_output();
-		let written = writer.join().unwrap_or_else(|_| Err(io::Error::other("writing to stdin panicked")));
-
-		(output, written)
-	});
-
-	let output = output?;
-
-	// a failing rustfmt may exit before reading its input: report its error rather than the broken pipe
-	if output.status.success() {
-		written?;
-	}
-
-	Ok(output)
-}
-
-/// Joins the `--config` overrides into one argument, validating them.
-///
-/// Overrides of the `forced` keys are dropped, and the forced values are appended.
-fn config_arg(overrides: &[(String, String)], forced: &[(&str, &str)]) -> Result<Option<String>, FormatError> {
-	let mut pairs = Vec::with_capacity(overrides.len() + forced.len());
-
-	for (key, value) in overrides {
-		// rustfmt splits the argument at commas, and each pair at its first `=`
-		if key.is_empty() || key.contains(['=', ',']) || value.contains(',') {
-			return Err(FormatError::InvalidRustFmtConfig(format!("{key}={value}")));
-		}
-
-		if !forced.iter().any(|&(forced_key, _)| forced_key == key) {
-			pairs.push(format!("{key}={value}"));
-		}
-	}
-
-	pairs.extend(forced.iter().map(|(key, value)| format!("{key}={value}")));
-
-	Ok((!pairs.is_empty()).then(|| pairs.join(",")))
-}
-
-/// Whether a program path is relative and has a directory component (so it is not looked up in `PATH`).
-fn is_relative_path(program: &Path) -> bool {
-	program.is_relative() && program.parent().is_some_and(|parent| !parent.as_os_str().is_empty())
-}
-
-fn failure_message(output: &Output) -> String {
-	let stderr = String::from_utf8_lossy(&output.stderr);
-	let stderr = stderr.trim();
-
-	if stderr.is_empty() {
-		format!("rustfmt exited with {}", output.status)
-	} else {
-		stderr.to_owned()
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::Edition;
 	use std::sync::OnceLock;
 
-	/// Configuration with rustfmt's defaults, so tests do not depend on configuration files around the repository.
-	fn default_config() -> PathBuf {
-		PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rustfmt/default/rustfmt.toml"))
-	}
-
-	fn options() -> RustFmtOptions {
-		RustFmtOptions {
-			edition: Some(Edition::E2024),
-			config_path: Some(default_config()),
-			..RustFmtOptions::default()
-		}
-	}
-
-	fn rustfmt_available() -> bool {
-		static AVAILABLE: OnceLock<bool> = OnceLock::new();
-
-		*AVAILABLE.get_or_init(|| {
-			let available = Command::new(program(&RustFmtOptions::default()))
-				.arg("--version")
-				.output()
-				.is_ok_and(|output| output.status.success());
-
-			if !available {
-				eprintln!("rustfmt is not available: skipping tests that run it");
-			}
-
-			available
-		})
-	}
-
 	#[test]
 	fn config_args() {
-		let overrides = vec![("max_width".to_owned(), "80".to_owned()), ("reorder_imports".to_owned(), "true".to_owned())];
+		let overrides = vec![
+			("max_width".to_owned(), "80".to_owned()),
+			("reorder_imports".to_owned(), "true".to_owned()),
+		];
 
 		assert_eq!(config_arg(&[], &[]).unwrap(), None);
 		assert_eq!(config_arg(&overrides, &[]).unwrap().as_deref(), Some("max_width=80,reorder_imports=true"));
 		assert_eq!(
-			config_arg(&overrides, &[("reorder_imports", "false"), ("reorder_modules", "false")]).unwrap().as_deref(),
+			config_arg(&overrides, &[("reorder_imports", "false"), ("reorder_modules", "false")])
+				.unwrap()
+				.as_deref(),
 			Some("max_width=80,reorder_imports=false,reorder_modules=false"),
 		);
 
@@ -255,31 +232,9 @@ mod tests {
 		assert!(config_arg(&[("key".to_owned(), "a=b".to_owned())], &[]).is_ok());
 	}
 
-	#[test]
-	fn relative_program_paths() {
-		assert!(!is_relative_path(Path::new("rustfmt")));
-		assert!(is_relative_path(Path::new("./rustfmt")));
-		assert!(is_relative_path(Path::new("bin/rustfmt")));
-		assert!(!is_relative_path(&std::path::absolute("bin/rustfmt").unwrap()));
-	}
-
-	#[test]
-	fn program_prefers_the_option() {
-		let options = RustFmtOptions {
-			program: Some(PathBuf::from("/opt/rustfmt")),
-			..RustFmtOptions::default()
-		};
-
-		assert_eq!(program(&options), Path::new("/opt/rustfmt"));
-	}
-
-	#[test]
-	fn formats_through_stdin() {
-		if !rustfmt_available() {
-			return;
-		}
-
-		assert_eq!(format("fn  main( ){let x=1;}", &options()).unwrap(), "fn main() {\n    let x = 1;\n}\n");
+	/// Configuration with rustfmt's defaults, so tests do not depend on configuration files around the repository.
+	fn default_config() -> PathBuf {
+		PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rustfmt/default/rustfmt.toml"))
 	}
 
 	#[test]
@@ -294,6 +249,23 @@ mod tests {
 
 		assert_eq!(formatted.lines().count(), 20_000 * 3);
 		assert!(formatted.ends_with("fn f19999() {\n    let x = 1;\n}\n"));
+	}
+
+	#[test]
+	fn formats_through_stdin() {
+		if !rustfmt_available() {
+			return;
+		}
+
+		assert_eq!(format("fn  main( ){let x=1;}", &options()).unwrap(), "fn main() {\n    let x = 1;\n}\n");
+	}
+
+	fn options() -> RustFmtOptions {
+		RustFmtOptions {
+			edition: Some(Edition::E2024),
+			config_path: Some(default_config()),
+			..RustFmtOptions::default()
+		}
 	}
 
 	#[test]
@@ -322,7 +294,10 @@ mod tests {
 		options.config.push(("imports_granularity".to_owned(), "Crate".to_owned()));
 
 		assert_eq!(format_preserving_items(source, &options).unwrap(), preserved);
-		assert_eq!(format_preserving_items("use a::b;\nuse a::c;\n", &options).unwrap(), "use a::b;\nuse a::c;\n");
+		assert_eq!(
+			format_preserving_items("use a::b;\nuse a::c;\n", &options).unwrap(),
+			"use a::b;\nuse a::c;\n"
+		);
 	}
 
 	#[test]
@@ -335,6 +310,24 @@ mod tests {
 		let wrapped = "use crate::expr::{\n    ExprBreak, ExprRange, ExprRawAddr, ExprReference, ExprReturn, ExprUnary, ExprYield,\n};\n";
 
 		assert_eq!(format_preserving_items(source, &options()).unwrap(), wrapped);
+	}
+
+	#[test]
+	fn program_prefers_the_option() {
+		let options = RustFmtOptions {
+			program: Some(PathBuf::from("/opt/rustfmt")),
+			..RustFmtOptions::default()
+		};
+
+		assert_eq!(program(&options), Path::new("/opt/rustfmt"));
+	}
+
+	#[test]
+	fn relative_program_paths() {
+		assert!(!is_relative_path(Path::new("rustfmt")));
+		assert!(is_relative_path(Path::new("./rustfmt")));
+		assert!(is_relative_path(Path::new("bin/rustfmt")));
+		assert!(!is_relative_path(&std::path::absolute("bin/rustfmt").unwrap()));
 	}
 
 	#[test]
@@ -367,5 +360,22 @@ mod tests {
 			}
 			other => panic!("unexpected result: {other:?}"),
 		}
+	}
+
+	fn rustfmt_available() -> bool {
+		static AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+		*AVAILABLE.get_or_init(|| {
+			let available = Command::new(program(&RustFmtOptions::default()))
+				.arg("--version")
+				.output()
+				.is_ok_and(|output| output.status.success());
+
+			if !available {
+				eprintln!("rustfmt is not available: skipping tests that run it");
+			}
+
+			available
+		})
 	}
 }

@@ -43,6 +43,9 @@ use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 
+/// Comma-separated expressions.
+type Arguments = Punctuated<Expr, Token![,]>;
+
 /// Standard library macros that format their arguments, with the index of their format string.
 const FORMAT_MACROS: &[(&str, usize)] = &[
 	("assert", 1),
@@ -65,120 +68,43 @@ const FORMAT_MACROS: &[(&str, usize)] = &[
 	("writeln", 1),
 ];
 
-/// Comma-separated expressions.
-type Arguments = Punctuated<Expr, Token![,]>;
-
 impl FileWalker<'_, '_> {
-	/// A macro invocation: its path (in the macro namespace), and its body.
-	pub(super) fn macro_call(&mut self, mac: &Macro) {
-		self.code_path(None, &mac.path, Namespace::Macro);
-
-		if self.tokens_mention_target(&mac.tokens) {
-			let declarations = thread_local::declarations(mac);
-
-			// the statics a `thread_local!` declares are documented like the items around it (doc comments inside of
-			// bodies are not searched)
-			for declaration in declarations.iter().flatten() {
-				self.doc_comments(&declaration.attrs, DocStyle::Outer);
-			}
-
-			self.body_depth += 1;
-			self.macro_body(mac, declarations.as_deref());
-			self.body_depth -= 1;
-		}
-	}
-
-	/// A macro's body; `declarations`: those of a `thread_local!`.
-	fn macro_body(&mut self, mac: &Macro, declarations: Option<&[Declaration]>) {
-		// declarations of statics (definitions, not references)
-		if let Some(declarations) = declarations {
-			for declaration in declarations {
-				self.visit_item_static(&declaration.to_item());
-			}
-		} else if let Ok(arguments) = mac.parse_body_with(Arguments::parse_terminated) {
-			self.macro_arguments(mac, &arguments);
-		} else if let Ok(stmts) = mac.parse_body_with(Block::parse_within) {
-			self.statements(&stmts);
-		} else if !self.special_macro(mac) && self.options.macro_tokens {
-			self.scan_tokens(&mac.tokens, None);
-		}
-	}
-
-	/// Statements parsed from a macro body, in a scope of their own.
-	fn statements(&mut self, stmts: &[Stmt]) {
-		let items = statement_items(stmts);
-		let scope = self.local_items(items.iter().map(AsRef::as_ref));
-
-		self.scopes.push(scope);
-
-		for stmt in stmts {
-			self.visit_stmt(stmt);
-		}
-
-		self.scopes.pop();
-	}
-
-	/// `vec![value; count]` and `matches!(value, pattern [if guard])` (whose patterns do not parse as expressions).
-	fn special_macro(&mut self, mac: &Macro) -> bool {
-		let Some(name) = mac.path.segments.last().map(|segment| &segment.ident) else {
-			return false;
+	/// Resolves `$crate::a::b` (starting with the `crate` token at `start`) from the crate root, returning the index
+	/// after the path.
+	fn dollar_crate_path(&mut self, tokens: &[TokenTree], start: usize) -> usize {
+		let TokenTree::Ident(krate) = &tokens[start] else {
+			return start + 1;
 		};
 
-		if name == "vec"
-			&& let Ok((value, count)) = mac.parse_body_with(parse_repeat)
+		let mut segments = vec![PathSegmentRef {
+			name: "$crate".into(),
+			range: self.parsed.range(krate.span()),
+			has_arguments: false,
+		}];
+
+		let mut index = start + 1;
+
+		while let Some(TokenTree::Ident(ident)) = tokens.get(index + 2)
+			&& is_punct(tokens.get(index), ':')
+			&& is_punct(tokens.get(index + 1), ':')
 		{
-			self.visit_expr(&value);
-			self.visit_expr(&count);
-			return true;
+			segments.push(self.segment(ident));
+			index += 3;
 		}
 
-		if (name == "matches" || name == "assert_matches" || name == "debug_assert_matches")
-			&& let Ok((value, pattern, guard, rest)) = mac.parse_body_with(parse_matches)
-		{
-			self.visit_expr(&value);
-			self.scopes.push(Default::default());
-			self.pattern(&pattern);
+		let path = PathRef {
+			leading_colon: false,
+			segments,
+		};
 
-			if let Some(guard) = &guard {
-				self.visit_expr(guard);
-			}
+		if path.segments.iter().any(|segment| self.targets.named_str(&segment.name).is_some()) {
+			let root = ItemId::crate_root(self.krate);
+			let res = PathRes::Segments(self.module_path(root, &path, None, PathKind::Code));
 
-			self.scopes.pop();
-
-			for argument in &rest {
-				self.visit_expr(argument);
-			}
-
-			return true;
+			self.report_path(&path, &res, ReferenceKind::MacroToken);
 		}
 
-		false
-	}
-
-	/// The arguments of a macro: expressions, except for the named arguments of formatting macros (`name = value`), and
-	/// the inline arguments of their format strings.
-	fn macro_arguments(&mut self, mac: &Macro, arguments: &Arguments) {
-		let format = self.format_macro(mac);
-		let mut named = Vec::new();
-
-		for (index, argument) in arguments.iter().enumerate() {
-			if let Some((format_index, _)) = format
-				&& index > format_index
-				&& let Some((name, value)) = named_argument(argument)
-			{
-				named.push(name);
-				self.visit_expr(value);
-				continue;
-			}
-
-			self.visit_expr(argument);
-		}
-
-		if let Some((index, certain)) = format
-			&& let Some(Expr::Lit(ExprLit { lit: Lit::Str(format), .. })) = arguments.iter().nth(index)
-		{
-			self.format_string(format, &named, certain);
-		}
+		index
 	}
 
 	/// For a formatting macro of the standard library: the index of its format string, and whether it certainly is the
@@ -232,14 +158,65 @@ impl FileWalker<'_, '_> {
 		}
 	}
 
-	/// Whether tokens contain an identifier named like a target, or a string literal mentioning one (a format string).
-	pub(super) fn tokens_mention_target(&self, tokens: &TokenStream) -> bool {
-		tokens.clone().into_iter().any(|token| match token {
-			TokenTree::Ident(ident) => self.targets.named(&ident).is_some(),
-			TokenTree::Group(group) => self.tokens_mention_target(&group.stream()),
-			TokenTree::Literal(literal) => self.targets.mentioned_in(&literal.to_string()),
-			TokenTree::Punct(_) => false,
-		})
+	/// The arguments of a macro: expressions, except for the named arguments of formatting macros (`name = value`), and
+	/// the inline arguments of their format strings.
+	fn macro_arguments(&mut self, mac: &Macro, arguments: &Arguments) {
+		let format = self.format_macro(mac);
+		let mut named = Vec::new();
+
+		for (index, argument) in arguments.iter().enumerate() {
+			if let Some((format_index, _)) = format
+				&& index > format_index
+				&& let Some((name, value)) = named_argument(argument)
+			{
+				named.push(name);
+				self.visit_expr(value);
+				continue;
+			}
+
+			self.visit_expr(argument);
+		}
+
+		if let Some((index, certain)) = format
+			&& let Some(Expr::Lit(ExprLit { lit: Lit::Str(format), .. })) = arguments.iter().nth(index)
+		{
+			self.format_string(format, &named, certain);
+		}
+	}
+
+	/// A macro's body; `declarations`: those of a `thread_local!`.
+	fn macro_body(&mut self, mac: &Macro, declarations: Option<&[Declaration]>) {
+		// declarations of statics (definitions, not references)
+		if let Some(declarations) = declarations {
+			for declaration in declarations {
+				self.visit_item_static(&declaration.to_item());
+			}
+		} else if let Ok(arguments) = mac.parse_body_with(Arguments::parse_terminated) {
+			self.macro_arguments(mac, &arguments);
+		} else if let Ok(stmts) = mac.parse_body_with(Block::parse_within) {
+			self.statements(&stmts);
+		} else if !self.special_macro(mac) && self.options.macro_tokens {
+			self.scan_tokens(&mac.tokens, None);
+		}
+	}
+
+	/// A macro invocation: its path (in the macro namespace), and its body.
+	pub(super) fn macro_call(&mut self, mac: &Macro) {
+		self.code_path(None, &mac.path, Namespace::Macro);
+
+		if self.tokens_mention_target(&mac.tokens) {
+			let declarations = thread_local::declarations(mac);
+
+			// the statics a `thread_local!` declares are documented like the items around it (doc comments inside of
+			// bodies are not searched)
+			for declaration in declarations.iter().flatten() {
+				self.doc_comments(&declaration.attrs, DocStyle::Outer);
+			}
+
+			self.body_depth += 1;
+			self.macro_body(mac, declarations.as_deref());
+			self.body_depth -= 1;
+		}
 	}
 
 	/// A `macro_rules!` definition: its transcribers are scanned (its matchers are patterns of tokens, not code).
@@ -265,11 +242,31 @@ impl FileWalker<'_, '_> {
 		self.body_depth -= 1;
 	}
 
-	/// Syntax syn does not model (verbatim items, types, expressions, and patterns).
-	pub(super) fn verbatim(&mut self, tokens: &TokenStream) {
-		if self.options.macro_tokens && self.tokens_mention_target(tokens) {
-			self.scan_tokens(tokens, None);
+	/// An identifier token that is not (the start of) a path, at `index` of `tokens`.
+	fn macro_token(&mut self, ident: &Ident, tokens: &[TokenTree], index: usize) {
+		let previous = index.checked_sub(1).and_then(|index| tokens.get(index));
+		let targets = self.targets;
+
+		let Some(target) = targets.named(ident) else {
+			return;
+		};
+
+		// a method call or a field
+		if is_punct(previous, '.') {
+			return self.method_call(ident);
 		}
+
+		// the name of a function the macro defines
+		if matches!(previous, Some(TokenTree::Ident(keyword)) if keyword == "fn")
+			&& !target
+				.items
+				.iter()
+				.any(|&item| matches!(self.ws.item(item).kind, ItemKind::Fn | ItemKind::AssocFn | ItemKind::ForeignFn))
+		{
+			return;
+		}
+
+		self.uncertain_token(ident);
 	}
 
 	/// Reports the identifiers named like targets in tokens that are not parsed as code, by their role:
@@ -310,6 +307,57 @@ impl FileWalker<'_, '_> {
 
 			index += 1;
 		}
+	}
+
+	/// `vec![value; count]` and `matches!(value, pattern [if guard])` (whose patterns do not parse as expressions).
+	fn special_macro(&mut self, mac: &Macro) -> bool {
+		let Some(name) = mac.path.segments.last().map(|segment| &segment.ident) else {
+			return false;
+		};
+
+		if name == "vec"
+			&& let Ok((value, count)) = mac.parse_body_with(parse_repeat)
+		{
+			self.visit_expr(&value);
+			self.visit_expr(&count);
+			return true;
+		}
+
+		if (name == "matches" || name == "assert_matches" || name == "debug_assert_matches")
+			&& let Ok((value, pattern, guard, rest)) = mac.parse_body_with(parse_matches)
+		{
+			self.visit_expr(&value);
+			self.scopes.push(Default::default());
+			self.pattern(&pattern);
+
+			if let Some(guard) = &guard {
+				self.visit_expr(guard);
+			}
+
+			self.scopes.pop();
+
+			for argument in &rest {
+				self.visit_expr(argument);
+			}
+
+			return true;
+		}
+
+		false
+	}
+
+	/// Statements parsed from a macro body, in a scope of their own.
+	fn statements(&mut self, stmts: &[Stmt]) {
+		let items = statement_items(stmts);
+		let scope = self.local_items(items.iter().map(AsRef::as_ref));
+
+		self.scopes.push(scope);
+
+		for stmt in stmts {
+			self.visit_stmt(stmt);
+		}
+
+		self.scopes.pop();
 	}
 
 	/// A path of tokens (`a::b`, `::a::b`, or `name!`) starting with the identifier at `start`, resolved where the
@@ -378,8 +426,7 @@ impl FileWalker<'_, '_> {
 
 		let mut res = self.resolve_path(path, Namespace::Type, Locals::Items);
 
-		if let (PathRes::Segments(segments), PathRes::Segments(values)) =
-			(&mut res, self.resolve_path(path, Namespace::Value, Locals::Items))
+		if let (PathRes::Segments(segments), PathRes::Segments(values)) = (&mut res, self.resolve_path(path, Namespace::Value, Locals::Items))
 			&& let (Some(last), Some(value_last)) = (segments.last_mut(), values.last())
 		{
 			last.extend(value_last.iter().cloned());
@@ -390,66 +437,14 @@ impl FileWalker<'_, '_> {
 		res
 	}
 
-	/// Resolves `$crate::a::b` (starting with the `crate` token at `start`) from the crate root, returning the index
-	/// after the path.
-	fn dollar_crate_path(&mut self, tokens: &[TokenTree], start: usize) -> usize {
-		let TokenTree::Ident(krate) = &tokens[start] else {
-			return start + 1;
-		};
-
-		let mut segments = vec![PathSegmentRef {
-			name: "$crate".into(),
-			range: self.parsed.range(krate.span()),
-			has_arguments: false,
-		}];
-
-		let mut index = start + 1;
-
-		while let Some(TokenTree::Ident(ident)) = tokens.get(index + 2)
-			&& is_punct(tokens.get(index), ':')
-			&& is_punct(tokens.get(index + 1), ':')
-		{
-			segments.push(self.segment(ident));
-			index += 3;
-		}
-
-		let path = PathRef {
-			leading_colon: false,
-			segments,
-		};
-
-		if path.segments.iter().any(|segment| self.targets.named_str(&segment.name).is_some()) {
-			let root = ItemId::crate_root(self.krate);
-			let res = PathRes::Segments(self.module_path(root, &path, None, PathKind::Code));
-
-			self.report_path(&path, &res, ReferenceKind::MacroToken);
-		}
-
-		index
-	}
-
-	/// An identifier token that is not (the start of) a path, at `index` of `tokens`.
-	fn macro_token(&mut self, ident: &Ident, tokens: &[TokenTree], index: usize) {
-		let previous = index.checked_sub(1).and_then(|index| tokens.get(index));
-		let targets = self.targets;
-
-		let Some(target) = targets.named(ident) else {
-			return;
-		};
-
-		// a method call or a field
-		if is_punct(previous, '.') {
-			return self.method_call(ident);
-		}
-
-		// the name of a function the macro defines
-		if matches!(previous, Some(TokenTree::Ident(keyword)) if keyword == "fn")
-			&& !target.items.iter().any(|&item| matches!(self.ws.item(item).kind, ItemKind::Fn | ItemKind::AssocFn | ItemKind::ForeignFn))
-		{
-			return;
-		}
-
-		self.uncertain_token(ident);
+	/// Whether tokens contain an identifier named like a target, or a string literal mentioning one (a format string).
+	pub(super) fn tokens_mention_target(&self, tokens: &TokenStream) -> bool {
+		tokens.clone().into_iter().any(|token| match token {
+			TokenTree::Ident(ident) => self.targets.named(&ident).is_some(),
+			TokenTree::Group(group) => self.tokens_mention_target(&group.stream()),
+			TokenTree::Literal(literal) => self.targets.mentioned_in(&literal.to_string()),
+			TokenTree::Punct(_) => false,
+		})
 	}
 
 	/// Reports an identifier named like a target as an uncertain token.
@@ -462,22 +457,17 @@ impl FileWalker<'_, '_> {
 			self.report(target.first(), ReferenceKind::MacroToken, self.parsed.range(ident.span()), false);
 		}
 	}
+
+	/// Syntax syn does not model (verbatim items, types, expressions, and patterns).
+	pub(super) fn verbatim(&mut self, tokens: &TokenStream) {
+		if self.options.macro_tokens && self.tokens_mention_target(tokens) {
+			self.scan_tokens(tokens, None);
+		}
+	}
 }
 
-/// Whether the identifier at `index` starts a path of tokens: `name!`, or `name::` followed by an identifier, and not
-/// after `.`, `::` (unless that is a leading `::`), or a `$` (of a metavariable).
-fn starts_path(tokens: &[TokenTree], index: usize) -> bool {
-	let before = |back: usize| index.checked_sub(back).and_then(|index| tokens.get(index));
-	let separated = is_punct(before(1), ':') && is_punct(before(2), ':');
-
-	if is_punct(before(1), '.') || is_punct(before(1), '$') || (separated && !leading_colon_before(tokens, index)) {
-		return false;
-	}
-
-	let after = |ahead: usize| tokens.get(index + ahead);
-
-	is_punct(after(1), '!')
-		|| (is_punct(after(1), ':') && is_punct(after(2), ':') && matches!(after(3), Some(TokenTree::Ident(_))))
+fn is_punct(token: Option<&TokenTree>, char: char) -> bool {
+	matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == char)
 }
 
 /// Whether the identifier at `index` follows a leading `::` (one that follows neither a path segment nor generic
@@ -485,18 +475,22 @@ fn starts_path(tokens: &[TokenTree], index: usize) -> bool {
 fn leading_colon_before(tokens: &[TokenTree], index: usize) -> bool {
 	let before = |back: usize| index.checked_sub(back).and_then(|index| tokens.get(index));
 
-	is_punct(before(1), ':')
-		&& is_punct(before(2), ':')
-		&& !matches!(before(3), Some(TokenTree::Ident(_)))
-		&& !is_punct(before(3), '>')
+	is_punct(before(1), ':') && is_punct(before(2), ':') && !matches!(before(3), Some(TokenTree::Ident(_))) && !is_punct(before(3), '>')
 }
 
-/// `vec!` arguments of the form `value; count`.
-fn parse_repeat(input: ParseStream) -> syn::Result<(Expr, Expr)> {
-	let value = input.parse()?;
+/// `name = value` (a named argument of a formatting macro).
+fn named_argument(argument: &Expr) -> Option<(SmolStr, &Expr)> {
+	let Expr::Assign(assign) = argument else {
+		return None;
+	};
 
-	input.parse::<Token![;]>()?;
-	Ok((value, input.parse()?))
+	let Expr::Path(left) = &*assign.left else {
+		return None;
+	};
+
+	let ident = left.path.get_ident().filter(|_| left.qself.is_none())?;
+
+	Some((ident_name(ident), &assign.right))
 }
 
 /// `matches!` arguments: a value, a pattern with an optional guard, and optional further arguments.
@@ -519,21 +513,25 @@ fn parse_matches(input: ParseStream) -> syn::Result<(Expr, Pat, Option<Expr>, Ar
 	Ok((value, pattern, guard, rest))
 }
 
-/// `name = value` (a named argument of a formatting macro).
-fn named_argument(argument: &Expr) -> Option<(SmolStr, &Expr)> {
-	let Expr::Assign(assign) = argument else {
-		return None;
-	};
+/// `vec!` arguments of the form `value; count`.
+fn parse_repeat(input: ParseStream) -> syn::Result<(Expr, Expr)> {
+	let value = input.parse()?;
 
-	let Expr::Path(left) = &*assign.left else {
-		return None;
-	};
-
-	let ident = left.path.get_ident().filter(|_| left.qself.is_none())?;
-
-	Some((ident_name(ident), &assign.right))
+	input.parse::<Token![;]>()?;
+	Ok((value, input.parse()?))
 }
 
-fn is_punct(token: Option<&TokenTree>, char: char) -> bool {
-	matches!(token, Some(TokenTree::Punct(punct)) if punct.as_char() == char)
+/// Whether the identifier at `index` starts a path of tokens: `name!`, or `name::` followed by an identifier, and not
+/// after `.`, `::` (unless that is a leading `::`), or a `$` (of a metavariable).
+fn starts_path(tokens: &[TokenTree], index: usize) -> bool {
+	let before = |back: usize| index.checked_sub(back).and_then(|index| tokens.get(index));
+	let separated = is_punct(before(1), ':') && is_punct(before(2), ':');
+
+	if is_punct(before(1), '.') || is_punct(before(1), '$') || (separated && !leading_colon_before(tokens, index)) {
+		return false;
+	}
+
+	let after = |ahead: usize| tokens.get(index + ahead);
+
+	is_punct(after(1), '!') || (is_punct(after(1), ':') && is_punct(after(2), ':') && matches!(after(3), Some(TokenTree::Ident(_))))
 }

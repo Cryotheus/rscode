@@ -22,8 +22,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let resolver = Resolver::new(&workspace);
 	let plan = rscode::edit::replace(&resolver, &path, &source, &args.options).map_err(|error| {
 		let hint = super::hint(&error, &resolver);
-		let all_variants =
-			matches!(error, rscode::Error::Ambiguous { .. }) && rscode::edit::replaces_all_variants(&resolver, &path);
+		let all_variants = matches!(error, rscode::Error::Ambiguous { .. }) && rscode::edit::replaces_all_variants(&resolver, &path);
 		let hint = match (hint, all_variants) {
 			// (`cfg` variants of an import: removing and inserting is not the better way)
 			(Some(_), true) if path.import => Some("pass `--all-variants` to replace every one of them".to_owned()),
@@ -40,7 +39,9 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		report.diff = Some(render::edit_diff(&plan.edits, &paths)?);
 
 		if args.format {
-			report.warnings.push("the diff shows the replacement before `--fmt` formats it".to_owned());
+			report
+				.warnings
+				.push("the diff shows the replacement before `--fmt` formats it".to_owned());
 		}
 	} else {
 		// what to format is decided before the edit changes the items

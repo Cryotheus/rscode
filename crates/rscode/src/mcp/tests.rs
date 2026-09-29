@@ -15,281 +15,13 @@ use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::task::JoinHandle;
 
-const QUERY_TOOLS: [&str; 3] = ["find_items", "view_items", "workspace_info"];
 const EDIT_TOOLS: [&str; 5] = ["format_items", "insert_items", "remove_items", "rename_item", "replace_item"];
-const SOURCE_TOOLS: [&str; 3] = ["attach_source", "detach_source", "list_sources"];
+const QUERY_TOOLS: [&str; 3] = ["find_items", "view_items", "workspace_info"];
 
 /// Parameters every tool accepts.
 const SELECTION: [&str; 7] = ["packages", "workspace", "features", "all_features", "all_targets", "lib", "bin"];
 
-fn read_only() -> ServerOptions {
-	ServerOptions {
-		read_only: true,
-		..ServerOptions::default()
-	}
-}
-
-fn sorted(names: impl IntoIterator<Item = impl ToString>) -> Vec<String> {
-	let mut names: Vec<String> = names.into_iter().map(|name| name.to_string()).collect();
-
-	names.sort();
-	names
-}
-
-fn all_tools() -> Vec<String> {
-	sorted(QUERY_TOOLS.iter().chain(&EDIT_TOOLS))
-}
-
-/// Options exposing a directory for reading.
-fn exposing() -> ServerOptions {
-	ServerOptions {
-		exposed: vec!["read=/nonexistent/refs/*".parse().unwrap()],
-		..ServerOptions::default()
-	}
-}
-
-#[test]
-fn exposing_directories_offers_sources() {
-	let server = Server::new(exposing());
-	let tools = server.tools();
-
-	assert_eq!(sorted(tools.iter().map(|tool| &tool.name)), sorted(all_tools().iter().chain(&sorted(SOURCE_TOOLS))));
-
-	for tool in &tools {
-		let schema = Value::Object((*tool.input_schema).clone());
-		let attached = schema["properties"].get("attached").is_some();
-
-		assert_eq!(attached, !SOURCE_TOOLS.contains(&tool.name.as_ref()), "{}: {schema}", tool.name);
-	}
-
-	// without exposed directories, neither the tools nor the parameter are offered
-	for tool in Server::new(ServerOptions::default()).tools() {
-		assert!(Value::Object((*tool.input_schema).clone())["properties"].get("attached").is_none(), "{}", tool.name);
-	}
-
-	// the parameters of every tool are complete and their own: the item code of `replace_item` and `insert_items`
-	// (`source`) is not taken over by another parameter
-	for server in [Server::new(ServerOptions::default()), Server::new(exposing())] {
-		for tool in server.tools() {
-			let schema = Value::Object((*tool.input_schema).clone());
-
-			for name in schema["required"].as_array().into_iter().flatten() {
-				let property = &schema["properties"][name.as_str().unwrap()];
-
-				assert!(property.is_object(), "{}: `{name}` is required, but not in {schema}", tool.name);
-				assert!(property["description"].as_str().unwrap_or_default().len() > 10, "{}.{name}", tool.name);
-			}
-		}
-
-		for tool in ["replace_item", "insert_items"] {
-			let schema = Value::Object((*server.get_tool(tool).unwrap().input_schema).clone());
-
-			assert_eq!(schema["properties"]["source"]["type"], "string", "{tool}: {schema}");
-		}
-	}
-
-	let read_only = Server::new(ServerOptions { read_only: true, ..exposing() });
-
-	assert_eq!(sorted(read_only.tools().iter().map(|tool| &tool.name)), sorted(QUERY_TOOLS.iter().chain(&SOURCE_TOOLS)));
-}
-
-#[test]
-fn source_tools() {
-	let server = Server::new(exposing());
-	let schema = |name: &str| Value::Object((*server.get_tool(name).unwrap().input_schema).clone());
-	let required = |name: &str| schema(name)["required"].as_array().cloned().unwrap_or_default();
-
-	assert_eq!(sorted(required("attach_source").iter().map(|name| name.as_str().unwrap())), ["manifest_path", "name"]);
-	assert_eq!(required("detach_source"), [json!("name")]);
-	assert_eq!(required("list_sources"), Vec::<Value>::new());
-	assert_eq!(schema("attach_source")["properties"]["write"]["default"], false);
-
-	for name in SOURCE_TOOLS {
-		let tool = server.get_tool(name).unwrap();
-		let annotations = tool.annotations.unwrap();
-
-		assert!(tool.description.unwrap().len() > 100, "{name} is not described");
-		assert!(annotations.title.is_some(), "{name}");
-		assert_eq!(annotations.read_only_hint, Some(name == "list_sources"), "{name}");
-		assert!(!annotations.destructive_hint.unwrap_or_default(), "{name}");
-		assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
-		assert_eq!(annotations.open_world_hint, Some(false), "{name}");
-	}
-
-	let instructions = server.get_info().instructions.unwrap();
-	// patterns are listed resolved: on Windows, with a drive and `\`
-	let resolved = |exposure: &str| exposure.parse::<Exposure>().unwrap().resolved_pattern().to_owned();
-
-	assert!(instructions.contains("attach_source"), "{instructions}");
-	assert!(instructions.contains("pass that name as `attached`"), "{instructions}");
-	assert!(instructions.ends_with(&format!("\n- read: {}", resolved("read=/nonexistent/refs/*"))), "{instructions}");
-	assert!(!Server::new(ServerOptions::default()).get_info().instructions.unwrap().contains("attach_source"));
-
-	// a read-only server does not offer writing
-	let exposed = vec!["write=/nonexistent/engine".parse().unwrap()];
-	let writable = Server::new(ServerOptions { exposed: exposed.clone(), ..ServerOptions::default() });
-	let read_only = Server::new(ServerOptions { exposed, read_only: true, ..ServerOptions::default() });
-	let writable = writable.get_info().instructions.unwrap();
-	let read_only = read_only.get_info().instructions.unwrap();
-	let engine = resolved("write=/nonexistent/engine");
-
-	assert!(writable.contains("`write` if you need to edit them") && writable.ends_with(&format!("- write: {engine}")));
-	assert!(!read_only.contains("`write`") && read_only.ends_with(&format!("- read: {engine}")), "{read_only}");
-}
-
-#[test]
-fn offers_every_tool() {
-	let server = Server::new(ServerOptions::default());
-
-	assert_eq!(sorted(server.tools().iter().map(|tool| &tool.name)), all_tools());
-}
-
-#[test]
-fn read_only_servers_do_not_offer_editing_tools() {
-	let server = Server::new(read_only());
-
-	assert_eq!(sorted(server.tools().iter().map(|tool| &tool.name)), sorted(QUERY_TOOLS));
-
-	for tool in EDIT_TOOLS {
-		assert!(server.get_tool(tool).is_none(), "{tool}");
-	}
-}
-
-#[test]
-fn input_schemas_are_objects_with_described_properties() {
-	for tool in Server::new(ServerOptions::default()).tools() {
-		let schema = Value::Object((*tool.input_schema).clone());
-		let properties = schema["properties"].as_object().unwrap_or_else(|| panic!("{}: {schema}", tool.name));
-
-		assert_eq!(schema["type"], "object", "{}", tool.name);
-
-		for name in SELECTION {
-			assert!(properties.contains_key(name), "{} lacks `{name}`", tool.name);
-		}
-
-		for (name, property) in properties {
-			let description = property["description"].as_str().unwrap_or_default();
-
-			assert!(description.len() > 10, "{}.{name} is not described: {property}", tool.name);
-		}
-
-		// clients that don't resolve references still see every parameter's type
-		assert!(!schema.to_string().contains("$ref"), "{}: {schema}", tool.name);
-
-		let description = tool.description.as_deref().unwrap_or_default();
-
-		assert!(description.len() > 100, "{} is not described", tool.name);
-	}
-}
-
-#[test]
-fn truncation_hints_name_the_tools_own_parameters() {
-	for tool in Server::new(ServerOptions::default()).tools() {
-		let schema = Value::Object((*tool.input_schema).clone()).to_string();
-		let hint = render::truncation_hint(&tool.name);
-
-		// every other piece of the hint is quoted: parameters, and values of enumerations
-		for word in hint.split('`').skip(1).step_by(2) {
-			assert!(schema.contains(&format!("\"{word}\"")), "{}: `{word}` is not in {schema}", tool.name);
-		}
-	}
-}
-
-#[test]
-fn required_parameters() {
-	let expected = [
-		("find_items", vec!["pattern"]),
-		("format_items", vec![]),
-		("insert_items", vec!["parent", "source"]),
-		("remove_items", vec!["paths"]),
-		("rename_item", vec!["new_name", "path"]),
-		("replace_item", vec!["path", "source"]),
-		("view_items", vec!["paths"]),
-		("workspace_info", vec![]),
-	];
-	let server = Server::new(ServerOptions::default());
-
-	for (name, required) in expected {
-		let tool = server.get_tool(name).unwrap();
-		let schema = Value::Object((*tool.input_schema).clone());
-		let actual =
-			schema["required"].as_array().map(|required| sorted(required.iter().map(|name| name.as_str().unwrap())));
-
-		assert_eq!(actual.unwrap_or_default(), sorted(required), "{name}");
-	}
-}
-
-#[test]
-fn enumerations_and_defaults_are_in_the_schemas() {
-	let server = Server::new(ServerOptions::default());
-	let property = |tool: &str, name: &str| {
-		let schema = Value::Object((*server.get_tool(tool).unwrap().input_schema).clone());
-
-		schema["properties"][name].clone()
-	};
-
-	assert_eq!(property("view_items", "mode")["enum"], json!(["auto", "full", "outline"]));
-	assert_eq!(property("view_items", "mode")["default"], "auto");
-	assert_eq!(property("view_items", "line_numbers")["default"], true);
-	assert_eq!(property("insert_items", "position")["enum"], json!(["end", "start", "before", "after"]));
-	assert_eq!(property("format_items", "formatter")["enum"], json!(["rustfmt", "prettyplease", "none"]));
-	assert_eq!(property("format_items", "targets")["default"], json!(["crate"]));
-	assert_eq!(property("format_items", "sort")["default"], true);
-	assert_eq!(property("find_items", "limit")["default"], 100);
-}
-
-#[test]
-fn annotations() {
-	let server = Server::new(ServerOptions::default());
-
-	for tool in server.tools() {
-		let annotations = tool.annotations.as_ref().unwrap_or_else(|| panic!("{} has no annotations", tool.name));
-		let read_only = QUERY_TOOLS.contains(&tool.name.as_ref());
-
-		assert!(annotations.title.is_some(), "{}", tool.name);
-		assert_eq!(annotations.read_only_hint, Some(read_only), "{}", tool.name);
-		assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
-
-		match tool.name.as_ref() {
-			"remove_items" | "replace_item" => assert_eq!(annotations.destructive_hint, Some(true)),
-			"rename_item" | "insert_items" | "format_items" => assert_eq!(annotations.destructive_hint, Some(false)),
-			_ => assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name),
-		}
-	}
-
-	assert_eq!(server.get_tool("format_items").unwrap().annotations.unwrap().idempotent_hint, Some(true));
-}
-
-#[test]
-fn server_info() {
-	let info = Server::new(ServerOptions::default()).get_info();
-
-	assert_eq!(info.server_info.name, "rscode");
-	assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-	assert!(info.capabilities.tools.is_some());
-
-	let instructions = info.instructions.unwrap();
-
-	for needle in [
-		"crate::module::Item",
-		"::crate_name::Item",
-		"`Type::method`",
-		"<Type as Trait>::method",
-		"impl Trait for Type",
-		"`**`",
-		"matches anywhere",
-		"all-or-nothing",
-		"must still parse",
-		"dry_run",
-		"loaded from disk again for every call",
-		"`use module::Name`",
-	] {
-		assert!(instructions.contains(needle), "the instructions do not mention {needle}");
-	}
-
-	assert!(!instructions.contains("read-only"));
-	assert!(Server::new(read_only()).get_info().instructions.unwrap().ends_with("the editing tools are disabled."));
-}
+const SOURCE_TOOLS: [&str; 3] = ["attach_source", "detach_source", "list_sources"];
 
 /// A client talking to a server over an in-process pipe, with newline-delimited JSON-RPC like stdio.
 struct Client {
@@ -327,10 +59,21 @@ impl Client {
 		client
 	}
 
-	async fn send(&mut self, message: Value) {
-		let line = format!("{message}\n");
+	/// Calls a tool: whether it failed, and its text.
+	async fn call(&mut self, tool: &str, arguments: Value) -> (bool, String) {
+		let response = self.request("tools/call", json!({ "name": tool, "arguments": arguments })).await;
+		let result = &response["result"];
+		let content = result["content"].as_array().unwrap_or_else(|| panic!("not a tool result: {response}"));
+		let text: Vec<&str> = content.iter().filter_map(|content| content["text"].as_str()).collect();
 
-		self.writer.write_all(line.as_bytes()).await.unwrap();
+		(result["isError"] == true, text.join("\n"))
+	}
+
+	/// Hangs up, and returns how the server ended.
+	async fn close(mut self) -> Result<(), Error> {
+		self.writer.shutdown().await.unwrap();
+		drop(self.lines);
+		self.server.await.unwrap()
 	}
 
 	/// Sends a request and waits for its response (skipping notifications).
@@ -355,14 +98,10 @@ impl Client {
 		}
 	}
 
-	/// Calls a tool: whether it failed, and its text.
-	async fn call(&mut self, tool: &str, arguments: Value) -> (bool, String) {
-		let response = self.request("tools/call", json!({ "name": tool, "arguments": arguments })).await;
-		let result = &response["result"];
-		let content = result["content"].as_array().unwrap_or_else(|| panic!("not a tool result: {response}"));
-		let text: Vec<&str> = content.iter().filter_map(|content| content["text"].as_str()).collect();
+	async fn send(&mut self, message: Value) {
+		let line = format!("{message}\n");
 
-		(result["isError"] == true, text.join("\n"))
+		self.writer.write_all(line.as_bytes()).await.unwrap();
 	}
 
 	async fn tool_names(&mut self) -> Vec<String> {
@@ -371,26 +110,131 @@ impl Client {
 
 		sorted(tools.iter().map(|tool| tool["name"].as_str().unwrap()))
 	}
-
-	/// Hangs up, and returns how the server ended.
-	async fn close(mut self) -> Result<(), Error> {
-		self.writer.shutdown().await.unwrap();
-		drop(self.lines);
-		self.server.await.unwrap()
-	}
 }
 
 #[tokio::test]
-async fn lists_tools() {
-	let mut client = Client::connect(ServerOptions::default()).await;
-	let response = client.request("tools/list", json!({})).await;
+async fn a_session_without_a_handshake_is_an_error() {
+	let (mut client, server) = tokio::io::duplex(1 << 16);
 
-	for tool in response["result"]["tools"].as_array().unwrap() {
-		assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+	client
+		.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+		.await
+		.unwrap();
+
+	let error = serve(ServerOptions::default(), server).await.unwrap_err();
+
+	assert!(error.to_string().starts_with("MCP connection: failed to start the session"), "{error}");
+}
+
+fn all_tools() -> Vec<String> {
+	sorted(QUERY_TOOLS.iter().chain(&EDIT_TOOLS))
+}
+
+#[test]
+fn annotations() {
+	let server = Server::new(ServerOptions::default());
+
+	for tool in server.tools() {
+		let annotations = tool.annotations.as_ref().unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+		let read_only = QUERY_TOOLS.contains(&tool.name.as_ref());
+
+		assert!(annotations.title.is_some(), "{}", tool.name);
+		assert_eq!(annotations.read_only_hint, Some(read_only), "{}", tool.name);
+		assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+
+		match tool.name.as_ref() {
+			"remove_items" | "replace_item" => assert_eq!(annotations.destructive_hint, Some(true)),
+			"rename_item" | "insert_items" | "format_items" => assert_eq!(annotations.destructive_hint, Some(false)),
+			_ => assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name),
+		}
 	}
 
-	assert_eq!(client.tool_names().await, all_tools());
-	client.close().await.unwrap();
+	assert_eq!(server.get_tool("format_items").unwrap().annotations.unwrap().idempotent_hint, Some(true));
+}
+
+#[test]
+fn enumerations_and_defaults_are_in_the_schemas() {
+	let server = Server::new(ServerOptions::default());
+	let property = |tool: &str, name: &str| {
+		let schema = Value::Object((*server.get_tool(tool).unwrap().input_schema).clone());
+
+		schema["properties"][name].clone()
+	};
+
+	assert_eq!(property("view_items", "mode")["enum"], json!(["auto", "full", "outline"]));
+	assert_eq!(property("view_items", "mode")["default"], "auto");
+	assert_eq!(property("view_items", "line_numbers")["default"], true);
+	assert_eq!(property("insert_items", "position")["enum"], json!(["end", "start", "before", "after"]));
+	assert_eq!(property("format_items", "formatter")["enum"], json!(["rustfmt", "prettyplease", "none"]));
+	assert_eq!(property("format_items", "targets")["default"], json!(["crate"]));
+	assert_eq!(property("format_items", "sort")["default"], true);
+	assert_eq!(property("find_items", "limit")["default"], 100);
+}
+
+/// Options exposing a directory for reading.
+fn exposing() -> ServerOptions {
+	ServerOptions {
+		exposed: vec!["read=/nonexistent/refs/*".parse().unwrap()],
+		..ServerOptions::default()
+	}
+}
+
+#[test]
+fn exposing_directories_offers_sources() {
+	let server = Server::new(exposing());
+	let tools = server.tools();
+
+	assert_eq!(
+		sorted(tools.iter().map(|tool| &tool.name)),
+		sorted(all_tools().iter().chain(&sorted(SOURCE_TOOLS)))
+	);
+
+	for tool in &tools {
+		let schema = Value::Object((*tool.input_schema).clone());
+		let attached = schema["properties"].get("attached").is_some();
+
+		assert_eq!(attached, !SOURCE_TOOLS.contains(&tool.name.as_ref()), "{}: {schema}", tool.name);
+	}
+
+	// without exposed directories, neither the tools nor the parameter are offered
+	for tool in Server::new(ServerOptions::default()).tools() {
+		assert!(
+			Value::Object((*tool.input_schema).clone())["properties"].get("attached").is_none(),
+			"{}",
+			tool.name
+		);
+	}
+
+	// the parameters of every tool are complete and their own: the item code of `replace_item` and `insert_items`
+	// (`source`) is not taken over by another parameter
+	for server in [Server::new(ServerOptions::default()), Server::new(exposing())] {
+		for tool in server.tools() {
+			let schema = Value::Object((*tool.input_schema).clone());
+
+			for name in schema["required"].as_array().into_iter().flatten() {
+				let property = &schema["properties"][name.as_str().unwrap()];
+
+				assert!(property.is_object(), "{}: `{name}` is required, but not in {schema}", tool.name);
+				assert!(property["description"].as_str().unwrap_or_default().len() > 10, "{}.{name}", tool.name);
+			}
+		}
+
+		for tool in ["replace_item", "insert_items"] {
+			let schema = Value::Object((*server.get_tool(tool).unwrap().input_schema).clone());
+
+			assert_eq!(schema["properties"]["source"]["type"], "string", "{tool}: {schema}");
+		}
+	}
+
+	let read_only = Server::new(ServerOptions {
+		read_only: true,
+		..exposing()
+	});
+
+	assert_eq!(
+		sorted(read_only.tools().iter().map(|tool| &tool.name)),
+		sorted(QUERY_TOOLS.iter().chain(&SOURCE_TOOLS))
+	);
 }
 
 #[tokio::test]
@@ -403,8 +247,9 @@ async fn failures_are_tool_errors() {
 	assert!(failed);
 	assert!(text.starts_with("unknown item kind `nope`; expected one of: mod, struct"), "{text}");
 
-	let (failed, text) =
-		client.call("insert_items", json!({ "parent": "crate", "source": "fn f() {}", "position": "before" })).await;
+	let (failed, text) = client
+		.call("insert_items", json!({ "parent": "crate", "source": "fn f() {}", "position": "before" }))
+		.await;
 
 	assert!(failed);
 	assert!(text.contains("`anchor`"), "{text}");
@@ -432,64 +277,6 @@ async fn failures_are_tool_errors() {
 	client.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn read_only_servers_refuse_edits() {
-	let mut client = Client::connect(read_only()).await;
-
-	assert_eq!(client.tool_names().await, sorted(QUERY_TOOLS));
-
-	for tool in EDIT_TOOLS {
-		let (failed, text) = client.call(tool, json!({ "path": "crate::a", "new_name": "b", "dry_run": true })).await;
-
-		assert!(failed, "{tool}");
-		assert_eq!(
-			text,
-			format!("`{tool}` modifies files, but this rscode server is read-only (it was started with `--read-only`)")
-		);
-	}
-
-	client.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn servers_without_exposed_directories_explain_the_source_tools() {
-	let mut client = Client::connect(ServerOptions::default()).await;
-
-	for tool in SOURCE_TOOLS {
-		let (failed, text) = client.call(tool, json!({ "name": "a", "manifest_path": "/a/Cargo.toml" })).await;
-
-		assert!(failed, "{tool}");
-		assert!(text.contains("exposes no directories to attach sources from"), "{tool}: {text}");
-	}
-
-	// a source is never ignored, even where the parameter is not offered
-	let (failed, text) = client.call("workspace_info", json!({ "attached": "a" })).await;
-
-	assert!(failed);
-	assert!(text.starts_with("no source is attached as `a`: this rscode server exposes no directories"), "{text}");
-	assert!(!text.contains("attach_source"), "{text}");
-	client.close().await.unwrap();
-}
-
-#[tokio::test]
-async fn hanging_up_before_initializing_is_not_an_error() {
-	let (client, server) = tokio::io::duplex(1024);
-
-	drop(client);
-	serve(ServerOptions::default(), server).await.unwrap();
-}
-
-#[tokio::test]
-async fn a_session_without_a_handshake_is_an_error() {
-	let (mut client, server) = tokio::io::duplex(1 << 16);
-
-	client.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n").await.unwrap();
-
-	let error = serve(ServerOptions::default(), server).await.unwrap_err();
-
-	assert!(error.to_string().starts_with("MCP connection: failed to start the session"), "{error}");
-}
-
 #[test]
 fn handshake_failures() {
 	let kind = |result: Result<(), Error>| match result {
@@ -502,11 +289,7 @@ fn handshake_failures() {
 		other => panic!("not a connection error: {other:?}"),
 	};
 	let transport = |kind: ErrorKind| ServerInitializeError::TransportError {
-		error: rmcp::transport::DynamicTransportError::from_parts(
-			"test",
-			std::any::TypeId::of::<()>(),
-			Box::new(std::io::Error::from(kind)),
-		),
+		error: rmcp::transport::DynamicTransportError::from_parts("test", std::any::TypeId::of::<()>(), Box::new(std::io::Error::from(kind))),
 		context: "sending the initialize result".into(),
 	};
 
@@ -515,9 +298,50 @@ fn handshake_failures() {
 	assert!(handshake_failure(transport(ErrorKind::BrokenPipe)).is_ok());
 
 	// the kind of an I/O error is kept, so that callers can tell failures apart
-	assert_eq!(kind(handshake_failure(transport(ErrorKind::PermissionDenied))), ErrorKind::PermissionDenied);
-	assert_eq!(kind(handshake_failure(ServerInitializeError::ExpectedInitializeRequest(None))), ErrorKind::InvalidData);
+	assert_eq!(
+		kind(handshake_failure(transport(ErrorKind::PermissionDenied))),
+		ErrorKind::PermissionDenied
+	);
+	assert_eq!(
+		kind(handshake_failure(ServerInitializeError::ExpectedInitializeRequest(None))),
+		ErrorKind::InvalidData
+	);
 	assert_eq!(kind(handshake_failure(ServerInitializeError::Cancelled)), ErrorKind::Other);
+}
+
+#[tokio::test]
+async fn hanging_up_before_initializing_is_not_an_error() {
+	let (client, server) = tokio::io::duplex(1024);
+
+	drop(client);
+	serve(ServerOptions::default(), server).await.unwrap();
+}
+
+#[test]
+fn input_schemas_are_objects_with_described_properties() {
+	for tool in Server::new(ServerOptions::default()).tools() {
+		let schema = Value::Object((*tool.input_schema).clone());
+		let properties = schema["properties"].as_object().unwrap_or_else(|| panic!("{}: {schema}", tool.name));
+
+		assert_eq!(schema["type"], "object", "{}", tool.name);
+
+		for name in SELECTION {
+			assert!(properties.contains_key(name), "{} lacks `{name}`", tool.name);
+		}
+
+		for (name, property) in properties {
+			let description = property["description"].as_str().unwrap_or_default();
+
+			assert!(description.len() > 10, "{}.{name} is not described: {property}", tool.name);
+		}
+
+		// clients that don't resolve references still see every parameter's type
+		assert!(!schema.to_string().contains("$ref"), "{}: {schema}", tool.name);
+
+		let description = tool.description.as_deref().unwrap_or_default();
+
+		assert!(description.len() > 100, "{} is not described", tool.name);
+	}
 }
 
 #[test]
@@ -543,14 +367,145 @@ fn io_error_kinds_are_found_in_causes() {
 }
 
 #[tokio::test]
-async fn waiting_for_edits_is_bounded() {
-	let edits = Mutex::new(());
+async fn lists_tools() {
+	let mut client = Client::connect(ServerOptions::default()).await;
+	let response = client.request("tools/list", json!({})).await;
 
-	assert!(edits_finished(&edits, Duration::from_secs(60)).await);
+	for tool in response["result"]["tools"].as_array().unwrap() {
+		assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+	}
 
-	let _running = edits.lock().await;
+	assert_eq!(client.tool_names().await, all_tools());
+	client.close().await.unwrap();
+}
 
-	assert!(!edits_finished(&edits, Duration::from_millis(50)).await);
+#[test]
+fn offers_every_tool() {
+	let server = Server::new(ServerOptions::default());
+
+	assert_eq!(sorted(server.tools().iter().map(|tool| &tool.name)), all_tools());
+}
+
+fn read_only() -> ServerOptions {
+	ServerOptions {
+		read_only: true,
+		..ServerOptions::default()
+	}
+}
+
+#[test]
+fn read_only_servers_do_not_offer_editing_tools() {
+	let server = Server::new(read_only());
+
+	assert_eq!(sorted(server.tools().iter().map(|tool| &tool.name)), sorted(QUERY_TOOLS));
+
+	for tool in EDIT_TOOLS {
+		assert!(server.get_tool(tool).is_none(), "{tool}");
+	}
+}
+
+#[tokio::test]
+async fn read_only_servers_refuse_edits() {
+	let mut client = Client::connect(read_only()).await;
+
+	assert_eq!(client.tool_names().await, sorted(QUERY_TOOLS));
+
+	for tool in EDIT_TOOLS {
+		let (failed, text) = client.call(tool, json!({ "path": "crate::a", "new_name": "b", "dry_run": true })).await;
+
+		assert!(failed, "{tool}");
+		assert_eq!(
+			text,
+			format!("`{tool}` modifies files, but this rscode server is read-only (it was started with `--read-only`)")
+		);
+	}
+
+	client.close().await.unwrap();
+}
+
+#[test]
+fn required_parameters() {
+	let expected = [
+		("find_items", vec!["pattern"]),
+		("format_items", vec![]),
+		("insert_items", vec!["parent", "source"]),
+		("remove_items", vec!["paths"]),
+		("rename_item", vec!["new_name", "path"]),
+		("replace_item", vec!["path", "source"]),
+		("view_items", vec!["paths"]),
+		("workspace_info", vec![]),
+	];
+	let server = Server::new(ServerOptions::default());
+
+	for (name, required) in expected {
+		let tool = server.get_tool(name).unwrap();
+		let schema = Value::Object((*tool.input_schema).clone());
+		let actual = schema["required"]
+			.as_array()
+			.map(|required| sorted(required.iter().map(|name| name.as_str().unwrap())));
+
+		assert_eq!(actual.unwrap_or_default(), sorted(required), "{name}");
+	}
+}
+
+#[test]
+fn server_info() {
+	let info = Server::new(ServerOptions::default()).get_info();
+
+	assert_eq!(info.server_info.name, "rscode");
+	assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+	assert!(info.capabilities.tools.is_some());
+
+	let instructions = info.instructions.unwrap();
+
+	for needle in [
+		"crate::module::Item",
+		"::crate_name::Item",
+		"`Type::method`",
+		"<Type as Trait>::method",
+		"impl Trait for Type",
+		"`**`",
+		"matches anywhere",
+		"all-or-nothing",
+		"must still parse",
+		"dry_run",
+		"loaded from disk again for every call",
+		"`use module::Name`",
+	] {
+		assert!(instructions.contains(needle), "the instructions do not mention {needle}");
+	}
+
+	assert!(!instructions.contains("read-only"));
+	assert!(
+		Server::new(read_only())
+			.get_info()
+			.instructions
+			.unwrap()
+			.ends_with("the editing tools are disabled.")
+	);
+}
+
+#[tokio::test]
+async fn servers_without_exposed_directories_explain_the_source_tools() {
+	let mut client = Client::connect(ServerOptions::default()).await;
+
+	for tool in SOURCE_TOOLS {
+		let (failed, text) = client.call(tool, json!({ "name": "a", "manifest_path": "/a/Cargo.toml" })).await;
+
+		assert!(failed, "{tool}");
+		assert!(text.contains("exposes no directories to attach sources from"), "{tool}: {text}");
+	}
+
+	// a source is never ignored, even where the parameter is not offered
+	let (failed, text) = client.call("workspace_info", json!({ "attached": "a" })).await;
+
+	assert!(failed);
+	assert!(
+		text.starts_with("no source is attached as `a`: this rscode server exposes no directories"),
+		"{text}"
+	);
+	assert!(!text.contains("attach_source"), "{text}");
+	client.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -567,9 +522,109 @@ async fn shutting_down_waits_for_running_edits() {
 	tokio::time::timeout(Duration::from_secs(10), closing).await.unwrap().unwrap().unwrap();
 }
 
+fn sorted(names: impl IntoIterator<Item = impl ToString>) -> Vec<String> {
+	let mut names: Vec<String> = names.into_iter().map(|name| name.to_string()).collect();
+
+	names.sort();
+	names
+}
+
+#[test]
+fn source_tools() {
+	let server = Server::new(exposing());
+	let schema = |name: &str| Value::Object((*server.get_tool(name).unwrap().input_schema).clone());
+	let required = |name: &str| schema(name)["required"].as_array().cloned().unwrap_or_default();
+
+	assert_eq!(
+		sorted(required("attach_source").iter().map(|name| name.as_str().unwrap())),
+		["manifest_path", "name"]
+	);
+	assert_eq!(required("detach_source"), [json!("name")]);
+	assert_eq!(required("list_sources"), Vec::<Value>::new());
+	assert_eq!(schema("attach_source")["properties"]["write"]["default"], false);
+
+	for name in SOURCE_TOOLS {
+		let tool = server.get_tool(name).unwrap();
+		let annotations = tool.annotations.unwrap();
+
+		assert!(tool.description.unwrap().len() > 100, "{name} is not described");
+		assert!(annotations.title.is_some(), "{name}");
+		assert_eq!(annotations.read_only_hint, Some(name == "list_sources"), "{name}");
+		assert!(!annotations.destructive_hint.unwrap_or_default(), "{name}");
+		assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
+		assert_eq!(annotations.open_world_hint, Some(false), "{name}");
+	}
+
+	let instructions = server.get_info().instructions.unwrap();
+	// patterns are listed resolved: on Windows, with a drive and `\`
+	let resolved = |exposure: &str| exposure.parse::<Exposure>().unwrap().resolved_pattern().to_owned();
+
+	assert!(instructions.contains("attach_source"), "{instructions}");
+	assert!(instructions.contains("pass that name as `attached`"), "{instructions}");
+	assert!(
+		instructions.ends_with(&format!("\n- read: {}", resolved("read=/nonexistent/refs/*"))),
+		"{instructions}"
+	);
+	assert!(
+		!Server::new(ServerOptions::default())
+			.get_info()
+			.instructions
+			.unwrap()
+			.contains("attach_source")
+	);
+
+	// a read-only server does not offer writing
+	let exposed = vec!["write=/nonexistent/engine".parse().unwrap()];
+	let writable = Server::new(ServerOptions {
+		exposed: exposed.clone(),
+		..ServerOptions::default()
+	});
+	let read_only = Server::new(ServerOptions {
+		exposed,
+		read_only: true,
+		..ServerOptions::default()
+	});
+	let writable = writable.get_info().instructions.unwrap();
+	let read_only = read_only.get_info().instructions.unwrap();
+	let engine = resolved("write=/nonexistent/engine");
+
+	assert!(writable.contains("`write` if you need to edit them") && writable.ends_with(&format!("- write: {engine}")));
+	assert!(
+		!read_only.contains("`write`") && read_only.ends_with(&format!("- read: {engine}")),
+		"{read_only}"
+	);
+}
+
+#[test]
+fn truncation_hints_name_the_tools_own_parameters() {
+	for tool in Server::new(ServerOptions::default()).tools() {
+		let schema = Value::Object((*tool.input_schema).clone()).to_string();
+		let hint = render::truncation_hint(&tool.name);
+
+		// every other piece of the hint is quoted: parameters, and values of enumerations
+		for word in hint.split('`').skip(1).step_by(2) {
+			assert!(schema.contains(&format!("\"{word}\"")), "{}: `{word}` is not in {schema}", tool.name);
+		}
+	}
+}
+
+#[tokio::test]
+async fn waiting_for_edits_is_bounded() {
+	let edits = Mutex::new(());
+
+	assert!(edits_finished(&edits, Duration::from_secs(60)).await);
+
+	let _running = edits.lock().await;
+
+	assert!(!edits_finished(&edits, Duration::from_millis(50)).await);
+}
+
 /// Sessions with fixture crates on disk, through every layer of rscode.
 mod end_to_end {
 	use super::*;
+
+	/// Two `impl` blocks of `W`, with a `get` each.
+	const IMPLS: &str = "\nimpl W<u8> {\n\tfn get() {}\n}\n\nimpl W<u16> {\n\tfn get() {}\n}\n";
 
 	/// A cargo package in a temporary directory, deleted on drop.
 	struct Fixture {
@@ -640,72 +695,6 @@ mod end_to_end {
 		}
 	}
 
-	/// `text` with `/` replaced by the platform's path separator, which the tools write paths with (except in the
-	/// headers of diffs).
-	fn native(text: &str) -> String {
-		text.replace('/', std::path::MAIN_SEPARATOR_STR)
-	}
-
-	#[tokio::test]
-	async fn queries() {
-		let fixture = Fixture::new("queries");
-		let mut client = Client::connect(fixture.options()).await;
-
-		let (failed, text) = client.call("workspace_info", json!({})).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(
-			&text,
-			&["demo 0.1.0  Cargo.toml", "extra", &native("demo  lib  src/lib.rs  edition 2024"), "load problems: none"],
-		);
-
-		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "kinds": ["fn", "assoc-fn"] })).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(
-			&text,
-			&[
-				&native("demo::add  fn  src/lib.rs:7:1-10:2"),
-				&native("demo::extra  fn  src/lib.rs:12:1-13:18  cfg: feature = \"extra\"  inactive"),
-				&native("demo::shapes::Circle::new  assoc-fn  src/shapes.rs:"),
-				"5 matches",
-			],
-		);
-
-		let (_, text) =
-			client.call("find_items", json!({ "pattern": "*", "kinds": "fn", "limit": 1, "offset": 1 })).await;
-
-		assert_contains(&text, &["3 matches; showing 2-2; for more, call again with `offset` 2"]);
-
-		let (_, text) =
-			client.call("find_items", json!({ "pattern": "Circle", "kinds": "struct", "from": "::" })).await;
-
-		assert_contains(&text, &["demo::shapes::Circle  struct", "usable: ::demo::Circle"]);
-
-		let (_, text) = client.call("find_items", json!({ "pattern": "extra", "features": "extra" })).await;
-
-		assert!(!text.contains("inactive"), "{text}");
-
-		let (failed, text) = client.call("view_items", json!({ "paths": ["crate::add", "crate::nope"] })).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(
-			&text,
-			&[
-				"// error: no item found for `crate::nope`",
-				&format!("// {}", native("demo::add (fn) src/lib.rs:7-10")),
-				"a + b",
-				"│",
-			],
-		);
-
-		let (failed, text) = client.call("view_items", json!({ "paths": "crate::nope" })).await;
-
-		assert!(failed);
-		assert_contains(&text, &["no item found for `crate::nope`", "hint: search with `find_items`"]);
-		client.close().await.unwrap();
-	}
-
 	#[tokio::test]
 	async fn edits() {
 		let fixture = Fixture::new("edits");
@@ -713,13 +702,20 @@ mod end_to_end {
 		let original = fixture.read("src/lib.rs");
 
 		// a dry run writes nothing
-		let (failed, text) =
-			client.call("rename_item", json!({ "path": "crate::add", "new_name": "sum", "dry_run": true })).await;
+		let (failed, text) = client
+			.call("rename_item", json!({ "path": "crate::add", "new_name": "sum", "dry_run": true }))
+			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&["would rename 1 item to `sum`", "demo::add", "nothing was written", "-pub fn add", "+pub fn sum"],
+			&[
+				"would rename 1 item to `sum`",
+				"demo::add",
+				"nothing was written",
+				"-pub fn add",
+				"+pub fn sum",
+			],
 		);
 		assert_eq!(fixture.read("src/lib.rs"), original);
 
@@ -735,15 +731,22 @@ mod end_to_end {
 		assert!(!fixture.read("src/lib.rs").contains("extra"));
 
 		let source = "pub fn area(&self) -> f64 {\n\tstd::f64::consts::PI * self.radius * self.radius\n}";
-		let (failed, text) =
-			client.call("replace_item", json!({ "path": "crate::shapes::Circle::area", "source": source })).await;
+		let (failed, text) = client
+			.call("replace_item", json!({ "path": "crate::shapes::Circle::area", "source": source }))
+			.await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&fixture.read("src/shapes.rs"), &["\tpub fn area(&self) -> f64 {\n\t\tstd::f64::consts::PI"]);
+		assert_contains(
+			&fixture.read("src/shapes.rs"),
+			&["\tpub fn area(&self) -> f64 {\n\t\tstd::f64::consts::PI"],
+		);
 
 		let source = "pub fn diameter(&self) -> f64 {\n\t2.0 * self.radius\n}";
 		let (failed, text) = client
-			.call("insert_items", json!({ "parent": "impl crate::shapes::Circle", "source": source, "format": true }))
+			.call(
+				"insert_items",
+				json!({ "parent": "impl crate::shapes::Circle", "source": source, "format": true }),
+			)
 			.await;
 
 		assert!(!failed, "{text}");
@@ -751,8 +754,9 @@ mod end_to_end {
 
 		// an edit that would break the syntax writes nothing
 		let before = fixture.read("src/shapes.rs");
-		let (failed, _) =
-			client.call("replace_item", json!({ "path": "crate::shapes::Circle::new", "source": "pub fn new(" })).await;
+		let (failed, _) = client
+			.call("replace_item", json!({ "path": "crate::shapes::Circle::new", "source": "pub fn new(" }))
+			.await;
 
 		assert!(failed);
 		assert_eq!(fixture.read("src/shapes.rs"), before);
@@ -763,14 +767,138 @@ mod end_to_end {
 		client.close().await.unwrap();
 	}
 
-	/// Two `impl` blocks of `W`, with a `get` each.
-	const IMPLS: &str = "\nimpl W<u8> {\n\tfn get() {}\n}\n\nimpl W<u16> {\n\tfn get() {}\n}\n";
+	#[test]
+	fn fixtures_are_cleaned_up() {
+		let root = {
+			let fixture = Fixture::new("cleanup");
+
+			assert!(fixture.read("src/lib.rs").contains("pub fn add"));
+			fixture.root.clone()
+		};
+
+		assert!(!Path::new(&root).exists());
+	}
+
+	/// Formatting after an edit formats what the edit touched: a replaced glob import, and an inserted `use` item.
+	#[tokio::test]
+	async fn formats_edited_imports() {
+		let fixture = Fixture::with_files(
+			"format-imports",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("rustfmt.toml", "hard_tabs = true\n"),
+				(
+					"src/lib.rs",
+					"pub mod shapes {\n\tpub struct Circle;\n}\n\nuse   shapes::{Circle};\nuse shapes::*;\n\npub fn make() -> Circle {\n\tCircle\n}\n",
+				),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let replaced = json!({ "path": "use crate::*", "source": "use   crate::shapes::*;", "format": true });
+		let (failed, text) = client.call("replace_item", replaced).await;
+
+		assert!(!failed, "{text}");
+		assert!(
+			fixture.read("src/lib.rs").contains("use   shapes::{Circle};\nuse crate::shapes::*;\n"),
+			"{}",
+			fixture.read("src/lib.rs")
+		);
+
+		let inserted = json!({ "parent": "crate", "source": "use   std::fmt::Debug;", "position": "start", "format": true });
+		let (failed, text) = client.call("insert_items", inserted).await;
+
+		assert!(!failed, "{text}");
+		assert!(
+			fixture.read("src/lib.rs").starts_with("use std::fmt::Debug;\n"),
+			"{}",
+			fixture.read("src/lib.rs")
+		);
+		client.close().await.unwrap();
+	}
+
+	/// Imports are named by `use` paths; a plain path through a private import is ambiguous for edits.
+	#[tokio::test]
+	async fn imports() {
+		let fixture = Fixture::with_files(
+			"imports",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				(
+					"src/lib.rs",
+					"pub mod shapes {\n\tpub struct Circle;\n}\n\nuse shapes::Circle;\n\npub fn make() -> Circle {\n\tCircle\n}\n",
+				),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "use *" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[&native("use demo::Circle  import  src/lib.rs:5:5-5:19  -> demo::shapes::Circle")],
+		);
+
+		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Circle" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[&format!("// {}", native("use demo::Circle (import) src/lib.rs:5")), "use shapes::Circle;"],
+		);
+
+		let (failed, text) = client.call("remove_items", json!({ "paths": "crate::Circle", "dry_run": true })).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&[
+				"`crate::Circle` is ambiguous",
+				&native("`use demo::Circle` (import) at src/lib.rs:5:5"),
+				&native("`demo::shapes::Circle` (struct) at src/lib.rs:2:2"),
+				"hint: the path names an item through a private import",
+			],
+		);
+
+		let (failed, text) = client
+			.call("remove_items", json!({ "paths": "use crate::Circle", "dry_run": true }))
+			.await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["-use shapes::Circle;", "nothing was written"]);
+
+		// a `use` path of an import's own text names nothing, with a hint
+		let (failed, text) = client
+			.call("remove_items", json!({ "paths": "use crate::shapes::Circle", "dry_run": true }))
+			.await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&["no item found for `use crate::shapes::Circle`", "hint: a `use` path names the imports of"],
+		);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "use Circl" })).await;
+
+		assert_contains(&text, &["try `use *Circl*`"]);
+		client.close().await.unwrap();
+	}
+
+	/// `text` with `/` replaced by the platform's path separator, which the tools write paths with (except in the
+	/// headers of diffs).
+	fn native(text: &str) -> String {
+		text.replace('/', std::path::MAIN_SEPARATOR_STR)
+	}
 
 	#[tokio::test]
 	async fn points_to_what_is_not_loaded() {
-		let package = |name: &str, workspace: &str| {
-			format!("[package]\nname = \"{name}\"\nversion = \"0.2.0\"\nedition = \"2024\"\n{workspace}")
-		};
+		let package = |name: &str, workspace: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.2.0\"\nedition = \"2024\"\n{workspace}");
 		let fixture = Fixture::with_files(
 			"members",
 			&[
@@ -799,7 +927,13 @@ mod end_to_end {
 		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist"] })).await;
 
 		assert!(failed);
-		assert_contains(&text, &["no item found for `::helper::assist`", "`helper` is a workspace member that is not selected"]);
+		assert_contains(
+			&text,
+			&[
+				"no item found for `::helper::assist`",
+				"`helper` is a workspace member that is not selected",
+			],
+		);
 		assert!(!text.contains("find_items"), "{text}");
 
 		let (_, text) = client.call("find_items", json!({ "pattern": "assist" })).await;
@@ -811,8 +945,9 @@ mod end_to_end {
 		assert_contains(&text, &["helper::assist  fn"]);
 
 		// `crate` is the root of the library and of the binary: `lib` or `bin` picks one
-		let (failed, text) =
-			client.call("insert_items", json!({ "parent": "crate", "source": "pub fn q() {}", "dry_run": true })).await;
+		let (failed, text) = client
+			.call("insert_items", json!({ "parent": "crate", "source": "pub fn q() {}", "dry_run": true }))
+			.await;
 
 		assert!(failed);
 		assert_contains(
@@ -825,22 +960,29 @@ mod end_to_end {
 		);
 
 		let (failed, text) = client
-			.call("insert_items", json!({ "parent": "crate", "source": "pub fn q() {}", "dry_run": true, "lib": true }))
+			.call(
+				"insert_items",
+				json!({ "parent": "crate", "source": "pub fn q() {}", "dry_run": true, "lib": true }),
+			)
 			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(&text, &["+++ b/src/lib.rs", "+pub fn q() {}"]);
 
 		let (failed, text) = client
-			.call("insert_items", json!({ "parent": "crate", "source": "fn q() {}", "dry_run": true, "bin": "demo" }))
+			.call(
+				"insert_items",
+				json!({ "parent": "crate", "source": "fn q() {}", "dry_run": true, "bin": "demo" }),
+			)
 			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(&text, &["+++ b/src/main.rs", "+fn q() {}"]);
 
 		// a collision names the parameter that overrides it
-		let (failed, text) =
-			client.call("insert_items", json!({ "parent": "crate", "source": "pub fn add() {}", "lib": true })).await;
+		let (failed, text) = client
+			.call("insert_items", json!({ "parent": "crate", "source": "pub fn add() {}", "lib": true }))
+			.await;
 
 		assert!(failed);
 		assert_contains(&text, &["collides with existing names", "hint: set `force` to proceed anyway"]);
@@ -852,93 +994,79 @@ mod end_to_end {
 		assert!(failed);
 		assert_contains(
 			&text,
-			&[&native("`<demo::W<u16>>::get` (assoc-fn) at src/lib.rs:10:2"), "hint: use one of the candidates'"],
+			&[
+				&native("`<demo::W<u16>>::get` (assoc-fn) at src/lib.rs:10:2"),
+				"hint: use one of the candidates'",
+			],
 		);
 		assert!(!text.contains("all_variants"), "{text}");
 		client.close().await.unwrap();
 	}
 
-	/// Imports are named by `use` paths; a plain path through a private import is ambiguous for edits.
 	#[tokio::test]
-	async fn imports() {
-		let fixture = Fixture::with_files(
-			"imports",
-			&[
-				("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
-				("src/lib.rs", "pub mod shapes {\n\tpub struct Circle;\n}\n\nuse shapes::Circle;\n\npub fn make() -> Circle {\n\tCircle\n}\n"),
-			],
-		);
+	async fn queries() {
+		let fixture = Fixture::new("queries");
 		let mut client = Client::connect(fixture.options()).await;
 
-		let (failed, text) = client.call("find_items", json!({ "pattern": "use *" })).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(&text, &[&native("use demo::Circle  import  src/lib.rs:5:5-5:19  -> demo::shapes::Circle")]);
-
-		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Circle" })).await;
+		let (failed, text) = client.call("workspace_info", json!({})).await;
 
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&[&format!("// {}", native("use demo::Circle (import) src/lib.rs:5")), "use shapes::Circle;"],
+			&[
+				"demo 0.1.0  Cargo.toml",
+				"extra",
+				&native("demo  lib  src/lib.rs  edition 2024"),
+				"load problems: none",
+			],
 		);
 
-		let (failed, text) = client.call("remove_items", json!({ "paths": "crate::Circle", "dry_run": true })).await;
+		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "kinds": ["fn", "assoc-fn"] })).await;
 
-		assert!(failed);
+		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
 			&[
-				"`crate::Circle` is ambiguous",
-				&native("`use demo::Circle` (import) at src/lib.rs:5:5"),
-				&native("`demo::shapes::Circle` (struct) at src/lib.rs:2:2"),
-				"hint: the path names an item through a private import",
+				&native("demo::add  fn  src/lib.rs:7:1-10:2"),
+				&native("demo::extra  fn  src/lib.rs:12:1-13:18  cfg: feature = \"extra\"  inactive"),
+				&native("demo::shapes::Circle::new  assoc-fn  src/shapes.rs:"),
+				"5 matches",
 			],
 		);
 
-		let (failed, text) = client.call("remove_items", json!({ "paths": "use crate::Circle", "dry_run": true })).await;
+		let (_, text) = client
+			.call("find_items", json!({ "pattern": "*", "kinds": "fn", "limit": 1, "offset": 1 }))
+			.await;
+
+		assert_contains(&text, &["3 matches; showing 2-2; for more, call again with `offset` 2"]);
+
+		let (_, text) = client
+			.call("find_items", json!({ "pattern": "Circle", "kinds": "struct", "from": "::" }))
+			.await;
+
+		assert_contains(&text, &["demo::shapes::Circle  struct", "usable: ::demo::Circle"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "extra", "features": "extra" })).await;
+
+		assert!(!text.contains("inactive"), "{text}");
+
+		let (failed, text) = client.call("view_items", json!({ "paths": ["crate::add", "crate::nope"] })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &["-use shapes::Circle;", "nothing was written"]);
+		assert_contains(
+			&text,
+			&[
+				"// error: no item found for `crate::nope`",
+				&format!("// {}", native("demo::add (fn) src/lib.rs:7-10")),
+				"a + b",
+				"│",
+			],
+		);
 
-		// a `use` path of an import's own text names nothing, with a hint
-		let (failed, text) = client.call("remove_items", json!({ "paths": "use crate::shapes::Circle", "dry_run": true })).await;
+		let (failed, text) = client.call("view_items", json!({ "paths": "crate::nope" })).await;
 
 		assert!(failed);
-		assert_contains(&text, &["no item found for `use crate::shapes::Circle`", "hint: a `use` path names the imports of"]);
-
-		let (_, text) = client.call("find_items", json!({ "pattern": "use Circl" })).await;
-
-		assert_contains(&text, &["try `use *Circl*`"]);
-		client.close().await.unwrap();
-	}
-
-	/// Formatting after an edit formats what the edit touched: a replaced glob import, and an inserted `use` item.
-	#[tokio::test]
-	async fn formats_edited_imports() {
-		let fixture = Fixture::with_files(
-			"format-imports",
-			&[
-				("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
-				("rustfmt.toml", "hard_tabs = true\n"),
-				(
-					"src/lib.rs",
-					"pub mod shapes {\n\tpub struct Circle;\n}\n\nuse   shapes::{Circle};\nuse shapes::*;\n\npub fn make() -> Circle {\n\tCircle\n}\n",
-				),
-			],
-		);
-		let mut client = Client::connect(fixture.options()).await;
-		let replaced = json!({ "path": "use crate::*", "source": "use   crate::shapes::*;", "format": true });
-		let (failed, text) = client.call("replace_item", replaced).await;
-
-		assert!(!failed, "{text}");
-		assert!(fixture.read("src/lib.rs").contains("use   shapes::{Circle};\nuse crate::shapes::*;\n"), "{}", fixture.read("src/lib.rs"));
-
-		let inserted = json!({ "parent": "crate", "source": "use   std::fmt::Debug;", "position": "start", "format": true });
-		let (failed, text) = client.call("insert_items", inserted).await;
-
-		assert!(!failed, "{text}");
-		assert!(fixture.read("src/lib.rs").starts_with("use std::fmt::Debug;\n"), "{}", fixture.read("src/lib.rs"));
+		assert_contains(&text, &["no item found for `crate::nope`", "hint: search with `find_items`"]);
 		client.close().await.unwrap();
 	}
 
@@ -984,7 +1112,10 @@ mod end_to_end {
 		assert_contains(
 			&text,
 			&[
-				&format!("the server's own workspace (used without `attached`): {}", root.join("own/Cargo.toml").display()),
+				&format!(
+					"the server's own workspace (used without `attached`): {}",
+					root.join("own/Cargo.toml").display()
+				),
 				"no sources are attached",
 				&format!("write  {}", project.resolved_pattern()),
 				&format!("read   {}", refs.resolved_pattern()),
@@ -993,8 +1124,9 @@ mod end_to_end {
 
 		// reading
 		let log = root.join(native("refs/log/Cargo.toml"));
-		let (failed, text) =
-			client.call("attach_source", json!({ "manifest_path": log.to_str().unwrap(), "name": "log" })).await;
+		let (failed, text) = client
+			.call("attach_source", json!({ "manifest_path": log.to_str().unwrap(), "name": "log" }))
+			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(
@@ -1026,7 +1158,10 @@ mod end_to_end {
 		let (failed, text) = client.call("rename_item", rename.clone()).await;
 
 		assert!(failed);
-		assert_contains(&text, &["source `log` is attached read-only", "nothing was written", "only exposed for reading"]);
+		assert_contains(
+			&text,
+			&["source `log` is attached read-only", "nothing was written", "only exposed for reading"],
+		);
 
 		let mut preview = rename;
 
@@ -1067,9 +1202,8 @@ mod end_to_end {
 		assert_eq!(fixture.read("own/src/lib.rs"), own);
 
 		// what may be attached, and how
-		let attach = |path: &str, name: &str, write: bool| {
-			json!({ "manifest_path": root.join(path).to_str().unwrap(), "name": name, "write": write })
-		};
+		let attach =
+			|path: &str, name: &str, write: bool| json!({ "manifest_path": root.join(path).to_str().unwrap(), "name": name, "write": write });
 		let (failed, text) = client.call("attach_source", attach("refs/log", "log", true)).await;
 
 		assert!(failed);
@@ -1091,8 +1225,9 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(&text, &["attached `engine` (read and write)", "packages loaded by default: engine 0.1.0"]);
 
-		let (failed, text) =
-			client.call("rename_item", json!({ "path": "crate::run", "new_name": "start", "attached": "engine" })).await;
+		let (failed, text) = client
+			.call("rename_item", json!({ "path": "crate::run", "new_name": "start", "attached": "engine" }))
+			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(&fixture.read("project/src/lib.rs"), &["pub fn start() {}", "\tstart();"]);
@@ -1112,7 +1247,10 @@ mod end_to_end {
 		// but only below the directories exposed for writing
 		let before = fixture.read("project/src/lib.rs");
 		let (failed, text) = client
-			.call("rename_item", json!({ "path": "crate::escape::escaped", "new_name": "caught", "attached": "engine" }))
+			.call(
+				"rename_item",
+				json!({ "path": "crate::escape::escaped", "new_name": "caught", "attached": "engine" }),
+			)
 			.await;
 
 		assert!(failed);
@@ -1150,17 +1288,5 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(&text, &["attached `engine` (read-only)", "replacing", "(read and write)"]);
 		client.close().await.unwrap();
-	}
-
-	#[test]
-	fn fixtures_are_cleaned_up() {
-		let root = {
-			let fixture = Fixture::new("cleanup");
-
-			assert!(fixture.read("src/lib.rs").contains("pub fn add"));
-			fixture.root.clone()
-		};
-
-		assert!(!Path::new(&root).exists());
 	}
 }

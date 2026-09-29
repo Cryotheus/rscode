@@ -99,17 +99,17 @@ impl Scope {
 
 	fn item_binding(&self, name: &str, namespace: Namespace) -> Option<&LocalBinding> {
 		// later declarations win (they cannot legally clash, but imports are declared after items)
-		self.items.iter().rev().find(|(item, item_namespace, _)| item == name && *item_namespace == namespace).map(|(_, _, binding)| binding)
+		self.items
+			.iter()
+			.rev()
+			.find(|(item, item_namespace, _)| item == name && *item_namespace == namespace)
+			.map(|(_, _, binding)| binding)
 	}
 
 	/// The members of an enum or module defined in the block.
 	pub(super) fn members_of(&self, name: &str) -> Option<&[(SmolStr, Namespace)]> {
 		self.members.iter().find(|(item, _)| item == name).map(|(_, members)| members.as_slice())
 	}
-}
-
-fn name(ident: &proc_macro2::Ident) -> SmolStr {
-	SmolStr::new(ident.unraw().to_string())
 }
 
 /// The stack of local scopes, innermost last.
@@ -119,19 +119,31 @@ pub(super) struct Scopes {
 }
 
 impl Scopes {
-	pub(super) fn push(&mut self, scope: Scope) {
-		self.stack.push(scope);
-	}
-
-	pub(super) fn pop(&mut self) {
-		self.stack.pop();
-	}
-
 	/// Binds a local variable in the innermost scope.
 	pub(super) fn bind_variable(&mut self, name: SmolStr) {
 		if let Some(scope) = self.stack.last_mut() {
 			scope.variables.push(name);
 		}
+	}
+
+	/// The trait bounds of the type parameter `name` (the innermost one of that name): those of its declaration, and
+	/// those of the `where` clauses of the items inside of the one declaring it.
+	pub(super) fn bounds_of(&self, name: &str) -> Vec<&PathRef> {
+		let mut bounds = Vec::new();
+
+		for scope in self.stack.iter().rev() {
+			bounds.extend(scope.bounds.iter().filter(|(parameter, _)| parameter == name).map(|(_, bound)| bound));
+
+			if scope
+				.generics
+				.iter()
+				.any(|(generic, namespace)| generic == name && *namespace == Namespace::Type)
+			{
+				break;
+			}
+		}
+
+		bounds
 	}
 
 	/// The innermost local binding of `name` in `namespace`, if any.
@@ -153,7 +165,11 @@ impl Scopes {
 					return Some(LocalBinding::Variable);
 				}
 
-				if scope.generics.iter().any(|(generic, generic_namespace)| generic == name && *generic_namespace == namespace) {
+				if scope
+					.generics
+					.iter()
+					.any(|(generic, generic_namespace)| generic == name && *generic_namespace == namespace)
+				{
 					return Some(LocalBinding::Generic);
 				}
 			}
@@ -175,7 +191,10 @@ impl Scopes {
 					}
 
 					LocalGlob::Names(names) => {
-						if names.iter().any(|(member, member_namespace)| member == name && *member_namespace == namespace) {
+						if names
+							.iter()
+							.any(|(member, member_namespace)| member == name && *member_namespace == namespace)
+						{
 							return Some(LocalBinding::Opaque);
 						}
 					}
@@ -193,21 +212,17 @@ impl Scopes {
 		self.stack.iter().rev().find_map(|scope| scope.members_of(name))
 	}
 
-	/// The trait bounds of the type parameter `name` (the innermost one of that name): those of its declaration, and
-	/// those of the `where` clauses of the items inside of the one declaring it.
-	pub(super) fn bounds_of(&self, name: &str) -> Vec<&PathRef> {
-		let mut bounds = Vec::new();
-
-		for scope in self.stack.iter().rev() {
-			bounds.extend(scope.bounds.iter().filter(|(parameter, _)| parameter == name).map(|(_, bound)| bound));
-
-			if scope.generics.iter().any(|(generic, namespace)| generic == name && *namespace == Namespace::Type) {
-				break;
-			}
-		}
-
-		bounds
+	pub(super) fn pop(&mut self) {
+		self.stack.pop();
 	}
+
+	pub(super) fn push(&mut self, scope: Scope) {
+		self.stack.push(scope);
+	}
+}
+
+fn name(ident: &proc_macro2::Ident) -> SmolStr {
+	SmolStr::new(ident.unraw().to_string())
 }
 
 /// The trait bounds that generics put on type parameters, as `(parameter, trait path)`: in the parameters'
@@ -257,12 +272,26 @@ mod tests {
 	use crate::model::CrateId;
 	use crate::model::ItemId;
 
-	fn no_members(_: &Res, _: &str, _: Namespace) -> Vec<Res> {
-		Vec::new()
-	}
+	#[test]
+	fn glob_imports_of_blocks() {
+		let module = Res::Item(ItemId::new(CrateId(0), 7));
+		let mut block = Scope::default();
 
-	fn lookup(scopes: &Scopes, name: &str, namespace: Namespace) -> Option<LocalBinding> {
-		scopes.lookup(name, namespace, false, no_members)
+		block.globs.push(LocalGlob::Sources(vec![module.clone()]));
+		block.globs.push(LocalGlob::Names(vec![("A".into(), Namespace::Value)]));
+
+		let mut scopes = Scopes::default();
+
+		scopes.push(block);
+
+		let members = |source: &Res, name: &str, _: Namespace| if name == "B" { vec![source.clone()] } else { Vec::new() };
+
+		assert_eq!(
+			scopes.lookup("B", Namespace::Type, false, members),
+			Some(LocalBinding::Imported(vec![module]))
+		);
+		assert_eq!(scopes.lookup("A", Namespace::Value, false, members), Some(LocalBinding::Opaque));
+		assert_eq!(scopes.lookup("A", Namespace::Type, false, members), None);
 	}
 
 	#[test]
@@ -314,22 +343,11 @@ mod tests {
 		assert_eq!(lookup(&scopes, "T", Namespace::Type), Some(LocalBinding::Generic));
 	}
 
-	#[test]
-	fn glob_imports_of_blocks() {
-		let module = Res::Item(ItemId::new(CrateId(0), 7));
-		let mut block = Scope::default();
+	fn lookup(scopes: &Scopes, name: &str, namespace: Namespace) -> Option<LocalBinding> {
+		scopes.lookup(name, namespace, false, no_members)
+	}
 
-		block.globs.push(LocalGlob::Sources(vec![module.clone()]));
-		block.globs.push(LocalGlob::Names(vec![("A".into(), Namespace::Value)]));
-
-		let mut scopes = Scopes::default();
-
-		scopes.push(block);
-
-		let members = |source: &Res, name: &str, _: Namespace| if name == "B" { vec![source.clone()] } else { Vec::new() };
-
-		assert_eq!(scopes.lookup("B", Namespace::Type, false, members), Some(LocalBinding::Imported(vec![module])));
-		assert_eq!(scopes.lookup("A", Namespace::Value, false, members), Some(LocalBinding::Opaque));
-		assert_eq!(scopes.lookup("A", Namespace::Type, false, members), None);
+	fn no_members(_: &Res, _: &str, _: Namespace) -> Vec<Res> {
+		Vec::new()
 	}
 }

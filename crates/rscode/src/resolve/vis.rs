@@ -8,51 +8,6 @@ use crate::model::PathRef;
 use crate::model::Visibility;
 use crate::model::Workspace;
 
-/// Where an item or a binding can be seen from.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub(super) enum Vis {
-	/// Everywhere, including other crates.
-	Public,
-
-	/// Inside of the module and its descendants.
-	Module(ItemId),
-}
-
-impl Vis {
-	pub(super) fn is_visible_from(self, tree: &ModuleTree, module: ItemId) -> bool {
-		match self {
-			Self::Public => true,
-			Self::Module(scope) => tree.is_within(module, scope),
-		}
-	}
-
-	/// The more restrictive of two visibilities: an import never makes what it imports more visible.
-	pub(super) fn narrow(self, tree: &ModuleTree, other: Self) -> Self {
-		match (self, other) {
-			(Self::Public, other) | (other, Self::Public) => other,
-			(Self::Module(this), Self::Module(other)) if tree.is_within(other, this) => Self::Module(other),
-			(this, _) => this,
-		}
-	}
-
-	/// Whether `self` admits strictly more modules than `other`.
-	pub(super) fn is_wider_than(self, tree: &ModuleTree, other: Self) -> bool {
-		match (self, other) {
-			(Self::Public, Self::Module(_)) => true,
-			(Self::Module(this), Self::Module(other)) => this != other && tree.is_within(other, this),
-			_ => false,
-		}
-	}
-
-	/// The module whose subtree may see the item, or `None` when it is public.
-	pub(super) fn scope(self) -> Option<ItemId> {
-		match self {
-			Self::Public => None,
-			Self::Module(module) => Some(module),
-		}
-	}
-}
-
 /// Answers whether a module is inside of another one in constant time.
 #[derive(Debug, Default)]
 pub(super) struct ModuleTree {
@@ -81,6 +36,121 @@ impl ModuleTree {
 			(Some(&(start, end)), Some(&(ancestor_start, ancestor_end))) => ancestor_start <= start && end <= ancestor_end,
 			_ => false,
 		}
+	}
+}
+
+/// Where an item or a binding can be seen from.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub(super) enum Vis {
+	/// Everywhere, including other crates.
+	Public,
+
+	/// Inside of the module and its descendants.
+	Module(ItemId),
+}
+
+impl Vis {
+	pub(super) fn is_visible_from(self, tree: &ModuleTree, module: ItemId) -> bool {
+		match self {
+			Self::Public => true,
+			Self::Module(scope) => tree.is_within(module, scope),
+		}
+	}
+
+	/// Whether `self` admits strictly more modules than `other`.
+	pub(super) fn is_wider_than(self, tree: &ModuleTree, other: Self) -> bool {
+		match (self, other) {
+			(Self::Public, Self::Module(_)) => true,
+			(Self::Module(this), Self::Module(other)) => this != other && tree.is_within(other, this),
+			_ => false,
+		}
+	}
+
+	/// The more restrictive of two visibilities: an import never makes what it imports more visible.
+	pub(super) fn narrow(self, tree: &ModuleTree, other: Self) -> Self {
+		match (self, other) {
+			(Self::Public, other) | (other, Self::Public) => other,
+			(Self::Module(this), Self::Module(other)) if tree.is_within(other, this) => Self::Module(other),
+			(this, _) => this,
+		}
+	}
+
+	/// The module whose subtree may see the item, or `None` when it is public.
+	pub(super) fn scope(self) -> Option<ItemId> {
+		match self {
+			Self::Public => None,
+			Self::Module(module) => Some(module),
+		}
+	}
+}
+
+/// Whether `module` is `ancestor` or one of its descendants.
+fn contains(ws: &Workspace, ancestor: ItemId, module: ItemId) -> bool {
+	let mut current = Some(module);
+
+	while let Some(module) = current {
+		if module == ancestor {
+			return true;
+		}
+
+		current = parent_module(ws, module);
+	}
+
+	false
+}
+
+/// The visibility an item is declared with.
+///
+/// `macro_rules!` macros are visible in the whole crate (`pub(crate)`, as far as re-exports are concerned), or
+/// everywhere with `#[macro_export]`. Items of trait `impl`s are public; variants and trait items have the visibility
+/// of their enum or trait.
+pub(super) fn declared_vis(ws: &Workspace, item: ItemId) -> Vis {
+	if item.is_crate_root() {
+		return Vis::Public;
+	}
+
+	let data = ws.item(item);
+	let home = home_module(ws, item);
+	let root = ItemId::crate_root(item.krate());
+
+	if is_macro_rules(data) {
+		return if data.attrs.macro_export { Vis::Public } else { Vis::Module(root) };
+	}
+
+	match &data.vis {
+		Visibility::Public => Vis::Public,
+		Visibility::Crate => Vis::Module(root),
+		Visibility::Super => Vis::Module(parent_module(ws, home).unwrap_or(root)),
+		Visibility::SelfModule | Visibility::Private => Vis::Module(home),
+
+		// an unresolvable `pub(in path)` is an error; be lenient
+		Visibility::InPath(path) => Vis::Module(vis_path_module(ws, home, path).unwrap_or(root)),
+
+		Visibility::Inherited => inherited_vis(ws, item, home),
+	}
+}
+
+/// The module an item is declared in: the nearest module strictly above it (the crate root for itself).
+///
+/// Extern blocks are transparent, and items of `impl` blocks, traits, and enums belong to the enclosing module.
+pub(super) fn home_module(ws: &Workspace, item: ItemId) -> ItemId {
+	match ws.parent(item) {
+		Some(parent) => ws.module_of(parent),
+		None => item,
+	}
+}
+
+fn inherited_vis(ws: &Workspace, item: ItemId, home: ItemId) -> Vis {
+	let Some(parent) = ws.parent(item) else {
+		return Vis::Public;
+	};
+
+	let parent_data = ws.item(parent);
+
+	match parent_data.kind {
+		ItemKind::Enum | ItemKind::Trait => declared_vis(ws, parent),
+		ItemKind::Impl if parent_data.impl_info().is_some_and(|info| info.trait_path.is_some()) => Vis::Public,
+		_ => Vis::Module(home),
 	}
 }
 
@@ -136,61 +206,6 @@ pub(super) fn parent_module(ws: &Workspace, module: ItemId) -> Option<ItemId> {
 	ws.parent(module).map(|parent| ws.module_of(parent))
 }
 
-/// The module an item is declared in: the nearest module strictly above it (the crate root for itself).
-///
-/// Extern blocks are transparent, and items of `impl` blocks, traits, and enums belong to the enclosing module.
-pub(super) fn home_module(ws: &Workspace, item: ItemId) -> ItemId {
-	match ws.parent(item) {
-		Some(parent) => ws.module_of(parent),
-		None => item,
-	}
-}
-
-/// The visibility an item is declared with.
-///
-/// `macro_rules!` macros are visible in the whole crate (`pub(crate)`, as far as re-exports are concerned), or
-/// everywhere with `#[macro_export]`. Items of trait `impl`s are public; variants and trait items have the visibility
-/// of their enum or trait.
-pub(super) fn declared_vis(ws: &Workspace, item: ItemId) -> Vis {
-	if item.is_crate_root() {
-		return Vis::Public;
-	}
-
-	let data = ws.item(item);
-	let home = home_module(ws, item);
-	let root = ItemId::crate_root(item.krate());
-
-	if is_macro_rules(data) {
-		return if data.attrs.macro_export { Vis::Public } else { Vis::Module(root) };
-	}
-
-	match &data.vis {
-		Visibility::Public => Vis::Public,
-		Visibility::Crate => Vis::Module(root),
-		Visibility::Super => Vis::Module(parent_module(ws, home).unwrap_or(root)),
-		Visibility::SelfModule | Visibility::Private => Vis::Module(home),
-
-		// an unresolvable `pub(in path)` is an error; be lenient
-		Visibility::InPath(path) => Vis::Module(vis_path_module(ws, home, path).unwrap_or(root)),
-
-		Visibility::Inherited => inherited_vis(ws, item, home),
-	}
-}
-
-fn inherited_vis(ws: &Workspace, item: ItemId, home: ItemId) -> Vis {
-	let Some(parent) = ws.parent(item) else {
-		return Vis::Public;
-	};
-
-	let parent_data = ws.item(parent);
-
-	match parent_data.kind {
-		ItemKind::Enum | ItemKind::Trait => declared_vis(ws, parent),
-		ItemKind::Impl if parent_data.impl_info().is_some_and(|info| info.trait_path.is_some()) => Vis::Public,
-		_ => Vis::Module(home),
-	}
-}
-
 /// The module named by the path of `pub(in path)` (`crate::a`, `super`, `self::b`; crate-relative in 2015).
 fn vis_path_module(ws: &Workspace, home: ItemId, path: &PathRef) -> Option<ItemId> {
 	let root = ItemId::crate_root(home.krate());
@@ -226,25 +241,14 @@ fn vis_path_module(ws: &Workspace, home: ItemId, path: &PathRef) -> Option<ItemI
 
 				let first = modules.next()?;
 
-				if contains(ws, first, home) { first } else { modules.find(|&module| contains(ws, module, home)).unwrap_or(first) }
+				if contains(ws, first, home) {
+					first
+				} else {
+					modules.find(|&module| contains(ws, module, home)).unwrap_or(first)
+				}
 			}
 		};
 	}
 
 	Some(current)
-}
-
-/// Whether `module` is `ancestor` or one of its descendants.
-fn contains(ws: &Workspace, ancestor: ItemId, module: ItemId) -> bool {
-	let mut current = Some(module);
-
-	while let Some(module) = current {
-		if module == ancestor {
-			return true;
-		}
-
-		current = parent_module(ws, module);
-	}
-
-	false
 }

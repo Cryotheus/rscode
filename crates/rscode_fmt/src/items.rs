@@ -25,147 +25,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
-/// An item targeted for formatting.
-#[derive(Debug, Clone)]
-struct Target {
-	/// The structural index path: `[4, 2]` is the 3rd item inside the 5th top-level item.
-	path: Vec<usize>,
-
-	/// The byte range in the original source.
-	range: Range<usize>,
-
-	kind: &'static str,
-	name: Option<String>,
-
-	/// Whether the item's items can be sorted.
-	container: bool,
-}
-
-impl Target {
-	/// Whether this target is nested inside `outer`.
-	fn is_inside(&self, outer: &Target) -> bool {
-		outer.path.len() < self.path.len() && self.path.starts_with(&outer.path)
-	}
-
-	fn describe(&self) -> String {
-		match &self.name {
-			Some(name) => format!("{} `{name}`", self.kind),
-			None => self.kind.to_owned(),
-		}
-	}
-}
-
-/// How often a whole file is sorted and formatted again when rustfmt changed how its items sort.
-const MAX_RESORTS: usize = 3;
-
-pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &FormatOptions) -> Result<String, FormatError> {
-	if targets.is_empty() {
-		return Ok(source.to_owned());
-	}
-
-	// parsed even when only the whole file is targeted, so every mode rejects invalid source alike
-	let parsed = Parsed::parse(source)?;
-	let whole_file = targets.contains(&FormatTarget::File);
-	let items = locate(&parsed, targets)?;
-	let sorted = match &options.sort {
-		Some(sort) => sort_containers(source, whole_file, &items, sort)?,
-		None => None,
-	};
-	let text = sorted.as_deref().unwrap_or(source);
-
-	if whole_file {
-		let mut formatted = format_file(text, sorted.is_some(), options)?;
-
-		// rustfmt may merge or split imports (`imports_granularity`), which changes how they sort: sort and format
-		// again until they settle, so that formatting the result changes nothing
-		if let (Some(sort), RsFormatter::RustFmt) = (&options.sort, options.formatter) {
-			// targeted containers that sorting the file does not reach (it is not recursive), found again after each
-			// pass (their positions change)
-			let containers: Vec<Identity> = match sort.recursive {
-				true => Vec::new(),
-				false => items.iter().filter(|item| item.container).map(|item| identity(&parsed, item)).collect(),
-			};
-
-			for _ in 0..MAX_RESORTS {
-				let targets = relocate(&formatted, &containers)?;
-
-				match sort_containers(&formatted, true, &targets, sort)? {
-					Some(resorted) if resorted != formatted => {
-						let reformatted = format_file(&resorted, true, options)?;
-
-						// rustfmt restored the text (it groups imports differently, `group_imports`): more passes would
-						// repeat it
-						if reformatted == formatted {
-							break;
-						}
-
-						formatted = reformatted;
-					}
-					_ => break,
-				}
-			}
-		}
-
-		return Ok(formatted);
-	}
-
-	let items = outermost(items);
-
-	if options.formatter == RsFormatter::None {
-		if sorted.is_some() {
-			ensure_parses(text, "sorting")?;
-		}
-
-		return Ok(text.to_owned());
-	}
-
-	match &sorted {
-		Some(sorted) => {
-			let parsed = parse_output(sorted, "sorting")?;
-
-			check_unmoved(&parsed, &items)?;
-			format_targets(sorted, &parsed, &items, options)
-		}
-		None => format_targets(source, &parsed, &items, options),
-	}
-}
-
-/// Finds the targeted items in the parsed source, in document order and without duplicates.
-fn locate(parsed: &Parsed, targets: &[FormatTarget]) -> Result<Vec<Target>, FormatError> {
-	let mut starts: Vec<usize> = targets
-		.iter()
-		.filter_map(|target| match target {
-			FormatTarget::Item(start) => Some(*start),
-			FormatTarget::File => None,
-		})
-		.collect();
-
-	if starts.is_empty() {
-		return Ok(Vec::new());
-	}
-
-	starts.sort_unstable();
-	starts.dedup();
-
-	let items = tree::index(parsed);
-	let by_start: HashMap<usize, &tree::Indexed<'_>> = items.iter().map(|item| (item.range.start, item)).collect();
-
-	starts
-		.into_iter()
-		.map(|start| {
-			let item = by_start.get(&start).ok_or(FormatError::NoItem(start))?;
-
-			Ok(Target {
-				path: item.path.clone(),
-				range: item.range.clone(),
-				kind: item.node.kind(),
-				name: item.node.name(),
-				container: item.node.is_container(),
-			})
-		})
-		.collect()
-}
-
 /// What identifies an item in a file whose items may move: the kinds, names, and headers (see [`Node::header`]) of the
 /// item and of its ancestors, outermost first, and how many items with the same ones precede it (identical twins).
 type Identity = (Vec<Link>, usize);
@@ -173,174 +32,8 @@ type Identity = (Vec<Link>, usize);
 /// The kind, name, and header of an item.
 type Link = (&'static str, Option<String>, String);
 
-/// The [`Link`]s of the item at `path` and of its ancestors, outermost first.
-fn chain(parsed: &Parsed, path: &[usize]) -> Vec<Link> {
-	(1..=path.len())
-		.filter_map(|length| Node::at(&parsed.file, &path[..length]))
-		.map(|node| (node.kind(), node.name(), node.header()))
-		.collect()
-}
-
-/// The [`Identity`] of a target of `parsed`.
-fn identity(parsed: &Parsed, target: &Target) -> Identity {
-	let chain = chain(parsed, &target.path);
-	let preceding = (tree::index(parsed).into_iter())
-		.take_while(|item| item.path != target.path)
-		.filter(|item| item.node.is_container() && self::chain(parsed, &item.path) == chain)
-		.count();
-
-	(chain, preceding)
-}
-
-/// The containers with these identities in `text`.
-fn relocate(text: &str, identities: &[Identity]) -> Result<Vec<Target>, FormatError> {
-	if identities.is_empty() {
-		return Ok(Vec::new());
-	}
-
-	let parsed = Parsed::parse(text)?;
-	let items: Vec<_> = tree::index(&parsed).into_iter().filter(|item| item.node.is_container()).collect();
-	let chains: Vec<_> = items.iter().map(|item| chain(&parsed, &item.path)).collect();
-
-	identities
-		.iter()
-		.map(|(chain, preceding)| {
-			let (item, _) = (items.iter().zip(&chains))
-				.filter(|(_, candidate)| *candidate == chain)
-				.nth(*preceding)
-				.ok_or_else(|| {
-					let name = chain.last().map(|(kind, name, _)| (kind, name));
-
-					FormatError::StructureMismatch(format!("{name:?} is gone after formatting"))
-				})?;
-
-			Ok(Target {
-				path: item.path.clone(),
-				range: item.range.clone(),
-				kind: item.node.kind(),
-				name: item.node.name(),
-				container: true,
-			})
-		})
-		.collect()
-}
-
-/// Sorts the whole file (if targeted) and the targeted containers. `None` if there is nothing to sort.
-fn sort_containers(
-	source: &str,
-	whole_file: bool,
-	targets: &[Target],
-	options: &SortOptions,
-) -> Result<Option<String>, FormatError> {
-	let mut sort_targets = Vec::new();
-
-	if whole_file {
-		sort_targets.push(SortTarget::File);
-	}
-
-	for target in targets.iter().filter(|target| target.container) {
-		// when sorting recursively, containers inside other targets are sorted with them
-		let inside_container = targets.iter().any(|outer| outer.container && target.is_inside(outer));
-		let covered = options.recursive && (whole_file || inside_container);
-
-		if !covered {
-			sort_targets.push(SortTarget::Item(target.range.start));
-		}
-	}
-
-	if sort_targets.is_empty() {
-		return Ok(None);
-	}
-
-	Ok(Some(Sorter::new(options.clone()).sort_str_within(source, &sort_targets)?))
-}
-
-/// Drops targets nested inside other targets: formatting the outer item formats them too.
-fn outermost(targets: Vec<Target>) -> Vec<Target> {
-	let mut kept: Vec<Target> = Vec::with_capacity(targets.len());
-
-	// in document order, a target can only be nested inside the last kept target
-	for target in targets {
-		if kept.last().is_none_or(|outer| !target.is_inside(outer)) {
-			kept.push(target);
-		}
-	}
-
-	kept
-}
-
-/// Checks that the (outermost) targets are where they were: sorting only rearranges the insides of the targets.
-fn check_unmoved(sorted: &Parsed, targets: &[Target]) -> Result<(), FormatError> {
-	for target in targets {
-		match Node::at(&sorted.file, &target.path) {
-			Some(node) if node.kind() == target.kind && node.name() == target.name => {}
-			_ => {
-				return Err(FormatError::StructureMismatch(format!(
-					"{} (item path {:?}) moved in the output of sorting",
-					target.describe(),
-					target.path,
-				)));
-			}
-		}
-	}
-
-	Ok(())
-}
-
-fn format_file(text: &str, sorted: bool, options: &FormatOptions) -> Result<String, FormatError> {
-	let formatted = match options.formatter {
-		RsFormatter::RustFmt => rustfmt::format(text, &options.rustfmt)?,
-		RsFormatter::PrettyPlease => prettyplease_fmt::format_str(text, options.allow_comment_loss)?,
-		RsFormatter::None if sorted => text.to_owned(),
-		RsFormatter::None => return Ok(text.to_owned()),
-	};
-	let produced_by = match options.formatter {
-		RsFormatter::None => "sorting",
-		formatter => formatter.name(),
-	};
-
-	ensure_parses(&formatted, produced_by)?;
-
-	Ok(formatted)
-}
-
-/// Formats the whole text, then splices the formatted text of each target into the text.
-fn format_targets(text: &str, parsed: &Parsed, targets: &[Target], options: &FormatOptions) -> Result<String, FormatError> {
-	let before: Vec<Range<usize>> = targets
-		.iter()
-		.map(|target| Node::at(&parsed.file, &target.path).map(|node| parsed.range(node.span())))
-		.collect::<Option<_>>()
-		.ok_or_else(|| FormatError::StructureMismatch("a target is missing from the source".to_owned()))?;
-
-	let formatted = match options.formatter {
-		RsFormatter::RustFmt => rustfmt::format_preserving_items(text, &options.rustfmt)?,
-		RsFormatter::PrettyPlease => {
-			// comments elsewhere are lost too, but only the targets' text is used
-			if !options.allow_comment_loss && before.iter().any(|range| contains_comments(&text[range.clone()])) {
-				return Err(FormatError::CommentsWouldBeLost);
-			}
-
-			prettyplease_fmt::format_str(text, true)?
-		}
-		RsFormatter::None => return Ok(text.to_owned()),
-	};
-
-	let produced_by = options.formatter.name();
-	let formatted_parsed = parse_output(&formatted, produced_by)?;
-	let mut matcher = Matcher::new(parsed, &formatted_parsed, produced_by);
-	let after: Vec<Option<Range<usize>>> = targets.iter().map(|target| matcher.find(&target.path)).collect::<Result<_, _>>()?;
-	let spliced = splice(text, &before, &formatted, &after);
-
-	ensure_parses(&spliced, produced_by)?;
-
-	Ok(spliced)
-}
-
-/// Parses text produced by sorting or formatting; failing to parse is a [`FormatError::StructureMismatch`].
-fn parse_output(text: &str, produced_by: &str) -> Result<Parsed, FormatError> {
-	Parsed::parse(text)
-		.map_err(|error| FormatError::StructureMismatch(format!("the output of {produced_by} does not parse: {error}")))
-}
+/// How often a whole file is sorted and formatted again when rustfmt changed how its items sort.
+const MAX_RESORTS: usize = 3;
 
 /// Finds the items of a source in the formatted source.
 ///
@@ -431,12 +124,60 @@ impl<'a> Matcher<'a> {
 	}
 }
 
-/// The items of a container (`None` for the file).
-fn children<'a>(file: &'a syn::File, container: Option<Node<'a>>) -> Vec<Node<'a>> {
-	match container {
-		Some(node) => node.children(),
-		None => Node::roots(file),
+/// An item targeted for formatting.
+#[derive(Debug, Clone)]
+struct Target {
+	/// The structural index path: `[4, 2]` is the 3rd item inside the 5th top-level item.
+	path: Vec<usize>,
+
+	/// The byte range in the original source.
+	range: Range<usize>,
+
+	kind: &'static str,
+	name: Option<String>,
+
+	/// Whether the item's items can be sorted.
+	container: bool,
+}
+
+impl Target {
+	fn describe(&self) -> String {
+		match &self.name {
+			Some(name) => format!("{} `{name}`", self.kind),
+			None => self.kind.to_owned(),
+		}
 	}
+
+	/// Whether this target is nested inside `outer`.
+	fn is_inside(&self, outer: &Target) -> bool {
+		outer.path.len() < self.path.len() && self.path.starts_with(&outer.path)
+	}
+}
+
+/// The [`Link`]s of the item at `path` and of its ancestors, outermost first.
+fn chain(parsed: &Parsed, path: &[usize]) -> Vec<Link> {
+	(1..=path.len())
+		.filter_map(|length| Node::at(&parsed.file, &path[..length]))
+		.map(|node| (node.kind(), node.name(), node.header()))
+		.collect()
+}
+
+/// Checks that the (outermost) targets are where they were: sorting only rearranges the insides of the targets.
+fn check_unmoved(sorted: &Parsed, targets: &[Target]) -> Result<(), FormatError> {
+	for target in targets {
+		match Node::at(&sorted.file, &target.path) {
+			Some(node) if node.kind() == target.kind && node.name() == target.name => {}
+			_ => {
+				return Err(FormatError::StructureMismatch(format!(
+					"{} (item path {:?}) moved in the output of sorting",
+					target.describe(),
+					target.path,
+				)));
+			}
+		}
+	}
+
+	Ok(())
 }
 
 /// The item at `index` in a container (`None` for the file).
@@ -445,6 +186,259 @@ fn child<'a>(file: &'a syn::File, container: Option<Node<'a>>, index: usize) -> 
 		Some(node) => node.child(index),
 		None => file.items.get(index).map(Node::Item),
 	}
+}
+
+/// The items of a container (`None` for the file).
+fn children<'a>(file: &'a syn::File, container: Option<Node<'a>>) -> Vec<Node<'a>> {
+	match container {
+		Some(node) => node.children(),
+		None => Node::roots(file),
+	}
+}
+
+fn format_file(text: &str, sorted: bool, options: &FormatOptions) -> Result<String, FormatError> {
+	let formatted = match options.formatter {
+		RsFormatter::RustFmt => rustfmt::format(text, &options.rustfmt)?,
+		RsFormatter::PrettyPlease => prettyplease_fmt::format_str(text, options.allow_comment_loss)?,
+		RsFormatter::None if sorted => text.to_owned(),
+		RsFormatter::None => return Ok(text.to_owned()),
+	};
+	let produced_by = match options.formatter {
+		RsFormatter::None => "sorting",
+		formatter => formatter.name(),
+	};
+
+	ensure_parses(&formatted, produced_by)?;
+
+	Ok(formatted)
+}
+
+pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &FormatOptions) -> Result<String, FormatError> {
+	if targets.is_empty() {
+		return Ok(source.to_owned());
+	}
+
+	// parsed even when only the whole file is targeted, so every mode rejects invalid source alike
+	let parsed = Parsed::parse(source)?;
+	let whole_file = targets.contains(&FormatTarget::File);
+	let items = locate(&parsed, targets)?;
+	let sorted = match &options.sort {
+		Some(sort) => sort_containers(source, whole_file, &items, sort)?,
+		None => None,
+	};
+	let text = sorted.as_deref().unwrap_or(source);
+
+	if whole_file {
+		let mut formatted = format_file(text, sorted.is_some(), options)?;
+
+		// rustfmt may merge or split imports (`imports_granularity`), which changes how they sort: sort and format
+		// again until they settle, so that formatting the result changes nothing
+		if let (Some(sort), RsFormatter::RustFmt) = (&options.sort, options.formatter) {
+			// targeted containers that sorting the file does not reach (it is not recursive), found again after each
+			// pass (their positions change)
+			let containers: Vec<Identity> = match sort.recursive {
+				true => Vec::new(),
+				false => items.iter().filter(|item| item.container).map(|item| identity(&parsed, item)).collect(),
+			};
+
+			for _ in 0..MAX_RESORTS {
+				let targets = relocate(&formatted, &containers)?;
+
+				match sort_containers(&formatted, true, &targets, sort)? {
+					Some(resorted) if resorted != formatted => {
+						let reformatted = format_file(&resorted, true, options)?;
+
+						// rustfmt restored the text (it groups imports differently, `group_imports`): more passes would
+						// repeat it
+						if reformatted == formatted {
+							break;
+						}
+
+						formatted = reformatted;
+					}
+					_ => break,
+				}
+			}
+		}
+
+		return Ok(formatted);
+	}
+
+	let items = outermost(items);
+
+	if options.formatter == RsFormatter::None {
+		if sorted.is_some() {
+			ensure_parses(text, "sorting")?;
+		}
+
+		return Ok(text.to_owned());
+	}
+
+	match &sorted {
+		Some(sorted) => {
+			let parsed = parse_output(sorted, "sorting")?;
+
+			check_unmoved(&parsed, &items)?;
+			format_targets(sorted, &parsed, &items, options)
+		}
+		None => format_targets(source, &parsed, &items, options),
+	}
+}
+
+/// Formats the whole text, then splices the formatted text of each target into the text.
+fn format_targets(text: &str, parsed: &Parsed, targets: &[Target], options: &FormatOptions) -> Result<String, FormatError> {
+	let before: Vec<Range<usize>> = targets
+		.iter()
+		.map(|target| Node::at(&parsed.file, &target.path).map(|node| parsed.range(node.span())))
+		.collect::<Option<_>>()
+		.ok_or_else(|| FormatError::StructureMismatch("a target is missing from the source".to_owned()))?;
+
+	let formatted = match options.formatter {
+		RsFormatter::RustFmt => rustfmt::format_preserving_items(text, &options.rustfmt)?,
+		RsFormatter::PrettyPlease => {
+			// comments elsewhere are lost too, but only the targets' text is used
+			if !options.allow_comment_loss && before.iter().any(|range| contains_comments(&text[range.clone()])) {
+				return Err(FormatError::CommentsWouldBeLost);
+			}
+
+			prettyplease_fmt::format_str(text, true)?
+		}
+		RsFormatter::None => return Ok(text.to_owned()),
+	};
+
+	let produced_by = options.formatter.name();
+	let formatted_parsed = parse_output(&formatted, produced_by)?;
+	let mut matcher = Matcher::new(parsed, &formatted_parsed, produced_by);
+	let after: Vec<Option<Range<usize>>> = targets.iter().map(|target| matcher.find(&target.path)).collect::<Result<_, _>>()?;
+	let spliced = splice(text, &before, &formatted, &after);
+
+	ensure_parses(&spliced, produced_by)?;
+
+	Ok(spliced)
+}
+
+/// The [`Identity`] of a target of `parsed`.
+fn identity(parsed: &Parsed, target: &Target) -> Identity {
+	let chain = chain(parsed, &target.path);
+	let preceding = (tree::index(parsed).into_iter())
+		.take_while(|item| item.path != target.path)
+		.filter(|item| item.node.is_container() && self::chain(parsed, &item.path) == chain)
+		.count();
+
+	(chain, preceding)
+}
+
+/// Finds the targeted items in the parsed source, in document order and without duplicates.
+fn locate(parsed: &Parsed, targets: &[FormatTarget]) -> Result<Vec<Target>, FormatError> {
+	let mut starts: Vec<usize> = targets
+		.iter()
+		.filter_map(|target| match target {
+			FormatTarget::Item(start) => Some(*start),
+			FormatTarget::File => None,
+		})
+		.collect();
+
+	if starts.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	starts.sort_unstable();
+	starts.dedup();
+
+	let items = tree::index(parsed);
+	let by_start: HashMap<usize, &tree::Indexed<'_>> = items.iter().map(|item| (item.range.start, item)).collect();
+
+	starts
+		.into_iter()
+		.map(|start| {
+			let item = by_start.get(&start).ok_or(FormatError::NoItem(start))?;
+
+			Ok(Target {
+				path: item.path.clone(),
+				range: item.range.clone(),
+				kind: item.node.kind(),
+				name: item.node.name(),
+				container: item.node.is_container(),
+			})
+		})
+		.collect()
+}
+
+/// Drops targets nested inside other targets: formatting the outer item formats them too.
+fn outermost(targets: Vec<Target>) -> Vec<Target> {
+	let mut kept: Vec<Target> = Vec::with_capacity(targets.len());
+
+	// in document order, a target can only be nested inside the last kept target
+	for target in targets {
+		if kept.last().is_none_or(|outer| !target.is_inside(outer)) {
+			kept.push(target);
+		}
+	}
+
+	kept
+}
+
+/// Parses text produced by sorting or formatting; failing to parse is a [`FormatError::StructureMismatch`].
+fn parse_output(text: &str, produced_by: &str) -> Result<Parsed, FormatError> {
+	Parsed::parse(text).map_err(|error| FormatError::StructureMismatch(format!("the output of {produced_by} does not parse: {error}")))
+}
+
+/// The containers with these identities in `text`.
+fn relocate(text: &str, identities: &[Identity]) -> Result<Vec<Target>, FormatError> {
+	if identities.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let parsed = Parsed::parse(text)?;
+	let items: Vec<_> = tree::index(&parsed).into_iter().filter(|item| item.node.is_container()).collect();
+	let chains: Vec<_> = items.iter().map(|item| chain(&parsed, &item.path)).collect();
+
+	identities
+		.iter()
+		.map(|(chain, preceding)| {
+			let (item, _) = (items.iter().zip(&chains))
+				.filter(|(_, candidate)| *candidate == chain)
+				.nth(*preceding)
+				.ok_or_else(|| {
+					let name = chain.last().map(|(kind, name, _)| (kind, name));
+
+					FormatError::StructureMismatch(format!("{name:?} is gone after formatting"))
+				})?;
+
+			Ok(Target {
+				path: item.path.clone(),
+				range: item.range.clone(),
+				kind: item.node.kind(),
+				name: item.node.name(),
+				container: true,
+			})
+		})
+		.collect()
+}
+
+/// Sorts the whole file (if targeted) and the targeted containers. `None` if there is nothing to sort.
+fn sort_containers(source: &str, whole_file: bool, targets: &[Target], options: &SortOptions) -> Result<Option<String>, FormatError> {
+	let mut sort_targets = Vec::new();
+
+	if whole_file {
+		sort_targets.push(SortTarget::File);
+	}
+
+	for target in targets.iter().filter(|target| target.container) {
+		// when sorting recursively, containers inside other targets are sorted with them
+		let inside_container = targets.iter().any(|outer| outer.container && target.is_inside(outer));
+		let covered = options.recursive && (whole_file || inside_container);
+
+		if !covered {
+			sort_targets.push(SortTarget::Item(target.range.start));
+		}
+	}
+
+	if sort_targets.is_empty() {
+		return Ok(None);
+	}
+
+	Ok(Some(Sorter::new(options.clone()).sort_str_within(source, &sort_targets)?))
 }
 
 /// Replaces each `before` range of `text` with the corresponding `after` range of `formatted`, or removes it if the
@@ -516,104 +510,6 @@ fn trailing_line_end(text: &str, offset: usize) -> Option<usize> {
 mod tests {
 	use super::*;
 
-	fn target(path: &[usize], range: Range<usize>) -> Target {
-		Target {
-			path: path.to_vec(),
-			range,
-			kind: "fn",
-			name: None,
-			container: false,
-		}
-	}
-
-	#[test]
-	fn outermost_targets() {
-		let targets = vec![
-			target(&[0], 0..10),
-			target(&[0, 1], 2..4),
-			target(&[0, 1, 0], 2..3),
-			target(&[1], 11..20),
-			target(&[2, 0], 25..30),
-			target(&[2, 1], 31..35),
-		];
-		let kept: Vec<Vec<usize>> = outermost(targets).into_iter().map(|target| target.path).collect();
-
-		assert_eq!(kept, [vec![0], vec![1], vec![2, 0], vec![2, 1]]);
-	}
-
-	#[test]
-	fn nesting() {
-		assert!(target(&[1, 2], 0..0).is_inside(&target(&[1], 0..0)));
-		assert!(!target(&[1], 0..0).is_inside(&target(&[1], 0..0)));
-		assert!(!target(&[1], 0..0).is_inside(&target(&[1, 2], 0..0)));
-		assert!(!target(&[2, 1], 0..0).is_inside(&target(&[1], 0..0)));
-	}
-
-	fn find(before: &str, after: &str, path: &[usize]) -> Result<String, FormatError> {
-		let before_parsed = Parsed::parse(before).unwrap();
-		let after_parsed = Parsed::parse(after).unwrap();
-		let range = Matcher::new(&before_parsed, &after_parsed, "test").find(path)?;
-
-		Ok(range.map_or_else(|| "<removed>".to_owned(), |range| after[range].to_owned()))
-	}
-
-	#[test]
-	fn matches_items_by_position() {
-		let before = "use b;\nfn a() {}\nmod m {\n    struct S;\n    fn f() {}\n}\n";
-		let after = "use b;\nfn a() {}\nmod m {\n    struct S;\n    fn f() {\n    }\n}\n";
-
-		assert_eq!(find(before, after, &[1]).unwrap(), "fn a() {}");
-		assert_eq!(find(before, after, &[2, 1]).unwrap(), "fn f() {\n    }");
-	}
-
-	#[test]
-	fn matches_reordered_imports_by_identity() {
-		let before = "use b::{y, x};\nuse a;\nextern crate q as r;\nextern crate p;\nfn f() {}\n";
-		let after = "use a;\nuse b::{x, y};\nextern crate p;\nextern crate q as r;\nfn f() {}\n";
-
-		assert_eq!(find(before, after, &[0]).unwrap(), "use b::{x, y};");
-		assert_eq!(find(before, after, &[1]).unwrap(), "use a;");
-		assert_eq!(find(before, after, &[2]).unwrap(), "extern crate q as r;");
-		assert_eq!(find(before, after, &[4]).unwrap(), "fn f() {}");
-	}
-
-	#[test]
-	fn matches_duplicate_imports_in_order() {
-		let before = "use c;\nuse a;\nuse c;\n";
-		let after = "use a;\nuse c;\nuse c ;\n";
-
-		assert_eq!(find(before, after, &[0]).unwrap(), "use c;");
-		assert_eq!(find(before, after, &[2]).unwrap(), "use c ;");
-	}
-
-	#[test]
-	fn matches_items_next_to_removed_imports() {
-		// rustfmt removes `use` items that import nothing, unless they have attributes or a visibility
-		let before = "use a::{};\nfn f() {}\nuse {};\n#[cfg(x)]\nuse b::{c::{}};\nmod m {\n    use d::{};\n    fn g() {}\n}\n";
-		let after = "fn f() {}\n#[cfg(x)]\nuse b::c::{};\nmod m {\n    fn g() {}\n}\n";
-
-		assert_eq!(find(before, after, &[0]).unwrap(), "<removed>");
-		assert_eq!(find(before, after, &[1]).unwrap(), "fn f() {}");
-		assert_eq!(find(before, after, &[2]).unwrap(), "<removed>");
-		assert_eq!(find(before, after, &[3]).unwrap(), "#[cfg(x)]\nuse b::c::{};");
-		assert_eq!(find(before, after, &[4]).unwrap(), "mod m {\n    fn g() {}\n}");
-		assert_eq!(find(before, after, &[4, 1]).unwrap(), "fn g() {}");
-
-		// other items cannot disappear
-		assert!(matches!(find("use a;\nfn f() {}\n", "fn f() {}\n", &[1]), Err(FormatError::StructureMismatch(_))));
-	}
-
-	#[test]
-	fn matches_imports_with_normalized_visibilities() {
-		let before = "pub(in crate) use a;\npub(in self) use  b;\npub(in super) use c;\npub(in crate::m) use d;\n";
-		let after = "pub(crate) use a;\npub(self) use b;\npub(super) use c;\npub(in crate::m) use d;\n";
-
-		assert_eq!(find(before, after, &[0]).unwrap(), "pub(crate) use a;");
-		assert_eq!(find(before, after, &[1]).unwrap(), "pub(self) use b;");
-		assert_eq!(find(before, after, &[2]).unwrap(), "pub(super) use c;");
-		assert_eq!(find(before, after, &[3]).unwrap(), "pub(in crate::m) use d;");
-	}
-
 	#[test]
 	fn detects_structural_changes() {
 		let cases = [
@@ -639,9 +535,138 @@ mod tests {
 		}
 	}
 
+	fn find(before: &str, after: &str, path: &[usize]) -> Result<String, FormatError> {
+		let before_parsed = Parsed::parse(before).unwrap();
+		let after_parsed = Parsed::parse(after).unwrap();
+		let range = Matcher::new(&before_parsed, &after_parsed, "test").find(path)?;
+
+		Ok(range.map_or_else(|| "<removed>".to_owned(), |range| after[range].to_owned()))
+	}
+
+	#[test]
+	fn matches_duplicate_imports_in_order() {
+		let before = "use c;\nuse a;\nuse c;\n";
+		let after = "use a;\nuse c;\nuse c ;\n";
+
+		assert_eq!(find(before, after, &[0]).unwrap(), "use c;");
+		assert_eq!(find(before, after, &[2]).unwrap(), "use c ;");
+	}
+
+	#[test]
+	fn matches_imports_with_normalized_visibilities() {
+		let before = "pub(in crate) use a;\npub(in self) use  b;\npub(in super) use c;\npub(in crate::m) use d;\n";
+		let after = "pub(crate) use a;\npub(self) use b;\npub(super) use c;\npub(in crate::m) use d;\n";
+
+		assert_eq!(find(before, after, &[0]).unwrap(), "pub(crate) use a;");
+		assert_eq!(find(before, after, &[1]).unwrap(), "pub(self) use b;");
+		assert_eq!(find(before, after, &[2]).unwrap(), "pub(super) use c;");
+		assert_eq!(find(before, after, &[3]).unwrap(), "pub(in crate::m) use d;");
+	}
+
+	#[test]
+	fn matches_items_by_position() {
+		let before = "use b;\nfn a() {}\nmod m {\n    struct S;\n    fn f() {}\n}\n";
+		let after = "use b;\nfn a() {}\nmod m {\n    struct S;\n    fn f() {\n    }\n}\n";
+
+		assert_eq!(find(before, after, &[1]).unwrap(), "fn a() {}");
+		assert_eq!(find(before, after, &[2, 1]).unwrap(), "fn f() {\n    }");
+	}
+
+	#[test]
+	fn matches_items_next_to_removed_imports() {
+		// rustfmt removes `use` items that import nothing, unless they have attributes or a visibility
+		let before = "use a::{};\nfn f() {}\nuse {};\n#[cfg(x)]\nuse b::{c::{}};\nmod m {\n    use d::{};\n    fn g() {}\n}\n";
+		let after = "fn f() {}\n#[cfg(x)]\nuse b::c::{};\nmod m {\n    fn g() {}\n}\n";
+
+		assert_eq!(find(before, after, &[0]).unwrap(), "<removed>");
+		assert_eq!(find(before, after, &[1]).unwrap(), "fn f() {}");
+		assert_eq!(find(before, after, &[2]).unwrap(), "<removed>");
+		assert_eq!(find(before, after, &[3]).unwrap(), "#[cfg(x)]\nuse b::c::{};");
+		assert_eq!(find(before, after, &[4]).unwrap(), "mod m {\n    fn g() {}\n}");
+		assert_eq!(find(before, after, &[4, 1]).unwrap(), "fn g() {}");
+
+		// other items cannot disappear
+		assert!(matches!(
+			find("use a;\nfn f() {}\n", "fn f() {}\n", &[1]),
+			Err(FormatError::StructureMismatch(_))
+		));
+	}
+
+	#[test]
+	fn matches_reordered_imports_by_identity() {
+		let before = "use b::{y, x};\nuse a;\nextern crate q as r;\nextern crate p;\nfn f() {}\n";
+		let after = "use a;\nuse b::{x, y};\nextern crate p;\nextern crate q as r;\nfn f() {}\n";
+
+		assert_eq!(find(before, after, &[0]).unwrap(), "use b::{x, y};");
+		assert_eq!(find(before, after, &[1]).unwrap(), "use a;");
+		assert_eq!(find(before, after, &[2]).unwrap(), "extern crate q as r;");
+		assert_eq!(find(before, after, &[4]).unwrap(), "fn f() {}");
+	}
+
+	#[test]
+	fn nesting() {
+		assert!(target(&[1, 2], 0..0).is_inside(&target(&[1], 0..0)));
+		assert!(!target(&[1], 0..0).is_inside(&target(&[1], 0..0)));
+		assert!(!target(&[1], 0..0).is_inside(&target(&[1, 2], 0..0)));
+		assert!(!target(&[2, 1], 0..0).is_inside(&target(&[1], 0..0)));
+	}
+
+	fn offset(text: &str, needle: &str) -> usize {
+		text.find(needle).unwrap()
+	}
+
+	#[test]
+	fn outermost_targets() {
+		let targets = vec![
+			target(&[0], 0..10),
+			target(&[0, 1], 2..4),
+			target(&[0, 1, 0], 2..3),
+			target(&[1], 11..20),
+			target(&[2, 0], 25..30),
+			target(&[2, 1], 31..35),
+		];
+		let kept: Vec<Vec<usize>> = outermost(targets).into_iter().map(|target| target.path).collect();
+
+		assert_eq!(kept, [vec![0], vec![1], vec![2, 0], vec![2, 1]]);
+	}
+
 	/// Splices one range.
 	fn splice_one(text: &str, before: Range<usize>, formatted: &str, after: Range<usize>) -> String {
 		splice(text, std::slice::from_ref(&before), formatted, &[Some(after)])
+	}
+
+	#[test]
+	fn splices_mid_line_items_without_indentation() {
+		let text = "fn a() {} fn  b( ) {}\n";
+		let formatted = "fn a() {}\nfn b() {}\n";
+
+		assert_eq!(
+			splice_one(text, 10..text.len() - 1, formatted, 10..formatted.len() - 1),
+			"fn a() {} fn b() {}\n"
+		);
+	}
+
+	#[test]
+	fn splices_multiple_ranges() {
+		let text = "fn  a( ) {}\nfn  b( ) {}\nfn  c( ) {}\n";
+		let formatted = "fn a() {}\nfn b() {}\nfn c() {}\n";
+		let before = [24..35, 0..11];
+		let after = [Some(20..29), Some(0..9)];
+
+		assert_eq!(splice(text, &before, formatted, &after), "fn a() {}\nfn  b( ) {}\nfn c() {}\n");
+	}
+
+	#[test]
+	fn splices_removed_items_with_their_lines() {
+		let text = "fn a() {}\n    use a::{};  \r\nfn  b( ) {} use c::{};\nuse d::{};";
+		let formatted = "fn a() {}\nfn b() {}\n";
+		let before = [
+			offset(text, "use a")..offset(text, "  \r\n"),
+			offset(text, "use c")..offset(text, "\nuse d"),
+			offset(text, "use d")..text.len(),
+		];
+
+		assert_eq!(splice(text, &before, formatted, &[None, None, None]), "fn a() {}\nfn  b( ) {} \n");
 	}
 
 	#[test]
@@ -655,46 +680,31 @@ mod tests {
 	}
 
 	#[test]
-	fn splices_mid_line_items_without_indentation() {
-		let text = "fn a() {} fn  b( ) {}\n";
-		let formatted = "fn a() {}\nfn b() {}\n";
-
-		assert_eq!(splice_one(text, 10..text.len() - 1, formatted, 10..formatted.len() - 1), "fn a() {} fn b() {}\n");
-	}
-
-	#[test]
 	fn splices_with_the_line_endings_of_the_text() {
 		let text = "fn  a( ) {let x=1;}\r\n";
 		let formatted = "fn a() {\n    let x = 1;\n}\n";
 
-		assert_eq!(splice_one(text, 0..text.len() - 2, formatted, 0..formatted.len() - 1), "fn a() {\r\n    let x = 1;\r\n}\r\n");
+		assert_eq!(
+			splice_one(text, 0..text.len() - 2, formatted, 0..formatted.len() - 1),
+			"fn a() {\r\n    let x = 1;\r\n}\r\n"
+		);
 
 		let text = "fn  a( ) {let x=1;}\n";
 		let formatted = "fn a() {\r\n    let x = 1;\r\n}\r\n";
 
-		assert_eq!(splice_one(text, 0..text.len() - 1, formatted, 0..formatted.len() - 2), "fn a() {\n    let x = 1;\n}\n");
+		assert_eq!(
+			splice_one(text, 0..text.len() - 1, formatted, 0..formatted.len() - 2),
+			"fn a() {\n    let x = 1;\n}\n"
+		);
 	}
 
-	#[test]
-	fn splices_removed_items_with_their_lines() {
-		let text = "fn a() {}\n    use a::{};  \r\nfn  b( ) {} use c::{};\nuse d::{};";
-		let formatted = "fn a() {}\nfn b() {}\n";
-		let before = [offset(text, "use a")..offset(text, "  \r\n"), offset(text, "use c")..offset(text, "\nuse d"), offset(text, "use d")..text.len()];
-
-		assert_eq!(splice(text, &before, formatted, &[None, None, None]), "fn a() {}\nfn  b( ) {} \n");
-	}
-
-	fn offset(text: &str, needle: &str) -> usize {
-		text.find(needle).unwrap()
-	}
-
-	#[test]
-	fn splices_multiple_ranges() {
-		let text = "fn  a( ) {}\nfn  b( ) {}\nfn  c( ) {}\n";
-		let formatted = "fn a() {}\nfn b() {}\nfn c() {}\n";
-		let before = [24..35, 0..11];
-		let after = [Some(20..29), Some(0..9)];
-
-		assert_eq!(splice(text, &before, formatted, &after), "fn a() {}\nfn  b( ) {}\nfn c() {}\n");
+	fn target(path: &[usize], range: Range<usize>) -> Target {
+		Target {
+			path: path.to_vec(),
+			range,
+			kind: "fn",
+			name: None,
+			container: false,
+		}
 	}
 }

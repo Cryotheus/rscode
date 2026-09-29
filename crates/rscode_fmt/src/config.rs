@@ -15,6 +15,47 @@ use std::path::PathBuf;
 /// The names of rustfmt's configuration files, in the order rustfmt looks for them in each directory.
 const FILE_NAMES: [&str; 2] = [".rustfmt.toml", "rustfmt.toml"];
 
+/// The configuration file rustfmt reads, given its `config_path` option (see [`RustFmtOptions::config_path`]).
+fn config_file(config_path: Option<&Path>) -> Option<PathBuf> {
+	let directory = match config_path {
+		Some(path) if !path.is_dir() => return Some(path.to_path_buf()),
+		Some(directory) => std::path::absolute(directory).ok()?,
+		None => std::env::current_dir().ok()?,
+	};
+
+	let searched = directory.ancestors().map(Path::to_path_buf);
+
+	searched.chain(user_directories()).find_map(|directory| in_directory(&directory))
+}
+
+/// The configuration file in a directory.
+fn in_directory(directory: &Path) -> Option<PathBuf> {
+	FILE_NAMES.iter().map(|name| directory.join(name)).find(|path| path.is_file())
+}
+
+/// Whether rustfmt's `newline_style` is `Auto`, its default: set to it or to nothing, by a `--config` override or else
+/// by the configuration file.
+pub(crate) fn newline_style_is_auto(options: &RustFmtOptions) -> bool {
+	let overridden = options.config.iter().rev().find(|(key, _)| key == "newline_style");
+	let style = match overridden {
+		Some((_, style)) => Some(style.clone()),
+		None => config_file(options.config_path.as_deref())
+			.and_then(|path| std::fs::read_to_string(path).ok())
+			.and_then(|text| toml_string(&text, "newline_style").map(str::to_owned)),
+	};
+
+	// rustfmt reads the values of its options ignoring case
+	style.is_none_or(|style| style.eq_ignore_ascii_case("Auto"))
+}
+
+/// An edition as rustfmt reads it (editions after 2024 order `use` items like 2024).
+fn parse_edition(value: &str) -> Option<Edition> {
+	match value.parse::<Edition>() {
+		Ok(edition) => Some(edition),
+		Err(_) => value.parse::<u16>().ok().filter(|&year| year > 2024).map(|_| Edition::E2024),
+	}
+}
+
 /// See [`RustFmtOptions::style_edition_in_effect`].
 pub(crate) fn style_edition(options: &RustFmtOptions) -> Edition {
 	// `--config` overrides are applied after everything else
@@ -44,65 +85,6 @@ pub(crate) fn style_edition(options: &RustFmtOptions) -> Edition {
 	}
 
 	options.edition.unwrap_or_default()
-}
-
-/// Whether rustfmt's `newline_style` is `Auto`, its default: set to it or to nothing, by a `--config` override or else
-/// by the configuration file.
-pub(crate) fn newline_style_is_auto(options: &RustFmtOptions) -> bool {
-	let overridden = options.config.iter().rev().find(|(key, _)| key == "newline_style");
-	let style = match overridden {
-		Some((_, style)) => Some(style.clone()),
-		None => config_file(options.config_path.as_deref())
-			.and_then(|path| std::fs::read_to_string(path).ok())
-			.and_then(|text| toml_string(&text, "newline_style").map(str::to_owned)),
-	};
-
-	// rustfmt reads the values of its options ignoring case
-	style.is_none_or(|style| style.eq_ignore_ascii_case("Auto"))
-}
-
-/// The configuration file rustfmt reads, given its `config_path` option (see [`RustFmtOptions::config_path`]).
-fn config_file(config_path: Option<&Path>) -> Option<PathBuf> {
-	let directory = match config_path {
-		Some(path) if !path.is_dir() => return Some(path.to_path_buf()),
-		Some(directory) => std::path::absolute(directory).ok()?,
-		None => std::env::current_dir().ok()?,
-	};
-
-	let searched = directory.ancestors().map(Path::to_path_buf);
-
-	searched.chain(user_directories()).find_map(|directory| in_directory(&directory))
-}
-
-/// The directories searched when neither the working directory nor its ancestors have a configuration file.
-fn user_directories() -> impl Iterator<Item = PathBuf> {
-	[std::env::home_dir(), user_config_dir().map(|directory| directory.join("rustfmt"))].into_iter().flatten()
-}
-
-/// The configuration file in a directory.
-fn in_directory(directory: &Path) -> Option<PathBuf> {
-	FILE_NAMES.iter().map(|name| directory.join(name)).find(|path| path.is_file())
-}
-
-/// The user's configuration directory (as the `dirs` crate, which rustfmt uses, finds it).
-fn user_config_dir() -> Option<PathBuf> {
-	let from_env = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|path| path.is_absolute());
-
-	if cfg!(windows) {
-		from_env("APPDATA")
-	} else if cfg!(target_os = "macos") {
-		std::env::home_dir().map(|home| home.join("Library/Application Support"))
-	} else {
-		from_env("XDG_CONFIG_HOME").or_else(|| std::env::home_dir().map(|home| home.join(".config")))
-	}
-}
-
-/// An edition as rustfmt reads it (editions after 2024 order `use` items like 2024).
-fn parse_edition(value: &str) -> Option<Edition> {
-	match value.parse::<Edition>() {
-		Ok(edition) => Some(edition),
-		Err(_) => value.parse::<u16>().ok().filter(|&year| year > 2024).map(|_| Edition::E2024),
-	}
 }
 
 /// The string value of a top-level key of a TOML document (`key = "value"` or `key = 'value'`), which is all that
@@ -136,6 +118,26 @@ fn toml_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 	None
 }
 
+/// The user's configuration directory (as the `dirs` crate, which rustfmt uses, finds it).
+fn user_config_dir() -> Option<PathBuf> {
+	let from_env = |name: &str| std::env::var_os(name).map(PathBuf::from).filter(|path| path.is_absolute());
+
+	if cfg!(windows) {
+		from_env("APPDATA")
+	} else if cfg!(target_os = "macos") {
+		std::env::home_dir().map(|home| home.join("Library/Application Support"))
+	} else {
+		from_env("XDG_CONFIG_HOME").or_else(|| std::env::home_dir().map(|home| home.join(".config")))
+	}
+}
+
+/// The directories searched when neither the working directory nor its ancestors have a configuration file.
+fn user_directories() -> impl Iterator<Item = PathBuf> {
+	[std::env::home_dir(), user_config_dir().map(|directory| directory.join("rustfmt"))]
+		.into_iter()
+		.flatten()
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -154,12 +156,16 @@ mod tests {
 			Self(path)
 		}
 
-		fn write(&self, relative: &str, text: &str) {
-			fs::write(self.0.join(relative), text).unwrap();
+		fn options(&self, relative: &str, edition: Option<Edition>) -> RustFmtOptions {
+			RustFmtOptions {
+				edition,
+				config_path: Some(self.0.join(relative)),
+				..RustFmtOptions::default()
+			}
 		}
 
-		fn options(&self, relative: &str, edition: Option<Edition>) -> RustFmtOptions {
-			RustFmtOptions { edition, config_path: Some(self.0.join(relative)), ..RustFmtOptions::default() }
+		fn write(&self, relative: &str, text: &str) {
+			fs::write(self.0.join(relative), text).unwrap();
 		}
 	}
 
@@ -167,26 +173,6 @@ mod tests {
 		fn drop(&mut self) {
 			let _ = fs::remove_dir_all(&self.0);
 		}
-	}
-
-	#[test]
-	fn reads_top_level_strings() {
-		let text = "# comment\nmax_width = 100\nstyle_edition = \"2024\" # the latest\n\"version\" = 'Two'\n[table]\nedition = \"2021\"\n";
-
-		assert_eq!(toml_string(text, "style_edition"), Some("2024"));
-		assert_eq!(toml_string(text, "version"), Some("Two"));
-		assert_eq!(toml_string(text, "max_width"), None);
-		assert_eq!(toml_string(text, "edition"), None);
-		assert_eq!(toml_string("style_edition=\"2015\"", "style_edition"), Some("2015"));
-		assert_eq!(toml_string("style_edition = \"2015", "style_edition"), None);
-	}
-
-	#[test]
-	fn parses_editions_like_rustfmt() {
-		assert_eq!(parse_edition("2021"), Some(Edition::E2021));
-		assert_eq!(parse_edition("2027"), Some(Edition::E2024));
-		assert_eq!(parse_edition("2019"), None);
-		assert_eq!(parse_edition("latest"), None);
 	}
 
 	#[test]
@@ -254,5 +240,25 @@ mod tests {
 		options.config.push(("newline_style".to_owned(), "Native".to_owned()));
 
 		assert!(!newline_style_is_auto(&options));
+	}
+
+	#[test]
+	fn parses_editions_like_rustfmt() {
+		assert_eq!(parse_edition("2021"), Some(Edition::E2021));
+		assert_eq!(parse_edition("2027"), Some(Edition::E2024));
+		assert_eq!(parse_edition("2019"), None);
+		assert_eq!(parse_edition("latest"), None);
+	}
+
+	#[test]
+	fn reads_top_level_strings() {
+		let text = "# comment\nmax_width = 100\nstyle_edition = \"2024\" # the latest\n\"version\" = 'Two'\n[table]\nedition = \"2021\"\n";
+
+		assert_eq!(toml_string(text, "style_edition"), Some("2024"));
+		assert_eq!(toml_string(text, "version"), Some("Two"));
+		assert_eq!(toml_string(text, "max_width"), None);
+		assert_eq!(toml_string(text, "edition"), None);
+		assert_eq!(toml_string("style_edition=\"2015\"", "style_edition"), Some("2015"));
+		assert_eq!(toml_string("style_edition = \"2015", "style_edition"), None);
 	}
 }

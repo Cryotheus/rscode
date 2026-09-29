@@ -14,6 +14,46 @@ use smol_str::SmolStr;
 /// near it, e.g. imports feeding each other ever longer external paths).
 const MAX_IMPORTED_BINDINGS: usize = 64;
 
+/// One binding of a name in a module scope.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct Entry {
+	pub(super) res: Res,
+	pub(super) import: Option<ItemId>,
+	pub(super) origin: Origin,
+	pub(super) vis: Vis,
+
+	/// Whether the namespace is a guess: a path outside of the loaded crates that is imported by name is bound in
+	/// every namespace, since which ones it is in is unknown. Such bindings are not shadowed by glob imports, and only
+	/// shadow glob bindings of the same target.
+	pub(super) guessed: bool,
+}
+
+impl Entry {
+	/// Whether two entries are the same binding (then only the wider visibility is kept).
+	fn is_same_binding(&self, other: &Self) -> bool {
+		self.res == other.res && self.origin == other.origin && (self.origin == Origin::Glob || self.import == other.import)
+	}
+
+	/// Definitions and named imports shadow glob imports, unless their namespace is a guess.
+	pub(super) fn shadows_globs(&self) -> bool {
+		self.origin.is_explicit() && !self.guessed
+	}
+
+	/// Whether the binding makes a glob binding unnecessary: it shadows glob imports, or it is a named import of the
+	/// same target (with a guessed namespace).
+	fn supersedes(&self, glob: &Self) -> bool {
+		self.shadows_globs() || self.guessed && self.origin == Origin::Import && self.res == glob.res
+	}
+
+	pub(super) fn to_binding(&self) -> Binding {
+		Binding {
+			res: self.res.clone(),
+			import: self.import,
+			glob: self.origin == Origin::Glob,
+		}
+	}
+}
+
 /// How a binding came into a scope.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub(super) enum Origin {
@@ -38,103 +78,6 @@ impl Origin {
 	}
 }
 
-/// One binding of a name in a module scope.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct Entry {
-	pub(super) res: Res,
-	pub(super) import: Option<ItemId>,
-	pub(super) origin: Origin,
-	pub(super) vis: Vis,
-
-	/// Whether the namespace is a guess: a path outside of the loaded crates that is imported by name is bound in
-	/// every namespace, since which ones it is in is unknown. Such bindings are not shadowed by glob imports, and only
-	/// shadow glob bindings of the same target.
-	pub(super) guessed: bool,
-}
-
-impl Entry {
-	pub(super) fn to_binding(&self) -> Binding {
-		Binding {
-			res: self.res.clone(),
-			import: self.import,
-			glob: self.origin == Origin::Glob,
-		}
-	}
-
-	/// Definitions and named imports shadow glob imports, unless their namespace is a guess.
-	pub(super) fn shadows_globs(&self) -> bool {
-		self.origin.is_explicit() && !self.guessed
-	}
-
-	/// Whether the binding makes a glob binding unnecessary: it shadows glob imports, or it is a named import of the
-	/// same target (with a guessed namespace).
-	fn supersedes(&self, glob: &Self) -> bool {
-		self.shadows_globs() || self.guessed && self.origin == Origin::Import && self.res == glob.res
-	}
-
-	/// Whether two entries are the same binding (then only the wider visibility is kept).
-	fn is_same_binding(&self, other: &Self) -> bool {
-		self.res == other.res && self.origin == other.origin && (self.origin == Origin::Glob || self.import == other.import)
-	}
-}
-
-/// The bindings of one name in one namespace.
-///
-/// Invariant: glob bindings only exist while no other binding supersedes them.
-#[derive(Debug, Default)]
-pub(super) struct Slot {
-	entries: Vec<Entry>,
-}
-
-impl Slot {
-	pub(super) fn entries(&self) -> &[Entry] {
-		&self.entries
-	}
-
-	/// Whether the slot holds bindings that shadow glob imports: then only named imports can still add to it.
-	pub(super) fn shadows_globs(&self) -> bool {
-		self.entries.iter().any(Entry::shadows_globs)
-	}
-
-	/// Adds a binding, applying shadowing. Returns whether the slot changed.
-	///
-	/// Changes are monotone (bindings are added, visibilities widened, and glob bindings removed at most once, when a
-	/// binding superseding them comes), so repeated insertion reaches a fixpoint.
-	fn insert(&mut self, tree: &ModuleTree, entry: Entry) -> bool {
-		let mut changed = false;
-
-		if entry.origin == Origin::Glob {
-			if self.entries.iter().any(|existing| existing.supersedes(&entry)) {
-				return false;
-			}
-		} else {
-			let before = self.entries.len();
-
-			self.entries.retain(|existing| existing.origin != Origin::Glob || !entry.supersedes(existing));
-			changed = self.entries.len() != before;
-		}
-
-		if let Some(existing) = self.entries.iter_mut().find(|existing| existing.is_same_binding(&entry)) {
-			if entry.vis.is_wider_than(tree, existing.vis) {
-				existing.vis = entry.vis;
-				existing.import = entry.import;
-
-				return true;
-			}
-
-			return changed;
-		}
-
-		// definitions are finite; only imports could grow a slot without bound
-		if matches!(entry.origin, Origin::Import | Origin::Glob) && self.entries.len() >= MAX_IMPORTED_BINDINGS {
-			return changed;
-		}
-
-		self.entries.push(entry);
-		true
-	}
-}
-
 /// The names bound in a module.
 #[derive(Debug, Default)]
 pub(super) struct Scope {
@@ -142,10 +85,6 @@ pub(super) struct Scope {
 }
 
 impl Scope {
-	pub(super) fn slot(&self, name: &str, namespace: Namespace) -> Option<&Slot> {
-		self.names.get(name).map(|slots| &slots[namespace.index()])
-	}
-
 	/// Adds a binding, applying shadowing. Returns whether the scope changed.
 	pub(super) fn insert(&mut self, tree: &ModuleTree, name: &SmolStr, namespace: Namespace, entry: Entry) -> bool {
 		match self.names.get_mut(name) {
@@ -169,6 +108,68 @@ impl Scope {
 				.map(move |namespace| (name, namespace, &slots[namespace.index()]))
 				.filter(|(_, _, slot)| !slot.entries.is_empty())
 		})
+	}
+
+	pub(super) fn slot(&self, name: &str, namespace: Namespace) -> Option<&Slot> {
+		self.names.get(name).map(|slots| &slots[namespace.index()])
+	}
+}
+
+/// The bindings of one name in one namespace.
+///
+/// Invariant: glob bindings only exist while no other binding supersedes them.
+#[derive(Debug, Default)]
+pub(super) struct Slot {
+	entries: Vec<Entry>,
+}
+
+impl Slot {
+	pub(super) fn entries(&self) -> &[Entry] {
+		&self.entries
+	}
+
+	/// Adds a binding, applying shadowing. Returns whether the slot changed.
+	///
+	/// Changes are monotone (bindings are added, visibilities widened, and glob bindings removed at most once, when a
+	/// binding superseding them comes), so repeated insertion reaches a fixpoint.
+	fn insert(&mut self, tree: &ModuleTree, entry: Entry) -> bool {
+		let mut changed = false;
+
+		if entry.origin == Origin::Glob {
+			if self.entries.iter().any(|existing| existing.supersedes(&entry)) {
+				return false;
+			}
+		} else {
+			let before = self.entries.len();
+
+			self.entries
+				.retain(|existing| existing.origin != Origin::Glob || !entry.supersedes(existing));
+			changed = self.entries.len() != before;
+		}
+
+		if let Some(existing) = self.entries.iter_mut().find(|existing| existing.is_same_binding(&entry)) {
+			if entry.vis.is_wider_than(tree, existing.vis) {
+				existing.vis = entry.vis;
+				existing.import = entry.import;
+
+				return true;
+			}
+
+			return changed;
+		}
+
+		// definitions are finite; only imports could grow a slot without bound
+		if matches!(entry.origin, Origin::Import | Origin::Glob) && self.entries.len() >= MAX_IMPORTED_BINDINGS {
+			return changed;
+		}
+
+		self.entries.push(entry);
+		true
+	}
+
+	/// Whether the slot holds bindings that shadow glob imports: then only named imports can still add to it.
+	pub(super) fn shadows_globs(&self) -> bool {
+		self.entries.iter().any(Entry::shadows_globs)
 	}
 }
 

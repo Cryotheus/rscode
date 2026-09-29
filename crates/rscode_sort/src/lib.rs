@@ -154,21 +154,11 @@ mod text;
 mod tokens;
 mod version;
 
-pub use version::version_cmp;
-
 use proc_macro2::TokenStream;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// Sorts all containers of a source file with the default [`SortOptions`].
-pub fn sort_str(source: &str) -> Result<String, SortError> {
-	Sorter::default().sort_str(source)
-}
-
-/// Sorts all containers of a token stream (a whole file's worth of items) with the default [`SortOptions`].
-pub fn sort_tokens(tokens: TokenStream) -> Result<TokenStream, SortError> {
-	Sorter::default().sort_tokens(tokens)
-}
+pub use version::version_cmp;
 
 /// A scheme for ordering items.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -222,53 +212,67 @@ impl clap::ValueEnum for OrderingSchema {
 	}
 }
 
-/// A style edition of rustfmt (its `style_edition` option), which decides how rustfmt orders `use` items.
-///
-/// Style editions 2015, 2018, and 2021 order them alike: within a path segment, `snake_case` names sort before
-/// `CamelCase` names, which sort before `UPPER_SNAKE_CASE` names, and names of the same kind by their bytes. Style
-/// edition 2024 compares names by their bytes, except that numbers compare by value: `Zeta` sorts before `alpha`, and
-/// `x9` before `x10`.
-///
-/// Unless its configuration sets a style edition, rustfmt uses the edition it formats for (and 2015 without one). In
-/// the 2015 edition, rustfmt also drops the leading `::` of `use` paths before comparing them, which sorting does not.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum StyleEdition {
-	/// Style edition 2015.
-	#[serde(rename = "2015")]
-	E2015,
+/// Errors produced while sorting.
+#[derive(Debug, thiserror::Error)]
+pub enum SortError {
+	/// The source does not parse as a Rust file.
+	#[error("failed to parse Rust source at {line}:{column}: {message}")]
+	Parse {
+		/// The parser's message.
+		message: String,
 
-	/// Style edition 2018.
-	#[serde(rename = "2018")]
-	E2018,
+		/// 1-based line.
+		line: usize,
 
-	/// Style edition 2021.
-	#[serde(rename = "2021")]
-	E2021,
+		/// 1-based column, in characters.
+		column: usize,
+	},
 
-	/// Style edition 2024.
-	#[default]
-	#[serde(rename = "2024")]
-	E2024,
+	/// A [`SortTarget::Item`] does not name a container.
+	#[error("no sortable container (inline module, impl, trait, or extern block) starts at byte {0}")]
+	NoContainer(usize),
+
+	/// An [`OrderingSchema`] name was not recognized.
+	#[error("unknown ordering schema `{0}`")]
+	UnknownSchema(String),
+
+	/// Sorting failed because of a bug in this crate (for example, its output would not parse). The source is left
+	/// as it is.
+	#[error("internal error while sorting at {line}:{column}: {message} (this is a bug in rscode_sort)")]
+	Internal {
+		/// What went wrong.
+		message: String,
+
+		/// 1-based line in the source.
+		line: usize,
+
+		/// 1-based column in the source, in characters.
+		column: usize,
+	},
 }
 
-impl StyleEdition {
-	/// Every style edition, oldest first.
-	pub const ALL: &'static [Self] = &[Self::E2015, Self::E2018, Self::E2021, Self::E2024];
+impl SortError {
+	/// Must be called on the thread that parsed: spans live in a thread-local source map.
+	pub(crate) fn from_syn(error: &syn::Error) -> Self {
+		let start = error.span().start();
 
-	/// The year of the style edition.
-	pub fn as_str(self) -> &'static str {
-		match self {
-			Self::E2015 => "2015",
-			Self::E2018 => "2018",
-			Self::E2021 => "2021",
-			Self::E2024 => "2024",
+		Self::Parse {
+			message: error.to_string(),
+			line: start.line,
+			column: start.column + 1,
 		}
 	}
-}
 
-impl std::fmt::Display for StyleEdition {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str(self.as_str())
+	/// Like [`SortError::from_syn`] for an error of `syn::parse_file(source)`, which strips a byte order mark before
+	/// parsing: the byte order mark counts as a character of the first line, like in `rscode` locations.
+	pub(crate) fn from_syn_in(error: &syn::Error, source: &str) -> Self {
+		let start = error.span().start();
+
+		Self::Parse {
+			message: error.to_string(),
+			line: start.line,
+			column: start.column + 1 + usize::from(start.line == 1 && source.starts_with('\u{feff}')),
+		}
 	}
 }
 
@@ -318,6 +322,36 @@ impl SortOptions {
 		}
 	}
 
+	/// Sets [`SortOptions::foreign_items`].
+	pub fn foreign_items(mut self, foreign_items: bool) -> Self {
+		self.foreign_items = foreign_items;
+		self
+	}
+
+	/// Sets [`SortOptions::impl_items`].
+	pub fn impl_items(mut self, impl_items: bool) -> Self {
+		self.impl_items = impl_items;
+		self
+	}
+
+	/// Sets [`SortOptions::inline_modules`].
+	pub fn inline_modules(mut self, inline_modules: bool) -> Self {
+		self.inline_modules = inline_modules;
+		self
+	}
+
+	/// Sets [`SortOptions::merge_extern_blocks`].
+	pub fn merge_extern_blocks(mut self, merge_extern_blocks: bool) -> Self {
+		self.merge_extern_blocks = merge_extern_blocks;
+		self
+	}
+
+	/// Sets [`SortOptions::recursive`].
+	pub fn recursive(mut self, recursive: bool) -> Self {
+		self.recursive = recursive;
+		self
+	}
+
 	/// Sets [`SortOptions::schema`].
 	pub fn schema(mut self, schema: OrderingSchema) -> Self {
 		self.schema = schema;
@@ -330,39 +364,9 @@ impl SortOptions {
 		self
 	}
 
-	/// Sets [`SortOptions::recursive`].
-	pub fn recursive(mut self, recursive: bool) -> Self {
-		self.recursive = recursive;
-		self
-	}
-
-	/// Sets [`SortOptions::inline_modules`].
-	pub fn inline_modules(mut self, inline_modules: bool) -> Self {
-		self.inline_modules = inline_modules;
-		self
-	}
-
-	/// Sets [`SortOptions::impl_items`].
-	pub fn impl_items(mut self, impl_items: bool) -> Self {
-		self.impl_items = impl_items;
-		self
-	}
-
 	/// Sets [`SortOptions::trait_items`].
 	pub fn trait_items(mut self, trait_items: bool) -> Self {
 		self.trait_items = trait_items;
-		self
-	}
-
-	/// Sets [`SortOptions::foreign_items`].
-	pub fn foreign_items(mut self, foreign_items: bool) -> Self {
-		self.foreign_items = foreign_items;
-		self
-	}
-
-	/// Sets [`SortOptions::merge_extern_blocks`].
-	pub fn merge_extern_blocks(mut self, merge_extern_blocks: bool) -> Self {
-		self.merge_extern_blocks = merge_extern_blocks;
 		self
 	}
 }
@@ -427,64 +431,64 @@ impl Sorter {
 	}
 }
 
-/// Errors produced while sorting.
-#[derive(Debug, thiserror::Error)]
-pub enum SortError {
-	/// The source does not parse as a Rust file.
-	#[error("failed to parse Rust source at {line}:{column}: {message}")]
-	Parse {
-		/// The parser's message.
-		message: String,
+/// A style edition of rustfmt (its `style_edition` option), which decides how rustfmt orders `use` items.
+///
+/// Style editions 2015, 2018, and 2021 order them alike: within a path segment, `snake_case` names sort before
+/// `CamelCase` names, which sort before `UPPER_SNAKE_CASE` names, and names of the same kind by their bytes. Style
+/// edition 2024 compares names by their bytes, except that numbers compare by value: `Zeta` sorts before `alpha`, and
+/// `x9` before `x10`.
+///
+/// Unless its configuration sets a style edition, rustfmt uses the edition it formats for (and 2015 without one). In
+/// the 2015 edition, rustfmt also drops the leading `::` of `use` paths before comparing them, which sorting does not.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum StyleEdition {
+	/// Style edition 2015.
+	#[serde(rename = "2015")]
+	E2015,
 
-		/// 1-based line.
-		line: usize,
+	/// Style edition 2018.
+	#[serde(rename = "2018")]
+	E2018,
 
-		/// 1-based column, in characters.
-		column: usize,
-	},
+	/// Style edition 2021.
+	#[serde(rename = "2021")]
+	E2021,
 
-	/// A [`SortTarget::Item`] does not name a container.
-	#[error("no sortable container (inline module, impl, trait, or extern block) starts at byte {0}")]
-	NoContainer(usize),
-
-	/// An [`OrderingSchema`] name was not recognized.
-	#[error("unknown ordering schema `{0}`")]
-	UnknownSchema(String),
-
-	/// Sorting failed because of a bug in this crate (for example, its output would not parse). The source is left
-	/// as it is.
-	#[error("internal error while sorting at {line}:{column}: {message} (this is a bug in rscode_sort)")]
-	Internal {
-		/// What went wrong.
-		message: String,
-
-		/// 1-based line in the source.
-		line: usize,
-
-		/// 1-based column in the source, in characters.
-		column: usize,
-	},
+	/// Style edition 2024.
+	#[default]
+	#[serde(rename = "2024")]
+	E2024,
 }
 
-impl SortError {
-	/// Must be called on the thread that parsed: spans live in a thread-local source map.
-	pub(crate) fn from_syn(error: &syn::Error) -> Self {
-		let start = error.span().start();
+impl StyleEdition {
+	/// Every style edition, oldest first.
+	pub const ALL: &'static [Self] = &[Self::E2015, Self::E2018, Self::E2021, Self::E2024];
 
-		Self::Parse { message: error.to_string(), line: start.line, column: start.column + 1 }
-	}
-
-	/// Like [`SortError::from_syn`] for an error of `syn::parse_file(source)`, which strips a byte order mark before
-	/// parsing: the byte order mark counts as a character of the first line, like in `rscode` locations.
-	pub(crate) fn from_syn_in(error: &syn::Error, source: &str) -> Self {
-		let start = error.span().start();
-
-		Self::Parse {
-			message: error.to_string(),
-			line: start.line,
-			column: start.column + 1 + usize::from(start.line == 1 && source.starts_with('\u{feff}')),
+	/// The year of the style edition.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::E2015 => "2015",
+			Self::E2018 => "2018",
+			Self::E2021 => "2021",
+			Self::E2024 => "2024",
 		}
 	}
+}
+
+impl std::fmt::Display for StyleEdition {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.as_str())
+	}
+}
+
+/// Sorts all containers of a source file with the default [`SortOptions`].
+pub fn sort_str(source: &str) -> Result<String, SortError> {
+	Sorter::default().sort_str(source)
+}
+
+/// Sorts all containers of a token stream (a whole file's worth of items) with the default [`SortOptions`].
+pub fn sort_tokens(tokens: TokenStream) -> Result<TokenStream, SortError> {
+	Sorter::default().sort_tokens(tokens)
 }
 
 #[cfg(test)]
@@ -493,8 +497,7 @@ mod tests {
 
 	#[test]
 	fn options_serialize_in_kebab_case_with_defaults() {
-		let options: SortOptions =
-			serde_json::from_str(r#"{ "recursive": false, "merge-extern-blocks": false }"#).unwrap();
+		let options: SortOptions = serde_json::from_str(r#"{ "recursive": false, "merge-extern-blocks": false }"#).unwrap();
 
 		assert_eq!(options, SortOptions::new().recursive(false).merge_extern_blocks(false));
 		assert_eq!(serde_json::from_str::<SortOptions>("{}").unwrap(), SortOptions::default());
@@ -510,9 +513,7 @@ mod tests {
 	fn schema_names() {
 		assert_eq!("cryotheum".parse::<OrderingSchema>().unwrap(), OrderingSchema::Cryotheum);
 		assert_eq!("Cryotheum".parse::<OrderingSchema>().unwrap(), OrderingSchema::Cryotheum);
-		assert!(
-			matches!("rustfmt".parse::<OrderingSchema>(), Err(SortError::UnknownSchema(name)) if name == "rustfmt")
-		);
+		assert!(matches!("rustfmt".parse::<OrderingSchema>(), Err(SortError::UnknownSchema(name)) if name == "rustfmt"));
 		assert_eq!(OrderingSchema::Cryotheum.to_string(), "cryotheum");
 		assert_eq!(serde_json::to_string(&OrderingSchema::Cryotheum).unwrap(), r#""cryotheum""#);
 	}
@@ -522,7 +523,10 @@ mod tests {
 	fn schema_value_enum() {
 		use clap::ValueEnum;
 
-		assert_eq!(<OrderingSchema as ValueEnum>::from_str("cryotheum", true).unwrap(), OrderingSchema::Cryotheum);
+		assert_eq!(
+			<OrderingSchema as ValueEnum>::from_str("cryotheum", true).unwrap(),
+			OrderingSchema::Cryotheum
+		);
 		assert_eq!(OrderingSchema::value_variants(), OrderingSchema::ALL);
 	}
 
@@ -535,7 +539,10 @@ mod tests {
 			sorter.sort_str("impl X {\n\tfn b() {}\n\tfn a() {}\n}\n").unwrap(),
 			"impl X {\n\tfn b() {}\n\tfn a() {}\n}\n"
 		);
-		assert_eq!(sort_tokens("fn b() {} fn a() {}".parse().unwrap()).unwrap().to_string(), "fn a () { } fn b () { }");
+		assert_eq!(
+			sort_tokens("fn b() {} fn a() {}".parse().unwrap()).unwrap().to_string(),
+			"fn a () { } fn b () { }"
+		);
 		assert!(matches!(sort_str("fn"), Err(SortError::Parse { line: 1, .. })));
 	}
 }

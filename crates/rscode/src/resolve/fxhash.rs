@@ -28,6 +28,10 @@ impl FxHasher {
 }
 
 impl Hasher for FxHasher {
+	fn finish(&self) -> u64 {
+		self.hash
+	}
+
 	fn write(&mut self, bytes: &[u8]) {
 		let (words, rest) = bytes.as_chunks::<8>();
 
@@ -58,10 +62,6 @@ impl Hasher for FxHasher {
 	fn write_usize(&mut self, value: usize) {
 		self.add(value as u64);
 	}
-
-	fn finish(&self) -> u64 {
-		self.hash
-	}
 }
 
 #[cfg(test)]
@@ -72,7 +72,10 @@ mod tests {
 	#[test]
 	fn hashes_depend_on_every_byte() {
 		let build = BuildHasherDefault::<FxHasher>::default();
-		let hashes: FxHashSet<u64> = ["", "a", "b", "ab", "ba", "abcdefgh", "abcdefghi", "abcdefgj"].iter().map(|text| build.hash_one(text)).collect();
+		let hashes: FxHashSet<u64> = ["", "a", "b", "ab", "ba", "abcdefgh", "abcdefghi", "abcdefgj"]
+			.iter()
+			.map(|text| build.hash_one(text))
+			.collect();
 
 		assert_eq!(hashes.len(), 8);
 	}

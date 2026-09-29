@@ -12,26 +12,6 @@ use crate::path::written_arguments;
 use smol_str::SmolStr;
 
 impl Resolver<'_> {
-	/// The crate name followed by the names of the modules down to `module`.
-	pub(super) fn module_segments(&self, module: ItemId) -> Vec<SmolStr> {
-		let mut segments = Vec::new();
-		let mut current = Some(module);
-
-		while let Some(module) = current {
-			let name = if module.is_crate_root() {
-				self.ws.krate(module.krate()).name().clone()
-			} else {
-				self.ws.item(module).name.clone().unwrap_or_default()
-			};
-
-			segments.push(name);
-			current = parent_module(self.ws, module);
-		}
-
-		segments.reverse();
-		segments
-	}
-
 	pub(super) fn compute_canonical_path(&self, item: ItemId) -> CanonicalPath {
 		let data = self.ws.item(item);
 
@@ -87,13 +67,38 @@ impl Resolver<'_> {
 		segments
 	}
 
+	/// The crate name followed by the names of the modules down to `module`.
+	pub(super) fn module_segments(&self, module: ItemId) -> Vec<SmolStr> {
+		let mut segments = Vec::new();
+		let mut current = Some(module);
+
+		while let Some(module) = current {
+			let name = if module.is_crate_root() {
+				self.ws.krate(module.krate()).name().clone()
+			} else {
+				self.ws.item(module).name.clone().unwrap_or_default()
+			};
+
+			segments.push(name);
+			current = parent_module(self.ws, module);
+		}
+
+		segments.reverse();
+		segments
+	}
+
 	/// Sets the owner of an `impl` block's path: its first resolved self type, or its module and the self type text.
 	///
 	/// A trait is not the owner of an `impl` for its trait objects (`impl Trait {}` in editions 2015 and 2018), whose
 	/// items would otherwise look like the trait's own.
 	fn set_impl_owner(&self, impl_block: ItemId, path: &mut CanonicalPath) {
 		let info = self.ws.item(impl_block).impl_info();
-		let owner = self.impls.self_types(impl_block).iter().copied().find(|&owner| self.ws.item(owner).kind != ItemKind::Trait);
+		let owner = self
+			.impls
+			.self_types(impl_block)
+			.iter()
+			.copied()
+			.find(|&owner| self.ws.item(owner).kind != ItemKind::Trait);
 
 		path.impl_trait = info.and_then(|info| info.trait_text.clone());
 

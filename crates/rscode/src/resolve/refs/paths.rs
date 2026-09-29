@@ -32,6 +32,18 @@ use syn::Type;
 use syn::ext::IdentExt;
 use syn::visit::Visit;
 
+/// The key of a cached path resolution: the module, the namespace of the last segment, the kind of path, and the path.
+pub(super) type PathKey = (ItemId, Option<Namespace>, PathKind, String);
+
+/// Kinds of items that can have `impl` blocks of their own (not traits).
+const DATA_TYPE_KINDS: &[ItemKind] = &[
+	ItemKind::Struct,
+	ItemKind::Enum,
+	ItemKind::Union,
+	ItemKind::TypeAlias,
+	ItemKind::ForeignType,
+];
+
 /// Kinds of items `Self` and the self type of an `impl` can name.
 const TYPE_KINDS: &[ItemKind] = &[
 	ItemKind::Struct,
@@ -41,9 +53,6 @@ const TYPE_KINDS: &[ItemKind] = &[
 	ItemKind::ForeignType,
 	ItemKind::Trait,
 ];
-
-/// Kinds of items that can have `impl` blocks of their own (not traits).
-const DATA_TYPE_KINDS: &[ItemKind] = &[ItemKind::Struct, ItemKind::Enum, ItemKind::Union, ItemKind::TypeAlias, ItemKind::ForeignType];
 
 /// How much of the local scopes a path sees.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -81,34 +90,70 @@ impl PathRes {
 	}
 }
 
-/// The key of a cached path resolution: the module, the namespace of the last segment, the kind of path, and the path.
-pub(super) type PathKey = (ItemId, Option<Namespace>, PathKind, String);
-
 impl FileWalker<'_, '_> {
-	/// A path segment for an identifier: its name without `r#`, and its range with it.
-	pub(super) fn segment(&self, ident: &Ident) -> PathSegmentRef {
-		PathSegmentRef {
-			name: ident_name(ident),
-			range: self.parsed.range(ident.span()),
-			has_arguments: false,
+	/// Reports associated item bindings of traits (`Iterator<Item = T>`, `Trait<N = 1>`, `Trait<Assoc: Bound>`) that name
+	/// target items.
+	fn assoc_bindings(&mut self, path: &syn::Path, res: &PathRes) {
+		let PathRes::Segments(segments) = res else {
+			return;
+		};
+
+		let targets = self.targets;
+
+		for (segment, resolutions) in path.segments.iter().zip(segments) {
+			let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+				continue;
+			};
+
+			for argument in &arguments.args {
+				let Some((ident, target)) = binding_ident(argument).and_then(|ident| Some((ident, targets.named(ident)?))) else {
+					continue;
+				};
+
+				let kind = if matches!(argument, GenericArgument::AssocConst(_)) {
+					ItemKind::AssocConst
+				} else {
+					ItemKind::AssocType
+				};
+				let name = ident_name(ident);
+
+				let candidates: Vec<Res> = (self.loaded(resolutions, &[ItemKind::Trait]).into_iter())
+					.flat_map(|trait_item| self.ws.children(trait_item))
+					.filter(|&item| {
+						let data = self.ws.item(item);
+
+						data.kind == kind && data.name.as_deref() == Some(name.as_str())
+					})
+					.map(Res::Item)
+					.collect();
+
+				if let Some(found) = target.find(&candidates) {
+					self.report(found, ReferenceKind::Path, self.parsed.range(ident.span()), true);
+				}
+			}
 		}
 	}
 
-	pub(super) fn path_ref(&self, path: &syn::Path) -> PathRef {
-		PathRef {
-			leading_colon: path.leading_colon.is_some(),
-			segments: (path.segments.iter())
-				.map(|segment| PathSegmentRef {
-					has_arguments: !segment.arguments.is_none(),
-					..self.segment(&segment.ident)
-				})
-				.collect(),
-		}
-	}
+	/// The associated items named `name` of a type (from its `impl`s) or trait, in `namespace`. Items of inherent `impl`s
+	/// shadow the items of trait `impl`s (like `Type::name` does).
+	pub(super) fn associated(&self, owner: ItemId, name: &str, namespace: Namespace) -> Vec<ItemId> {
+		let mut items: Vec<ItemId> = (self.resolver.associated_items(owner).into_iter())
+			.filter(|&item| {
+				let data = self.ws.item(item);
 
-	/// Whether a path could contain a reference: a segment or an associated item binding is named like a target.
-	pub(super) fn mentions_target(&self, path: &syn::Path) -> bool {
-		(path.segments.iter()).any(|segment| self.targets.named(&segment.ident).is_some() || self.bindings_mention_target(&segment.arguments))
+				data.name.as_deref() == Some(name) && item_namespaces(data).contains(&namespace)
+			})
+			.collect();
+
+		if items.iter().any(|&item| is_inherent_item(self.ws, item)) {
+			items.retain(|&item| is_inherent_item(self.ws, item));
+		}
+
+		if items.is_empty() && DATA_TYPE_KINDS.contains(&self.ws.item(owner).kind) {
+			items = self.provided(owner, name, namespace);
+		}
+
+		items
 	}
 
 	fn bindings_mention_target(&self, arguments: &PathArguments) -> bool {
@@ -119,42 +164,74 @@ impl FileWalker<'_, '_> {
 		(arguments.args.iter()).any(|argument| binding_ident(argument).is_some_and(|ident| self.targets.named(ident).is_some()))
 	}
 
-	/// Resolves a path written at the current point, whose last segment is in `namespace`.
-	pub(super) fn resolve_path(&mut self, path: &PathRef, namespace: Namespace, locals: Locals) -> PathRes {
-		let Some(first) = path.segments.first() else {
-			return PathRes::Segments(Vec::new());
-		};
+	/// Resolves and reports a path in code whose last segment is in `namespace`, and walks its generic arguments.
+	pub(super) fn code_path(&mut self, qself: Option<&QSelf>, path: &syn::Path, namespace: Namespace) {
+		if let Some(qself) = qself {
+			self.visit_type(&qself.ty);
+		}
 
-		if !path.leading_colon {
-			match first.name.as_str() {
-				"Self" => return PathRes::Segments(self.self_path(path, namespace)),
+		if self.mentions_target(path) {
+			match qself {
+				Some(qself) => self.qualified_path(qself, path, namespace),
 
-				// relative to a module that is not loaded
-				"self" | "super" if self.unloaded_modules > 0 => return PathRes::Local,
+				None => {
+					let path_ref = self.path_ref(path);
+					let res = self.resolve_path(&path_ref, namespace, Locals::All);
 
-				"crate" | "self" | "super" | "$crate" => {}
-
-				name => {
-					let first_namespace = if path.segments.len() == 1 { namespace } else { Namespace::Type };
-
-					match self.lookup_local(name, first_namespace, locals) {
-						Some(LocalBinding::Variable | LocalBinding::Opaque) => return PathRes::Local,
-
-						Some(LocalBinding::Generic) => {
-							return match self.generic_path(name, path, namespace) {
-								Some(segments) => PathRes::Segments(segments),
-								None => PathRes::Generic,
-							};
-						}
-
-						Some(LocalBinding::Imported(first)) => return PathRes::Segments(self.continue_path(first, path, namespace)),
-						None => {}
-					}
+					self.report_path(&path_ref, &res, ReferenceKind::Path);
+					self.check_capture(&path_ref, &res, namespace);
+					self.assoc_bindings(path, &res);
 				}
 			}
 		}
 
-		PathRes::Segments(self.module_path(self.module, path, Some(namespace), PathKind::Code))
+		for segment in &path.segments {
+			self.visit_path_arguments(&segment.arguments);
+		}
+	}
+
+	/// The resolutions of the segments of a path whose first segment resolves to `first`.
+	pub(super) fn continue_path(&self, first: Vec<Res>, path: &PathRef, namespace: Namespace) -> Vec<Vec<Res>> {
+		let count = path.segments.len();
+		let mut segments = Vec::with_capacity(count);
+
+		segments.push(first);
+
+		for index in 1..count {
+			let wanted = if index + 1 == count { namespace } else { Namespace::Type };
+			let name = &path.segments[index].name;
+			let mut next: Vec<Res> = segments[index - 1]
+				.iter()
+				.flat_map(|container| self.members(container, name, wanted))
+				.collect();
+
+			next.sort();
+			next.dedup();
+			segments.push(next);
+		}
+
+		segments
+	}
+
+	/// The module whose scope the first segment of a path (`name`) is looked up in, if any: the module of the code,
+	/// or the crate root for crate-relative paths of edition 2015 (`use` paths, and `::a`). `None` when a local binding
+	/// shadows it, or it names a crate (`::a`).
+	fn first_scope(&self, path: &PathRef, name: &str, kind: ReferenceKind) -> Option<ItemId> {
+		let edition_2015 = self.ws.krate(self.krate).edition() == Edition::E2015;
+		let root = ItemId::crate_root(self.krate);
+
+		match path.leading_colon {
+			true => edition_2015.then_some(root),
+			false if kind == ReferenceKind::Import && edition_2015 => Some(root),
+
+			false => {
+				let shadowed = [Namespace::Type, Namespace::Value]
+					.into_iter()
+					.any(|namespace| self.lookup_local(name, namespace, Locals::All).is_some());
+
+				(!shadowed).then_some(self.module)
+			}
+		}
 	}
 
 	/// The resolutions of the segments of a path through the generic parameter `name` (`T::item`), when the traits
@@ -169,7 +246,12 @@ impl FileWalker<'_, '_> {
 			// not through generic parameters (a bound like `T: T::X` would never end)
 			let res = self.resolve_path(bound, Namespace::Type, Locals::Items);
 
-			traits.extend(res.last().iter().filter(|res| matches!(res, Res::Item(item) if self.ws.item(*item).kind == ItemKind::Trait)).cloned());
+			traits.extend(
+				res.last()
+					.iter()
+					.filter(|res| matches!(res, Res::Item(item) if self.ws.item(*item).kind == ItemKind::Trait))
+					.cloned(),
+			);
 		}
 
 		let wanted = if path.segments.len() == 2 { namespace } else { Namespace::Type };
@@ -183,11 +265,24 @@ impl FileWalker<'_, '_> {
 		}
 
 		// the parameter itself is never a target
-		let rest = PathRef { leading_colon: false, segments: path.segments[1..].to_vec() };
+		let rest = PathRef {
+			leading_colon: false,
+			segments: path.segments[1..].to_vec(),
+		};
 		let mut segments = vec![Vec::new()];
 
 		segments.extend(self.continue_path(found, &rest, namespace));
 		Some(segments)
+	}
+
+	/// The loaded items among resolutions, of the given kinds.
+	pub(super) fn loaded(&self, resolutions: &[Res], kinds: &[ItemKind]) -> Vec<ItemId> {
+		(resolutions.iter())
+			.filter_map(|res| match res {
+				Res::Item(item) if kinds.contains(&self.ws.item(*item).kind) => Some(*item),
+				_ => None,
+			})
+			.collect()
 	}
 
 	/// The local binding of a name, if any.
@@ -196,7 +291,57 @@ impl FileWalker<'_, '_> {
 			return None;
 		}
 
-		self.scopes.lookup(name, namespace, locals == Locals::Items, |source, name, namespace| self.members(source, name, namespace))
+		self.scopes.lookup(name, namespace, locals == Locals::Items, |source, name, namespace| {
+			self.members(source, name, namespace)
+		})
+	}
+
+	/// What `container::name` names in `namespace`: a module's binding, a variant of an enum, or an associated item of a
+	/// type or trait.
+	pub(super) fn members(&self, container: &Res, name: &str, namespace: Namespace) -> Vec<Res> {
+		let Res::Item(item) = *container else {
+			return Vec::new();
+		};
+
+		let members = match self.ws.item(item).kind {
+			ItemKind::Module => {
+				return self
+					.resolver
+					.bindings(item, name, namespace)
+					.into_iter()
+					.map(|binding| binding.res)
+					.collect();
+			}
+
+			// variants shadow associated items
+			ItemKind::Enum => {
+				let variants: Vec<ItemId> = (self.ws.children(item))
+					.filter(|&variant| {
+						let data = self.ws.item(variant);
+
+						data.kind == ItemKind::Variant && data.name.as_deref() == Some(name) && item_namespaces(data).contains(&namespace)
+					})
+					.collect();
+
+				match variants.is_empty() {
+					true => self.associated(item, name, namespace),
+					false => variants,
+				}
+			}
+
+			ItemKind::Struct | ItemKind::Union | ItemKind::TypeAlias | ItemKind::ForeignType | ItemKind::Trait => {
+				self.associated(item, name, namespace)
+			}
+
+			_ => Vec::new(),
+		};
+
+		members.into_iter().map(Res::Item).collect()
+	}
+
+	/// Whether a path could contain a reference: a segment or an associated item binding is named like a target.
+	pub(super) fn mentions_target(&self, path: &syn::Path) -> bool {
+		(path.segments.iter()).any(|segment| self.targets.named(&segment.ident).is_some() || self.bindings_mention_target(&segment.arguments))
 	}
 
 	/// Resolves a path written in `module` (not considering local scopes), with a cache.
@@ -220,6 +365,103 @@ impl FileWalker<'_, '_> {
 
 		self.cache.insert(key, found.clone());
 		found
+	}
+
+	/// The children of an `impl` block or trait named `name`, in `namespace`.
+	pub(super) fn named_children(&self, container: ItemId, name: &str, namespace: Namespace) -> impl Iterator<Item = ItemId> {
+		self.ws.children(container).filter(move |&child| {
+			let data = self.ws.item(child);
+
+			data.name.as_deref() == Some(name) && item_namespaces(data).contains(&namespace)
+		})
+	}
+
+	pub(super) fn path_ref(&self, path: &syn::Path) -> PathRef {
+		PathRef {
+			leading_colon: path.leading_colon.is_some(),
+			segments: (path.segments.iter())
+				.map(|segment| PathSegmentRef {
+					has_arguments: !segment.arguments.is_none(),
+					..self.segment(&segment.ident)
+				})
+				.collect(),
+		}
+	}
+
+	/// The items named `name` of the traits a type implements (in `namespace`), which `Type::name` names when the
+	/// `impl` does not define them (provided methods, constants, and types).
+	fn provided(&self, ty: ItemId, name: &str, namespace: Namespace) -> Vec<ItemId> {
+		let mut items: Vec<ItemId> = (self.resolver.impls_of(ty).into_iter())
+			.filter(|&impl_block| self.named_children(impl_block, name, namespace).next().is_none())
+			.flat_map(|impl_block| self.resolver.impl_traits(impl_block))
+			.flat_map(|trait_item| self.named_children(trait_item, name, namespace).collect::<Vec<_>>())
+			.collect();
+
+		items.sort();
+		items.dedup();
+		items
+	}
+
+	/// `<Type as Trait>::item` (the `Trait` segments are the first `qself.position` segments of `path`) or `<Type>::item`.
+	/// Segments after the first member depend on types, so they are not resolved.
+	fn qualified_path(&mut self, qself: &QSelf, path: &syn::Path, namespace: Namespace) {
+		let position = qself.position.min(path.segments.len());
+		let mut traits = Vec::new();
+
+		if position > 0 {
+			let mut trait_path = self.path_ref(path);
+
+			trait_path.segments.truncate(position);
+
+			let res = self.resolve_path(&trait_path, Namespace::Type, Locals::All);
+
+			self.report_path(&trait_path, &res, ReferenceKind::Path);
+			self.check_capture(&trait_path, &res, Namespace::Type);
+			self.assoc_bindings(path, &res);
+			traits = self.loaded(res.last(), &[ItemKind::Trait]);
+		}
+
+		let Some(member) = path.segments.get(position) else {
+			return;
+		};
+
+		let targets = self.targets;
+
+		let Some(target) = targets.named(&member.ident) else {
+			return;
+		};
+
+		let wanted = if position + 1 == path.segments.len() {
+			namespace
+		} else {
+			Namespace::Type
+		};
+		let name = ident_name(&member.ident);
+		let types = self.type_items(&qself.ty);
+		let mut candidates: Vec<Res> = Vec::new();
+
+		if position == 0 {
+			for &ty in &types {
+				candidates.extend(self.members(&Res::Item(ty), &name, wanted));
+			}
+		} else {
+			for &trait_item in &traits {
+				candidates.extend(self.associated(trait_item, &name, wanted).into_iter().map(Res::Item));
+
+				// the item of the type's `impl` of the trait
+				for &ty in &types {
+					for impl_block in self.resolver.impls_of(ty) {
+						if self.resolver.impl_traits(impl_block).contains(&trait_item) {
+							candidates.extend(self.named_children(impl_block, &name, wanted).map(Res::Item));
+						}
+					}
+				}
+			}
+		}
+
+		if let Some(found) = target.find(&candidates) {
+			self.report(found, ReferenceKind::Path, self.parsed.range(member.ident.span()), true);
+		}
 	}
 
 	/// Applies the rules of `Type::name` to what the resolver found as members of types: items of inherent `impl`s
@@ -257,141 +499,6 @@ impl FileWalker<'_, '_> {
 
 		found.sort();
 		found.dedup();
-	}
-
-	/// A path starting with `Self`.
-	fn self_path(&self, path: &PathRef, namespace: Namespace) -> Vec<Vec<Res>> {
-		let first: Vec<Res> = match self.self_types.last() {
-			// `Self` alone names types; `Self::item` may also name an item of the implemented (or defined) trait
-			Some(self_types) if path.segments.len() == 1 => self_types.types.iter().map(|&item| Res::Item(item)).collect(),
-			Some(self_types) => self_types.types.iter().chain(&self_types.traits).map(|&item| Res::Item(item)).collect(),
-			None => Vec::new(),
-		};
-
-		self.continue_path(first, path, namespace)
-	}
-
-	/// The resolutions of the segments of a path whose first segment resolves to `first`.
-	pub(super) fn continue_path(&self, first: Vec<Res>, path: &PathRef, namespace: Namespace) -> Vec<Vec<Res>> {
-		let count = path.segments.len();
-		let mut segments = Vec::with_capacity(count);
-
-		segments.push(first);
-
-		for index in 1..count {
-			let wanted = if index + 1 == count { namespace } else { Namespace::Type };
-			let name = &path.segments[index].name;
-			let mut next: Vec<Res> = segments[index - 1].iter().flat_map(|container| self.members(container, name, wanted)).collect();
-
-			next.sort();
-			next.dedup();
-			segments.push(next);
-		}
-
-		segments
-	}
-
-	/// What `container::name` names in `namespace`: a module's binding, a variant of an enum, or an associated item of a
-	/// type or trait.
-	pub(super) fn members(&self, container: &Res, name: &str, namespace: Namespace) -> Vec<Res> {
-		let Res::Item(item) = *container else {
-			return Vec::new();
-		};
-
-		let members = match self.ws.item(item).kind {
-			ItemKind::Module => return self.resolver.bindings(item, name, namespace).into_iter().map(|binding| binding.res).collect(),
-
-			// variants shadow associated items
-			ItemKind::Enum => {
-				let variants: Vec<ItemId> = (self.ws.children(item))
-					.filter(|&variant| {
-						let data = self.ws.item(variant);
-
-						data.kind == ItemKind::Variant && data.name.as_deref() == Some(name) && item_namespaces(data).contains(&namespace)
-					})
-					.collect();
-
-				match variants.is_empty() {
-					true => self.associated(item, name, namespace),
-					false => variants,
-				}
-			}
-
-			ItemKind::Struct | ItemKind::Union | ItemKind::TypeAlias | ItemKind::ForeignType | ItemKind::Trait => {
-				self.associated(item, name, namespace)
-			}
-
-			_ => Vec::new(),
-		};
-
-		members.into_iter().map(Res::Item).collect()
-	}
-
-	/// The associated items named `name` of a type (from its `impl`s) or trait, in `namespace`. Items of inherent `impl`s
-	/// shadow the items of trait `impl`s (like `Type::name` does).
-	pub(super) fn associated(&self, owner: ItemId, name: &str, namespace: Namespace) -> Vec<ItemId> {
-		let mut items: Vec<ItemId> = (self.resolver.associated_items(owner).into_iter())
-			.filter(|&item| {
-				let data = self.ws.item(item);
-
-				data.name.as_deref() == Some(name) && item_namespaces(data).contains(&namespace)
-			})
-			.collect();
-
-		if items.iter().any(|&item| is_inherent_item(self.ws, item)) {
-			items.retain(|&item| is_inherent_item(self.ws, item));
-		}
-
-		if items.is_empty() && DATA_TYPE_KINDS.contains(&self.ws.item(owner).kind) {
-			items = self.provided(owner, name, namespace);
-		}
-
-		items
-	}
-
-	/// The items named `name` of the traits a type implements (in `namespace`), which `Type::name` names when the
-	/// `impl` does not define them (provided methods, constants, and types).
-	fn provided(&self, ty: ItemId, name: &str, namespace: Namespace) -> Vec<ItemId> {
-		let mut items: Vec<ItemId> = (self.resolver.impls_of(ty).into_iter())
-			.filter(|&impl_block| self.named_children(impl_block, name, namespace).next().is_none())
-			.flat_map(|impl_block| self.resolver.impl_traits(impl_block))
-			.flat_map(|trait_item| self.named_children(trait_item, name, namespace).collect::<Vec<_>>())
-			.collect();
-
-		items.sort();
-		items.dedup();
-		items
-	}
-
-	/// Reports the segments of a resolved path that name targets (by their own name, so not through aliases), and those
-	/// that name something through lost bindings.
-	pub(super) fn report_path(&mut self, path: &PathRef, res: &PathRes, kind: ReferenceKind) {
-		let targets = self.targets;
-
-		match res {
-			PathRes::Segments(segments) => {
-				for (segment, resolutions) in path.segments.iter().zip(segments) {
-					if let Some(target) = targets.named_str(&segment.name).and_then(|target| target.find(resolutions)) {
-						self.report(target, kind, segment.range, true);
-					}
-				}
-
-				if !targets.lost.is_empty() || !targets.dead.is_empty() {
-					self.report_lost(path, segments, kind);
-				}
-			}
-
-			// `T::item`: an item of a trait `T` might be bounded by
-			PathRes::Generic if kind == ReferenceKind::Path && self.options.method_calls => {
-				let target = path.segments.get(1).and_then(|segment| Some((segment, targets.named_str(&segment.name)?.trait_items.first()?)));
-
-				if let Some((segment, &target)) = target {
-					self.report(target, kind, segment.range, false);
-				}
-			}
-
-			PathRes::Generic | PathRes::Local => {}
-		}
 	}
 
 	/// Reports the segments of a resolved path that are looked up in a module whose binding of their name is lost (see
@@ -435,10 +542,11 @@ impl FileWalker<'_, '_> {
 				.map(|binding| binding.import)
 				.or_else(|| {
 					// (the first segment falls back to preludes when its scope does not bind it)
-					let unresolved = resolutions.is_empty()
-						|| (index == 0 && scopes.iter().all(|&scope| !self.resolver.binds(scope, &segment.name)));
+					let unresolved = resolutions.is_empty() || (index == 0 && scopes.iter().all(|&scope| !self.resolver.binds(scope, &segment.name)));
 
-					(dead.iter().filter(|_| unresolved)).find(|dead| scopes.contains(&dead.module)).map(|dead| dead.import)
+					(dead.iter().filter(|_| unresolved))
+						.find(|dead| scopes.contains(&dead.module))
+						.map(|dead| dead.import)
 				});
 
 			if let Some(import) = through {
@@ -456,145 +564,97 @@ impl FileWalker<'_, '_> {
 		}
 	}
 
-	/// The module whose scope the first segment of a path (`name`) is looked up in, if any: the module of the code,
-	/// or the crate root for crate-relative paths of edition 2015 (`use` paths, and `::a`). `None` when a local binding
-	/// shadows it, or it names a crate (`::a`).
-	fn first_scope(&self, path: &PathRef, name: &str, kind: ReferenceKind) -> Option<ItemId> {
-		let edition_2015 = self.ws.krate(self.krate).edition() == Edition::E2015;
-		let root = ItemId::crate_root(self.krate);
-
-		match path.leading_colon {
-			true => edition_2015.then_some(root),
-			false if kind == ReferenceKind::Import && edition_2015 => Some(root),
-
-			false => {
-				let shadowed = [Namespace::Type, Namespace::Value]
-					.into_iter()
-					.any(|namespace| self.lookup_local(name, namespace, Locals::All).is_some());
-
-				(!shadowed).then_some(self.module)
-			}
-		}
-	}
-
-	/// Resolves and reports a path in code whose last segment is in `namespace`, and walks its generic arguments.
-	pub(super) fn code_path(&mut self, qself: Option<&QSelf>, path: &syn::Path, namespace: Namespace) {
-		if let Some(qself) = qself {
-			self.visit_type(&qself.ty);
-		}
-
-		if self.mentions_target(path) {
-			match qself {
-				Some(qself) => self.qualified_path(qself, path, namespace),
-
-				None => {
-					let path_ref = self.path_ref(path);
-					let res = self.resolve_path(&path_ref, namespace, Locals::All);
-
-					self.report_path(&path_ref, &res, ReferenceKind::Path);
-					self.check_capture(&path_ref, &res, namespace);
-					self.assoc_bindings(path, &res);
-				}
-			}
-		}
-
-		for segment in &path.segments {
-			self.visit_path_arguments(&segment.arguments);
-		}
-	}
-
-	/// A single identifier in a generic argument (`Foo<N>`), which is a type unless it only resolves to a constant.
-	pub(super) fn type_or_const_argument(&mut self, ident: &Ident) {
-		let path = PathRef {
-			leading_colon: false,
-			segments: vec![self.segment(ident)],
-		};
-
-		let mut res = self.resolve_path(&path, Namespace::Type, Locals::All);
-
-		if res.last().is_empty() && matches!(res, PathRes::Segments(_)) {
-			res = self.resolve_path(&path, Namespace::Value, Locals::All);
-		}
-
-		self.report_path(&path, &res, ReferenceKind::Path);
-		self.check_capture(&path, &res, Namespace::Type);
-	}
-
-	/// `<Type as Trait>::item` (the `Trait` segments are the first `qself.position` segments of `path`) or `<Type>::item`.
-	/// Segments after the first member depend on types, so they are not resolved.
-	fn qualified_path(&mut self, qself: &QSelf, path: &syn::Path, namespace: Namespace) {
-		let position = qself.position.min(path.segments.len());
-		let mut traits = Vec::new();
-
-		if position > 0 {
-			let mut trait_path = self.path_ref(path);
-
-			trait_path.segments.truncate(position);
-
-			let res = self.resolve_path(&trait_path, Namespace::Type, Locals::All);
-
-			self.report_path(&trait_path, &res, ReferenceKind::Path);
-			self.check_capture(&trait_path, &res, Namespace::Type);
-			self.assoc_bindings(path, &res);
-			traits = self.loaded(res.last(), &[ItemKind::Trait]);
-		}
-
-		let Some(member) = path.segments.get(position) else {
-			return;
-		};
-
+	/// Reports the segments of a resolved path that name targets (by their own name, so not through aliases), and those
+	/// that name something through lost bindings.
+	pub(super) fn report_path(&mut self, path: &PathRef, res: &PathRes, kind: ReferenceKind) {
 		let targets = self.targets;
 
-		let Some(target) = targets.named(&member.ident) else {
-			return;
+		match res {
+			PathRes::Segments(segments) => {
+				for (segment, resolutions) in path.segments.iter().zip(segments) {
+					if let Some(target) = targets.named_str(&segment.name).and_then(|target| target.find(resolutions)) {
+						self.report(target, kind, segment.range, true);
+					}
+				}
+
+				if !targets.lost.is_empty() || !targets.dead.is_empty() {
+					self.report_lost(path, segments, kind);
+				}
+			}
+
+			// `T::item`: an item of a trait `T` might be bounded by
+			PathRes::Generic if kind == ReferenceKind::Path && self.options.method_calls => {
+				let target = path
+					.segments
+					.get(1)
+					.and_then(|segment| Some((segment, targets.named_str(&segment.name)?.trait_items.first()?)));
+
+				if let Some((segment, &target)) = target {
+					self.report(target, kind, segment.range, false);
+				}
+			}
+
+			PathRes::Generic | PathRes::Local => {}
+		}
+	}
+
+	/// Resolves a path written at the current point, whose last segment is in `namespace`.
+	pub(super) fn resolve_path(&mut self, path: &PathRef, namespace: Namespace, locals: Locals) -> PathRes {
+		let Some(first) = path.segments.first() else {
+			return PathRes::Segments(Vec::new());
 		};
 
-		let wanted = if position + 1 == path.segments.len() { namespace } else { Namespace::Type };
-		let name = ident_name(&member.ident);
-		let types = self.type_items(&qself.ty);
-		let mut candidates: Vec<Res> = Vec::new();
+		if !path.leading_colon {
+			match first.name.as_str() {
+				"Self" => return PathRes::Segments(self.self_path(path, namespace)),
 
-		if position == 0 {
-			for &ty in &types {
-				candidates.extend(self.members(&Res::Item(ty), &name, wanted));
-			}
-		} else {
-			for &trait_item in &traits {
-				candidates.extend(self.associated(trait_item, &name, wanted).into_iter().map(Res::Item));
+				// relative to a module that is not loaded
+				"self" | "super" if self.unloaded_modules > 0 => return PathRes::Local,
 
-				// the item of the type's `impl` of the trait
-				for &ty in &types {
-					for impl_block in self.resolver.impls_of(ty) {
-						if self.resolver.impl_traits(impl_block).contains(&trait_item) {
-							candidates.extend(self.named_children(impl_block, &name, wanted).map(Res::Item));
+				"crate" | "self" | "super" | "$crate" => {}
+
+				name => {
+					let first_namespace = if path.segments.len() == 1 { namespace } else { Namespace::Type };
+
+					match self.lookup_local(name, first_namespace, locals) {
+						Some(LocalBinding::Variable | LocalBinding::Opaque) => return PathRes::Local,
+
+						Some(LocalBinding::Generic) => {
+							return match self.generic_path(name, path, namespace) {
+								Some(segments) => PathRes::Segments(segments),
+								None => PathRes::Generic,
+							};
 						}
+
+						Some(LocalBinding::Imported(first)) => return PathRes::Segments(self.continue_path(first, path, namespace)),
+						None => {}
 					}
 				}
 			}
 		}
 
-		if let Some(found) = target.find(&candidates) {
-			self.report(found, ReferenceKind::Path, self.parsed.range(member.ident.span()), true);
+		PathRes::Segments(self.module_path(self.module, path, Some(namespace), PathKind::Code))
+	}
+
+	/// A path segment for an identifier: its name without `r#`, and its range with it.
+	pub(super) fn segment(&self, ident: &Ident) -> PathSegmentRef {
+		PathSegmentRef {
+			name: ident_name(ident),
+			range: self.parsed.range(ident.span()),
+			has_arguments: false,
 		}
 	}
 
-	/// The children of an `impl` block or trait named `name`, in `namespace`.
-	pub(super) fn named_children(&self, container: ItemId, name: &str, namespace: Namespace) -> impl Iterator<Item = ItemId> {
-		self.ws.children(container).filter(move |&child| {
-			let data = self.ws.item(child);
+	/// A path starting with `Self`.
+	fn self_path(&self, path: &PathRef, namespace: Namespace) -> Vec<Vec<Res>> {
+		let first: Vec<Res> = match self.self_types.last() {
+			// `Self` alone names types; `Self::item` may also name an item of the implemented (or defined) trait
+			Some(self_types) if path.segments.len() == 1 => self_types.types.iter().map(|&item| Res::Item(item)).collect(),
+			Some(self_types) => self_types.types.iter().chain(&self_types.traits).map(|&item| Res::Item(item)).collect(),
+			None => Vec::new(),
+		};
 
-			data.name.as_deref() == Some(name) && item_namespaces(data).contains(&namespace)
-		})
-	}
-
-	/// The loaded items among resolutions, of the given kinds.
-	pub(super) fn loaded(&self, resolutions: &[Res], kinds: &[ItemKind]) -> Vec<ItemId> {
-		(resolutions.iter())
-			.filter_map(|res| match res {
-				Res::Item(item) if kinds.contains(&self.ws.item(*item).kind) => Some(*item),
-				_ => None,
-			})
-			.collect()
+		self.continue_path(first, path, namespace)
 	}
 
 	/// The loaded types (or traits) a type names, after stripping references, pointers, parentheses, slices, and arrays.
@@ -627,43 +687,21 @@ impl FileWalker<'_, '_> {
 		self.loaded(res.last(), TYPE_KINDS)
 	}
 
-	/// Reports associated item bindings of traits (`Iterator<Item = T>`, `Trait<N = 1>`, `Trait<Assoc: Bound>`) that name
-	/// target items.
-	fn assoc_bindings(&mut self, path: &syn::Path, res: &PathRes) {
-		let PathRes::Segments(segments) = res else {
-			return;
+	/// A single identifier in a generic argument (`Foo<N>`), which is a type unless it only resolves to a constant.
+	pub(super) fn type_or_const_argument(&mut self, ident: &Ident) {
+		let path = PathRef {
+			leading_colon: false,
+			segments: vec![self.segment(ident)],
 		};
 
-		let targets = self.targets;
+		let mut res = self.resolve_path(&path, Namespace::Type, Locals::All);
 
-		for (segment, resolutions) in path.segments.iter().zip(segments) {
-			let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-				continue;
-			};
-
-			for argument in &arguments.args {
-				let Some((ident, target)) = binding_ident(argument).and_then(|ident| Some((ident, targets.named(ident)?))) else {
-					continue;
-				};
-
-				let kind = if matches!(argument, GenericArgument::AssocConst(_)) { ItemKind::AssocConst } else { ItemKind::AssocType };
-				let name = ident_name(ident);
-
-				let candidates: Vec<Res> = (self.loaded(resolutions, &[ItemKind::Trait]).into_iter())
-					.flat_map(|trait_item| self.ws.children(trait_item))
-					.filter(|&item| {
-						let data = self.ws.item(item);
-
-						data.kind == kind && data.name.as_deref() == Some(name.as_str())
-					})
-					.map(Res::Item)
-					.collect();
-
-				if let Some(found) = target.find(&candidates) {
-					self.report(found, ReferenceKind::Path, self.parsed.range(ident.span()), true);
-				}
-			}
+		if res.last().is_empty() && matches!(res, PathRes::Segments(_)) {
+			res = self.resolve_path(&path, Namespace::Value, Locals::All);
 		}
+
+		self.report_path(&path, &res, ReferenceKind::Path);
+		self.check_capture(&path, &res, Namespace::Type);
 	}
 }
 
@@ -680,6 +718,30 @@ fn binding_ident(argument: &GenericArgument) -> Option<&Ident> {
 /// The name of an identifier, without `r#`.
 pub(super) fn ident_name(ident: &Ident) -> SmolStr {
 	SmolStr::new(ident.unraw().to_string())
+}
+
+/// Whether an item is an item of an inherent `impl` block.
+fn is_inherent_item(ws: &crate::model::Workspace, item: ItemId) -> bool {
+	(ws.parent(item).map(|parent| ws.item(parent)))
+		.and_then(ItemData::impl_info)
+		.is_some_and(|info| info.trait_path.is_none())
+}
+
+/// Whether an identifier pattern naming this item is a path pattern rather than a new binding: constants, statics, and
+/// unit structs and variants.
+pub(super) fn is_pattern_item(data: &ItemData) -> bool {
+	match data.kind {
+		ItemKind::Const | ItemKind::Static | ItemKind::ForeignStatic | ItemKind::AssocConst => true,
+		ItemKind::Struct | ItemKind::Variant => matches!(data.detail, ItemDetail::Data { shape: DataShape::Unit, .. }),
+		_ => false,
+	}
+}
+
+/// Whether an item is an item of a trait `impl` block.
+fn is_trait_impl_item(ws: &crate::model::Workspace, item: ItemId) -> bool {
+	(ws.parent(item).map(|parent| ws.item(parent)))
+		.and_then(ItemData::impl_info)
+		.is_some_and(|info| info.trait_path.is_some())
 }
 
 /// The namespaces an item is bound in as a member of a module (or of an enum, type, or trait).
@@ -729,40 +791,10 @@ pub(super) fn item_namespaces(data: &ItemData) -> &'static [Namespace] {
 	}
 }
 
-/// Whether an item is an item of an inherent `impl` block.
-fn is_inherent_item(ws: &crate::model::Workspace, item: ItemId) -> bool {
-	(ws.parent(item).map(|parent| ws.item(parent)))
-		.and_then(ItemData::impl_info)
-		.is_some_and(|info| info.trait_path.is_none())
-}
-
-/// Whether an item is an item of a trait `impl` block.
-fn is_trait_impl_item(ws: &crate::model::Workspace, item: ItemId) -> bool {
-	(ws.parent(item).map(|parent| ws.item(parent)))
-		.and_then(ItemData::impl_info)
-		.is_some_and(|info| info.trait_path.is_some())
-}
-
 /// Whether a resolution can be bound in a namespace (what things outside of the loaded crates are is unknown).
 pub(super) fn res_in_namespace(ws: &crate::model::Workspace, res: &Res, namespace: Namespace) -> bool {
 	match res {
 		Res::Item(item) => item_namespaces(ws.item(*item)).contains(&namespace),
 		Res::External(_) | Res::Builtin(_) => true,
-	}
-}
-
-/// Whether an identifier pattern naming this item is a path pattern rather than a new binding: constants, statics, and
-/// unit structs and variants.
-pub(super) fn is_pattern_item(data: &ItemData) -> bool {
-	match data.kind {
-		ItemKind::Const | ItemKind::Static | ItemKind::ForeignStatic | ItemKind::AssocConst => true,
-		ItemKind::Struct | ItemKind::Variant => matches!(
-			data.detail,
-			ItemDetail::Data {
-				shape: DataShape::Unit,
-				..
-			}
-		),
-		_ => false,
 	}
 }

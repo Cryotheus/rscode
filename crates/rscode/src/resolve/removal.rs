@@ -18,22 +18,6 @@ use crate::model::ItemKind;
 use rscode_fmt::Edition;
 use smol_str::SmolStr;
 
-/// A binding of a module scope that comes through removed imports (see [`Resolver::lost_bindings`]).
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct LostBinding {
-	pub(crate) module: ItemId,
-	pub(crate) name: SmolStr,
-	pub(crate) namespace: Namespace,
-	pub(crate) res: Res,
-
-	/// The import (of `module`) that bound it.
-	pub(crate) import: ItemId,
-
-	/// What the name is bound to without the removed imports, in the namespace: when something is (a glob import that
-	/// the removed import shadowed), code that used the binding still compiles, but names something else.
-	pub(crate) now: Vec<Res>,
-}
-
 /// A name that a removed import bound in a module, or that an import through it binds (see
 /// [`Resolver::dead_names`]).
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -55,36 +39,54 @@ pub(crate) struct DeadNames {
 	pub(crate) broken: Vec<ItemId>,
 }
 
+/// A binding of a module scope that comes through removed imports (see [`Resolver::lost_bindings`]).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct LostBinding {
+	pub(crate) module: ItemId,
+	pub(crate) name: SmolStr,
+	pub(crate) namespace: Namespace,
+	pub(crate) res: Res,
+
+	/// The import (of `module`) that bound it.
+	pub(crate) import: ItemId,
+
+	/// What the name is bound to without the removed imports, in the namespace: when something is (a glob import that
+	/// the removed import shadowed), code that used the binding still compiles, but names something else.
+	pub(crate) now: Vec<Res>,
+}
+
 impl Resolver<'_> {
-	/// The bindings of module scopes that `other`, a resolver of the same workspace without some imports (see
-	/// [`Resolver::without_imports`]), does not have: those that came through the missing imports, directly or through
-	/// other imports (and glob imports) of what they bound.
-	pub(crate) fn lost_bindings(&self, other: &Resolver<'_>) -> Vec<LostBinding> {
-		let mut lost = Vec::new();
+	/// Adds the name that `import` binds in `module` (the name of a named import, or `name` for a glob import) to the
+	/// dead names, unless it is there, or `module` binds it otherwise, or a glob import might (see
+	/// [`Resolver::dead_names`]).
+	fn add_dead(&self, dead: &mut Vec<DeadName>, import: ItemId, module: ItemId, name: Option<SmolStr>) {
+		let name = match name {
+			Some(name) => name,
+			None => {
+				let info = self.ws.item(import).import_info();
 
-		for (&module, scope) in &self.tables.scopes {
-			let other_scope = other.tables.scopes.get(&module);
-
-			for (name, namespace, slot) in scope.iter() {
-				let kept = other_scope.and_then(|scope| scope.slot(name, namespace)).map(|slot| slot.entries()).unwrap_or_default();
-
-				for entry in slot.entries() {
-					if let Some(import) = entry.import.filter(|_| !kept.iter().any(|kept| kept.res == entry.res)) {
-						lost.push(LostBinding {
-							module,
-							name: name.clone(),
-							namespace,
-							res: entry.res.clone(),
-							import,
-							now: kept.iter().map(|kept| kept.res.clone()).collect(),
-						});
-					}
+				match info.and_then(|info| info.binding_name()).filter(|name| !names::is_path_keyword(name)) {
+					Some(name) => name.clone(),
+					None => return,
 				}
 			}
-		}
+		};
 
-		lost.sort_by(|a, b| (a.module, &a.name, a.namespace.index(), a.import).cmp(&(b.module, &b.name, b.namespace.index(), b.import)));
-		lost
+		let known = dead.iter().any(|dead| dead.module == module && dead.name == name);
+		let bound = Namespace::ALL
+			.into_iter()
+			.any(|namespace| !self.bindings(module, &name, namespace).is_empty());
+
+		if !known && !bound && !self.globs_may_bind(module, &name, dead, &mut Vec::new()) {
+			dead.push(DeadName { module, name, import });
+		}
+	}
+
+	/// Whether a module's scope binds a name, in any namespace.
+	pub(crate) fn binds(&self, module: ItemId, name: &str) -> bool {
+		Namespace::ALL
+			.into_iter()
+			.any(|namespace| !self.bindings(module, name, namespace).is_empty())
 	}
 
 	/// The imports that resolve to something here, but to nothing in `other` (a resolver of the same workspace without
@@ -161,30 +163,6 @@ impl Resolver<'_> {
 		}
 	}
 
-	/// Adds the name that `import` binds in `module` (the name of a named import, or `name` for a glob import) to the
-	/// dead names, unless it is there, or `module` binds it otherwise, or a glob import might (see
-	/// [`Resolver::dead_names`]).
-	fn add_dead(&self, dead: &mut Vec<DeadName>, import: ItemId, module: ItemId, name: Option<SmolStr>) {
-		let name = match name {
-			Some(name) => name,
-			None => {
-				let info = self.ws.item(import).import_info();
-
-				match info.and_then(|info| info.binding_name()).filter(|name| !names::is_path_keyword(name)) {
-					Some(name) => name.clone(),
-					None => return,
-				}
-			}
-		};
-
-		let known = dead.iter().any(|dead| dead.module == module && dead.name == name);
-		let bound = Namespace::ALL.into_iter().any(|namespace| !self.bindings(module, &name, namespace).is_empty());
-
-		if !known && !bound && !self.globs_may_bind(module, &name, dead, &mut Vec::new()) {
-			dead.push(DeadName { module, name, import });
-		}
-	}
-
 	/// Whether a glob import of `module` might bind `name` to items that are not loaded.
 	fn globs_may_bind(&self, module: ItemId, name: &str, dead: &[DeadName], visited: &mut Vec<ItemId>) -> bool {
 		if visited.contains(&module) {
@@ -218,6 +196,40 @@ impl Resolver<'_> {
 		false
 	}
 
+	/// The bindings of module scopes that `other`, a resolver of the same workspace without some imports (see
+	/// [`Resolver::without_imports`]), does not have: those that came through the missing imports, directly or through
+	/// other imports (and glob imports) of what they bound.
+	pub(crate) fn lost_bindings(&self, other: &Resolver<'_>) -> Vec<LostBinding> {
+		let mut lost = Vec::new();
+
+		for (&module, scope) in &self.tables.scopes {
+			let other_scope = other.tables.scopes.get(&module);
+
+			for (name, namespace, slot) in scope.iter() {
+				let kept = other_scope
+					.and_then(|scope| scope.slot(name, namespace))
+					.map(|slot| slot.entries())
+					.unwrap_or_default();
+
+				for entry in slot.entries() {
+					if let Some(import) = entry.import.filter(|_| !kept.iter().any(|kept| kept.res == entry.res)) {
+						lost.push(LostBinding {
+							module,
+							name: name.clone(),
+							namespace,
+							res: entry.res.clone(),
+							import,
+							now: kept.iter().map(|kept| kept.res.clone()).collect(),
+						});
+					}
+				}
+			}
+		}
+
+		lost.sort_by(|a, b| (a.module, &a.name, a.namespace.index(), a.import).cmp(&(b.module, &b.name, b.namespace.index(), b.import)));
+		lost
+	}
+
 	/// Whether a module might bind `name` to items that are not loaded: it has macro invocations (other than
 	/// `thread_local!`, whose statics are loaded), or imports that resolve to nothing and are not dead, or glob
 	/// imports that might. Not when the name is dead in it: its import of the name would have clashed with an item of
@@ -227,8 +239,8 @@ impl Resolver<'_> {
 			return false;
 		}
 
-		let macro_calls = (self.ws.children(module))
-			.any(|child| self.ws.item(child).kind == ItemKind::MacroCall && self.ws.children(child).next().is_none());
+		let macro_calls =
+			(self.ws.children(module)).any(|child| self.ws.item(child).kind == ItemKind::MacroCall && self.ws.children(child).next().is_none());
 
 		let uses = self.ws.children(module).filter(|&child| self.ws.item(child).kind == ItemKind::Use);
 		let unresolved = uses.flat_map(|use_item| self.ws.children(use_item)).any(|import| {
@@ -254,29 +266,26 @@ impl Resolver<'_> {
 		let edition_2015 = self.ws.krate(import.krate()).edition() == Edition::E2015;
 		let prefixes = self.resolve_prefixes(module, &info.path, None, PathKind::Use);
 
-		(info.path.segments.iter().zip(&prefixes)).enumerate().any(|(index, (segment, resolutions))| {
-			let scopes: Vec<ItemId> = match index {
-				0 if names::is_path_keyword(&segment.name) => return false,
-				0 if edition_2015 => vec![ItemId::crate_root(import.krate())],
-				0 if info.path.leading_colon => return false,
-				0 => vec![module],
-				_ => (prefixes[index - 1].iter())
-					.filter_map(|res| match res {
-						Res::Item(item) if self.ws.item(*item).kind == ItemKind::Module => Some(*item),
-						_ => None,
-					})
-					.collect(),
-			};
+		(info.path.segments.iter().zip(&prefixes))
+			.enumerate()
+			.any(|(index, (segment, resolutions))| {
+				let scopes: Vec<ItemId> = match index {
+					0 if names::is_path_keyword(&segment.name) => return false,
+					0 if edition_2015 => vec![ItemId::crate_root(import.krate())],
+					0 if info.path.leading_colon => return false,
+					0 => vec![module],
+					_ => (prefixes[index - 1].iter())
+						.filter_map(|res| match res {
+							Res::Item(item) if self.ws.item(*item).kind == ItemKind::Module => Some(*item),
+							_ => None,
+						})
+						.collect(),
+				};
 
-			// (the first segment falls back to preludes when the scope does not bind it)
-			let unresolved = resolutions.is_empty() || (index == 0 && scopes.iter().all(|&scope| !self.binds(scope, &segment.name)));
+				// (the first segment falls back to preludes when the scope does not bind it)
+				let unresolved = resolutions.is_empty() || (index == 0 && scopes.iter().all(|&scope| !self.binds(scope, &segment.name)));
 
-			unresolved && dead.iter().any(|dead| dead.name == segment.name && scopes.contains(&dead.module))
-		})
-	}
-
-	/// Whether a module's scope binds a name, in any namespace.
-	pub(crate) fn binds(&self, module: ItemId, name: &str) -> bool {
-		Namespace::ALL.into_iter().any(|namespace| !self.bindings(module, name, namespace).is_empty())
+				unresolved && dead.iter().any(|dead| dead.name == segment.name && scopes.contains(&dead.module))
+			})
 	}
 }

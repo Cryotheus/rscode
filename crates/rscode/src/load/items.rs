@@ -42,6 +42,13 @@ use syn::TraitItem;
 use syn::UseTree;
 use syn::Variant;
 
+/// What the leaves of a `use` item share.
+struct Leaf<'a> {
+	use_item: u32,
+	vis: &'a Visibility,
+	leading_colon: bool,
+}
+
 /// A tree of a `use` item that may start with `::`: the whole tree of the item, or an element of a group that syn
 /// does not model (see [`verbatim::UseElement`]).
 pub(super) struct UseRoot<'a> {
@@ -55,43 +62,235 @@ pub(super) struct UseRoot<'a> {
 }
 
 impl Walker<'_, '_, '_> {
-	/// Starts an item from what every item has: its tokens, attributes, and visibility.
-	fn new_item(&mut self, kind: ItemKind, source: &dyn ToTokens, attrs: &[Attribute], vis: Visibility) -> ItemData {
-		let outer = attrs.iter().filter(|attr| matches!(attr.style, syn::AttrStyle::Outer)).count();
-		let extent = self.extent(source, outer);
-		let summary = self.attributes(attrs, kind == ItemKind::Module);
+	fn extern_block(&mut self, parent: u32, item: &ItemForeignMod) {
+		let mut data = self.new_item(ItemKind::ExternBlock, item, &item.attrs, Visibility::Private);
 
-		ItemData {
-			kind,
-			name: None,
+		data.detail = ItemDetail::ExternBlock {
+			abi: item.abi.name.as_ref().map(syn::LitStr::value),
+			is_unsafe: item.unsafety.is_some(),
+			body: self.inside(&item.brace_token.span),
+		};
+
+		let index = self.loader.push(parent, data);
+
+		for member in &item.items {
+			self.foreign_item(index, member);
+		}
+	}
+
+	fn foreign_item(&mut self, parent: u32, item: &ForeignItem) {
+		let private = Visibility::Private;
+
+		match item {
+			ForeignItem::Fn(item) => {
+				let vis = self.visibility(&item.vis, private);
+				let mut data = self.new_item(ItemKind::ForeignFn, item, &item.attrs, vis);
+
+				data.detail = ItemDetail::Fn(self.fn_info(&item.sig, None));
+				self.push_named(parent, data, Some(&item.sig.ident));
+			}
+
+			ForeignItem::Static(item) => {
+				let vis = self.visibility(&item.vis, private);
+				let mut data = self.new_item(ItemKind::ForeignStatic, item, &item.attrs, vis);
+
+				data.detail = ItemDetail::Static {
+					mutable: matches!(item.mutability, StaticMutability::Mut(_)),
+					thread_local: false,
+				};
+
+				self.push_named(parent, data, Some(&item.ident));
+			}
+
+			ForeignItem::Type(item) => {
+				let vis = self.visibility(&item.vis, private);
+				let data = self.new_item(ItemKind::ForeignType, item, &item.attrs, vis);
+
+				self.push_named(parent, data, Some(&item.ident));
+			}
+
+			ForeignItem::Macro(item) => self.macro_item(parent, item, &item.attrs, None, &item.mac, Container::Extern),
+			ForeignItem::Verbatim(tokens) => self.verbatim(parent, tokens, Container::Extern),
+			item => self.verbatim(parent, &item.to_token_stream(), Container::Extern),
+		}
+	}
+
+	/// An `impl` block; `source` spans its tokens (the item itself, or the `Verbatim` it was re-parsed from).
+	fn impl_block(&mut self, parent: u32, source: &dyn ToTokens, item: &ItemImpl) {
+		let mut data = self.new_item(ItemKind::Impl, source, &item.attrs, Visibility::Private);
+		let trait_path = item.trait_.as_ref().map(|(path, _)| path);
+
+		data.detail = ItemDetail::Impl(ImplInfo {
+			self_ty: self.type_ref(&item.self_ty),
+			self_ty_text: self.compact_text(item.self_ty.to_token_stream()),
+			trait_path: trait_path.map(|path| self.path_ref(path)),
+			trait_text: trait_path.map(|path| self.compact_text(path.to_token_stream())),
+			negative: item.modifiers.polarity.is_some(),
+			is_unsafe: item.unsafety.is_some(),
+			body: self.inside(&item.brace_token.span),
+		});
+
+		let index = self.loader.push(parent, data);
+		let container = Container::Impl {
+			of_trait: trait_path.is_some(),
+		};
+
+		for member in &item.items {
+			self.impl_member(index, member, container);
+		}
+	}
+
+	fn impl_member(&mut self, parent: u32, item: &ImplItem, container: Container) {
+		let default = container.default_vis();
+
+		match item {
+			ImplItem::Const(item) => {
+				let vis = self.visibility(&item.vis, default);
+				let data = self.new_item(ItemKind::AssocConst, item, &item.attrs, vis);
+
+				self.push_named(parent, data, Some(&item.ident));
+			}
+
+			ImplItem::Fn(item) => {
+				let vis = self.visibility(&item.vis, default);
+				let mut data = self.new_item(ItemKind::AssocFn, item, &item.attrs, vis);
+
+				data.detail = ItemDetail::Fn(self.fn_info(&item.sig, Some(&item.block)));
+				self.push_named(parent, data, Some(&item.sig.ident));
+			}
+
+			ImplItem::Type(item) => {
+				let vis = self.visibility(&item.vis, default);
+				let data = self.new_item(ItemKind::AssocType, item, &item.attrs, vis);
+
+				self.push_named(parent, data, Some(&item.ident));
+			}
+
+			ImplItem::Macro(item) => self.macro_item(parent, item, &item.attrs, None, &item.mac, container),
+			ImplItem::Verbatim(tokens) => self.verbatim(parent, tokens, container),
+			item => self.verbatim(parent, &item.to_token_stream(), container),
+		}
+	}
+
+	/// An import of `prefix::ident [as alias]`, or of `prefix::*` if `ident` is `None`.
+	fn import(&mut self, leaf: &Leaf, range: TextRange, prefix: &[PathSegmentRef], ident: Option<&Ident>, alias: Option<&Ident>) {
+		let is_self = ident.is_some_and(|ident| *ident == "self");
+		let mut path = PathRef {
+			leading_colon: leaf.leading_colon,
+			segments: prefix.to_vec(),
+		};
+
+		if let Some(ident) = ident.filter(|_| !is_self) {
+			path.segments.push(self.segment(ident));
+		}
+
+		let info = ImportInfo {
+			path,
+			alias: alias.map(ident_name),
+			alias_range: alias.map(|alias| self.range(alias.span())),
+			glob: ident.is_none(),
+			is_self,
+		};
+
+		let name = info.binding_name().cloned();
+		let name_range = name.as_ref().and(alias.or(ident)).map(|ident| self.range(ident.span()));
+
+		let item = ItemData {
+			kind: ItemKind::Import,
+			name,
 			parent: None,
 			children: Vec::new(),
 			file: self.file,
-			range: extent.range,
-			name_range: None,
-			vis,
-			cfg: CfgExpr::all(summary.cfgs),
+			range,
+			name_range,
+			vis: leaf.vis.clone(),
+			cfg: None,
 			attrs: ItemAttrs {
-				after_attrs: extent.after_attrs,
-				..summary.attrs
+				after_attrs: range.start,
+				..ItemAttrs::default()
 			},
-			detail: ItemDetail::None,
+			detail: ItemDetail::Import(info),
+		};
+
+		self.loader.push(leaf.use_item, item);
+	}
+
+	/// Details of a macro-like item; without a delimited `body`, the body is empty and at the item's `end`.
+	fn macro_detail(&self, path: &str, body: Option<DelimSpan>, end: usize) -> ItemDetail {
+		ItemDetail::Macro {
+			path: path.to_owned(),
+			body: body.map_or(TextRange::new(end, end), |body| self.inside(&body)),
 		}
 	}
 
-	/// Adds an item named by `ident` (unless it is `_`), returning its index.
-	fn push_named(&mut self, parent: u32, mut item: ItemData, ident: Option<&Ident>) -> u32 {
-		if let Some(ident) = ident.filter(|ident| *ident != "_") {
-			item.name = Some(ident_name(ident));
-			item.name_range = Some(self.range(ident.span()));
-		}
+	/// A `macro_rules!` definition (named by `ident`) or another macro invocation.
+	fn macro_item(&mut self, parent: u32, source: &dyn ToTokens, attrs: &[Attribute], ident: Option<&Ident>, mac: &Macro, container: Container) {
+		let rules = container == Container::Module && ident.is_some() && mac.path.is_ident("macro_rules");
+		let kind = if rules { ItemKind::MacroRules } else { container.macro_kind() };
+		let mut data = self.new_item(kind, source, attrs, container.default_vis());
 
-		self.loader.push(parent, item)
+		data.detail = ItemDetail::Macro {
+			path: self.compact_text(mac.path.to_token_stream()),
+			body: self.inside(mac.delimiter.span()),
+		};
+
+		let index = self.push_named(parent, data, ident.filter(|_| rules));
+
+		// the statics a `thread_local!` declares live in the module, like the items of `extern` blocks
+		if container == Container::Module
+			&& !rules
+			&& let Some(declarations) = thread_local::declarations(mac)
+		{
+			for declaration in &declarations {
+				let vis = self.visibility(&declaration.vis, Visibility::Private);
+				let mut data = self.new_item(ItemKind::Static, declaration, &declaration.attrs, vis);
+
+				data.detail = ItemDetail::Static {
+					mutable: false,
+					thread_local: true,
+				};
+				self.push_named(index, data, Some(&declaration.ident));
+			}
+		}
 	}
 
-	pub(super) fn module_items(&mut self, module: u32, items: &[Item], dir: &ModDir, active: Tristate) {
-		for item in items {
-			self.module_item(module, item, dir, active);
+	fn module(&mut self, parent: u32, item: &ItemMod, dir: &ModDir, active: Tristate) {
+		let vis = self.visibility(&item.vis, Visibility::Private);
+		let mut data = self.new_item(ItemKind::Module, item, &item.attrs, vis);
+		let name = ident_name(&item.ident);
+		let active = active.and(self.loader.eval(data.cfg.as_ref()));
+		let path_attr = data.attrs.path.clone();
+
+		match &item.content {
+			Some((brace, items)) => {
+				data.detail = ItemDetail::Module(ModuleInfo {
+					inline: true,
+					body: Some(self.inside(&brace.span)),
+					..ModuleInfo::default()
+				});
+
+				let index = self.push_named(parent, data, Some(&item.ident));
+
+				self.module_items(index, items, &dir.inline(&name, path_attr.as_deref()), active);
+			}
+
+			None => {
+				let file = dir.resolve(&name, path_attr.as_deref());
+				let declaration = self.range(item.ident.span()).start;
+
+				data.detail = ItemDetail::Module(ModuleInfo {
+					inline: false,
+					body: None,
+					file: None,
+					file_path: Some(file.path.clone()),
+					dir_owner: file.dir.relative.is_none(),
+					load_error: None,
+				});
+
+				let index = self.push_named(parent, data, Some(&item.ident));
+
+				self.load_out_of_line(index, &name, file, declaration, active);
+			}
 		}
 	}
 
@@ -210,108 +409,64 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
-	fn variant(&mut self, parent: u32, variant: &Variant) {
-		let mut data = self.new_item(ItemKind::Variant, variant, &variant.attrs, Visibility::Inherited);
-
-		data.detail = self.fields_detail(&variant.fields);
-		self.push_named(parent, data, Some(&variant.ident));
-	}
-
-	fn module(&mut self, parent: u32, item: &ItemMod, dir: &ModDir, active: Tristate) {
-		let vis = self.visibility(&item.vis, Visibility::Private);
-		let mut data = self.new_item(ItemKind::Module, item, &item.attrs, vis);
-		let name = ident_name(&item.ident);
-		let active = active.and(self.loader.eval(data.cfg.as_ref()));
-		let path_attr = data.attrs.path.clone();
-
-		match &item.content {
-			Some((brace, items)) => {
-				data.detail = ItemDetail::Module(ModuleInfo {
-					inline: true,
-					body: Some(self.inside(&brace.span)),
-					..ModuleInfo::default()
-				});
-
-				let index = self.push_named(parent, data, Some(&item.ident));
-
-				self.module_items(index, items, &dir.inline(&name, path_attr.as_deref()), active);
-			}
-
-			None => {
-				let file = dir.resolve(&name, path_attr.as_deref());
-				let declaration = self.range(item.ident.span()).start;
-
-				data.detail = ItemDetail::Module(ModuleInfo {
-					inline: false,
-					body: None,
-					file: None,
-					file_path: Some(file.path.clone()),
-					dir_owner: file.dir.relative.is_none(),
-					load_error: None,
-				});
-
-				let index = self.push_named(parent, data, Some(&item.ident));
-
-				self.load_out_of_line(index, &name, file, declaration, active);
-			}
+	pub(super) fn module_items(&mut self, module: u32, items: &[Item], dir: &ModDir, active: Tristate) {
+		for item in items {
+			self.module_item(module, item, dir, active);
 		}
 	}
 
-	/// An `impl` block; `source` spans its tokens (the item itself, or the `Verbatim` it was re-parsed from).
-	fn impl_block(&mut self, parent: u32, source: &dyn ToTokens, item: &ItemImpl) {
-		let mut data = self.new_item(ItemKind::Impl, source, &item.attrs, Visibility::Private);
-		let trait_path = item.trait_.as_ref().map(|(path, _)| path);
+	/// Starts an item from what every item has: its tokens, attributes, and visibility.
+	fn new_item(&mut self, kind: ItemKind, source: &dyn ToTokens, attrs: &[Attribute], vis: Visibility) -> ItemData {
+		let outer = attrs.iter().filter(|attr| matches!(attr.style, syn::AttrStyle::Outer)).count();
+		let extent = self.extent(source, outer);
+		let summary = self.attributes(attrs, kind == ItemKind::Module);
 
-		data.detail = ItemDetail::Impl(ImplInfo {
-			self_ty: self.type_ref(&item.self_ty),
-			self_ty_text: self.compact_text(item.self_ty.to_token_stream()),
-			trait_path: trait_path.map(|path| self.path_ref(path)),
-			trait_text: trait_path.map(|path| self.compact_text(path.to_token_stream())),
-			negative: item.modifiers.polarity.is_some(),
-			is_unsafe: item.unsafety.is_some(),
-			body: self.inside(&item.brace_token.span),
-		});
+		ItemData {
+			kind,
+			name: None,
+			parent: None,
+			children: Vec::new(),
+			file: self.file,
+			range: extent.range,
+			name_range: None,
+			vis,
+			cfg: CfgExpr::all(summary.cfgs),
+			attrs: ItemAttrs {
+				after_attrs: extent.after_attrs,
+				..summary.attrs
+			},
+			detail: ItemDetail::None,
+		}
+	}
 
-		let index = self.loader.push(parent, data);
-		let container = Container::Impl {
-			of_trait: trait_path.is_some(),
+	/// Adds an item named by `ident` (unless it is `_`), returning its index.
+	fn push_named(&mut self, parent: u32, mut item: ItemData, ident: Option<&Ident>) -> u32 {
+		if let Some(ident) = ident.filter(|ident| *ident != "_") {
+			item.name = Some(ident_name(ident));
+			item.name_range = Some(self.range(ident.span()));
+		}
+
+		self.loader.push(parent, item)
+	}
+
+	/// The range of a tree of a `use` item, including its leading `::`.
+	fn rooted_range(&self, leading_colon: Option<&Token![::]>, tree: &UseTree) -> TextRange {
+		let range = self.range_of(tree);
+
+		leading_colon.map_or(range, |colon| self.range_of(colon).cover(range))
+	}
+
+	fn trait_alias(&mut self, parent: u32, source: &dyn ToTokens, item: &ItemTraitAlias) {
+		let vis = self.visibility(&item.vis, Visibility::Private);
+		let mut data = self.new_item(ItemKind::TraitAlias, source, &item.attrs, vis);
+
+		data.detail = ItemDetail::Trait {
+			is_unsafe: false,
+			is_auto: false,
+			body: None,
 		};
 
-		for member in &item.items {
-			self.impl_member(index, member, container);
-		}
-	}
-
-	fn impl_member(&mut self, parent: u32, item: &ImplItem, container: Container) {
-		let default = container.default_vis();
-
-		match item {
-			ImplItem::Const(item) => {
-				let vis = self.visibility(&item.vis, default);
-				let data = self.new_item(ItemKind::AssocConst, item, &item.attrs, vis);
-
-				self.push_named(parent, data, Some(&item.ident));
-			}
-
-			ImplItem::Fn(item) => {
-				let vis = self.visibility(&item.vis, default);
-				let mut data = self.new_item(ItemKind::AssocFn, item, &item.attrs, vis);
-
-				data.detail = ItemDetail::Fn(self.fn_info(&item.sig, Some(&item.block)));
-				self.push_named(parent, data, Some(&item.sig.ident));
-			}
-
-			ImplItem::Type(item) => {
-				let vis = self.visibility(&item.vis, default);
-				let data = self.new_item(ItemKind::AssocType, item, &item.attrs, vis);
-
-				self.push_named(parent, data, Some(&item.ident));
-			}
-
-			ImplItem::Macro(item) => self.macro_item(parent, item, &item.attrs, None, &item.mac, container),
-			ImplItem::Verbatim(tokens) => self.verbatim(parent, tokens, container),
-			item => self.verbatim(parent, &item.to_token_stream(), container),
-		}
+		self.push_named(parent, data, Some(&item.ident));
 	}
 
 	/// A trait; `source` spans its tokens (the item itself, or the `Verbatim` it was re-parsed from).
@@ -330,19 +485,6 @@ impl Walker<'_, '_, '_> {
 		for member in &item.items {
 			self.trait_member(index, member);
 		}
-	}
-
-	fn trait_alias(&mut self, parent: u32, source: &dyn ToTokens, item: &ItemTraitAlias) {
-		let vis = self.visibility(&item.vis, Visibility::Private);
-		let mut data = self.new_item(ItemKind::TraitAlias, source, &item.attrs, vis);
-
-		data.detail = ItemDetail::Trait {
-			is_unsafe: false,
-			is_auto: false,
-			body: None,
-		};
-
-		self.push_named(parent, data, Some(&item.ident));
 	}
 
 	fn trait_member(&mut self, parent: u32, item: &TraitItem) {
@@ -374,95 +516,6 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
-	fn extern_block(&mut self, parent: u32, item: &ItemForeignMod) {
-		let mut data = self.new_item(ItemKind::ExternBlock, item, &item.attrs, Visibility::Private);
-
-		data.detail = ItemDetail::ExternBlock {
-			abi: item.abi.name.as_ref().map(syn::LitStr::value),
-			is_unsafe: item.unsafety.is_some(),
-			body: self.inside(&item.brace_token.span),
-		};
-
-		let index = self.loader.push(parent, data);
-
-		for member in &item.items {
-			self.foreign_item(index, member);
-		}
-	}
-
-	fn foreign_item(&mut self, parent: u32, item: &ForeignItem) {
-		let private = Visibility::Private;
-
-		match item {
-			ForeignItem::Fn(item) => {
-				let vis = self.visibility(&item.vis, private);
-				let mut data = self.new_item(ItemKind::ForeignFn, item, &item.attrs, vis);
-
-				data.detail = ItemDetail::Fn(self.fn_info(&item.sig, None));
-				self.push_named(parent, data, Some(&item.sig.ident));
-			}
-
-			ForeignItem::Static(item) => {
-				let vis = self.visibility(&item.vis, private);
-				let mut data = self.new_item(ItemKind::ForeignStatic, item, &item.attrs, vis);
-
-				data.detail = ItemDetail::Static {
-					mutable: matches!(item.mutability, StaticMutability::Mut(_)),
-					thread_local: false,
-				};
-
-				self.push_named(parent, data, Some(&item.ident));
-			}
-
-			ForeignItem::Type(item) => {
-				let vis = self.visibility(&item.vis, private);
-				let data = self.new_item(ItemKind::ForeignType, item, &item.attrs, vis);
-
-				self.push_named(parent, data, Some(&item.ident));
-			}
-
-			ForeignItem::Macro(item) => self.macro_item(parent, item, &item.attrs, None, &item.mac, Container::Extern),
-			ForeignItem::Verbatim(tokens) => self.verbatim(parent, tokens, Container::Extern),
-			item => self.verbatim(parent, &item.to_token_stream(), Container::Extern),
-		}
-	}
-
-	/// A `macro_rules!` definition (named by `ident`) or another macro invocation.
-	fn macro_item(
-		&mut self,
-		parent: u32,
-		source: &dyn ToTokens,
-		attrs: &[Attribute],
-		ident: Option<&Ident>,
-		mac: &Macro,
-		container: Container,
-	) {
-		let rules = container == Container::Module && ident.is_some() && mac.path.is_ident("macro_rules");
-		let kind = if rules { ItemKind::MacroRules } else { container.macro_kind() };
-		let mut data = self.new_item(kind, source, attrs, container.default_vis());
-
-		data.detail = ItemDetail::Macro {
-			path: self.compact_text(mac.path.to_token_stream()),
-			body: self.inside(mac.delimiter.span()),
-		};
-
-		let index = self.push_named(parent, data, ident.filter(|_| rules));
-
-		// the statics a `thread_local!` declares live in the module, like the items of `extern` blocks
-		if container == Container::Module
-			&& !rules
-			&& let Some(declarations) = thread_local::declarations(mac)
-		{
-			for declaration in &declarations {
-				let vis = self.visibility(&declaration.vis, Visibility::Private);
-				let mut data = self.new_item(ItemKind::Static, declaration, &declaration.attrs, vis);
-
-				data.detail = ItemDetail::Static { mutable: false, thread_local: true };
-				self.push_named(index, data, Some(&declaration.ident));
-			}
-		}
-	}
-
 	/// A `use` item and its leaves.
 	fn use_item(&mut self, parent: u32, source: &dyn ToTokens, attrs: &[Attribute], vis: Visibility, roots: &[UseRoot]) {
 		let data = self.new_item(ItemKind::Use, source, attrs, vis.clone());
@@ -478,13 +531,6 @@ impl Walker<'_, '_, '_> {
 
 			self.use_tree(&leaf, root.tree, root.range, &mut prefix);
 		}
-	}
-
-	/// The range of a tree of a `use` item, including its leading `::`.
-	fn rooted_range(&self, leading_colon: Option<&Token![::]>, tree: &UseTree) -> TextRange {
-		let range = self.range_of(tree);
-
-		leading_colon.map_or(range, |colon| self.range_of(colon).cover(range))
 	}
 
 	/// Adds an [`ItemKind::Import`] for every leaf of a `use` tree.
@@ -511,47 +557,11 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
-	/// An import of `prefix::ident [as alias]`, or of `prefix::*` if `ident` is `None`.
-	fn import(&mut self, leaf: &Leaf, range: TextRange, prefix: &[PathSegmentRef], ident: Option<&Ident>, alias: Option<&Ident>) {
-		let is_self = ident.is_some_and(|ident| *ident == "self");
-		let mut path = PathRef {
-			leading_colon: leaf.leading_colon,
-			segments: prefix.to_vec(),
-		};
+	fn variant(&mut self, parent: u32, variant: &Variant) {
+		let mut data = self.new_item(ItemKind::Variant, variant, &variant.attrs, Visibility::Inherited);
 
-		if let Some(ident) = ident.filter(|_| !is_self) {
-			path.segments.push(self.segment(ident));
-		}
-
-		let info = ImportInfo {
-			path,
-			alias: alias.map(ident_name),
-			alias_range: alias.map(|alias| self.range(alias.span())),
-			glob: ident.is_none(),
-			is_self,
-		};
-
-		let name = info.binding_name().cloned();
-		let name_range = name.as_ref().and(alias.or(ident)).map(|ident| self.range(ident.span()));
-
-		let item = ItemData {
-			kind: ItemKind::Import,
-			name,
-			parent: None,
-			children: Vec::new(),
-			file: self.file,
-			range,
-			name_range,
-			vis: leaf.vis.clone(),
-			cfg: None,
-			attrs: ItemAttrs {
-				after_attrs: range.start,
-				..ItemAttrs::default()
-			},
-			detail: ItemDetail::Import(info),
-		};
-
-		self.loader.push(leaf.use_item, item);
+		data.detail = self.fields_detail(&variant.fields);
+		self.push_named(parent, data, Some(&variant.ident));
 	}
 
 	/// Syntax syn does not model, classified by its tokens (see [`verbatim`]).
@@ -592,7 +602,14 @@ impl Walker<'_, '_, '_> {
 			},
 
 			Shape::Static { name, mutable } => match container.static_kind() {
-				Some(kind) => (kind, Some(name), ItemDetail::Static { mutable, thread_local: false }),
+				Some(kind) => (
+					kind,
+					Some(name),
+					ItemDetail::Static {
+						mutable,
+						thread_local: false,
+					},
+				),
 				None => unknown(self, None),
 			},
 
@@ -610,14 +627,6 @@ impl Walker<'_, '_, '_> {
 		self.push_named(parent, data, name.as_ref());
 	}
 
-	/// Details of a macro-like item; without a delimited `body`, the body is empty and at the item's `end`.
-	fn macro_detail(&self, path: &str, body: Option<DelimSpan>, end: usize) -> ItemDetail {
-		ItemDetail::Macro {
-			path: path.to_owned(),
-			body: body.map_or(TextRange::new(end, end), |body| self.inside(&body)),
-		}
-	}
-
 	/// A `use` item with `::` at the start of group elements (`use {::a, b};`, `use {a, {::b}};`).
 	fn verbatim_use(&mut self, parent: u32, tokens: &TokenStream, attrs: &[Attribute], vis: Visibility, elements: &[verbatim::UseElement]) {
 		let roots: Vec<UseRoot> = elements
@@ -631,11 +640,4 @@ impl Walker<'_, '_, '_> {
 
 		self.use_item(parent, tokens, attrs, vis, &roots);
 	}
-}
-
-/// What the leaves of a `use` item share.
-struct Leaf<'a> {
-	use_item: u32,
-	vis: &'a Visibility,
-	leading_colon: bool,
 }

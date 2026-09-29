@@ -10,27 +10,6 @@ use crate::source::FileId;
 use crate::source::SourceFile;
 use crate::source::TextRange;
 
-/// The outline of an item: its source text with bodies elided, and everything else (comments included) as written.
-///
-/// - Function and method bodies become `{ ... }`; the bodies of `macro_rules!` definitions and of macro invocations
-///   become `{ ... }`, `( ... )`, or `[ ... ]`, keeping the kind of delimiter. Empty bodies are kept.
-/// - Initializers of `const`s and `static`s spanning several lines become `= ...;`.
-/// - A module is outlined with its items, and the inline modules in it become `mod name { ... }`. Out-of-line modules
-///   (and crate roots) are outlined from their file, without their `mod name;` declaration.
-/// - `impl` blocks and traits keep their headers, and their items are outlined.
-/// - Everything else (`use` items, structs, enums, type aliases, ...) is kept as it is.
-/// - Without `docs`, doc comments and `#[doc = ...]` attributes are removed, with the lines they occupy.
-///
-/// Runs of blank lines become one blank line, and line breaks become `\n`.
-///
-/// Indentation of the first line is taken from the item's line in the file, so outlines of nested items line up.
-pub fn outline_text(workspace: &Workspace, item: ItemId, docs: bool) -> String {
-	let source = Source::of(workspace, item);
-	let syntax = Syntax::of(source.file.text());
-
-	item_snippet(workspace, item, &source, &syntax, true, docs).render(false)
-}
-
 /// Where the text of an item's view comes from: the item's own text, or the whole file of a module that has one (an
 /// out-of-line module whose file was loaded, or a crate root).
 pub(super) struct Source<'ws> {
@@ -51,57 +30,21 @@ impl<'ws> Source<'ws> {
 			let file = krate.file(file_id);
 			let bom = if file.text().starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
 
-			return Self { file_id, file, region: TextRange::new(bom, file.text().len()), module_file: true };
+			return Self {
+				file_id,
+				file,
+				region: TextRange::new(bom, file.text().len()),
+				module_file: true,
+			};
 		}
 
-		Self { file_id: data.file, file: krate.file(data.file), region: data.range, module_file: false }
+		Self {
+			file_id: data.file,
+			file: krate.file(data.file),
+			region: data.range,
+			module_file: false,
+		}
 	}
-}
-
-/// The lines of an item's [`Source`], outlined if `outline`, and without doc comments unless `docs`.
-///
-/// `syntax` must be that of the source's file.
-pub(super) fn item_snippet(
-	workspace: &Workspace,
-	item: ItemId,
-	source: &Source<'_>,
-	syntax: &Syntax,
-	outline: bool,
-	docs: bool,
-) -> Snippet {
-	let mut edits = Vec::new();
-
-	if outline {
-		collect_elisions(workspace, item, true, source.file.text(), &mut edits);
-		let text = source.file.text();
-		let initializers = within(&syntax.initializers, source.region).iter();
-
-		// the last declaration of a `thread_local!` may have no `;`
-		edits.extend(initializers.map(|&range| match text[range.as_range()].ends_with(';') {
-			true => Edit::Replace(range, "= ...;"),
-			false => Edit::Replace(range, "= ..."),
-		}));
-	}
-
-	if !docs {
-		edits.extend(within(&syntax.docs, source.region).iter().map(|&range| Edit::Delete(range)));
-	}
-
-	let mut snippet = Snippet::new(source.file, source.region, &edits, within(&syntax.strings, source.region));
-
-	if outline {
-		snippet.collapse_blank_lines();
-	}
-
-	snippet
-}
-
-/// The ranges (sorted by start) that start inside of `region`.
-fn within(ranges: &[TextRange], region: TextRange) -> &[TextRange] {
-	let start = ranges.partition_point(|range| range.start < region.start);
-	let end = ranges.partition_point(|range| range.start < region.end);
-
-	&ranges[start..end.max(start)]
 }
 
 /// Collects the elisions of an item and the items inside of it: bodies of functions and macros (but not of
@@ -112,8 +55,10 @@ fn within(ranges: &[TextRange], region: TextRange) -> &[TextRange] {
 fn collect_elisions(workspace: &Workspace, item: ItemId, root: bool, text: &str, edits: &mut Vec<Edit>) {
 	match &workspace.item(item).detail {
 		ItemDetail::Fn(info) => {
-			let inside =
-				info.body.filter(|body| body.len() >= 2).map(|body| TextRange::new(body.start + 1, body.end - 1));
+			let inside = info
+				.body
+				.filter(|body| body.len() >= 2)
+				.map(|body| TextRange::new(body.start + 1, body.end - 1));
 
 			edits.extend(inside.and_then(|inside| elide_group(text, inside)));
 		}
@@ -157,16 +102,69 @@ fn elide_group(text: &str, inside: TextRange) -> Option<Edit> {
 	(!contents.trim().is_empty()).then(|| Edit::Replace(TextRange::new(open, inside.end + 1), replacement))
 }
 
+/// The lines of an item's [`Source`], outlined if `outline`, and without doc comments unless `docs`.
+///
+/// `syntax` must be that of the source's file.
+pub(super) fn item_snippet(workspace: &Workspace, item: ItemId, source: &Source<'_>, syntax: &Syntax, outline: bool, docs: bool) -> Snippet {
+	let mut edits = Vec::new();
+
+	if outline {
+		collect_elisions(workspace, item, true, source.file.text(), &mut edits);
+		let text = source.file.text();
+		let initializers = within(&syntax.initializers, source.region).iter();
+
+		// the last declaration of a `thread_local!` may have no `;`
+		edits.extend(initializers.map(|&range| match text[range.as_range()].ends_with(';') {
+			true => Edit::Replace(range, "= ...;"),
+			false => Edit::Replace(range, "= ..."),
+		}));
+	}
+
+	if !docs {
+		edits.extend(within(&syntax.docs, source.region).iter().map(|&range| Edit::Delete(range)));
+	}
+
+	let mut snippet = Snippet::new(source.file, source.region, &edits, within(&syntax.strings, source.region));
+
+	if outline {
+		snippet.collapse_blank_lines();
+	}
+
+	snippet
+}
+
+/// The outline of an item: its source text with bodies elided, and everything else (comments included) as written.
+///
+/// - Function and method bodies become `{ ... }`; the bodies of `macro_rules!` definitions and of macro invocations
+///   become `{ ... }`, `( ... )`, or `[ ... ]`, keeping the kind of delimiter. Empty bodies are kept.
+/// - Initializers of `const`s and `static`s spanning several lines become `= ...;`.
+/// - A module is outlined with its items, and the inline modules in it become `mod name { ... }`. Out-of-line modules
+///   (and crate roots) are outlined from their file, without their `mod name;` declaration.
+/// - `impl` blocks and traits keep their headers, and their items are outlined.
+/// - Everything else (`use` items, structs, enums, type aliases, ...) is kept as it is.
+/// - Without `docs`, doc comments and `#[doc = ...]` attributes are removed, with the lines they occupy.
+///
+/// Runs of blank lines become one blank line, and line breaks become `\n`.
+///
+/// Indentation of the first line is taken from the item's line in the file, so outlines of nested items line up.
+pub fn outline_text(workspace: &Workspace, item: ItemId, docs: bool) -> String {
+	let source = Source::of(workspace, item);
+	let syntax = Syntax::of(source.file.text());
+
+	item_snippet(workspace, item, &source, &syntax, true, docs).render(false)
+}
+
+/// The ranges (sorted by start) that start inside of `region`.
+fn within(ranges: &[TextRange], region: TextRange) -> &[TextRange] {
+	let start = ranges.partition_point(|range| range.start < region.start);
+	let end = ranges.partition_point(|range| range.start < region.end);
+
+	&ranges[start..end.max(start)]
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	fn inside(text: &str, open: char) -> TextRange {
-		let start = text.find(open).unwrap() + 1;
-		let end = text.rfind(['}', ')', ']']).unwrap();
-
-		TextRange::new(start, end)
-	}
 
 	#[test]
 	fn elides_groups_by_delimiter() {
@@ -185,6 +183,13 @@ mod tests {
 		assert_eq!(replacement("m!(a];", '('), None);
 		assert_eq!(elide_group("{}", TextRange::new(0, 1)), None);
 		assert_eq!(elide_group("x", TextRange::new(1, 1)), None);
+	}
+
+	fn inside(text: &str, open: char) -> TextRange {
+		let start = text.find(open).unwrap() + 1;
+		let end = text.rfind(['}', ')', ']']).unwrap();
+
+		TextRange::new(start, end)
 	}
 
 	#[test]

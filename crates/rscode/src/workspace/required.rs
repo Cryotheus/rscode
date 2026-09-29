@@ -15,6 +15,16 @@ use cargo::core::Summary;
 use cargo::core::dependency::DepKind;
 use cargo::util::interning::InternedString;
 
+/// The package a dependency refers to.
+struct Known<'a> {
+	id: PackageId,
+
+	/// Unknown for packages that cargo resolved, but did not load.
+	summary: Option<&'a Summary>,
+
+	proc_macro: bool,
+}
+
 /// Evaluates the `required-features` of the selected packages' targets like cargo does.
 pub(super) struct RequiredFeatures<'a> {
 	pub local: &'a LocalPackages<'a>,
@@ -24,16 +34,6 @@ pub(super) struct RequiredFeatures<'a> {
 
 	/// Whether examples, tests, or benchmarks are built, which puts dev-dependencies in use.
 	pub has_dev_units: bool,
-}
-
-/// The package a dependency refers to.
-struct Known<'a> {
-	id: PackageId,
-
-	/// Unknown for packages that cargo resolved, but did not load.
-	summary: Option<&'a Summary>,
-
-	proc_macro: bool,
 }
 
 impl RequiredFeatures<'_> {
@@ -59,10 +59,14 @@ impl RequiredFeatures<'_> {
 					}
 				}
 				FeatureValue::Dep { .. } => {
-					return Err(Error::Cargo(format!("{invalid}: `dep:` prefixed feature values are not allowed in required-features")));
+					return Err(Error::Cargo(format!(
+						"{invalid}: `dep:` prefixed feature values are not allowed in required-features"
+					)));
 				}
 				FeatureValue::DepFeature { weak: true, .. } => {
-					return Err(Error::Cargo(format!("{invalid}: optional dependency with `?` is not allowed in required-features")));
+					return Err(Error::Cargo(format!(
+						"{invalid}: optional dependency with `?` is not allowed in required-features"
+					)));
 				}
 				FeatureValue::DepFeature {
 					dep_name,
@@ -88,6 +92,31 @@ impl RequiredFeatures<'_> {
 		Ok(warnings)
 	}
 
+	/// Whether a feature of a dependency is enabled, for a dependency that the package uses.
+	fn dependency_feature_enabled(&self, package: &Package, dep_name: InternedString, dep_feature: InternedString) -> bool {
+		let mut dependencies = package
+			.dependencies()
+			.iter()
+			.filter(|dependency| dependency.name_in_toml() == dep_name && self.in_use(package.package_id(), dependency));
+
+		dependencies.any(|dependency| {
+			let Some(known) = self.known(package, dependency) else {
+				// the features of registry and git dependencies are unknown without `exact_features`
+				return true;
+			};
+
+			let build = if known.proc_macro || dependency.is_build() {
+				Build::Host
+			} else {
+				Build::Target
+			};
+
+			self.activation
+				.features(known.id, build)
+				.is_some_and(|features| features.contains(&dep_feature))
+		})
+	}
+
 	/// Whether all of a target's `required-features` are enabled (`resolve_all_features`): features of its package, and
 	/// `dependency/feature` for features of its dependencies.
 	pub fn enabled(&self, candidate: &Candidate<'_>) -> bool {
@@ -110,25 +139,6 @@ impl RequiredFeatures<'_> {
 
 			// not allowed (see `check`)
 			FeatureValue::Dep { .. } | FeatureValue::DepFeature { weak: true, .. } => false,
-		})
-	}
-
-	/// Whether a feature of a dependency is enabled, for a dependency that the package uses.
-	fn dependency_feature_enabled(&self, package: &Package, dep_name: InternedString, dep_feature: InternedString) -> bool {
-		let mut dependencies = package
-			.dependencies()
-			.iter()
-			.filter(|dependency| dependency.name_in_toml() == dep_name && self.in_use(package.package_id(), dependency));
-
-		dependencies.any(|dependency| {
-			let Some(known) = self.known(package, dependency) else {
-				// the features of registry and git dependencies are unknown without `exact_features`
-				return true;
-			};
-
-			let build = if known.proc_macro || dependency.is_build() { Build::Host } else { Build::Target };
-
-			self.activation.features(known.id, build).is_some_and(|features| features.contains(&dep_feature))
 		})
 	}
 
@@ -166,5 +176,8 @@ impl RequiredFeatures<'_> {
 /// Whether a package has a feature, or an optional dependency that can be named like one.
 fn has_feature(summary: &Summary, feature: InternedString) -> bool {
 	summary.features().contains_key(&feature)
-		|| summary.dependencies().iter().any(|dependency| dependency.name_in_toml() == feature && dependency.is_optional())
+		|| summary
+			.dependencies()
+			.iter()
+			.any(|dependency| dependency.name_in_toml() == feature && dependency.is_optional())
 }

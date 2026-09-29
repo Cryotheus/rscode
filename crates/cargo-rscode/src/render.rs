@@ -16,81 +16,6 @@ use serde::Serialize;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Displays file paths relative to the current directory when they are below it, absolute otherwise.
-#[derive(Debug, Clone)]
-pub(crate) struct PathDisplay {
-	/// Relative paths (as in [`FindMatch::file`]) are relative to this directory: the workspace root.
-	root: PathBuf,
-
-	cwd: Option<PathBuf>,
-
-	/// `--absolute-paths`
-	absolute: bool,
-}
-
-impl PathDisplay {
-	/// With the current directory as the process has it, like the paths of the loaded workspace (not canonicalized:
-	/// on Windows that gives verbatim paths, `\\?\C:\...`, which no other path starts with).
-	pub(crate) fn new(root: &Path, absolute: bool) -> Self {
-		let cwd = std::env::current_dir().ok();
-
-		Self::with_cwd(root, cwd.as_deref(), absolute)
-	}
-
-	pub(crate) fn with_cwd(root: &Path, cwd: Option<&Path>, absolute: bool) -> Self {
-		Self {
-			root: root.to_path_buf(),
-			cwd: cwd.map(Path::to_path_buf),
-			absolute,
-		}
-	}
-
-	pub(crate) fn path(&self, path: &Path) -> PathBuf {
-		let absolute = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
-
-		if !self.absolute
-			&& let Some(cwd) = &self.cwd
-			&& let Ok(relative) = absolute.strip_prefix(cwd)
-		{
-			return match relative.as_os_str().is_empty() {
-				true => PathBuf::from("."),
-				false => relative.to_path_buf(),
-			};
-		}
-
-		absolute
-	}
-
-	pub(crate) fn display(&self, path: &Path) -> String {
-		self.path(path).display().to_string()
-	}
-
-	/// The path of a file in a diff: relative to the workspace root when below it (whatever the current directory, so
-	/// that every file of a diff has the same base, as `patch -p1` and `git apply` need), absolute otherwise.
-	pub(crate) fn diff_path(&self, path: &Path) -> PathBuf {
-		let absolute = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
-
-		match absolute.strip_prefix(&self.root) {
-			Ok(relative) if !self.absolute && !relative.as_os_str().is_empty() => relative.to_path_buf(),
-			_ => absolute,
-		}
-	}
-}
-
-/// The last line an item occupies, given its exclusive end.
-pub(crate) fn last_line(start: LineCol, end: LineCol) -> usize {
-	if end.column <= 1 && end.line > start.line { end.line - 1 } else { end.line }
-}
-
-/// A load problem, as `file:line:column: message`.
-pub(crate) fn diagnostic(diagnostic: &Diagnostic, paths: &PathDisplay) -> String {
-	match (&diagnostic.file, diagnostic.location) {
-		(Some(file), Some(location)) => format!("{}:{location}: {}", paths.display(file), diagnostic.message),
-		(Some(file), None) => format!("{}: {}", paths.display(file), diagnostic.message),
-		(None, _) => diagnostic.message.clone(),
-	}
-}
-
 /// A found item, ready for display.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct MatchRow {
@@ -127,12 +52,160 @@ impl MatchRow {
 	}
 }
 
-/// The name of a kind, marking statics declared by `thread_local!`.
-fn kind_label(kind: ItemKind, thread_local: bool) -> String {
-	match thread_local {
-		true => format!("{} (thread_local!)", kind.name()),
-		false => kind.name().to_owned(),
+/// Displays file paths relative to the current directory when they are below it, absolute otherwise.
+#[derive(Debug, Clone)]
+pub(crate) struct PathDisplay {
+	/// Relative paths (as in [`FindMatch::file`]) are relative to this directory: the workspace root.
+	root: PathBuf,
+
+	cwd: Option<PathBuf>,
+
+	/// `--absolute-paths`
+	absolute: bool,
+}
+
+impl PathDisplay {
+	/// With the current directory as the process has it, like the paths of the loaded workspace (not canonicalized:
+	/// on Windows that gives verbatim paths, `\\?\C:\...`, which no other path starts with).
+	pub(crate) fn new(root: &Path, absolute: bool) -> Self {
+		let cwd = std::env::current_dir().ok();
+
+		Self::with_cwd(root, cwd.as_deref(), absolute)
 	}
+
+	pub(crate) fn with_cwd(root: &Path, cwd: Option<&Path>, absolute: bool) -> Self {
+		Self {
+			root: root.to_path_buf(),
+			cwd: cwd.map(Path::to_path_buf),
+			absolute,
+		}
+	}
+
+	/// The path of a file in a diff: relative to the workspace root when below it (whatever the current directory, so
+	/// that every file of a diff has the same base, as `patch -p1` and `git apply` need), absolute otherwise.
+	pub(crate) fn diff_path(&self, path: &Path) -> PathBuf {
+		let absolute = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
+
+		match absolute.strip_prefix(&self.root) {
+			Ok(relative) if !self.absolute && !relative.as_os_str().is_empty() => relative.to_path_buf(),
+			_ => absolute,
+		}
+	}
+
+	pub(crate) fn display(&self, path: &Path) -> String {
+		self.path(path).display().to_string()
+	}
+
+	pub(crate) fn path(&self, path: &Path) -> PathBuf {
+		let absolute = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
+
+		if !self.absolute
+			&& let Some(cwd) = &self.cwd
+			&& let Ok(relative) = absolute.strip_prefix(cwd)
+		{
+			return match relative.as_os_str().is_empty() {
+				true => PathBuf::from("."),
+				false => relative.to_path_buf(),
+			};
+		}
+
+		absolute
+	}
+}
+
+/// A viewed item, ready for display.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ViewRow {
+	pub(crate) path: String,
+	pub(crate) kind: ItemKind,
+	pub(crate) file: String,
+	pub(crate) start: LineCol,
+	pub(crate) end: LineCol,
+	pub(crate) cfg: Option<String>,
+	pub(crate) active: Tristate,
+	pub(crate) thread_local: bool,
+	pub(crate) text: String,
+	pub(crate) impls: Vec<ViewRow>,
+}
+
+impl ViewRow {
+	pub(crate) fn new(view: &ItemView, paths: &PathDisplay) -> Self {
+		Self {
+			path: view.path.clone(),
+			kind: view.kind,
+			file: paths.display(&view.file),
+			start: view.start,
+			end: view.end,
+			cfg: view.cfg.clone(),
+			active: view.active,
+			thread_local: view.thread_local,
+			text: view.text.clone(),
+			impls: view.impls.iter().map(|view| Self::new(view, paths)).collect(),
+		}
+	}
+}
+
+/// A load problem, as `file:line:column: message`.
+pub(crate) fn diagnostic(diagnostic: &Diagnostic, paths: &PathDisplay) -> String {
+	match (&diagnostic.file, diagnostic.location) {
+		(Some(file), Some(location)) => format!("{}:{location}: {}", paths.display(file), diagnostic.message),
+		(Some(file), None) => format!("{}: {}", paths.display(file), diagnostic.message),
+		(None, _) => diagnostic.message.clone(),
+	}
+}
+
+/// File changes with display paths (for rscode_fmt's emitters).
+pub(crate) fn display_changes(changes: &[FileChange], paths: &PathDisplay) -> Vec<FileChange> {
+	changes
+		.iter()
+		.map(|change| FileChange {
+			path: paths.path(&change.path),
+			original: change.original.clone(),
+			formatted: change.formatted.clone(),
+		})
+		.collect()
+}
+
+/// A unified diff of an edit set's text edits, followed by its moves and deletions.
+pub(crate) fn edit_diff(edits: &EditSet, paths: &PathDisplay) -> Result<String, rscode::Error> {
+	let mut diff = unified_diff(&edits.preview()?, paths);
+
+	diff.push_str(&file_operations(edits.moves(), edits.deletions(), paths));
+	Ok(diff)
+}
+
+/// rustfmt's `--file-lines` JSON: one `{"file", "range": [first, last]}` entry per item, in order.
+pub(crate) fn file_lines(rows: &[MatchRow]) -> serde_json::Result<String> {
+	#[derive(Serialize)]
+	struct FileLines<'a> {
+		file: &'a str,
+		range: [usize; 2],
+	}
+
+	let entries: Vec<FileLines<'_>> = rows
+		.iter()
+		.map(|row| FileLines {
+			file: &row.file,
+			range: [row.start.line, last_line(row.start, row.end)],
+		})
+		.collect();
+
+	json_line(&entries)
+}
+
+/// `rename <from> -> <to>` and `delete <path>` lines.
+pub(crate) fn file_operations(moves: &[(PathBuf, PathBuf)], deletions: &[PathBuf], paths: &PathDisplay) -> String {
+	let mut out = String::new();
+
+	for (from, to) in moves {
+		out.push_str(&format!("rename {} -> {}\n", paths.display(from), paths.display(to)));
+	}
+
+	for path in deletions {
+		out.push_str(&format!("delete {}\n", paths.display(path)));
+	}
+
+	out
 }
 
 /// One line per item: the path, then the `--show` fields, separated by two spaces.
@@ -174,25 +247,6 @@ pub(crate) fn find_human(rows: &[MatchRow], show: &[ShowField]) -> String {
 	out
 }
 
-/// rustfmt's `--file-lines` JSON: one `{"file", "range": [first, last]}` entry per item, in order.
-pub(crate) fn file_lines(rows: &[MatchRow]) -> serde_json::Result<String> {
-	#[derive(Serialize)]
-	struct FileLines<'a> {
-		file: &'a str,
-		range: [usize; 2],
-	}
-
-	let entries: Vec<FileLines<'_>> = rows
-		.iter()
-		.map(|row| FileLines {
-			file: &row.file,
-			range: [row.start.line, last_line(row.start, row.end)],
-		})
-		.collect();
-
-	json_line(&entries)
-}
-
 /// [`FindMatch`]es as a JSON array, with display paths.
 pub(crate) fn find_json(matches: &[FindMatch], paths: &PathDisplay) -> serde_json::Result<String> {
 	let matches: Vec<FindMatch> = matches
@@ -207,36 +261,52 @@ pub(crate) fn find_json(matches: &[FindMatch], paths: &PathDisplay) -> serde_jso
 	json_line(&matches)
 }
 
-/// A viewed item, ready for display.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct ViewRow {
-	pub(crate) path: String,
-	pub(crate) kind: ItemKind,
-	pub(crate) file: String,
-	pub(crate) start: LineCol,
-	pub(crate) end: LineCol,
-	pub(crate) cfg: Option<String>,
-	pub(crate) active: Tristate,
-	pub(crate) thread_local: bool,
-	pub(crate) text: String,
-	pub(crate) impls: Vec<ViewRow>,
+/// The formatted contents of files, each preceded by `<path>:` and a blank line when there are several (like
+/// `rustfmt --emit stdout`).
+pub(crate) fn formatted_contents(changes: &[FileChange]) -> String {
+	match changes {
+		[single] => single.formatted.clone(),
+		_ => changes
+			.iter()
+			.map(|change| format!("{}:\n\n{}", change.path.display(), change.formatted))
+			.collect(),
+	}
 }
 
-impl ViewRow {
-	pub(crate) fn new(view: &ItemView, paths: &PathDisplay) -> Self {
-		Self {
-			path: view.path.clone(),
-			kind: view.kind,
-			file: paths.display(&view.file),
-			start: view.start,
-			end: view.end,
-			cfg: view.cfg.clone(),
-			active: view.active,
-			thread_local: view.thread_local,
-			text: view.text.clone(),
-			impls: view.impls.iter().map(|view| Self::new(view, paths)).collect(),
-		}
+/// Compact JSON followed by a line break.
+pub(crate) fn json_line(value: &impl Serialize) -> serde_json::Result<String> {
+	serde_json::to_string(value).map(|json| json + "\n")
+}
+
+/// The name of a kind, marking statics declared by `thread_local!`.
+fn kind_label(kind: ItemKind, thread_local: bool) -> String {
+	match thread_local {
+		true => format!("{} (thread_local!)", kind.name()),
+		false => kind.name().to_owned(),
 	}
+}
+
+/// The last line an item occupies, given its exclusive end.
+pub(crate) fn last_line(start: LineCol, end: LineCol) -> usize {
+	if end.column <= 1 && end.line > start.line {
+		end.line - 1
+	} else {
+		end.line
+	}
+}
+
+/// A unified diff of file changes, with the paths of [`PathDisplay::diff_path`].
+pub(crate) fn unified_diff(changes: &[FileChange], paths: &PathDisplay) -> String {
+	let changes: Vec<FileChange> = changes
+		.iter()
+		.map(|change| FileChange {
+			path: paths.diff_path(&change.path),
+			original: change.original.clone(),
+			formatted: change.formatted.clone(),
+		})
+		.collect();
+
+	rscode::rscode_fmt::emit::unified_diff(&changes, 3)
 }
 
 /// For each item (and then each of its `impl` blocks) a `// path (kind) file:line-line` header line followed by its
@@ -244,7 +314,13 @@ impl ViewRow {
 pub(crate) fn view_human(rows: &[ViewRow]) -> String {
 	fn blocks(row: &ViewRow, out: &mut Vec<String>) {
 		let kind = kind_label(row.kind, row.thread_local);
-		let mut block = format!("// {} ({kind}) {}:{}-{}", row.path, row.file, row.start.line, last_line(row.start, row.end));
+		let mut block = format!(
+			"// {} ({kind}) {}:{}-{}",
+			row.path,
+			row.file,
+			row.start.line,
+			last_line(row.start, row.end)
+		);
 
 		if let Some(cfg) = &row.cfg {
 			block.push_str(&format!(" [cfg: {cfg}]"));
@@ -292,69 +368,6 @@ pub(crate) fn view_json(views: &[ItemView], paths: &PathDisplay) -> serde_json::
 	json_line(&views)
 }
 
-/// Compact JSON followed by a line break.
-pub(crate) fn json_line(value: &impl Serialize) -> serde_json::Result<String> {
-	serde_json::to_string(value).map(|json| json + "\n")
-}
-
-/// File changes with display paths (for rscode_fmt's emitters).
-pub(crate) fn display_changes(changes: &[FileChange], paths: &PathDisplay) -> Vec<FileChange> {
-	changes
-		.iter()
-		.map(|change| FileChange {
-			path: paths.path(&change.path),
-			original: change.original.clone(),
-			formatted: change.formatted.clone(),
-		})
-		.collect()
-}
-
-/// The formatted contents of files, each preceded by `<path>:` and a blank line when there are several (like
-/// `rustfmt --emit stdout`).
-pub(crate) fn formatted_contents(changes: &[FileChange]) -> String {
-	match changes {
-		[single] => single.formatted.clone(),
-		_ => changes.iter().map(|change| format!("{}:\n\n{}", change.path.display(), change.formatted)).collect(),
-	}
-}
-
-/// A unified diff of file changes, with the paths of [`PathDisplay::diff_path`].
-pub(crate) fn unified_diff(changes: &[FileChange], paths: &PathDisplay) -> String {
-	let changes: Vec<FileChange> = changes
-		.iter()
-		.map(|change| FileChange {
-			path: paths.diff_path(&change.path),
-			original: change.original.clone(),
-			formatted: change.formatted.clone(),
-		})
-		.collect();
-
-	rscode::rscode_fmt::emit::unified_diff(&changes, 3)
-}
-
-/// A unified diff of an edit set's text edits, followed by its moves and deletions.
-pub(crate) fn edit_diff(edits: &EditSet, paths: &PathDisplay) -> Result<String, rscode::Error> {
-	let mut diff = unified_diff(&edits.preview()?, paths);
-
-	diff.push_str(&file_operations(edits.moves(), edits.deletions(), paths));
-	Ok(diff)
-}
-
-/// `rename <from> -> <to>` and `delete <path>` lines.
-pub(crate) fn file_operations(moves: &[(PathBuf, PathBuf)], deletions: &[PathBuf], paths: &PathDisplay) -> String {
-	let mut out = String::new();
-
-	for (from, to) in moves {
-		out.push_str(&format!("rename {} -> {}\n", paths.display(from), paths.display(to)));
-	}
-
-	for path in deletions {
-		out.push_str(&format!("delete {}\n", paths.display(path)));
-	}
-
-	out
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -364,25 +377,32 @@ mod tests {
 		LineCol { line, column }
 	}
 
-	fn paths() -> PathDisplay {
-		PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), false)
-	}
+	#[test]
+	fn diffs_have_one_base() {
+		let below = PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws/crates/b")), false);
+		let change = |path: &str| FileChange {
+			path: PathBuf::from(path),
+			original: "fn a() {}\n".to_owned(),
+			formatted: "fn b() {}\n".to_owned(),
+		};
+		let diff = unified_diff(&[change("/ws/crates/b/src/lib.rs"), change("/ws/src/lib.rs"), change("/x/y.rs")], &below);
+		let headers: Vec<&str> = diff.lines().filter(|line| line.starts_with("---") || line.starts_with("+++")).collect();
 
-	fn row(path: &str, kind: ItemKind, file: &str, start: LineCol, end: LineCol) -> MatchRow {
-		MatchRow {
-			path: path.to_owned(),
-			kind,
-			krate: "demo".to_owned(),
-			file: file.to_owned(),
-			start,
-			end,
-			visibility: "pub".to_owned(),
-			cfg: None,
-			active: Tristate::True,
-			usable_paths: Vec::new(),
-			import_targets: Vec::new(),
-			thread_local: false,
-		}
+		assert_eq!(
+			headers,
+			[
+				"--- a/crates/b/src/lib.rs",
+				"+++ b/crates/b/src/lib.rs",
+				"--- a/src/lib.rs",
+				"+++ b/src/lib.rs",
+				"--- /x/y.rs",
+				"+++ /x/y.rs"
+			]
+		);
+
+		let absolute = PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), true);
+
+		assert_eq!(absolute.diff_path(Path::new("src/lib.rs")), Path::new("/ws/src/lib.rs"));
 	}
 
 	#[test]
@@ -423,6 +443,10 @@ mod tests {
 		assert_eq!(last_line(at(3, 1), at(3, 1)), 3);
 	}
 
+	fn paths() -> PathDisplay {
+		PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), false)
+	}
+
 	#[test]
 	fn renders_diagnostics() {
 		let mut problem = Diagnostic {
@@ -444,6 +468,34 @@ mod tests {
 	}
 
 	#[test]
+	fn renders_file_lines() {
+		let rows = [
+			row("demo::add", ItemKind::Fn, "src/lib.rs", at(9, 1), at(11, 2)),
+			row("demo::shapes::Circle", ItemKind::Struct, "src/shapes.rs", at(4, 1), at(8, 1)),
+			row("demo::X", ItemKind::Const, "src/lib.rs", at(2, 1), at(2, 20)),
+		];
+
+		assert_eq!(
+			file_lines(&rows).unwrap(),
+			"[{\"file\":\"src/lib.rs\",\"range\":[9,11]},{\"file\":\"src/shapes.rs\",\"range\":[4,7]},\
+			 {\"file\":\"src/lib.rs\",\"range\":[2,2]}]\n"
+		);
+		assert_eq!(file_lines(&[]).unwrap(), "[]\n");
+	}
+
+	#[test]
+	fn renders_file_operations() {
+		let moves = [(PathBuf::from("/ws/src/old.rs"), PathBuf::from("/ws/src/new.rs"))];
+		let deletions = [PathBuf::from("/ws/src/gone"), PathBuf::from("/tmp/x.rs")];
+
+		assert_eq!(
+			file_operations(&moves, &deletions, &paths()),
+			"rename src/old.rs -> src/new.rs\ndelete src/gone\ndelete /tmp/x.rs\n"
+		);
+		assert_eq!(file_operations(&[], &[], &paths()), "");
+	}
+
+	#[test]
 	fn renders_find_matches() {
 		let mut circle = row("demo::shapes::Circle", ItemKind::Struct, "src/shapes.rs", at(4, 1), at(7, 2));
 		let mut extra = row("demo::extra", ItemKind::Fn, "src/lib.rs", at(20, 1), at(23, 2));
@@ -462,8 +514,14 @@ mod tests {
 		circle.cfg = Some("unix".to_owned());
 		circle.active = Tristate::Unknown;
 
-		let all =
-			[ShowField::Kind, ShowField::Span, ShowField::Vis, ShowField::Crate, ShowField::Cfg, ShowField::Usable];
+		let all = [
+			ShowField::Kind,
+			ShowField::Span,
+			ShowField::Vis,
+			ShowField::Crate,
+			ShowField::Cfg,
+			ShowField::Usable,
+		];
 
 		assert_eq!(
 			find_human(&[circle], &all),
@@ -476,28 +534,36 @@ mod tests {
 	}
 
 	#[test]
+	fn renders_formatted_contents() {
+		let change = |path: &str, formatted: &str| FileChange {
+			path: PathBuf::from(path),
+			original: String::new(),
+			formatted: formatted.to_owned(),
+		};
+
+		assert_eq!(formatted_contents(&[change("src/lib.rs", "fn a() {}\n")]), "fn a() {}\n");
+		assert_eq!(
+			formatted_contents(&[change("src/lib.rs", "mod a;\n"), change("src/a.rs", "fn b() {}\n")]),
+			"src/lib.rs:\n\nmod a;\nsrc/a.rs:\n\nfn b() {}\n"
+		);
+		assert_eq!(formatted_contents(&[]), "");
+
+		let changes = display_changes(&[change("/ws/src/a.rs", "x")], &paths());
+
+		assert_eq!(changes[0].path, Path::new("src/a.rs"));
+		assert_eq!(changes[0].formatted, "x");
+	}
+
+	#[test]
 	fn renders_imports() {
 		let mut import = row("demo::Circle", ItemKind::Import, "src/lib.rs", at(4, 9), at(4, 23));
 
 		import.import_targets = vec!["demo::shapes::Circle".to_owned()];
 
-		assert_eq!(find_human(&[import], &[ShowField::Kind]), "demo::Circle  import  -> demo::shapes::Circle\n");
-	}
-
-	#[test]
-	fn renders_file_lines() {
-		let rows = [
-			row("demo::add", ItemKind::Fn, "src/lib.rs", at(9, 1), at(11, 2)),
-			row("demo::shapes::Circle", ItemKind::Struct, "src/shapes.rs", at(4, 1), at(8, 1)),
-			row("demo::X", ItemKind::Const, "src/lib.rs", at(2, 1), at(2, 20)),
-		];
-
 		assert_eq!(
-			file_lines(&rows).unwrap(),
-			"[{\"file\":\"src/lib.rs\",\"range\":[9,11]},{\"file\":\"src/shapes.rs\",\"range\":[4,7]},\
-			 {\"file\":\"src/lib.rs\",\"range\":[2,2]}]\n"
+			find_human(&[import], &[ShowField::Kind]),
+			"demo::Circle  import  -> demo::shapes::Circle\n"
 		);
-		assert_eq!(file_lines(&[]).unwrap(), "[]\n");
 	}
 
 	#[test]
@@ -553,64 +619,20 @@ mod tests {
 		assert_eq!(view_human(&[]), "");
 	}
 
-	#[test]
-	fn renders_formatted_contents() {
-		let change = |path: &str, formatted: &str| FileChange {
-			path: PathBuf::from(path),
-			original: String::new(),
-			formatted: formatted.to_owned(),
-		};
-
-		assert_eq!(formatted_contents(&[change("src/lib.rs", "fn a() {}\n")]), "fn a() {}\n");
-		assert_eq!(
-			formatted_contents(&[change("src/lib.rs", "mod a;\n"), change("src/a.rs", "fn b() {}\n")]),
-			"src/lib.rs:\n\nmod a;\nsrc/a.rs:\n\nfn b() {}\n"
-		);
-		assert_eq!(formatted_contents(&[]), "");
-
-		let changes = display_changes(&[change("/ws/src/a.rs", "x")], &paths());
-
-		assert_eq!(changes[0].path, Path::new("src/a.rs"));
-		assert_eq!(changes[0].formatted, "x");
-	}
-
-	#[test]
-	fn diffs_have_one_base() {
-		let below = PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws/crates/b")), false);
-		let change = |path: &str| FileChange {
-			path: PathBuf::from(path),
-			original: "fn a() {}\n".to_owned(),
-			formatted: "fn b() {}\n".to_owned(),
-		};
-		let diff = unified_diff(&[change("/ws/crates/b/src/lib.rs"), change("/ws/src/lib.rs"), change("/x/y.rs")], &below);
-		let headers: Vec<&str> = diff.lines().filter(|line| line.starts_with("---") || line.starts_with("+++")).collect();
-
-		assert_eq!(
-			headers,
-			[
-				"--- a/crates/b/src/lib.rs",
-				"+++ b/crates/b/src/lib.rs",
-				"--- a/src/lib.rs",
-				"+++ b/src/lib.rs",
-				"--- /x/y.rs",
-				"+++ /x/y.rs"
-			]
-		);
-
-		let absolute = PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), true);
-
-		assert_eq!(absolute.diff_path(Path::new("src/lib.rs")), Path::new("/ws/src/lib.rs"));
-	}
-
-	#[test]
-	fn renders_file_operations() {
-		let moves = [(PathBuf::from("/ws/src/old.rs"), PathBuf::from("/ws/src/new.rs"))];
-		let deletions = [PathBuf::from("/ws/src/gone"), PathBuf::from("/tmp/x.rs")];
-
-		assert_eq!(
-			file_operations(&moves, &deletions, &paths()),
-			"rename src/old.rs -> src/new.rs\ndelete src/gone\ndelete /tmp/x.rs\n"
-		);
-		assert_eq!(file_operations(&[], &[], &paths()), "");
+	fn row(path: &str, kind: ItemKind, file: &str, start: LineCol, end: LineCol) -> MatchRow {
+		MatchRow {
+			path: path.to_owned(),
+			kind,
+			krate: "demo".to_owned(),
+			file: file.to_owned(),
+			start,
+			end,
+			visibility: "pub".to_owned(),
+			cfg: None,
+			active: Tristate::True,
+			usable_paths: Vec::new(),
+			import_targets: Vec::new(),
+			thread_local: false,
+		}
 	}
 }

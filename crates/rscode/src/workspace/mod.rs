@@ -30,68 +30,6 @@ use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// Which targets (crates) of the selected packages to load, mirroring cargo's target selection flags.
-///
-/// When nothing is selected, the library and all binaries are loaded (like `cargo build`). Targets selected in bulk
-/// (by default, or with `--bins`, `--examples`, `--tests`, `--benches`, `--all-targets`) are skipped when their
-/// `required-features` are not enabled, like cargo does; targets selected by name are always loaded. Build scripts are
-/// never loaded.
-#[derive(Debug, Default, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
-pub struct TargetSelection {
-	/// `--lib`: the library (or proc-macro) target. It is an error if no selected package has one.
-	pub lib: bool,
-
-	/// `--bin <NAME>...`: binaries by name. Glob patterns (`app-*`) are allowed; a name that matches nothing is an
-	/// error.
-	pub bins: Vec<String>,
-
-	/// `--bins`: all binaries.
-	pub all_bins: bool,
-
-	/// `--example <NAME>...`: examples by name (or glob pattern).
-	pub examples: Vec<String>,
-
-	/// `--examples`: all examples.
-	pub all_examples: bool,
-
-	/// `--test <NAME>...`: integration tests by name (or glob pattern).
-	pub tests: Vec<String>,
-
-	/// `--tests`: all integration tests (`tests/*.rs` and `[[test]]` targets).
-	///
-	/// Unlike cargo, this does not add the unit tests of libraries and binaries: those are part of the library and
-	/// binary crates, which are loaded with `cfg(test)` disabled.
-	pub all_tests: bool,
-
-	/// `--bench <NAME>...`: benchmarks by name (or glob pattern).
-	pub benches: Vec<String>,
-
-	/// `--benches`: all benchmarks (`benches/*.rs` and `[[bench]]` targets).
-	pub all_benches: bool,
-
-	/// `--all-targets`: the library, binaries, examples, tests, and benchmarks.
-	pub all_targets: bool,
-}
-
-impl TargetSelection {
-	/// Whether no target was explicitly selected.
-	pub fn is_default(&self) -> bool {
-		*self == Self::default()
-	}
-
-	/// Whether examples, tests, or benchmarks are requested, which puts dev-dependencies in use (like `cargo test`).
-	pub fn uses_dev_dependencies(&self) -> bool {
-		self.all_targets
-			|| self.all_examples
-			|| self.all_tests
-			|| self.all_benches
-			|| !self.examples.is_empty()
-			|| !self.tests.is_empty()
-			|| !self.benches.is_empty()
-	}
-}
-
 /// Options for [`plan_workspace`] and [`load_workspace`], mirroring cargo's command-line flags.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -185,6 +123,68 @@ pub struct LoadOptions {
 	pub silent: bool,
 }
 
+/// Which targets (crates) of the selected packages to load, mirroring cargo's target selection flags.
+///
+/// When nothing is selected, the library and all binaries are loaded (like `cargo build`). Targets selected in bulk
+/// (by default, or with `--bins`, `--examples`, `--tests`, `--benches`, `--all-targets`) are skipped when their
+/// `required-features` are not enabled, like cargo does; targets selected by name are always loaded. Build scripts are
+/// never loaded.
+#[derive(Debug, Default, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct TargetSelection {
+	/// `--lib`: the library (or proc-macro) target. It is an error if no selected package has one.
+	pub lib: bool,
+
+	/// `--bin <NAME>...`: binaries by name. Glob patterns (`app-*`) are allowed; a name that matches nothing is an
+	/// error.
+	pub bins: Vec<String>,
+
+	/// `--bins`: all binaries.
+	pub all_bins: bool,
+
+	/// `--example <NAME>...`: examples by name (or glob pattern).
+	pub examples: Vec<String>,
+
+	/// `--examples`: all examples.
+	pub all_examples: bool,
+
+	/// `--test <NAME>...`: integration tests by name (or glob pattern).
+	pub tests: Vec<String>,
+
+	/// `--tests`: all integration tests (`tests/*.rs` and `[[test]]` targets).
+	///
+	/// Unlike cargo, this does not add the unit tests of libraries and binaries: those are part of the library and
+	/// binary crates, which are loaded with `cfg(test)` disabled.
+	pub all_tests: bool,
+
+	/// `--bench <NAME>...`: benchmarks by name (or glob pattern).
+	pub benches: Vec<String>,
+
+	/// `--benches`: all benchmarks (`benches/*.rs` and `[[bench]]` targets).
+	pub all_benches: bool,
+
+	/// `--all-targets`: the library, binaries, examples, tests, and benchmarks.
+	pub all_targets: bool,
+}
+
+impl TargetSelection {
+	/// Whether no target was explicitly selected.
+	pub fn is_default(&self) -> bool {
+		*self == Self::default()
+	}
+
+	/// Whether examples, tests, or benchmarks are requested, which puts dev-dependencies in use (like `cargo test`).
+	pub fn uses_dev_dependencies(&self) -> bool {
+		self.all_targets
+			|| self.all_examples
+			|| self.all_tests
+			|| self.all_benches
+			|| !self.examples.is_empty()
+			|| !self.tests.is_empty()
+			|| !self.benches.is_empty()
+	}
+}
+
 /// Everything needed to load a cargo workspace, computed from cargo's metadata without parsing any Rust source.
 #[derive(Debug, Clone)]
 pub struct WorkspacePlan {
@@ -233,6 +233,16 @@ impl WorkspacePlan {
 	}
 }
 
+/// An error reported by cargo, with its causes.
+fn cargo_error(error: impl Display) -> Error {
+	Error::Cargo(format!("{error:#}"))
+}
+
+/// Loads the selected packages' targets of a cargo workspace: [`plan_workspace`], then [`WorkspacePlan::load`].
+pub fn load_workspace(options: &LoadOptions) -> Result<Workspace, Error> {
+	Ok(plan_workspace(options)?.load())
+}
+
 /// Works out which crates of a cargo workspace to load and how (see [`WorkspacePlan`]), without parsing any Rust
 /// source.
 ///
@@ -247,16 +257,6 @@ pub fn plan_workspace(options: &LoadOptions) -> Result<WorkspacePlan, Error> {
 	};
 
 	plan::plan(options, output)
-}
-
-/// Loads the selected packages' targets of a cargo workspace: [`plan_workspace`], then [`WorkspacePlan::load`].
-pub fn load_workspace(options: &LoadOptions) -> Result<Workspace, Error> {
-	Ok(plan_workspace(options)?.load())
-}
-
-/// An error reported by cargo, with its causes.
-fn cargo_error(error: impl Display) -> Error {
-	Error::Cargo(format!("{error:#}"))
 }
 
 /// An error from running rustc (through cargo), with its causes.

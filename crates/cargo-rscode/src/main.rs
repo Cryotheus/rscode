@@ -85,7 +85,10 @@ fn main() -> ExitCode {
 	}
 
 	// first: it edits the environment, which is only sound while the process has a single thread
-	CompleteEnv::with_factory(cli::cli).var(complete::COMPLETE_VAR).shells(shells::SHELLS).complete();
+	CompleteEnv::with_factory(cli::cli)
+		.var(complete::COMPLETE_VAR)
+		.shells(shells::SHELLS)
+		.complete();
 
 	let (args, via_cargo) = cli::normalize_args(std::env::args_os().collect());
 

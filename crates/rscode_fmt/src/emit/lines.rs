@@ -5,6 +5,10 @@
 use similar::Algorithm;
 use similar::DiffOp;
 
+/// The largest table (in cells, 4 bytes each) built to align lines exactly like rustfmt.
+/// Larger changed regions are aligned with the Myers algorithm instead, which may split blocks differently.
+const MAX_TABLE_CELLS: usize = 1 << 24;
+
 /// A line of a line diff.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum Line<'a> {
@@ -16,45 +20,6 @@ pub(super) enum Line<'a> {
 
 	/// A line only in the formatted text.
 	Formatted(&'a str),
-}
-
-/// The largest table (in cells, 4 bytes each) built to align lines exactly like rustfmt.
-/// Larger changed regions are aligned with the Myers algorithm instead, which may split blocks differently.
-const MAX_TABLE_CELLS: usize = 1 << 24;
-
-/// Diffs the lines (as split by [`str::lines`]) of two texts. A text ending with a line break has a final empty line.
-pub(super) fn diff<'a>(original: &'a str, formatted: &'a str) -> Vec<Line<'a>> {
-	let old: Vec<&str> = original.lines().collect();
-	let new: Vec<&str> = formatted.lines().collect();
-	let mut lines = diff_slices(&old, &new);
-
-	match (original.ends_with('\n'), formatted.ends_with('\n')) {
-		(true, true) => lines.push(Line::Both("")),
-		(true, false) => lines.push(Line::Original("")),
-		(false, true) => lines.push(Line::Formatted("")),
-		(false, false) => {}
-	}
-
-	lines
-}
-
-fn diff_slices<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Line<'a>> {
-	let prefix = old.iter().zip(new).take_while(|(old, new)| old == new).count();
-	let suffix = old[prefix..].iter().rev().zip(new[prefix..].iter().rev()).take_while(|(old, new)| old == new).count();
-	let old_middle = &old[prefix..old.len() - suffix];
-	let new_middle = &new[prefix..new.len() - suffix];
-	let mut lines = Vec::with_capacity(old.len().max(new.len()));
-
-	lines.extend(old[..prefix].iter().map(|&line| Line::Both(line)));
-
-	if (old_middle.len() + 1).saturating_mul(new_middle.len() + 1) <= MAX_TABLE_CELLS {
-		align_lcs(old_middle, new_middle, &mut lines);
-	} else {
-		align_myers(old_middle, new_middle, &mut lines);
-	}
-
-	lines.extend(old[old.len() - suffix..].iter().map(|&line| Line::Both(line)));
-	lines
 }
 
 /// The `diff` crate's alignment: a table of longest common subsequence lengths of prefixes, walked back from the end,
@@ -110,19 +75,61 @@ fn align_myers<'a>(old: &[&'a str], new: &[&'a str], lines: &mut Vec<Line<'a>>) 
 	}
 }
 
+/// Diffs the lines (as split by [`str::lines`]) of two texts. A text ending with a line break has a final empty line.
+pub(super) fn diff<'a>(original: &'a str, formatted: &'a str) -> Vec<Line<'a>> {
+	let old: Vec<&str> = original.lines().collect();
+	let new: Vec<&str> = formatted.lines().collect();
+	let mut lines = diff_slices(&old, &new);
+
+	match (original.ends_with('\n'), formatted.ends_with('\n')) {
+		(true, true) => lines.push(Line::Both("")),
+		(true, false) => lines.push(Line::Original("")),
+		(false, true) => lines.push(Line::Formatted("")),
+		(false, false) => {}
+	}
+
+	lines
+}
+
+fn diff_slices<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<Line<'a>> {
+	let prefix = old.iter().zip(new).take_while(|(old, new)| old == new).count();
+	let suffix = old[prefix..]
+		.iter()
+		.rev()
+		.zip(new[prefix..].iter().rev())
+		.take_while(|(old, new)| old == new)
+		.count();
+	let old_middle = &old[prefix..old.len() - suffix];
+	let new_middle = &new[prefix..new.len() - suffix];
+	let mut lines = Vec::with_capacity(old.len().max(new.len()));
+
+	lines.extend(old[..prefix].iter().map(|&line| Line::Both(line)));
+
+	if (old_middle.len() + 1).saturating_mul(new_middle.len() + 1) <= MAX_TABLE_CELLS {
+		align_lcs(old_middle, new_middle, &mut lines);
+	} else {
+		align_myers(old_middle, new_middle, &mut lines);
+	}
+
+	lines.extend(old[old.len() - suffix..].iter().map(|&line| Line::Both(line)));
+	lines
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn render(lines: &[Line<'_>]) -> String {
-		lines
-			.iter()
-			.map(|line| match line {
-				Line::Original(text) => format!("-{text}\n"),
-				Line::Both(text) => format!(" {text}\n"),
-				Line::Formatted(text) => format!("+{text}\n"),
-			})
-			.collect()
+	#[test]
+	fn large_regions_fall_back_to_myers() {
+		let old: Vec<String> = (0..5_000).map(|index| format!("old {index}")).collect();
+		let new: Vec<String> = (0..5_000).map(|index| format!("new {index}")).collect();
+		let original = old.join("\n");
+		let formatted = new.join("\n");
+		let lines = diff(&original, &formatted);
+
+		assert_eq!(lines.len(), 10_000);
+		assert!(lines[..5_000].iter().all(|line| matches!(line, Line::Original(_))));
+		assert!(lines[5_000..].iter().all(|line| matches!(line, Line::Formatted(_))));
 	}
 
 	/// Expected outputs were produced by `diff::lines` of the `diff` crate (0.1.13), which rustfmt uses.
@@ -150,19 +157,6 @@ mod tests {
 	}
 
 	#[test]
-	fn large_regions_fall_back_to_myers() {
-		let old: Vec<String> = (0..5_000).map(|index| format!("old {index}")).collect();
-		let new: Vec<String> = (0..5_000).map(|index| format!("new {index}")).collect();
-		let original = old.join("\n");
-		let formatted = new.join("\n");
-		let lines = diff(&original, &formatted);
-
-		assert_eq!(lines.len(), 10_000);
-		assert!(lines[..5_000].iter().all(|line| matches!(line, Line::Original(_))));
-		assert!(lines[5_000..].iter().all(|line| matches!(line, Line::Formatted(_))));
-	}
-
-	#[test]
 	fn myers_alignment_keeps_every_line() {
 		let old = ["a", "b", "c", "d"];
 		let new = ["a", "x", "c", "d", "e"];
@@ -171,5 +165,16 @@ mod tests {
 		align_myers(&old, &new, &mut lines);
 
 		assert_eq!(render(&lines), " a\n-b\n+x\n c\n d\n+e\n");
+	}
+
+	fn render(lines: &[Line<'_>]) -> String {
+		lines
+			.iter()
+			.map(|line| match line {
+				Line::Original(text) => format!("-{text}\n"),
+				Line::Both(text) => format!(" {text}\n"),
+				Line::Formatted(text) => format!("+{text}\n"),
+			})
+			.collect()
 	}
 }

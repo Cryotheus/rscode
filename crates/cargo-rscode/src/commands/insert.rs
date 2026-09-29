@@ -31,7 +31,9 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		}
 	} else {
 		// the container is resolved before the edit changes it
-		let targets = args.format.then(|| format_edited::inserted(&resolver, &parent, &plan.file, &plan.inserted, &plan.imports));
+		let targets = args
+			.format
+			.then(|| format_edited::inserted(&resolver, &parent, &plan.file, &plan.inserted, &plan.imports));
 
 		report.warnings.extend(plan.edits.apply()?.warnings);
 

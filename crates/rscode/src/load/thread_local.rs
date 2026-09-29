@@ -88,15 +88,12 @@ impl ToTokens for Declaration {
 	}
 }
 
-/// Parses the declarations of a list (a `thread_local!` body, or source replacing one declaration).
-pub(crate) fn parse_declarations(input: ParseStream<'_>) -> syn::Result<Vec<Declaration>> {
-	let mut declarations = Vec::new();
-
-	while !input.is_empty() {
-		declarations.push(input.parse()?);
+/// The declarations of a `thread_local!` invocation, or `None` for another macro (or a body that does not parse).
+pub(crate) fn declarations(mac: &Macro) -> Option<Vec<Declaration>> {
+	match is_thread_local(mac) {
+		true => mac.parse_body_with(parse_declarations).ok(),
+		false => None,
 	}
-
-	Ok(declarations)
 }
 
 /// Whether a macro path names the standard library's `thread_local!`: `thread_local`, `std::thread_local`, or
@@ -111,26 +108,40 @@ pub(crate) fn is_thread_local(mac: &Macro) -> bool {
 	}
 }
 
-/// The declarations of a `thread_local!` invocation, or `None` for another macro (or a body that does not parse).
-pub(crate) fn declarations(mac: &Macro) -> Option<Vec<Declaration>> {
-	match is_thread_local(mac) {
-		true => mac.parse_body_with(parse_declarations).ok(),
-		false => None,
+/// Parses the declarations of a list (a `thread_local!` body, or source replacing one declaration).
+pub(crate) fn parse_declarations(input: ParseStream<'_>) -> syn::Result<Vec<Declaration>> {
+	let mut declarations = Vec::new();
+
+	while !input.is_empty() {
+		declarations.push(input.parse()?);
 	}
+
+	Ok(declarations)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
+	fn names(source: &str) -> Option<Vec<String>> {
+		parse(source).map(|declarations| declarations.iter().map(|declaration| declaration.ident.to_string()).collect())
+	}
+
+	#[test]
+	fn only_the_standard_macro() {
+		assert_eq!(names("std::thread_local!(static A: u8 = 0);").unwrap(), ["A"]);
+		assert_eq!(names("::std::thread_local!(static A: u8 = 0;);").unwrap(), ["A"]);
+		assert_eq!(names("thread_local!();").unwrap(), Vec::<String>::new());
+		assert!(names("other::thread_local!(static A: u8 = 0);").is_none());
+		assert!(names("my_thread_local!(static A: u8 = 0);").is_none());
+		assert!(names("thread_local!(static A: u8 = 0 static B: u8 = 1);").is_none());
+		assert!(names("thread_local!(static mut A: u8 = 0;);").is_none());
+	}
+
 	fn parse(source: &str) -> Option<Vec<Declaration>> {
 		let item: syn::ItemMacro = syn::parse_str(source).unwrap();
 
 		declarations(&item.mac)
-	}
-
-	fn names(source: &str) -> Option<Vec<String>> {
-		parse(source).map(|declarations| declarations.iter().map(|declaration| declaration.ident.to_string()).collect())
 	}
 
 	#[test]
@@ -153,16 +164,5 @@ mod tests {
 		assert!(declarations[1].semi_token.is_some() && declarations[2].semi_token.is_none());
 		assert_eq!(declarations[2].to_token_stream().to_string(), "pub (crate) static C : u8 = 1");
 		assert_eq!(declarations[2].to_item().to_token_stream().to_string(), "pub (crate) static C : u8 = 1 ;");
-	}
-
-	#[test]
-	fn only_the_standard_macro() {
-		assert_eq!(names("std::thread_local!(static A: u8 = 0);").unwrap(), ["A"]);
-		assert_eq!(names("::std::thread_local!(static A: u8 = 0;);").unwrap(), ["A"]);
-		assert_eq!(names("thread_local!();").unwrap(), Vec::<String>::new());
-		assert!(names("other::thread_local!(static A: u8 = 0);").is_none());
-		assert!(names("my_thread_local!(static A: u8 = 0);").is_none());
-		assert!(names("thread_local!(static A: u8 = 0 static B: u8 = 1);").is_none());
-		assert!(names("thread_local!(static mut A: u8 = 0;);").is_none());
 	}
 }

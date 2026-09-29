@@ -9,6 +9,15 @@ use clap::ArgMatches;
 use std::io::ErrorKind;
 use std::process::ExitCode;
 
+/// Whether an error of the server comes from writing to a closed pipe (stdout, the transport).
+fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
+	std::iter::successors(Some(error), |error| error.source()).any(|cause| {
+		cause
+			.downcast_ref::<std::io::Error>()
+			.is_some_and(|error| error.kind() == ErrorKind::BrokenPipe)
+	})
+}
+
 pub(super) fn run(matches: &ArgMatches) -> anyhow::Result<ExitCode> {
 	let options = args::server_options(matches)?;
 	let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
@@ -18,12 +27,6 @@ pub(super) fn run(matches: &ArgMatches) -> anyhow::Result<ExitCode> {
 		Err(error) if is_broken_pipe(&error) => Ok(ExitCode::SUCCESS),
 		result => result.map(|()| ExitCode::SUCCESS).map_err(Into::into),
 	}
-}
-
-/// Whether an error of the server comes from writing to a closed pipe (stdout, the transport).
-fn is_broken_pipe(error: &(dyn std::error::Error + 'static)) -> bool {
-	std::iter::successors(Some(error), |error| error.source())
-		.any(|cause| cause.downcast_ref::<std::io::Error>().is_some_and(|error| error.kind() == ErrorKind::BrokenPipe))
 }
 
 #[cfg(test)]

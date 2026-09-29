@@ -76,18 +76,63 @@ use std::sync::Arc;
 /// Index of the crate root module in [`Crate::items`].
 const ROOT: u32 = 0;
 
-/// Loads a crate from its spec. Never fails: problems become [`Crate::diagnostics`](crate::Crate::diagnostics).
-pub(crate) fn load_crate(id: CrateId, spec: CrateSpec) -> Crate {
-	let mut loader = Loader::new(spec);
+/// The kind of item whose body an item is in.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Container {
+	Module,
+	Impl { of_trait: bool },
+	Trait,
+	Extern,
+}
 
-	loader.load_root();
+impl Container {
+	fn const_kind(self) -> Option<ItemKind> {
+		match self {
+			Self::Module => Some(ItemKind::Const),
+			Self::Impl { .. } | Self::Trait => Some(ItemKind::AssocConst),
+			Self::Extern => None,
+		}
+	}
 
-	Crate {
-		id,
-		spec: loader.spec,
-		files: loader.files,
-		items: loader.items,
-		diagnostics: loader.diagnostics,
+	/// The visibility of items without a visibility keyword.
+	fn default_vis(self) -> Visibility {
+		match self {
+			Self::Module | Self::Extern | Self::Impl { of_trait: false } => Visibility::Private,
+			Self::Impl { of_trait: true } | Self::Trait => Visibility::Inherited,
+		}
+	}
+
+	fn fn_kind(self) -> ItemKind {
+		match self {
+			Self::Module => ItemKind::Fn,
+			Self::Impl { .. } | Self::Trait => ItemKind::AssocFn,
+			Self::Extern => ItemKind::ForeignFn,
+		}
+	}
+
+	/// The kind of a macro invocation (other than a `macro_rules!` definition).
+	fn macro_kind(self) -> ItemKind {
+		match self {
+			Self::Module => ItemKind::MacroCall,
+			Self::Impl { .. } | Self::Trait => ItemKind::AssocMacro,
+			Self::Extern => ItemKind::ForeignMacro,
+		}
+	}
+
+	fn static_kind(self) -> Option<ItemKind> {
+		match self {
+			Self::Module => Some(ItemKind::Static),
+			Self::Extern => Some(ItemKind::ForeignStatic),
+			Self::Impl { .. } | Self::Trait => None,
+		}
+	}
+
+	fn type_kind(self) -> ItemKind {
+		match self {
+			Self::Module => ItemKind::TypeAlias,
+			Self::Impl { .. } | Self::Trait => ItemKind::AssocType,
+			Self::Extern => ItemKind::ForeignType,
+		}
 	}
 }
 
@@ -112,6 +157,56 @@ impl Loader {
 			items: Vec::new(),
 			diagnostics: Vec::new(),
 			file_stack: Vec::new(),
+		}
+	}
+
+	fn add_file(&mut self, path: PathBuf, text: String) -> FileId {
+		let id = FileId(self.files.len() as u32);
+
+		self.file_ids.insert(path.clone(), id);
+		self.files.push(SourceFile::new(path, text));
+		id
+	}
+
+	fn diagnostic_at(&mut self, severity: Severity, file: FileId, offset: usize, message: String) {
+		let source = &self.files[file.index()];
+
+		self.diagnostics.push(Diagnostic {
+			severity,
+			message,
+			file: Some(source.path().to_owned()),
+			location: Some(source.line_col(offset)),
+		});
+	}
+
+	fn eval(&self, cfg: Option<&CfgExpr>) -> Tristate {
+		cfg.map_or(Tristate::True, |cfg| self.spec.cfg.eval(cfg))
+	}
+
+	/// Parses the file of a module (the crate root or an out-of-line module) and adds its items to the module.
+	///
+	/// `active`: whether the module is active, as far as known before reading its inner attributes.
+	fn load_module_file(&mut self, module: u32, file: FileId, dir: &ModDir, active: Tristate) {
+		let text = Arc::clone(self.files[file.index()].shared_text());
+
+		match ParsedFile::parse(&text) {
+			Ok(parsed) => Walker::new(self, &parsed, file).module_file(module, dir, active),
+
+			Err(error) => {
+				let source = &self.files[file.index()];
+				let message = format!("cannot parse file: {error}");
+				let location = parse_error_location(source, &error);
+				let path = source.path().to_owned();
+
+				self.set_load_error(module, message.clone());
+
+				self.diagnostics.push(Diagnostic {
+					severity: severity(active),
+					message,
+					file: Some(path),
+					location: Some(location),
+				});
+			}
 		}
 	}
 
@@ -166,12 +261,14 @@ impl Loader {
 		self.file_stack.pop();
 	}
 
-	fn add_file(&mut self, path: PathBuf, text: String) -> FileId {
-		let id = FileId(self.files.len() as u32);
+	/// Adds an item as the last child of `parent`, returning its index.
+	fn push(&mut self, parent: u32, mut item: ItemData) -> u32 {
+		let index = self.items.len() as u32;
 
-		self.file_ids.insert(path.clone(), id);
-		self.files.push(SourceFile::new(path, text));
-		id
+		item.parent = Some(parent);
+		self.items.push(item);
+		self.items[parent as usize].children.push(index);
+		index
 	}
 
 	/// Reads a file, or returns its id if the crate already loaded it.
@@ -185,252 +282,15 @@ impl Loader {
 		Ok(self.add_file(path.to_owned(), text))
 	}
 
-	/// Parses the file of a module (the crate root or an out-of-line module) and adds its items to the module.
-	///
-	/// `active`: whether the module is active, as far as known before reading its inner attributes.
-	fn load_module_file(&mut self, module: u32, file: FileId, dir: &ModDir, active: Tristate) {
-		let text = Arc::clone(self.files[file.index()].shared_text());
-
-		match ParsedFile::parse(&text) {
-			Ok(parsed) => Walker::new(self, &parsed, file).module_file(module, dir, active),
-
-			Err(error) => {
-				let source = &self.files[file.index()];
-				let message = format!("cannot parse file: {error}");
-				let location = parse_error_location(source, &error);
-				let path = source.path().to_owned();
-
-				self.set_load_error(module, message.clone());
-
-				self.diagnostics.push(Diagnostic {
-					severity: severity(active),
-					message,
-					file: Some(path),
-					location: Some(location),
-				});
-			}
-		}
-	}
-
-	/// Adds an item as the last child of `parent`, returning its index.
-	fn push(&mut self, parent: u32, mut item: ItemData) -> u32 {
-		let index = self.items.len() as u32;
-
-		item.parent = Some(parent);
-		self.items.push(item);
-		self.items[parent as usize].children.push(index);
-		index
-	}
-
-	fn set_module_file(&mut self, module: u32, file: FileId) {
-		if let ItemDetail::Module(info) = &mut self.items[module as usize].detail {
-			info.file = Some(file);
-		}
-	}
-
 	fn set_load_error(&mut self, module: u32, error: String) {
 		if let ItemDetail::Module(info) = &mut self.items[module as usize].detail {
 			info.load_error = Some(error);
 		}
 	}
 
-	fn eval(&self, cfg: Option<&CfgExpr>) -> Tristate {
-		cfg.map_or(Tristate::True, |cfg| self.spec.cfg.eval(cfg))
-	}
-
-	fn diagnostic_at(&mut self, severity: Severity, file: FileId, offset: usize, message: String) {
-		let source = &self.files[file.index()];
-
-		self.diagnostics.push(Diagnostic {
-			severity,
-			message,
-			file: Some(source.path().to_owned()),
-			location: Some(source.line_col(offset)),
-		});
-	}
-}
-
-/// The location of a parse error of a file. syn places errors at the end of the file at the call site (the start of
-/// the file); they are placed at the last token instead, as rustc does.
-fn parse_error_location(source: &SourceFile, error: &syn::Error) -> LineCol {
-	let at_end = error.span().byte_range() == (0..0) && error.to_string().starts_with("unexpected end of input");
-
-	if at_end {
-		source.line_col(last_token_start(source.text()))
-	} else {
-		source.error_location(error)
-	}
-}
-
-/// The start of the last token of `text` (of the closing delimiter, for a group), or the end of its last
-/// non-whitespace character if it cannot be tokenized.
-fn last_token_start(text: &str) -> usize {
-	let bom = if text.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
-	let tokens = text[bom..].parse::<TokenStream>().ok();
-
-	let span = tokens.and_then(|tokens| tokens.into_iter().last()).map(|token| match token {
-		TokenTree::Group(group) => group.span_close(),
-		token => token.span(),
-	});
-
-	span.map_or_else(|| text.trim_end().len(), |span| bom + span.byte_range().start)
-}
-
-/// Problems with a module that is definitely inactive are only warnings: rustc never looks at it.
-fn severity(active: Tristate) -> Severity {
-	match active {
-		Tristate::False => Severity::Warning,
-		Tristate::True | Tristate::Unknown => Severity::Error,
-	}
-}
-
-/// Extracts the items of one parsed file into the crate being loaded.
-struct Walker<'l, 'p, 't> {
-	loader: &'l mut Loader,
-	parsed: &'p ParsedFile<'t>,
-	file: FileId,
-}
-
-impl<'l, 'p, 't> Walker<'l, 'p, 't> {
-	fn new(loader: &'l mut Loader, parsed: &'p ParsedFile<'t>, file: FileId) -> Self {
-		Self { loader, parsed, file }
-	}
-
-	/// Adds the inner attributes and the items of the parsed file to `module`.
-	fn module_file(&mut self, module: u32, dir: &ModDir, active: Tristate) {
-		let parsed = self.parsed;
-		let inner = self.attributes(&parsed.file.attrs, true);
-		let inner_cfg = CfgExpr::all(inner.cfgs);
-		let active = active.and(self.loader.eval(inner_cfg.as_ref()));
-		let item = &mut self.loader.items[module as usize];
-
-		item.cfg = CfgExpr::all(item.cfg.take().into_iter().chain(inner_cfg));
-		item.attrs.doc_hidden |= inner.attrs.doc_hidden;
-		item.attrs.macro_export |= inner.attrs.macro_export;
-		item.attrs.macro_use |= inner.attrs.macro_use;
-		item.attrs.test |= inner.attrs.test;
-
-		self.module_items(module, &parsed.file.items, dir, active);
-	}
-
-	/// Loads the file of an out-of-line module (`mod name;`) whose item was just added.
-	///
-	/// `declaration`: the offset of the module's name, for diagnostics.
-	fn load_out_of_line(&mut self, module: u32, name: &str, file: ModFile, declaration: usize, active: Tristate) {
-		let severity = severity(active);
-
-		if file.ambiguous
-			&& let Some(mod_rs) = &file.mod_rs
-		{
-			let message = format!(
-				"file for module `{name}` found at both `{}` and `{}`; using the former",
-				file.path.display(),
-				mod_rs.display(),
-			);
-
-			self.loader.diagnostic_at(severity, self.file, declaration, message);
-		}
-
-		let error = if !file.exists {
-			match &file.mod_rs {
-				Some(mod_rs) => format!(
-					"file not found for module `{name}`: neither `{}` nor `{}` exists",
-					file.path.display(),
-					mod_rs.display(),
-				),
-
-				None => format!("file not found for module `{name}`: `{}` does not exist", file.path.display()),
-			}
-		} else if let Some(start) = self.loader.file_stack.iter().position(|path| *path == file.path) {
-			let chain: Vec<String> = self.loader.file_stack[start..]
-				.iter()
-				.chain([&file.path])
-				.map(|path| format!("`{}`", path.display()))
-				.collect();
-
-			format!("circular modules: {}", chain.join(" -> "))
-		} else {
-			match self.loader.read_file(&file.path) {
-				Ok(id) => {
-					self.loader.set_module_file(module, id);
-					self.loader.file_stack.push(file.path);
-					self.loader.load_module_file(module, id, &file.dir, active);
-					self.loader.file_stack.pop();
-
-					return;
-				}
-
-				Err(error) => format!("cannot read file `{}` of module `{name}`: {error}", file.path.display()),
-			}
-		};
-
-		self.loader.set_load_error(module, error.clone());
-		self.loader.diagnostic_at(severity, self.file, declaration, error);
-	}
-
-	fn warning(&mut self, offset: usize, message: String) {
-		self.loader.diagnostic_at(Severity::Warning, self.file, offset, message);
-	}
-}
-
-/// The kind of item whose body an item is in.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Container {
-	Module,
-	Impl {
-		of_trait: bool,
-	},
-	Trait,
-	Extern,
-}
-
-impl Container {
-	/// The visibility of items without a visibility keyword.
-	fn default_vis(self) -> Visibility {
-		match self {
-			Self::Module | Self::Extern | Self::Impl { of_trait: false } => Visibility::Private,
-			Self::Impl { of_trait: true } | Self::Trait => Visibility::Inherited,
-		}
-	}
-
-	fn fn_kind(self) -> ItemKind {
-		match self {
-			Self::Module => ItemKind::Fn,
-			Self::Impl { .. } | Self::Trait => ItemKind::AssocFn,
-			Self::Extern => ItemKind::ForeignFn,
-		}
-	}
-
-	fn const_kind(self) -> Option<ItemKind> {
-		match self {
-			Self::Module => Some(ItemKind::Const),
-			Self::Impl { .. } | Self::Trait => Some(ItemKind::AssocConst),
-			Self::Extern => None,
-		}
-	}
-
-	fn static_kind(self) -> Option<ItemKind> {
-		match self {
-			Self::Module => Some(ItemKind::Static),
-			Self::Extern => Some(ItemKind::ForeignStatic),
-			Self::Impl { .. } | Self::Trait => None,
-		}
-	}
-
-	fn type_kind(self) -> ItemKind {
-		match self {
-			Self::Module => ItemKind::TypeAlias,
-			Self::Impl { .. } | Self::Trait => ItemKind::AssocType,
-			Self::Extern => ItemKind::ForeignType,
-		}
-	}
-
-	/// The kind of a macro invocation (other than a `macro_rules!` definition).
-	fn macro_kind(self) -> ItemKind {
-		match self {
-			Self::Module => ItemKind::MacroCall,
-			Self::Impl { .. } | Self::Trait => ItemKind::AssocMacro,
-			Self::Extern => ItemKind::ForeignMacro,
+	fn set_module_file(&mut self, module: u32, file: FileId) {
+		if let ItemDetail::Module(info) = &mut self.items[module as usize].detail {
+			info.file = Some(file);
 		}
 	}
 }
@@ -527,6 +387,137 @@ struct ModFile {
 	ambiguous: bool,
 }
 
+/// Extracts the items of one parsed file into the crate being loaded.
+struct Walker<'l, 'p, 't> {
+	loader: &'l mut Loader,
+	parsed: &'p ParsedFile<'t>,
+	file: FileId,
+}
+
+impl<'l, 'p, 't> Walker<'l, 'p, 't> {
+	fn new(loader: &'l mut Loader, parsed: &'p ParsedFile<'t>, file: FileId) -> Self {
+		Self { loader, parsed, file }
+	}
+
+	/// Loads the file of an out-of-line module (`mod name;`) whose item was just added.
+	///
+	/// `declaration`: the offset of the module's name, for diagnostics.
+	fn load_out_of_line(&mut self, module: u32, name: &str, file: ModFile, declaration: usize, active: Tristate) {
+		let severity = severity(active);
+
+		if file.ambiguous
+			&& let Some(mod_rs) = &file.mod_rs
+		{
+			let message = format!(
+				"file for module `{name}` found at both `{}` and `{}`; using the former",
+				file.path.display(),
+				mod_rs.display(),
+			);
+
+			self.loader.diagnostic_at(severity, self.file, declaration, message);
+		}
+
+		let error = if !file.exists {
+			match &file.mod_rs {
+				Some(mod_rs) => format!(
+					"file not found for module `{name}`: neither `{}` nor `{}` exists",
+					file.path.display(),
+					mod_rs.display(),
+				),
+
+				None => format!("file not found for module `{name}`: `{}` does not exist", file.path.display()),
+			}
+		} else if let Some(start) = self.loader.file_stack.iter().position(|path| *path == file.path) {
+			let chain: Vec<String> = self.loader.file_stack[start..]
+				.iter()
+				.chain([&file.path])
+				.map(|path| format!("`{}`", path.display()))
+				.collect();
+
+			format!("circular modules: {}", chain.join(" -> "))
+		} else {
+			match self.loader.read_file(&file.path) {
+				Ok(id) => {
+					self.loader.set_module_file(module, id);
+					self.loader.file_stack.push(file.path);
+					self.loader.load_module_file(module, id, &file.dir, active);
+					self.loader.file_stack.pop();
+
+					return;
+				}
+
+				Err(error) => format!("cannot read file `{}` of module `{name}`: {error}", file.path.display()),
+			}
+		};
+
+		self.loader.set_load_error(module, error.clone());
+		self.loader.diagnostic_at(severity, self.file, declaration, error);
+	}
+
+	/// Adds the inner attributes and the items of the parsed file to `module`.
+	fn module_file(&mut self, module: u32, dir: &ModDir, active: Tristate) {
+		let parsed = self.parsed;
+		let inner = self.attributes(&parsed.file.attrs, true);
+		let inner_cfg = CfgExpr::all(inner.cfgs);
+		let active = active.and(self.loader.eval(inner_cfg.as_ref()));
+		let item = &mut self.loader.items[module as usize];
+
+		item.cfg = CfgExpr::all(item.cfg.take().into_iter().chain(inner_cfg));
+		item.attrs.doc_hidden |= inner.attrs.doc_hidden;
+		item.attrs.macro_export |= inner.attrs.macro_export;
+		item.attrs.macro_use |= inner.attrs.macro_use;
+		item.attrs.test |= inner.attrs.test;
+
+		self.module_items(module, &parsed.file.items, dir, active);
+	}
+
+	fn warning(&mut self, offset: usize, message: String) {
+		self.loader.diagnostic_at(Severity::Warning, self.file, offset, message);
+	}
+}
+
+/// Whether a file name means the same in a path without `\\?\`: Windows takes names like `NUL` and `nul.txt` for
+/// devices, drops the `.` and ` ` that names end with, and does not allow some characters in them.
+fn is_plain_name(name: &str) -> bool {
+	// (the name before its first `.`, without the spaces it ends with: `nul .tar.gz` names `NUL` too)
+	let base = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+	let numbered = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{b9}", "\u{b2}", "\u{b3}"];
+	let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+		|| ((base.starts_with("COM") || base.starts_with("LPT")) && numbered.contains(&&base[3..]));
+	let invalid = |char: char| char < ' ' || "<>:\"/\\|?*".contains(char);
+
+	!(device || name.is_empty() || name.ends_with(['.', ' ']) || name.contains(invalid))
+}
+
+/// The start of the last token of `text` (of the closing delimiter, for a group), or the end of its last
+/// non-whitespace character if it cannot be tokenized.
+fn last_token_start(text: &str) -> usize {
+	let bom = if text.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
+	let tokens = text[bom..].parse::<TokenStream>().ok();
+
+	let span = tokens.and_then(|tokens| tokens.into_iter().last()).map(|token| match token {
+		TokenTree::Group(group) => group.span_close(),
+		token => token.span(),
+	});
+
+	span.map_or_else(|| text.trim_end().len(), |span| bom + span.byte_range().start)
+}
+
+/// Loads a crate from its spec. Never fails: problems become [`Crate::diagnostics`](crate::Crate::diagnostics).
+pub(crate) fn load_crate(id: CrateId, spec: CrateSpec) -> Crate {
+	let mut loader = Loader::new(spec);
+
+	loader.load_root();
+
+	Crate {
+		id,
+		spec: loader.spec,
+		files: loader.files,
+		items: loader.items,
+		diagnostics: loader.diagnostics,
+	}
+}
+
 /// An absolute, normalized path naming the same file as `path`: `.` components are removed, and `..` components
 /// remove the preceding component (see [`parent`]). Symbolic links are only resolved where `..` needs it.
 fn normalize_path(path: &Path) -> PathBuf {
@@ -564,11 +555,16 @@ fn parent(path: &mut PathBuf) {
 	}
 }
 
-/// `path` without the `\\?\` that canonicalizing gives Windows paths, as they are usually written: `\\?\C:\a` as
-/// `C:\a`, and `\\?\UNC\server\share\a` (on a network share) as `\\server\share\a`. Paths that mean something else
-/// without it keep it (see [`is_plain_name`]).
-pub(crate) fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
-	plain_form(&path).unwrap_or(path)
+/// The location of a parse error of a file. syn places errors at the end of the file at the call site (the start of
+/// the file); they are placed at the last token instead, as rustc does.
+fn parse_error_location(source: &SourceFile, error: &syn::Error) -> LineCol {
+	let at_end = error.span().byte_range() == (0..0) && error.to_string().starts_with("unexpected end of input");
+
+	if at_end {
+		source.line_col(last_token_start(source.text()))
+	} else {
+		source.error_location(error)
+	}
 }
 
 /// `path` without its `\\?\` (see [`without_verbatim_prefix`]), if it has one it can do without.
@@ -597,17 +593,19 @@ fn plain_form(path: &Path) -> Option<PathBuf> {
 	Some(PathBuf::from(format!(r"{prefix}\{}", names.join(r"\"))))
 }
 
-/// Whether a file name means the same in a path without `\\?\`: Windows takes names like `NUL` and `nul.txt` for
-/// devices, drops the `.` and ` ` that names end with, and does not allow some characters in them.
-fn is_plain_name(name: &str) -> bool {
-	// (the name before its first `.`, without the spaces it ends with: `nul .tar.gz` names `NUL` too)
-	let base = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
-	let numbered = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{b9}", "\u{b2}", "\u{b3}"];
-	let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
-		|| ((base.starts_with("COM") || base.starts_with("LPT")) && numbered.contains(&&base[3..]));
-	let invalid = |char: char| char < ' ' || "<>:\"/\\|?*".contains(char);
+/// Problems with a module that is definitely inactive are only warnings: rustc never looks at it.
+fn severity(active: Tristate) -> Severity {
+	match active {
+		Tristate::False => Severity::Warning,
+		Tristate::True | Tristate::Unknown => Severity::Error,
+	}
+}
 
-	!(device || name.is_empty() || name.ends_with(['.', ' ']) || name.contains(invalid))
+/// `path` without the `\\?\` that canonicalizing gives Windows paths, as they are usually written: `\\?\C:\a` as
+/// `C:\a`, and `\\?\UNC\server\share\a` (on a network share) as `\\server\share\a`. Paths that mean something else
+/// without it keep it (see [`is_plain_name`]).
+pub(crate) fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+	plain_form(&path).unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -621,8 +619,82 @@ mod tests {
 	}
 
 	#[test]
+	fn module_directories_follow_rustc() {
+		let root = ModDir::of_file(&abs("/c/src/lib.rs"), None);
+
+		assert_eq!(root.child_dir(), abs("/c/src"));
+		assert_eq!(root.inline("m", None).child_dir(), abs("/c/src/m"));
+		assert_eq!(root.inline("m", Some("p")).child_dir(), abs("/c/src/p"));
+
+		// `src/a.rs`, loaded by `mod a;`
+		let a = ModDir::of_file(&abs("/c/src/a.rs"), Some("a".into()));
+
+		assert_eq!(a.child_dir(), abs("/c/src/a"));
+		assert_eq!(
+			a.inline("inl", None),
+			ModDir {
+				dir: abs("/c/src/a/inl"),
+				relative: None
+			}
+		);
+		assert_eq!(
+			a.inline("inl", Some("x")),
+			ModDir {
+				dir: abs("/c/src/x"),
+				relative: None
+			}
+		);
+
+		let missing = a.resolve("b", None);
+
+		assert_eq!(missing.path, abs("/c/src/a/b.rs"));
+		assert_eq!(
+			missing.dir,
+			ModDir {
+				dir: abs("/c/src/a"),
+				relative: Some("b".into())
+			}
+		);
+		assert!(!missing.exists);
+		assert_eq!(a.resolve("c", Some("c.rs")).path, abs("/c/src/c.rs"));
+		assert_eq!(
+			a.resolve("c", Some("c.rs")).dir,
+			ModDir {
+				dir: abs("/c/src"),
+				relative: None
+			}
+		);
+		assert_eq!(a.resolve("c", Some("/abs/c.rs")).path, abs("/abs/c.rs"));
+		assert_eq!(a.resolve("c", Some("../up.rs")).path, abs("/c/up.rs"));
+	}
+
+	#[test]
+	fn normalizes_paths_lexically() {
+		assert_eq!(normalize_path(Path::new("/a/./b/../c.rs")), abs("/a/c.rs"));
+		assert_eq!(normalize_path(Path::new("/a/b/../../../c")), abs("/c"));
+		assert_eq!(normalize_path(Path::new("/a//b/")), abs("/a/b"));
+		assert!(normalize_path(Path::new("relative/x.rs")).is_absolute());
+		assert!(normalize_path(Path::new("relative/x.rs")).ends_with("relative/x.rs"));
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn paths_have_no_verbatim_prefixes() {
+		assert_eq!(without_verbatim_prefix(PathBuf::from(r"/a/\\?\C:")), Path::new(r"/a/\\?\C:"));
+	}
+
+	#[test]
 	fn plain_names() {
-		for name in ["lib.rs", "a b.rs", "console.rs", "com10.rs", "comx.rs", "nul_check.rs", ".hidden", "ünï.rs"] {
+		for name in [
+			"lib.rs",
+			"a b.rs",
+			"console.rs",
+			"com10.rs",
+			"comx.rs",
+			"nul_check.rs",
+			".hidden",
+			"ünï.rs",
+		] {
 			assert!(is_plain_name(name), "{name}");
 		}
 
@@ -656,46 +728,5 @@ mod tests {
 		] {
 			assert_eq!(plain(path), path);
 		}
-	}
-
-	#[cfg(not(windows))]
-	#[test]
-	fn paths_have_no_verbatim_prefixes() {
-		assert_eq!(without_verbatim_prefix(PathBuf::from(r"/a/\\?\C:")), Path::new(r"/a/\\?\C:"));
-	}
-
-	#[test]
-	fn normalizes_paths_lexically() {
-		assert_eq!(normalize_path(Path::new("/a/./b/../c.rs")), abs("/a/c.rs"));
-		assert_eq!(normalize_path(Path::new("/a/b/../../../c")), abs("/c"));
-		assert_eq!(normalize_path(Path::new("/a//b/")), abs("/a/b"));
-		assert!(normalize_path(Path::new("relative/x.rs")).is_absolute());
-		assert!(normalize_path(Path::new("relative/x.rs")).ends_with("relative/x.rs"));
-	}
-
-	#[test]
-	fn module_directories_follow_rustc() {
-		let root = ModDir::of_file(&abs("/c/src/lib.rs"), None);
-
-		assert_eq!(root.child_dir(), abs("/c/src"));
-		assert_eq!(root.inline("m", None).child_dir(), abs("/c/src/m"));
-		assert_eq!(root.inline("m", Some("p")).child_dir(), abs("/c/src/p"));
-
-		// `src/a.rs`, loaded by `mod a;`
-		let a = ModDir::of_file(&abs("/c/src/a.rs"), Some("a".into()));
-
-		assert_eq!(a.child_dir(), abs("/c/src/a"));
-		assert_eq!(a.inline("inl", None), ModDir { dir: abs("/c/src/a/inl"), relative: None });
-		assert_eq!(a.inline("inl", Some("x")), ModDir { dir: abs("/c/src/x"), relative: None });
-
-		let missing = a.resolve("b", None);
-
-		assert_eq!(missing.path, abs("/c/src/a/b.rs"));
-		assert_eq!(missing.dir, ModDir { dir: abs("/c/src/a"), relative: Some("b".into()) });
-		assert!(!missing.exists);
-		assert_eq!(a.resolve("c", Some("c.rs")).path, abs("/c/src/c.rs"));
-		assert_eq!(a.resolve("c", Some("c.rs")).dir, ModDir { dir: abs("/c/src"), relative: None });
-		assert_eq!(a.resolve("c", Some("/abs/c.rs")).path, abs("/abs/c.rs"));
-		assert_eq!(a.resolve("c", Some("../up.rs")).path, abs("/c/up.rs"));
 	}
 }

@@ -62,6 +62,66 @@ impl Platform {
 	}
 }
 
+/// The platform crates are compiled for, and the host platform (for proc-macro crates).
+#[derive(Debug, Clone)]
+pub(super) struct Platforms {
+	target: Platform,
+
+	/// The host platform when it differs from the target: when compiling for a `--target` (even the host's own triple,
+	/// as cargo then applies `RUSTFLAGS` to the target only).
+	host: Option<Platform>,
+}
+
+impl Platforms {
+	/// The platforms of target data cargo queried already.
+	pub fn from_target_data(target_data: &RustcTargetData<'_>, kind: CompileKind) -> Self {
+		let platform = |kind: CompileKind| Platform::new(target_data.short_name(&kind), target_data.cfg(kind).to_vec());
+		let host = match kind {
+			CompileKind::Host => None,
+			CompileKind::Target(_) => Some(platform(CompileKind::Host)),
+		};
+
+		Self {
+			target: platform(kind),
+			host,
+		}
+	}
+
+	/// Asks rustc (through cargo, so `RUSTC`, `RUSTFLAGS`, and cargo's configuration are honored) about the platform of
+	/// `kind` and, when compiling for a target, the host.
+	///
+	/// rustc's information is not cached in the target directory, so nothing is written.
+	pub fn query(gctx: &GlobalContext, kind: CompileKind) -> Result<Self, Error> {
+		let rustc = gctx.load_global_rustc(None).map_err(rustc_error)?;
+		let requested = [kind];
+		let target = Platform::query(gctx, &rustc, &requested, kind)?;
+		let host = match kind {
+			CompileKind::Host => None,
+			CompileKind::Target(_) => Some(Platform::query(gctx, &rustc, &requested, CompileKind::Host)?),
+		};
+
+		Ok(Self { target, host })
+	}
+
+	/// The platform build scripts and proc-macros are compiled for.
+	pub fn host(&self) -> &Platform {
+		self.host.as_ref().unwrap_or(&self.target)
+	}
+
+	/// The platform a crate of the kind is compiled for.
+	pub fn of(&self, kind: TargetKind) -> &Platform {
+		match kind {
+			TargetKind::ProcMacro | TargetKind::BuildScript => self.host(),
+			_ => self.target(),
+		}
+	}
+
+	/// The platform crates are compiled for.
+	pub fn target(&self) -> &Platform {
+		&self.target
+	}
+}
+
 /// Converts rustc's `cfg`s into a context in which every well-known name is definite.
 fn cfg_context(cfgs: &[Cfg]) -> CfgContext {
 	let lines: Vec<String> = cfgs.iter().map(cfg_line).collect();
@@ -81,66 +141,6 @@ fn cfg_line(cfg: &Cfg) -> String {
 	match cfg {
 		Cfg::Name(name) => name.to_string(),
 		Cfg::KeyPair(key, value) => format!("{key} = {value:?}"),
-	}
-}
-
-/// The platform crates are compiled for, and the host platform (for proc-macro crates).
-#[derive(Debug, Clone)]
-pub(super) struct Platforms {
-	target: Platform,
-
-	/// The host platform when it differs from the target: when compiling for a `--target` (even the host's own triple,
-	/// as cargo then applies `RUSTFLAGS` to the target only).
-	host: Option<Platform>,
-}
-
-impl Platforms {
-	/// Asks rustc (through cargo, so `RUSTC`, `RUSTFLAGS`, and cargo's configuration are honored) about the platform of
-	/// `kind` and, when compiling for a target, the host.
-	///
-	/// rustc's information is not cached in the target directory, so nothing is written.
-	pub fn query(gctx: &GlobalContext, kind: CompileKind) -> Result<Self, Error> {
-		let rustc = gctx.load_global_rustc(None).map_err(rustc_error)?;
-		let requested = [kind];
-		let target = Platform::query(gctx, &rustc, &requested, kind)?;
-		let host = match kind {
-			CompileKind::Host => None,
-			CompileKind::Target(_) => Some(Platform::query(gctx, &rustc, &requested, CompileKind::Host)?),
-		};
-
-		Ok(Self { target, host })
-	}
-
-	/// The platforms of target data cargo queried already.
-	pub fn from_target_data(target_data: &RustcTargetData<'_>, kind: CompileKind) -> Self {
-		let platform = |kind: CompileKind| Platform::new(target_data.short_name(&kind), target_data.cfg(kind).to_vec());
-		let host = match kind {
-			CompileKind::Host => None,
-			CompileKind::Target(_) => Some(platform(CompileKind::Host)),
-		};
-
-		Self {
-			target: platform(kind),
-			host,
-		}
-	}
-
-	/// The platform crates are compiled for.
-	pub fn target(&self) -> &Platform {
-		&self.target
-	}
-
-	/// The platform build scripts and proc-macros are compiled for.
-	pub fn host(&self) -> &Platform {
-		self.host.as_ref().unwrap_or(&self.target)
-	}
-
-	/// The platform a crate of the kind is compiled for.
-	pub fn of(&self, kind: TargetKind) -> &Platform {
-		match kind {
-			TargetKind::ProcMacro | TargetKind::BuildScript => self.host(),
-			_ => self.target(),
-		}
 	}
 }
 
@@ -164,10 +164,6 @@ mod tests {
 		lines.iter().map(|line| Cfg::from_str(line).unwrap()).collect()
 	}
 
-	fn eval(platform: &Platform, predicate: &str) -> Tristate {
-		platform.cfg_context().eval(&CfgExpr::parse(predicate).unwrap())
-	}
-
 	#[test]
 	fn converts_rustc_cfgs() {
 		let platform = Platform::new(
@@ -188,7 +184,10 @@ mod tests {
 		assert_eq!(eval(&platform, "windows"), Tristate::False);
 		assert_eq!(eval(&platform, r#"target_os = "linux""#), Tristate::True);
 		assert_eq!(eval(&platform, r#"target_os = "windows""#), Tristate::False);
-		assert_eq!(eval(&platform, r#"all(target_feature = "sse2", target_feature = "fxsr")"#), Tristate::True);
+		assert_eq!(
+			eval(&platform, r#"all(target_feature = "sse2", target_feature = "fxsr")"#),
+			Tristate::True
+		);
 		assert_eq!(eval(&platform, r#"target_feature = "avx2""#), Tristate::False);
 		assert_eq!(eval(&platform, r#"target_abi = """#), Tristate::True);
 		assert_eq!(eval(&platform, r#"panic = "abort""#), Tristate::False);
@@ -207,14 +206,6 @@ mod tests {
 	}
 
 	#[test]
-	fn overflow_checks_follow_debug_assertions() {
-		let release = Platform::new("x86_64-unknown-linux-gnu", cfgs(&["unix"]));
-
-		assert_eq!(eval(&release, "debug_assertions"), Tristate::False);
-		assert_eq!(eval(&release, "overflow_checks"), Tristate::False);
-	}
-
-	#[test]
 	fn escapes_values() {
 		let key = cargo_platform::Ident {
 			name: "key".into(),
@@ -225,6 +216,10 @@ mod tests {
 
 		assert_eq!(cfg_line(&platform.cfgs[0]), r#"key = "a\"b\\c""#);
 		assert_eq!(eval(&platform, r#"key = "a\"b\\c""#), Tristate::True);
+	}
+
+	fn eval(platform: &Platform, predicate: &str) -> Tristate {
+		platform.cfg_context().eval(&CfgExpr::parse(predicate).unwrap())
 	}
 
 	#[test]
@@ -246,5 +241,13 @@ mod tests {
 		assert_eq!(cross.of(TargetKind::Lib).triple, "x86_64-pc-windows-msvc");
 		assert_eq!(cross.of(TargetKind::Test).triple, "x86_64-pc-windows-msvc");
 		assert_eq!(cross.of(TargetKind::ProcMacro).triple, "x86_64-unknown-linux-gnu");
+	}
+
+	#[test]
+	fn overflow_checks_follow_debug_assertions() {
+		let release = Platform::new("x86_64-unknown-linux-gnu", cfgs(&["unix"]));
+
+		assert_eq!(eval(&release, "debug_assertions"), Tristate::False);
+		assert_eq!(eval(&release, "overflow_checks"), Tristate::False);
 	}
 }

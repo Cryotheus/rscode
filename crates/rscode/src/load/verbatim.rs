@@ -26,6 +26,13 @@ use syn::UseTree;
 use syn::parse::ParseStream;
 use syn::parse::Parser;
 
+/// Keywords that cannot name an item (unless written as raw identifiers).
+const KEYWORDS: &[&str] = &[
+	"as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in", "let",
+	"loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+	"use", "where", "while",
+];
+
 /// A `Verbatim` item split into its outer attributes, its visibility, and the remaining tokens.
 pub(super) struct Parts {
 	pub(super) attrs: Vec<Attribute>,
@@ -49,13 +56,6 @@ impl Parts {
 			rest: tokens.clone().into_iter().collect(),
 		})
 	}
-}
-
-/// An element of a group of a `use` item reached from the start of the item through groups only, which may start
-/// with `::` (`::a` and `::c` in `use {::a, b, {::c}};`).
-pub(super) struct UseElement {
-	pub(super) leading_colon: Option<Token![::]>,
-	pub(super) tree: UseTree,
 }
 
 /// What a `Verbatim` item is.
@@ -110,6 +110,13 @@ pub(super) enum Shape {
 		/// The last delimited group.
 		body: Option<DelimSpan>,
 	},
+}
+
+/// An element of a group of a `use` item reached from the start of the item through groups only, which may start
+/// with `::` (`::a` and `::c` in `use {::a, b, {::c}};`).
+pub(super) struct UseElement {
+	pub(super) leading_colon: Option<Token![::]>,
+	pub(super) tree: UseTree,
 }
 
 /// Classifies a `Verbatim` item by its leading tokens (after attributes and visibility).
@@ -194,6 +201,26 @@ fn function(rest: &[TokenTree]) -> Option<Shape> {
 	})
 }
 
+/// Whether a token is the identifier (or keyword) `keyword`.
+fn is(token: &TokenTree, keyword: &str) -> bool {
+	matches!(token, TokenTree::Ident(ident) if ident == keyword)
+}
+
+fn last_group(tokens: &[TokenTree]) -> Option<DelimSpan> {
+	tokens.iter().rev().find_map(|token| match token {
+		TokenTree::Group(group) if group.delimiter() != Delimiter::None => Some(group.delim_span()),
+		_ => None,
+	})
+}
+
+/// An identifier token that can be the name of an item.
+fn name(token: &TokenTree) -> Option<&Ident> {
+	match token {
+		TokenTree::Ident(ident) if !KEYWORDS.iter().any(|keyword| ident == keyword) => Some(ident),
+		_ => None,
+	}
+}
+
 /// Re-parses traits and `impl` blocks without the modifiers syn rejects: `impl(..)` restrictions and `const`.
 fn reparse(parts: &Parts) -> Option<Shape> {
 	let kept = match parts.rest.as_slice() {
@@ -205,7 +232,9 @@ fn reparse(parts: &Parts) -> Option<Shape> {
 		_ => return None,
 	};
 
-	let is_trait_or_impl = kept.first().is_some_and(|token| ["trait", "unsafe", "auto", "impl"].iter().any(|keyword| is(token, keyword)));
+	let is_trait_or_impl = kept
+		.first()
+		.is_some_and(|token| ["trait", "unsafe", "auto", "impl"].iter().any(|keyword| is(token, keyword)));
 
 	if !is_trait_or_impl {
 		return None;
@@ -226,24 +255,6 @@ fn reparse(parts: &Parts) -> Option<Shape> {
 		Item::Impl(item) => Some(Shape::Impl(Box::new(item))),
 		_ => None,
 	}
-}
-
-/// `use {::a, b};`, `use {a, {::b}};`: syn gives up on `::` at the start of group elements.
-fn rooted_use(rest: &[TokenTree]) -> Option<Shape> {
-	if !rest.first().is_some_and(|token| is(token, "use")) {
-		return None;
-	}
-
-	let parser = |input: ParseStream| {
-		let mut elements = Vec::new();
-
-		input.parse::<Token![use]>()?;
-		rooted_group(input, &mut elements)?;
-		input.parse::<Token![;]>()?;
-		Ok(elements)
-	};
-
-	parser.parse2(rest.iter().cloned().collect()).ok().map(Shape::Use)
 }
 
 /// Parses a group whose elements may start with `::`, adding its elements to `elements`; elements that are groups
@@ -273,36 +284,33 @@ fn rooted_group(input: ParseStream, elements: &mut Vec<UseElement>) -> syn::Resu
 	Ok(())
 }
 
+/// `use {::a, b};`, `use {a, {::b}};`: syn gives up on `::` at the start of group elements.
+fn rooted_use(rest: &[TokenTree]) -> Option<Shape> {
+	if !rest.first().is_some_and(|token| is(token, "use")) {
+		return None;
+	}
+
+	let parser = |input: ParseStream| {
+		let mut elements = Vec::new();
+
+		input.parse::<Token![use]>()?;
+		rooted_group(input, &mut elements)?;
+		input.parse::<Token![;]>()?;
+		Ok(elements)
+	};
+
+	parser.parse2(rest.iter().cloned().collect()).ok().map(Shape::Use)
+}
+
 /// `[safe | unsafe] static [mut] name ...`
 fn static_item(rest: &[TokenTree]) -> Option<Shape> {
 	let rest = strip(rest, &["safe", "unsafe"]);
 	let mutable = rest.get(1).is_some_and(|token| is(token, "mut"));
 	let name = rest.get(if mutable { 2 } else { 1 }).and_then(name)?;
 
-	rest.first().filter(|keyword| is(keyword, "static")).map(|_| Shape::Static {
-		name: name.clone(),
-		mutable,
-	})
-}
-
-/// Whether a token is the identifier (or keyword) `keyword`.
-fn is(token: &TokenTree, keyword: &str) -> bool {
-	matches!(token, TokenTree::Ident(ident) if ident == keyword)
-}
-
-/// Keywords that cannot name an item (unless written as raw identifiers).
-const KEYWORDS: &[&str] = &[
-	"as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
-	"if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self", "static",
-	"struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
-];
-
-/// An identifier token that can be the name of an item.
-fn name(token: &TokenTree) -> Option<&Ident> {
-	match token {
-		TokenTree::Ident(ident) if !KEYWORDS.iter().any(|keyword| ident == keyword) => Some(ident),
-		_ => None,
-	}
+	rest.first()
+		.filter(|keyword| is(keyword, "static"))
+		.map(|_| Shape::Static { name: name.clone(), mutable })
 }
 
 /// Skips leading tokens that are any of `keywords`.
@@ -316,19 +324,124 @@ fn strip<'a>(mut tokens: &'a [TokenTree], keywords: &[&str]) -> &'a [TokenTree] 
 	tokens
 }
 
-fn last_group(tokens: &[TokenTree]) -> Option<DelimSpan> {
-	tokens.iter().rev().find_map(|token| match token {
-		TokenTree::Group(group) if group.delimiter() != Delimiter::None => Some(group.delim_span()),
-		_ => None,
-	})
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use syn::ForeignItem;
 	use syn::ImplItem;
 	use syn::TraitItem;
+
+	#[test]
+	fn classifies_associated_and_foreign_items() {
+		let inherent = Container::Impl { of_trait: false };
+
+		assert_eq!(
+			describe("fn f(&mut self);", inherent),
+			"fn f receiver=Some(Receiver { reference: true, mutable: true, typed: false }) const=false async=false unsafe=false body=false"
+		);
+
+		assert_eq!(
+			describe("default async fn f(self: Box<Self>);", inherent),
+			"fn f receiver=Some(Receiver { reference: false, mutable: false, typed: true }) const=false async=true unsafe=false body=false"
+		);
+
+		assert_eq!(describe("const C: u8;", inherent), "const C");
+		assert_eq!(describe("default type T;", inherent), "type T");
+		assert_eq!(describe("type T: Clone = u8;", inherent), "type T");
+		assert_eq!(
+			describe("pub fn f();", Container::Trait),
+			"fn f receiver=None const=false async=false unsafe=false body=false"
+		);
+		assert_eq!(describe("const C<T>: u8;", Container::Trait), "const C");
+		assert_eq!(describe("pub type T;", Container::Trait), "type T");
+		assert_eq!(
+			describe("safe fn f() {}", Container::Extern),
+			"fn f receiver=None const=false async=false unsafe=false body=true"
+		);
+		assert_eq!(describe("unsafe static mut S: u8 = 1;", Container::Extern), "static S mut=true");
+		assert_eq!(describe("type T = u8;", Container::Extern), "type T");
+	}
+
+	#[test]
+	fn classifies_module_items() {
+		let module = Container::Module;
+
+		assert_eq!(
+			describe("fn f();", module),
+			"fn f receiver=None const=false async=false unsafe=false body=false"
+		);
+		assert_eq!(
+			describe("pub const unsafe extern \"C\" fn f<T: Fn(u8)>(x: T) -> u8 where T: Copy;", module),
+			"fn f receiver=None const=true async=false unsafe=true body=false"
+		);
+		assert_eq!(describe("static S: u8;", module), "static S mut=false");
+		assert_eq!(describe("static mut S = 1;", module), "static S mut=true");
+		assert_eq!(describe("const C: u8;", module), "const C");
+		assert_eq!(describe("const G<T>: u8 = 1;", module), "const G");
+		assert_eq!(describe("type T: Bound = u8;", module), "type T");
+		assert_eq!(describe("const trait T { fn f(); }", module), "trait T (1 items)");
+		assert_eq!(describe("const unsafe trait T {}", module), "trait T (0 items)");
+		assert_eq!(describe("pub impl(crate) const trait T { type A; }", module), "trait T (1 items)");
+		assert_eq!(describe("const impl T for u8 { fn f() {} }", module), "impl u8 (1 items)");
+		assert_eq!(describe("const unsafe impl T for u8 {}", module), "impl u8 (0 items)");
+		assert_eq!(describe("macro m($x:expr) { $x }", module), "macro m body=true");
+		assert_eq!(describe("pub macro m { () => {} }", module), "macro m body=true");
+		assert_eq!(describe("use {::a::b, c, ::d};", module), "use (3 elements, 2 rooted)");
+		assert_eq!(describe("use {c::d, {::std::fmt}};", module), "use (2 elements, 1 rooted)");
+		assert_eq!(
+			describe("pub use {{::a, {}, {b}}, ::c::{d, e}, {{::f as g}}};", module),
+			"use (4 elements, 3 rooted)"
+		);
+	}
+
+	fn describe(source: &str, container: Container) -> String {
+		let parts = Parts::split(&verbatim(source, container));
+
+		match classify(&parts, container) {
+			Shape::Trait(item) => format!("trait {} ({} items)", item.ident, item.items.len()),
+			Shape::TraitAlias(item) => format!("trait alias {}", item.ident),
+			Shape::Impl(item) => format!("impl {} ({} items)", item.self_ty.to_token_stream(), item.items.len()),
+			Shape::Use(elements) => {
+				let rooted = elements.iter().filter(|element| element.leading_colon.is_some()).count();
+
+				format!("use ({} elements, {rooted} rooted)", elements.len())
+			}
+
+			Shape::Fn {
+				name,
+				receiver,
+				is_const,
+				is_async,
+				is_unsafe,
+				body,
+			} => format!(
+				"fn {name} receiver={receiver:?} const={is_const} async={is_async} unsafe={is_unsafe} body={}",
+				body.is_some()
+			),
+
+			Shape::Const { name } => format!("const {name}"),
+			Shape::Static { name, mutable } => format!("static {name} mut={mutable}"),
+			Shape::Type { name } => format!("type {name}"),
+			Shape::Macro { name, body } => format!("macro {name} body={}", body.is_some()),
+			Shape::Unknown { body } => format!("unknown body={}", body.is_some()),
+		}
+	}
+
+	#[test]
+	fn falls_back_to_unknown() {
+		let parts = Parts::split(&"#[a] something weird ( x ) ;".parse().unwrap());
+
+		assert_eq!(parts.attrs.len(), 1);
+		assert!(matches!(classify(&parts, Container::Module), Shape::Unknown { body: Some(_) }));
+
+		let parts = Parts::split(&"const impl".parse().unwrap());
+
+		assert!(matches!(classify(&parts, Container::Module), Shape::Unknown { body: None }));
+		assert!(matches!(
+			classify(&Parts::split(&TokenStream::new()), Container::Trait),
+			Shape::Unknown { body: None }
+		));
+	}
 
 	/// The `Verbatim` tokens of the first item of `source` in a container.
 	fn verbatim(source: &str, container: Container) -> TokenStream {
@@ -357,99 +470,5 @@ mod tests {
 			},
 			(other, _) => panic!("not verbatim: {}", other.to_token_stream()),
 		}
-	}
-
-	fn describe(source: &str, container: Container) -> String {
-		let parts = Parts::split(&verbatim(source, container));
-
-		match classify(&parts, container) {
-			Shape::Trait(item) => format!("trait {} ({} items)", item.ident, item.items.len()),
-			Shape::TraitAlias(item) => format!("trait alias {}", item.ident),
-			Shape::Impl(item) => format!("impl {} ({} items)", item.self_ty.to_token_stream(), item.items.len()),
-			Shape::Use(elements) => {
-				let rooted = elements.iter().filter(|element| element.leading_colon.is_some()).count();
-
-				format!("use ({} elements, {rooted} rooted)", elements.len())
-			}
-
-			Shape::Fn {
-				name,
-				receiver,
-				is_const,
-				is_async,
-				is_unsafe,
-				body,
-			} => format!("fn {name} receiver={receiver:?} const={is_const} async={is_async} unsafe={is_unsafe} body={}", body.is_some()),
-
-			Shape::Const { name } => format!("const {name}"),
-			Shape::Static { name, mutable } => format!("static {name} mut={mutable}"),
-			Shape::Type { name } => format!("type {name}"),
-			Shape::Macro { name, body } => format!("macro {name} body={}", body.is_some()),
-			Shape::Unknown { body } => format!("unknown body={}", body.is_some()),
-		}
-	}
-
-	#[test]
-	fn classifies_module_items() {
-		let module = Container::Module;
-
-		assert_eq!(describe("fn f();", module), "fn f receiver=None const=false async=false unsafe=false body=false");
-		assert_eq!(
-			describe("pub const unsafe extern \"C\" fn f<T: Fn(u8)>(x: T) -> u8 where T: Copy;", module),
-			"fn f receiver=None const=true async=false unsafe=true body=false"
-		);
-		assert_eq!(describe("static S: u8;", module), "static S mut=false");
-		assert_eq!(describe("static mut S = 1;", module), "static S mut=true");
-		assert_eq!(describe("const C: u8;", module), "const C");
-		assert_eq!(describe("const G<T>: u8 = 1;", module), "const G");
-		assert_eq!(describe("type T: Bound = u8;", module), "type T");
-		assert_eq!(describe("const trait T { fn f(); }", module), "trait T (1 items)");
-		assert_eq!(describe("const unsafe trait T {}", module), "trait T (0 items)");
-		assert_eq!(describe("pub impl(crate) const trait T { type A; }", module), "trait T (1 items)");
-		assert_eq!(describe("const impl T for u8 { fn f() {} }", module), "impl u8 (1 items)");
-		assert_eq!(describe("const unsafe impl T for u8 {}", module), "impl u8 (0 items)");
-		assert_eq!(describe("macro m($x:expr) { $x }", module), "macro m body=true");
-		assert_eq!(describe("pub macro m { () => {} }", module), "macro m body=true");
-		assert_eq!(describe("use {::a::b, c, ::d};", module), "use (3 elements, 2 rooted)");
-		assert_eq!(describe("use {c::d, {::std::fmt}};", module), "use (2 elements, 1 rooted)");
-		assert_eq!(describe("pub use {{::a, {}, {b}}, ::c::{d, e}, {{::f as g}}};", module), "use (4 elements, 3 rooted)");
-	}
-
-	#[test]
-	fn classifies_associated_and_foreign_items() {
-		let inherent = Container::Impl { of_trait: false };
-
-		assert_eq!(
-			describe("fn f(&mut self);", inherent),
-			"fn f receiver=Some(Receiver { reference: true, mutable: true, typed: false }) const=false async=false unsafe=false body=false"
-		);
-
-		assert_eq!(
-			describe("default async fn f(self: Box<Self>);", inherent),
-			"fn f receiver=Some(Receiver { reference: false, mutable: false, typed: true }) const=false async=true unsafe=false body=false"
-		);
-
-		assert_eq!(describe("const C: u8;", inherent), "const C");
-		assert_eq!(describe("default type T;", inherent), "type T");
-		assert_eq!(describe("type T: Clone = u8;", inherent), "type T");
-		assert_eq!(describe("pub fn f();", Container::Trait), "fn f receiver=None const=false async=false unsafe=false body=false");
-		assert_eq!(describe("const C<T>: u8;", Container::Trait), "const C");
-		assert_eq!(describe("pub type T;", Container::Trait), "type T");
-		assert_eq!(describe("safe fn f() {}", Container::Extern), "fn f receiver=None const=false async=false unsafe=false body=true");
-		assert_eq!(describe("unsafe static mut S: u8 = 1;", Container::Extern), "static S mut=true");
-		assert_eq!(describe("type T = u8;", Container::Extern), "type T");
-	}
-
-	#[test]
-	fn falls_back_to_unknown() {
-		let parts = Parts::split(&"#[a] something weird ( x ) ;".parse().unwrap());
-
-		assert_eq!(parts.attrs.len(), 1);
-		assert!(matches!(classify(&parts, Container::Module), Shape::Unknown { body: Some(_) }));
-
-		let parts = Parts::split(&"const impl".parse().unwrap());
-
-		assert!(matches!(classify(&parts, Container::Module), Shape::Unknown { body: None }));
-		assert!(matches!(classify(&Parts::split(&TokenStream::new()), Container::Trait), Shape::Unknown { body: None }));
 	}
 }

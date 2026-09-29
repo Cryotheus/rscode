@@ -36,19 +36,6 @@ impl Level {
 	}
 }
 
-/// A `level: message` line, with the label colored like cargo's.
-pub(crate) fn format_message(level: Level, message: &str, color: bool) -> String {
-	let label = level.label();
-
-	if color {
-		let style = level.style();
-
-		format!("{style}{label}{style:#}: {message}")
-	} else {
-		format!("{label}: {message}")
-	}
-}
-
 /// Verbosity and colors of the stderr output (`-q`, `-v`, `--color`).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Ui {
@@ -67,16 +54,6 @@ impl Ui {
 		}
 	}
 
-	/// `-q`: only errors (and results) are printed.
-	pub(crate) fn quiet(&self) -> bool {
-		self.quiet
-	}
-
-	/// The number of `-v`s.
-	pub(crate) fn verbose(&self) -> u32 {
-		self.verbose
-	}
-
 	pub(crate) fn error(&self, message: impl Display) {
 		self.write(&format_message(Level::Error, &message.to_string(), self.color));
 	}
@@ -88,12 +65,13 @@ impl Ui {
 		}
 	}
 
-	pub(crate) fn warn(&self, message: impl Display) {
-		self.message(Level::Warning, message);
-	}
-
 	pub(crate) fn note(&self, message: impl Display) {
 		self.message(Level::Note, message);
+	}
+
+	/// `-q`: only errors (and results) are printed.
+	pub(crate) fn quiet(&self) -> bool {
+		self.quiet
 	}
 
 	/// Plain status lines on stderr (nothing with `-q`), for summaries that must not mix with results on stdout.
@@ -103,10 +81,40 @@ impl Ui {
 		}
 	}
 
+	/// The number of `-v`s.
+	pub(crate) fn verbose(&self) -> u32 {
+		self.verbose
+	}
+
+	pub(crate) fn warn(&self, message: impl Display) {
+		self.message(Level::Warning, message);
+	}
+
 	fn write(&self, line: &str) {
 		// nothing sensible is left to do when stderr is gone
 		let _ = writeln!(std::io::stderr().lock(), "{line}");
 	}
+}
+
+/// A `level: message` line, with the label colored like cargo's.
+pub(crate) fn format_message(level: Level, message: &str, color: bool) -> String {
+	let label = level.label();
+
+	if color {
+		let style = level.style();
+
+		format!("{style}{label}{style:#}: {message}")
+	} else {
+		format!("{label}: {message}")
+	}
+}
+
+/// Writes results to stdout.
+///
+/// When stdout is a pipe that was closed (`cargo rscode find x | head -1`), the results are dropped: the reader
+/// wanted no more, and the command still ends with its own exit code (`fmt --check` fails when files would change).
+pub(crate) fn print(text: &str) -> anyhow::Result<()> {
+	write_results(&mut std::io::stdout().lock(), text).context("failed to write to stdout")
 }
 
 /// Whether to color stderr: `--color`, else cargo's `CARGO_TERM_COLOR`, else when stderr is a terminal and
@@ -121,14 +129,6 @@ fn stderr_color(choice: Option<&str>) -> bool {
 	}
 }
 
-/// Writes results to stdout.
-///
-/// When stdout is a pipe that was closed (`cargo rscode find x | head -1`), the results are dropped: the reader
-/// wanted no more, and the command still ends with its own exit code (`fmt --check` fails when files would change).
-pub(crate) fn print(text: &str) -> anyhow::Result<()> {
-	write_results(&mut std::io::stdout().lock(), text).context("failed to write to stdout")
-}
-
 /// Writes and flushes `text`, taking a closed pipe for success (see [`print`]).
 fn write_results(out: &mut impl Write, text: &str) -> std::io::Result<()> {
 	match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
@@ -141,40 +141,6 @@ fn write_results(out: &mut impl Write, text: &str) -> std::io::Result<()> {
 mod tests {
 	use super::*;
 
-	#[test]
-	fn formats_messages() {
-		assert_eq!(format_message(Level::Error, "oops", false), "error: oops");
-		assert_eq!(format_message(Level::Warning, "hmm", false), "warning: hmm");
-		assert_eq!(format_message(Level::Note, "fyi", false), "note: fyi");
-
-		let colored = format_message(Level::Error, "oops", true);
-
-		assert!(colored.starts_with('\u{1b}'), "{colored:?}");
-		assert!(colored.contains("error\u{1b}[0m: oops"), "{colored:?}");
-	}
-
-	#[test]
-	fn color_choice() {
-		assert!(stderr_color(Some("always")));
-		assert!(stderr_color(Some("ALWAYS")));
-		assert!(!stderr_color(Some("never")));
-	}
-
-	#[test]
-	fn reads_verbosity_from_the_arguments() {
-		let matches =
-			crate::cli::cli().try_get_matches_from(["cargo-rscode", "view", "x", "-vv", "--color", "never"]).unwrap();
-		let ui = Ui::new(matches.subcommand().unwrap().1);
-
-		assert_eq!(ui.verbose(), 2);
-		assert!(!ui.quiet());
-		assert!(!ui.color);
-
-		let matches = crate::cli::cli().try_get_matches_from(["cargo-rscode", "view", "x", "-q"]).unwrap();
-
-		assert!(Ui::new(matches.subcommand().unwrap().1).quiet());
-	}
-
 	/// A writer that accepts `capacity` bytes, then fails like a pipe whose reader is gone, or with `error`.
 	struct Pipe {
 		written: Vec<u8>,
@@ -183,6 +149,10 @@ mod tests {
 	}
 
 	impl Write for Pipe {
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+
 		fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
 			let room = self.capacity - self.written.len();
 
@@ -195,27 +165,6 @@ mod tests {
 			self.written.extend_from_slice(&bytes[..count]);
 			Ok(count)
 		}
-
-		fn flush(&mut self) -> std::io::Result<()> {
-			Ok(())
-		}
-	}
-
-	fn pipe(capacity: usize, error: ErrorKind) -> Pipe {
-		Pipe {
-			written: Vec::new(),
-			capacity,
-			error,
-		}
-	}
-
-	#[test]
-	fn writes_results() {
-		let mut out = pipe(100, ErrorKind::BrokenPipe);
-
-		write_results(&mut out, "a\n").unwrap();
-		write_results(&mut out, "b\n").unwrap();
-		assert_eq!(out.written, b"a\nb\n");
 	}
 
 	#[test]
@@ -230,10 +179,62 @@ mod tests {
 	}
 
 	#[test]
+	fn color_choice() {
+		assert!(stderr_color(Some("always")));
+		assert!(stderr_color(Some("ALWAYS")));
+		assert!(!stderr_color(Some("never")));
+	}
+
+	#[test]
+	fn formats_messages() {
+		assert_eq!(format_message(Level::Error, "oops", false), "error: oops");
+		assert_eq!(format_message(Level::Warning, "hmm", false), "warning: hmm");
+		assert_eq!(format_message(Level::Note, "fyi", false), "note: fyi");
+
+		let colored = format_message(Level::Error, "oops", true);
+
+		assert!(colored.starts_with('\u{1b}'), "{colored:?}");
+		assert!(colored.contains("error\u{1b}[0m: oops"), "{colored:?}");
+	}
+
+	#[test]
 	fn other_write_errors_are_errors() {
 		let mut out = pipe(0, ErrorKind::StorageFull);
 		let error = write_results(&mut out, "x").unwrap_err();
 
 		assert_eq!(error.kind(), ErrorKind::StorageFull);
+	}
+
+	fn pipe(capacity: usize, error: ErrorKind) -> Pipe {
+		Pipe {
+			written: Vec::new(),
+			capacity,
+			error,
+		}
+	}
+
+	#[test]
+	fn reads_verbosity_from_the_arguments() {
+		let matches = crate::cli::cli()
+			.try_get_matches_from(["cargo-rscode", "view", "x", "-vv", "--color", "never"])
+			.unwrap();
+		let ui = Ui::new(matches.subcommand().unwrap().1);
+
+		assert_eq!(ui.verbose(), 2);
+		assert!(!ui.quiet());
+		assert!(!ui.color);
+
+		let matches = crate::cli::cli().try_get_matches_from(["cargo-rscode", "view", "x", "-q"]).unwrap();
+
+		assert!(Ui::new(matches.subcommand().unwrap().1).quiet());
+	}
+
+	#[test]
+	fn writes_results() {
+		let mut out = pipe(100, ErrorKind::BrokenPipe);
+
+		write_results(&mut out, "a\n").unwrap();
+		write_results(&mut out, "b\n").unwrap();
+		assert_eq!(out.written, b"a\nb\n");
 	}
 }

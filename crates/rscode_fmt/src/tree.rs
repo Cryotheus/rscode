@@ -11,6 +11,28 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use syn::spanned::Spanned;
 
+/// An item of a parsed file, with its position.
+#[derive(Debug, Clone)]
+pub(crate) struct Indexed<'a> {
+	/// The structural index path.
+	pub(crate) path: Vec<usize>,
+
+	/// The byte range in the parsed text.
+	pub(crate) range: Range<usize>,
+
+	pub(crate) node: Node<'a>,
+}
+
+/// Why two lists of sibling items do not correspond (see [`align`]).
+#[derive(Debug)]
+pub(crate) enum Misalignment<'a> {
+	/// The items are not the same items in the same order.
+	Changed,
+
+	/// A reorderable item has no counterpart.
+	Missing(Node<'a>),
+}
+
 /// An item at any nesting level.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Node<'a> {
@@ -21,11 +43,6 @@ pub(crate) enum Node<'a> {
 }
 
 impl<'a> Node<'a> {
-	/// The items at the root of a file.
-	pub(crate) fn roots(file: &'a syn::File) -> Vec<Self> {
-		file.items.iter().map(Node::Item).collect()
-	}
-
 	/// The node at a structural index path: `[4, 2]` is the 3rd item inside the 5th top-level item.
 	pub(crate) fn at(file: &'a syn::File, path: &[usize]) -> Option<Self> {
 		let (&first, rest) = path.split_first()?;
@@ -38,13 +55,19 @@ impl<'a> Node<'a> {
 		Some(node)
 	}
 
-	/// The span of the whole item, from its first outer attribute (or doc comment) to its last token.
-	pub(crate) fn span(self) -> Span {
+	/// The items at the root of a file.
+	pub(crate) fn roots(file: &'a syn::File) -> Vec<Self> {
+		file.items.iter().map(Node::Item).collect()
+	}
+
+	/// The item at `index` directly inside this item.
+	pub(crate) fn child(self, index: usize) -> Option<Self> {
 		match self {
-			Self::Item(item) => item.span(),
-			Self::ImplItem(item) => item.span(),
-			Self::TraitItem(item) => item.span(),
-			Self::ForeignItem(item) => item.span(),
+			Self::Item(syn::Item::Mod(module)) => module.content.as_ref()?.1.get(index).map(Node::Item),
+			Self::Item(syn::Item::Impl(block)) => block.items.get(index).map(Node::ImplItem),
+			Self::Item(syn::Item::Trait(definition)) => definition.items.get(index).map(Node::TraitItem),
+			Self::Item(syn::Item::ForeignMod(block)) => block.items.get(index).map(Node::ForeignItem),
+			_ => None,
 		}
 	}
 
@@ -62,24 +85,11 @@ impl<'a> Node<'a> {
 		}
 	}
 
-	/// The item at `index` directly inside this item.
-	pub(crate) fn child(self, index: usize) -> Option<Self> {
-		match self {
-			Self::Item(syn::Item::Mod(module)) => module.content.as_ref()?.1.get(index).map(Node::Item),
-			Self::Item(syn::Item::Impl(block)) => block.items.get(index).map(Node::ImplItem),
-			Self::Item(syn::Item::Trait(definition)) => definition.items.get(index).map(Node::TraitItem),
-			Self::Item(syn::Item::ForeignMod(block)) => block.items.get(index).map(Node::ForeignItem),
-			_ => None,
-		}
-	}
-
-	/// Whether this item contains items that can be sorted: an inline module, an `impl` block, a trait, or an
-	/// `extern` block.
-	pub(crate) fn is_container(self) -> bool {
-		match self {
-			Self::Item(syn::Item::Mod(module)) => module.content.is_some(),
-			Self::Item(syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::ForeignMod(_)) => true,
-			_ => false,
+	/// `kind` and `name` for messages, such as ``fn `main` ``.
+	pub(crate) fn describe(self) -> String {
+		match self.name() {
+			Some(name) => format!("{} `{name}`", self.kind()),
+			None => self.kind().to_owned(),
 		}
 	}
 
@@ -95,7 +105,14 @@ impl<'a> Node<'a> {
 			}
 
 			Self::Item(syn::Item::Impl(block)) => {
-				let syn::ItemImpl { attrs, unsafety, generics, trait_, self_ty, .. } = block;
+				let syn::ItemImpl {
+					attrs,
+					unsafety,
+					generics,
+					trait_,
+					self_ty,
+					..
+				} = block;
 				let where_clause = &generics.where_clause;
 				let trait_ = trait_.as_ref().map(|(path, _)| quote!(#path for));
 
@@ -103,7 +120,15 @@ impl<'a> Node<'a> {
 			}
 
 			Self::Item(syn::Item::Trait(item)) => {
-				let syn::ItemTrait { attrs, vis, unsafety, ident, generics, supertraits, .. } = item;
+				let syn::ItemTrait {
+					attrs,
+					vis,
+					unsafety,
+					ident,
+					generics,
+					supertraits,
+					..
+				} = item;
 				let where_clause = &generics.where_clause;
 
 				quote!(#(#attrs)* #vis #unsafety trait #ident #generics : #supertraits #where_clause)
@@ -119,6 +144,59 @@ impl<'a> Node<'a> {
 		};
 
 		tokens.to_string()
+	}
+
+	/// What identifies a reorderable item (see [`Node::is_reorderable`]) wherever rustfmt moves it: its attributes,
+	/// visibility, and what it imports. rustfmt's normalizations of import lists (sorting, removing redundant braces
+	/// and renames, removing duplicates) and of visibilities (`pub(in crate)` to `pub(crate)`) do not change it.
+	pub(crate) fn identity(self) -> Option<String> {
+		match self {
+			Self::Item(syn::Item::Use(item)) => {
+				let mut leaves = Vec::new();
+				let prefix = if item.leading_colon.is_some() { "::" } else { "" };
+
+				flatten_use_tree(prefix.to_owned(), &item.tree, &mut leaves);
+				leaves.sort_unstable();
+				leaves.dedup();
+
+				Some(format!("{} {} use {}", attributes(&item.attrs), visibility(&item.vis), leaves.join(", ")))
+			}
+			Self::Item(syn::Item::ExternCrate(item)) => {
+				let rename = match &item.rename {
+					Some((_, rename)) if *rename != item.ident => format!(" as {rename}"),
+					_ => String::new(),
+				};
+
+				Some(format!(
+					"{} {} extern crate {}{rename}",
+					attributes(&item.attrs),
+					visibility(&item.vis),
+					item.ident
+				))
+			}
+			_ => None,
+		}
+	}
+
+	/// Whether this is a `use` item that imports nothing, such as `use a::{};`, which rustfmt may remove.
+	pub(crate) fn imports_nothing(self) -> bool {
+		matches!(self, Self::Item(syn::Item::Use(item)) if imports_nothing(&item.tree))
+	}
+
+	/// Whether this item contains items that can be sorted: an inline module, an `impl` block, a trait, or an
+	/// `extern` block.
+	pub(crate) fn is_container(self) -> bool {
+		match self {
+			Self::Item(syn::Item::Mod(module)) => module.content.is_some(),
+			Self::Item(syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::ForeignMod(_)) => true,
+			_ => false,
+		}
+	}
+
+	/// Whether rustfmt may reorder this item among its neighbors of the same kind: `use` and `extern crate` items
+	/// (with its `reorder_imports` option, on by default).
+	pub(crate) fn is_reorderable(self) -> bool {
+		matches!(self, Self::Item(syn::Item::Use(_) | syn::Item::ExternCrate(_)))
 	}
 
 	/// A short description of the kind of item, for comparisons and messages.
@@ -181,61 +259,15 @@ impl<'a> Node<'a> {
 		}
 	}
 
-	/// `kind` and `name` for messages, such as ``fn `main` ``.
-	pub(crate) fn describe(self) -> String {
-		match self.name() {
-			Some(name) => format!("{} `{name}`", self.kind()),
-			None => self.kind().to_owned(),
-		}
-	}
-
-	/// Whether rustfmt may reorder this item among its neighbors of the same kind: `use` and `extern crate` items
-	/// (with its `reorder_imports` option, on by default).
-	pub(crate) fn is_reorderable(self) -> bool {
-		matches!(self, Self::Item(syn::Item::Use(_) | syn::Item::ExternCrate(_)))
-	}
-
-	/// Whether this is a `use` item that imports nothing, such as `use a::{};`, which rustfmt may remove.
-	pub(crate) fn imports_nothing(self) -> bool {
-		matches!(self, Self::Item(syn::Item::Use(item)) if imports_nothing(&item.tree))
-	}
-
-	/// What identifies a reorderable item (see [`Node::is_reorderable`]) wherever rustfmt moves it: its attributes,
-	/// visibility, and what it imports. rustfmt's normalizations of import lists (sorting, removing redundant braces
-	/// and renames, removing duplicates) and of visibilities (`pub(in crate)` to `pub(crate)`) do not change it.
-	pub(crate) fn identity(self) -> Option<String> {
+	/// The span of the whole item, from its first outer attribute (or doc comment) to its last token.
+	pub(crate) fn span(self) -> Span {
 		match self {
-			Self::Item(syn::Item::Use(item)) => {
-				let mut leaves = Vec::new();
-				let prefix = if item.leading_colon.is_some() { "::" } else { "" };
-
-				flatten_use_tree(prefix.to_owned(), &item.tree, &mut leaves);
-				leaves.sort_unstable();
-				leaves.dedup();
-
-				Some(format!("{} {} use {}", attributes(&item.attrs), visibility(&item.vis), leaves.join(", ")))
-			}
-			Self::Item(syn::Item::ExternCrate(item)) => {
-				let rename = match &item.rename {
-					Some((_, rename)) if *rename != item.ident => format!(" as {rename}"),
-					_ => String::new(),
-				};
-
-				Some(format!("{} {} extern crate {}{rename}", attributes(&item.attrs), visibility(&item.vis), item.ident))
-			}
-			_ => None,
+			Self::Item(item) => item.span(),
+			Self::ImplItem(item) => item.span(),
+			Self::TraitItem(item) => item.span(),
+			Self::ForeignItem(item) => item.span(),
 		}
 	}
-}
-
-/// Why two lists of sibling items do not correspond (see [`align`]).
-#[derive(Debug)]
-pub(crate) enum Misalignment<'a> {
-	/// The items are not the same items in the same order.
-	Changed,
-
-	/// A reorderable item has no counterpart.
-	Missing(Node<'a>),
 }
 
 /// Maps each item of a list of sibling items to the corresponding item of another list: `alignment[i]` is the index
@@ -247,7 +279,12 @@ pub(crate) enum Misalignment<'a> {
 /// item of an identity in `a` with the n-th in `b`.
 pub(crate) fn align<'a>(a: &[Node<'a>], b: &[Node<'_>]) -> Result<Vec<Option<usize>>, Misalignment<'a>> {
 	let kept = |nodes: &[Node<'_>]| -> Vec<usize> {
-		nodes.iter().enumerate().filter(|(_, node)| !node.imports_nothing()).map(|(index, _)| index).collect()
+		nodes
+			.iter()
+			.enumerate()
+			.filter(|(_, node)| !node.imports_nothing())
+			.map(|(index, _)| index)
+			.collect()
 	};
 	let kept_a = kept(a);
 	let kept_b = kept(b);
@@ -292,50 +329,20 @@ pub(crate) fn align<'a>(a: &[Node<'a>], b: &[Node<'_>]) -> Result<Vec<Option<usi
 	Ok(alignment)
 }
 
-/// Whether the items inside two items correspond (see [`align`]) at every level.
-pub(crate) fn same_subtree(a: Node<'_>, b: Node<'_>) -> bool {
-	let a = a.children();
-	let b = b.children();
-
-	match align(&a, &b) {
-		// reorderable items have no children
-		Ok(alignment) => alignment.iter().zip(&a).all(|(found, &node)| match found {
-			Some(index) => node.is_reorderable() || same_subtree(node, b[*index]),
-			None => true,
-		}),
-		Err(_) => false,
-	}
+fn attributes(attributes: &[syn::Attribute]) -> String {
+	attributes.iter().map(tokens).collect::<Vec<_>>().join(" ")
 }
 
 /// Writes `pub(in crate)`, `pub(in self)`, and `pub(in super)` as `pub(crate)`, `pub(self)`, and `pub(super)`, as
 /// rustfmt does.
 pub(crate) fn drop_redundant_in(restricted: &mut syn::VisRestricted) {
-	let keyword = restricted.path.get_ident().is_some_and(|ident| ident == "crate" || ident == "self" || ident == "super");
+	let keyword = restricted
+		.path
+		.get_ident()
+		.is_some_and(|ident| ident == "crate" || ident == "self" || ident == "super");
 
 	if keyword {
 		restricted.in_token = None;
-	}
-}
-
-/// The tokens of a visibility as text, normalized like rustfmt does (see [`drop_redundant_in`]).
-fn visibility(visibility: &syn::Visibility) -> String {
-	match visibility {
-		syn::Visibility::Restricted(restricted) if restricted.in_token.is_some() => {
-			let mut restricted = restricted.clone();
-
-			drop_redundant_in(&mut restricted);
-			tokens(&syn::Visibility::Restricted(restricted))
-		}
-		_ => tokens(visibility),
-	}
-}
-
-/// Whether a use tree imports nothing, such as `a::{}` or `a::{b::{}}`.
-fn imports_nothing(tree: &syn::UseTree) -> bool {
-	match tree {
-		syn::UseTree::Path(path) => imports_nothing(&path.tree),
-		syn::UseTree::Name(_) | syn::UseTree::Rename(_) | syn::UseTree::Glob(_) => false,
-		syn::UseTree::Group(group) => group.items.iter().all(imports_nothing),
 	}
 }
 
@@ -356,25 +363,22 @@ fn flatten_use_tree(prefix: String, tree: &syn::UseTree, leaves: &mut Vec<String
 	}
 }
 
-/// The tokens of syntax as text, ignoring whitespace and comments.
-fn tokens(node: &impl quote::ToTokens) -> String {
-	node.to_token_stream().to_string()
+fn impl_name(item: &syn::ItemImpl) -> String {
+	let self_name = type_name(&item.self_ty).unwrap_or_else(|| "_".to_owned());
+
+	match item.trait_.as_ref().and_then(|(path, _)| path.segments.last()) {
+		Some(segment) => format!("{} for {self_name}", segment.ident),
+		None => self_name,
+	}
 }
 
-fn attributes(attributes: &[syn::Attribute]) -> String {
-	attributes.iter().map(tokens).collect::<Vec<_>>().join(" ")
-}
-
-/// An item of a parsed file, with its position.
-#[derive(Debug, Clone)]
-pub(crate) struct Indexed<'a> {
-	/// The structural index path.
-	pub(crate) path: Vec<usize>,
-
-	/// The byte range in the parsed text.
-	pub(crate) range: Range<usize>,
-
-	pub(crate) node: Node<'a>,
+/// Whether a use tree imports nothing, such as `a::{}` or `a::{b::{}}`.
+fn imports_nothing(tree: &syn::UseTree) -> bool {
+	match tree {
+		syn::UseTree::Path(path) => imports_nothing(&path.tree),
+		syn::UseTree::Name(_) | syn::UseTree::Rename(_) | syn::UseTree::Glob(_) => false,
+		syn::UseTree::Group(group) => group.items.iter().all(imports_nothing),
+	}
 }
 
 /// Every item of a parsed file at every nesting level, in document order.
@@ -382,8 +386,12 @@ pub(crate) struct Indexed<'a> {
 /// Spans are computed once per item: computing a span converts the whole item to tokens.
 pub(crate) fn index<'a>(parsed: &'a Parsed) -> Vec<Indexed<'a>> {
 	let mut items = Vec::new();
-	let mut stack: Vec<(Vec<usize>, Node<'a>)> =
-		Node::roots(&parsed.file).into_iter().enumerate().rev().map(|(index, node)| (vec![index], node)).collect();
+	let mut stack: Vec<(Vec<usize>, Node<'a>)> = Node::roots(&parsed.file)
+		.into_iter()
+		.enumerate()
+		.rev()
+		.map(|(index, node)| (vec![index], node))
+		.collect();
 
 	while let Some((path, node)) = stack.pop() {
 		for (index, child) in node.children().into_iter().enumerate().rev() {
@@ -448,13 +456,28 @@ fn item_name(item: &syn::Item) -> Option<String> {
 	}
 }
 
-fn impl_name(item: &syn::ItemImpl) -> String {
-	let self_name = type_name(&item.self_ty).unwrap_or_else(|| "_".to_owned());
+fn macro_name(mac: &syn::Macro) -> Option<String> {
+	mac.path.segments.last().map(|segment| format!("{}!", segment.ident))
+}
 
-	match item.trait_.as_ref().and_then(|(path, _)| path.segments.last()) {
-		Some(segment) => format!("{} for {self_name}", segment.ident),
-		None => self_name,
+/// Whether the items inside two items correspond (see [`align`]) at every level.
+pub(crate) fn same_subtree(a: Node<'_>, b: Node<'_>) -> bool {
+	let a = a.children();
+	let b = b.children();
+
+	match align(&a, &b) {
+		// reorderable items have no children
+		Ok(alignment) => alignment.iter().zip(&a).all(|(found, &node)| match found {
+			Some(index) => node.is_reorderable() || same_subtree(node, b[*index]),
+			None => true,
+		}),
+		Err(_) => false,
 	}
+}
+
+/// The tokens of syntax as text, ignoring whitespace and comments.
+fn tokens(node: &impl quote::ToTokens) -> String {
+	node.to_token_stream().to_string()
 }
 
 /// The last identifier of a path type, looking through references, pointers, parentheses, and groups.
@@ -469,8 +492,17 @@ fn type_name(ty: &syn::Type) -> Option<String> {
 	}
 }
 
-fn macro_name(mac: &syn::Macro) -> Option<String> {
-	mac.path.segments.last().map(|segment| format!("{}!", segment.ident))
+/// The tokens of a visibility as text, normalized like rustfmt does (see [`drop_redundant_in`]).
+fn visibility(visibility: &syn::Visibility) -> String {
+	match visibility {
+		syn::Visibility::Restricted(restricted) if restricted.in_token.is_some() => {
+			let mut restricted = restricted.clone();
+
+			drop_redundant_in(&mut restricted);
+			tokens(&syn::Visibility::Restricted(restricted))
+		}
+		_ => tokens(visibility),
+	}
 }
 
 #[cfg(test)]
@@ -514,12 +546,51 @@ macro_rules! mac {
 mac!();
 ";
 
-	fn parse() -> Parsed {
-		Parsed::parse(SOURCE).unwrap()
+	#[test]
+	fn aligns_siblings() {
+		let a = Parsed::parse("use b;\nuse a::{};\nuse a;\nuse b;\nfn f() {}\n").unwrap();
+		let b = Parsed::parse("use a;\nuse b;\nuse b;\nfn f() {}\n").unwrap();
+		let alignment = align(&Node::roots(&a.file), &Node::roots(&b.file)).unwrap();
+
+		assert_eq!(alignment, [Some(1), None, Some(0), Some(2), Some(3)]);
+
+		let renamed = Parsed::parse("use a;\nuse b;\nuse b;\nfn g() {}\n").unwrap();
+		let changed_import = Parsed::parse("use a;\nuse b;\nuse c;\nfn f() {}\n").unwrap();
+
+		assert!(matches!(
+			align(&Node::roots(&a.file), &Node::roots(&renamed.file)),
+			Err(Misalignment::Changed)
+		));
+		assert!(matches!(
+			align(&Node::roots(&a.file), &Node::roots(&changed_import.file)),
+			Err(Misalignment::Missing(_))
+		));
 	}
 
-	fn start_of(needle: &str) -> usize {
-		SOURCE.find(needle).unwrap()
+	#[test]
+	fn containers() {
+		let parsed = parse();
+		let container = |path: &[usize]| Node::at(&parsed.file, path).unwrap().is_container();
+
+		assert!(!container(&[0]));
+		assert!(!container(&[1]));
+		assert!(container(&[2]));
+		assert!(container(&[3]));
+		assert!(container(&[3, 0]));
+		assert!(container(&[3, 1]));
+		assert!(!container(&[3, 2]));
+		assert!(!container(&[4]));
+		assert!(Node::at(&parsed.file, &[3, 2, 0]).is_none());
+		assert!(Node::at(&parsed.file, &[]).is_none());
+		assert!(Node::at(&parsed.file, &[99]).is_none());
+	}
+
+	#[test]
+	fn describe() {
+		let parsed = parse();
+
+		assert_eq!(Node::at(&parsed.file, &[1]).unwrap().describe(), "struct `Foo`");
+		assert_eq!(Node::at(&parsed.file, &[0]).unwrap().describe(), "use");
 	}
 
 	fn find(parsed: &Parsed, start: usize) -> Option<Indexed<'_>> {
@@ -566,43 +637,11 @@ mac!();
 	}
 
 	#[test]
-	fn rejects_offsets_that_are_not_item_starts() {
-		let parsed = parse();
-
-		for offset in [start_of("#[derive"), start_of("struct Foo"), start_of("Ok(())"), start_of("C\""), SOURCE.len(), 10_000] {
-			assert!(find(&parsed, offset).is_none(), "{offset}");
-		}
-	}
-
-	#[test]
-	fn item_ranges_include_attributes_and_docs() {
-		let parsed = parse();
-		let item = find(&parsed, start_of("/// Docs.")).unwrap();
-
-		assert_eq!(&SOURCE[item.range], "/// Docs.\n#[derive(Debug)]\nstruct Foo;");
-	}
-
-	#[test]
-	fn containers() {
-		let parsed = parse();
-		let container = |path: &[usize]| Node::at(&parsed.file, path).unwrap().is_container();
-
-		assert!(!container(&[0]));
-		assert!(!container(&[1]));
-		assert!(container(&[2]));
-		assert!(container(&[3]));
-		assert!(container(&[3, 0]));
-		assert!(container(&[3, 1]));
-		assert!(!container(&[3, 2]));
-		assert!(!container(&[4]));
-		assert!(Node::at(&parsed.file, &[3, 2, 0]).is_none());
-		assert!(Node::at(&parsed.file, &[]).is_none());
-		assert!(Node::at(&parsed.file, &[99]).is_none());
-	}
-
-	#[test]
 	fn identities_normalize_visibilities() {
-		let parsed = Parsed::parse("pub(in crate) use a;\npub(crate) use a;\npub(in crate::m) use a;\npub(in self) extern crate b;\npub(self) extern crate b;\n").unwrap();
+		let parsed = Parsed::parse(
+			"pub(in crate) use a;\npub(crate) use a;\npub(in crate::m) use a;\npub(in self) extern crate b;\npub(self) extern crate b;\n",
+		)
+		.unwrap();
 		let identity = |index: usize| Node::at(&parsed.file, &[index]).unwrap().identity().unwrap();
 
 		assert_eq!(identity(0), identity(1));
@@ -619,25 +658,34 @@ mac!();
 	}
 
 	#[test]
-	fn aligns_siblings() {
-		let a = Parsed::parse("use b;\nuse a::{};\nuse a;\nuse b;\nfn f() {}\n").unwrap();
-		let b = Parsed::parse("use a;\nuse b;\nuse b;\nfn f() {}\n").unwrap();
-		let alignment = align(&Node::roots(&a.file), &Node::roots(&b.file)).unwrap();
+	fn item_ranges_include_attributes_and_docs() {
+		let parsed = parse();
+		let item = find(&parsed, start_of("/// Docs.")).unwrap();
 
-		assert_eq!(alignment, [Some(1), None, Some(0), Some(2), Some(3)]);
+		assert_eq!(&SOURCE[item.range], "/// Docs.\n#[derive(Debug)]\nstruct Foo;");
+	}
 
-		let renamed = Parsed::parse("use a;\nuse b;\nuse b;\nfn g() {}\n").unwrap();
-		let changed_import = Parsed::parse("use a;\nuse b;\nuse c;\nfn f() {}\n").unwrap();
-
-		assert!(matches!(align(&Node::roots(&a.file), &Node::roots(&renamed.file)), Err(Misalignment::Changed)));
-		assert!(matches!(align(&Node::roots(&a.file), &Node::roots(&changed_import.file)), Err(Misalignment::Missing(_))));
+	fn parse() -> Parsed {
+		Parsed::parse(SOURCE).unwrap()
 	}
 
 	#[test]
-	fn describe() {
+	fn rejects_offsets_that_are_not_item_starts() {
 		let parsed = parse();
 
-		assert_eq!(Node::at(&parsed.file, &[1]).unwrap().describe(), "struct `Foo`");
-		assert_eq!(Node::at(&parsed.file, &[0]).unwrap().describe(), "use");
+		for offset in [
+			start_of("#[derive"),
+			start_of("struct Foo"),
+			start_of("Ok(())"),
+			start_of("C\""),
+			SOURCE.len(),
+			10_000,
+		] {
+			assert!(find(&parsed, offset).is_none(), "{offset}");
+		}
+	}
+
+	fn start_of(needle: &str) -> usize {
+		SOURCE.find(needle).unwrap()
 	}
 }

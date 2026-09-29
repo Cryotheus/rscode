@@ -60,6 +60,42 @@ impl ImplIndex {
 	}
 }
 
+/// Associated items reachable as `Owner::name`: for types, the items of their inherent `impl`s, then of their trait
+/// `impl`s (each in item order); for traits, their own items.
+pub(super) fn assoc_index(ws: &Workspace, impls: &ImplIndex) -> FxHashMap<ItemId, Vec<ItemId>> {
+	let mut inherent: FxHashMap<ItemId, Vec<ItemId>> = FxHashMap::default();
+	let mut from_traits: FxHashMap<ItemId, Vec<ItemId>> = FxHashMap::default();
+
+	for &impl_block in &impls.all {
+		let is_trait_impl = ws.item(impl_block).impl_info().is_some_and(|info| info.trait_path.is_some());
+
+		for &owner in impls.self_types(impl_block) {
+			// `impl dyn Trait` items are not reachable as `Trait::name`
+			if ws.item(owner).kind == ItemKind::Trait {
+				continue;
+			}
+
+			let items = if is_trait_impl { &mut from_traits } else { &mut inherent };
+
+			items.entry(owner).or_default().extend(named_assoc_items(ws, impl_block));
+		}
+	}
+
+	for (owner, items) in from_traits {
+		inherent.entry(owner).or_default().extend(items);
+	}
+
+	for krate in ws.crates() {
+		for (id, data) in krate.items() {
+			if data.kind == ItemKind::Trait {
+				inherent.insert(id, named_assoc_items(ws, id).collect());
+			}
+		}
+	}
+
+	inherent
+}
+
 /// Resolves the self type and trait of every `impl` block (after imports are resolved).
 pub(super) fn build(ws: &Workspace, tables: &Tables) -> ImplIndex {
 	let mut index = ImplIndex::default();
@@ -107,95 +143,6 @@ pub(super) fn build(ws: &Workspace, tables: &Tables) -> ImplIndex {
 	index
 }
 
-fn resolve_type(walker: &mut Walker<'_>, path: &PathRef) -> Vec<Res> {
-	walker.resolve(path, Want::One(Namespace::Type)).into_iter().map(|found| found.res).collect()
-}
-
-fn loaded(ws: &Workspace, res: &[Res], kinds: &[ItemKind]) -> Vec<ItemId> {
-	res.iter()
-		.filter_map(|res| match res {
-			Res::Item(id) if kinds.contains(&ws.item(*id).kind) => Some(*id),
-			_ => None,
-		})
-		.collect()
-}
-
-fn starts_with_generic(path: &PathRef, generics: &[&str]) -> bool {
-	!path.leading_colon && path.segments.first().is_some_and(|segment| generics.contains(&segment.name.as_str()))
-}
-
-/// Associated items reachable as `Owner::name`: for types, the items of their inherent `impl`s, then of their trait
-/// `impl`s (each in item order); for traits, their own items.
-pub(super) fn assoc_index(ws: &Workspace, impls: &ImplIndex) -> FxHashMap<ItemId, Vec<ItemId>> {
-	let mut inherent: FxHashMap<ItemId, Vec<ItemId>> = FxHashMap::default();
-	let mut from_traits: FxHashMap<ItemId, Vec<ItemId>> = FxHashMap::default();
-
-	for &impl_block in &impls.all {
-		let is_trait_impl = ws.item(impl_block).impl_info().is_some_and(|info| info.trait_path.is_some());
-
-		for &owner in impls.self_types(impl_block) {
-			// `impl dyn Trait` items are not reachable as `Trait::name`
-			if ws.item(owner).kind == ItemKind::Trait {
-				continue;
-			}
-
-			let items = if is_trait_impl { &mut from_traits } else { &mut inherent };
-
-			items.entry(owner).or_default().extend(named_assoc_items(ws, impl_block));
-		}
-	}
-
-	for (owner, items) in from_traits {
-		inherent.entry(owner).or_default().extend(items);
-	}
-
-	for krate in ws.crates() {
-		for (id, data) in krate.items() {
-			if data.kind == ItemKind::Trait {
-				inherent.insert(id, named_assoc_items(ws, id).collect());
-			}
-		}
-	}
-
-	inherent
-}
-
-/// The named associated items of an `impl` block or trait, in source order.
-pub(super) fn named_assoc_items(ws: &Workspace, container: ItemId) -> impl Iterator<Item = ItemId> + '_ {
-	ws.children(container).filter(|&child| {
-		let data = ws.item(child);
-
-		data.kind.is_associated() && data.name.is_some()
-	})
-}
-
-/// Names of the type and const generic parameters of an `impl` block (`impl<'a, T: Tr, const N: usize>` → `T`, `N`).
-fn generic_params(ws: &Workspace, impl_block: ItemId) -> Vec<&str> {
-	let data = ws.item(impl_block);
-	let range = data.range;
-
-	// the header starts after the outer attributes (and doc comments, which could mention `impl<...>`)
-	let start = if (range.start..=range.end).contains(&data.attrs.after_attrs) { data.attrs.after_attrs } else { range.start };
-
-	ws.file_of(impl_block)
-		.text()
-		.get(start..range.end)
-		.and_then(impl_header)
-		.map(generic_param_names)
-		.unwrap_or_default()
-}
-
-/// The text after the `impl` keyword of an `impl` block (skipping `default` and `unsafe`).
-fn impl_header(text: &str) -> Option<&str> {
-	let mut rest = skip_trivia(text);
-
-	while let Some(after) = strip_keyword(rest, "default").or_else(|| strip_keyword(rest, "unsafe")) {
-		rest = skip_trivia(after);
-	}
-
-	strip_keyword(rest, "impl")
-}
-
 /// Names of the type and const parameters in the generics list at the start of `text` (after `impl`).
 fn generic_param_names(text: &str) -> Vec<&str> {
 	let Some(list) = skip_trivia(text).strip_prefix('<') else {
@@ -235,6 +182,55 @@ fn generic_param_names(text: &str) -> Vec<&str> {
 	names
 }
 
+/// Names of the type and const generic parameters of an `impl` block (`impl<'a, T: Tr, const N: usize>` → `T`, `N`).
+fn generic_params(ws: &Workspace, impl_block: ItemId) -> Vec<&str> {
+	let data = ws.item(impl_block);
+	let range = data.range;
+
+	// the header starts after the outer attributes (and doc comments, which could mention `impl<...>`)
+	let start = if (range.start..=range.end).contains(&data.attrs.after_attrs) {
+		data.attrs.after_attrs
+	} else {
+		range.start
+	};
+
+	ws.file_of(impl_block)
+		.text()
+		.get(start..range.end)
+		.and_then(impl_header)
+		.map(generic_param_names)
+		.unwrap_or_default()
+}
+
+/// The text after the `impl` keyword of an `impl` block (skipping `default` and `unsafe`).
+fn impl_header(text: &str) -> Option<&str> {
+	let mut rest = skip_trivia(text);
+
+	while let Some(after) = strip_keyword(rest, "default").or_else(|| strip_keyword(rest, "unsafe")) {
+		rest = skip_trivia(after);
+	}
+
+	strip_keyword(rest, "impl")
+}
+
+fn loaded(ws: &Workspace, res: &[Res], kinds: &[ItemKind]) -> Vec<ItemId> {
+	res.iter()
+		.filter_map(|res| match res {
+			Res::Item(id) if kinds.contains(&ws.item(*id).kind) => Some(*id),
+			_ => None,
+		})
+		.collect()
+}
+
+/// The named associated items of an `impl` block or trait, in source order.
+pub(super) fn named_assoc_items(ws: &Workspace, container: ItemId) -> impl Iterator<Item = ItemId> + '_ {
+	ws.children(container).filter(|&child| {
+		let data = ws.item(child);
+
+		data.kind.is_associated() && data.name.is_some()
+	})
+}
+
 /// The name of one generic parameter (`T: Bound`, `const N: usize`), or `None` for lifetimes.
 fn param_name(param: &str) -> Option<&str> {
 	let mut param = skip_trivia(param);
@@ -260,6 +256,18 @@ fn param_name(param: &str) -> Option<&str> {
 	(end > 0).then(|| &param[..end])
 }
 
+fn resolve_type(walker: &mut Walker<'_>, path: &PathRef) -> Vec<Res> {
+	walker
+		.resolve(path, Want::One(Namespace::Type))
+		.into_iter()
+		.map(|found| found.res)
+		.collect()
+}
+
+fn starts_with_generic(path: &PathRef, generics: &[&str]) -> bool {
+	!path.leading_colon && path.segments.first().is_some_and(|segment| generics.contains(&segment.name.as_str()))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -271,7 +279,10 @@ mod tests {
 		}
 
 		assert_eq!(names("impl<T> Tr for T {}"), ["T"]);
-		assert_eq!(names("unsafe impl<'a, T: Fn(u8) -> Vec<u8>, const N: usize> Tr for [T; N] {}"), ["T", "N"]);
+		assert_eq!(
+			names("unsafe impl<'a, T: Fn(u8) -> Vec<u8>, const N: usize> Tr for [T; N] {}"),
+			["T", "N"]
+		);
 		assert_eq!(names("impl < /* c */ #[cfg(x)] U , > Tr for U {}"), ["U"]);
 		assert_eq!(names("impl<T: Iterator<Item = (A, B)>, r#S> X {}"), ["T", "S"]);
 		assert_eq!(names("default impl<T> Tr for T {}"), ["T"]);

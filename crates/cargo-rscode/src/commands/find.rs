@@ -81,7 +81,11 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 
 		let member = args.patterns.iter().find_map(|pattern| {
 			let pattern = pattern.trim();
-			let pattern = pattern.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace)).unwrap_or(pattern).trim();
+			let pattern = pattern
+				.strip_prefix("use")
+				.filter(|rest| rest.starts_with(char::is_whitespace))
+				.unwrap_or(pattern)
+				.trim();
 			let first = pattern.strip_prefix("::").unwrap_or(pattern).split("::").next()?;
 
 			workspace.unloaded_member_with_crate(first)
@@ -102,7 +106,10 @@ fn search(args: &FindArgs) -> Result<Find, rscode::Error> {
 	let options = MatchOptions {
 		ignore_case: args.ignore_case,
 	};
-	let mut find = Find::new().ignore_case(args.ignore_case).active_only(args.active_only).imports(args.imports);
+	let mut find = Find::new()
+		.ignore_case(args.ignore_case)
+		.active_only(args.active_only)
+		.imports(args.imports);
 
 	for pattern in &args.patterns {
 		find = find.pattern(pattern)?;
@@ -146,8 +153,7 @@ fn viewpoint(resolver: &Resolver<'_>, from: &FromArg) -> anyhow::Result<Option<V
 		[] => anyhow::bail!("`--from {text}` does not name a module"),
 
 		_ => {
-			let candidates: Vec<String> =
-				modules.iter().map(|&module| resolver.canonical_path(module).to_string()).collect();
+			let candidates: Vec<String> = modules.iter().map(|&module| resolver.canonical_path(module).to_string()).collect();
 
 			anyhow::bail!("`--from {text}` names several modules:\n{}", candidates.join("\n"))
 		}

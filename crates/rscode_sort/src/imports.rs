@@ -9,15 +9,6 @@ use crate::version::rustfmt_version_cmp;
 use std::cmp::Ordering;
 use syn::ext::IdentExt;
 
-/// The sort key of a `use` item: its normalized use tree.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct UseKey {
-	path: Vec<Segment>,
-
-	/// Whether names are compared by version sorting (style edition 2024), rather than by case, then by bytes.
-	version_sorting: bool,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum Segment {
 	/// An identifier (prefixed with `::` when it starts a global path) and its `as` rename.
@@ -37,6 +28,93 @@ enum Segment {
 
 	/// `{..}`
 	List(Vec<UseKey>),
+}
+
+impl Segment {
+	fn from_ident(ident: &syn::Ident, global: bool, rename: Option<String>) -> Self {
+		let name = ident.to_string();
+
+		match name.as_str() {
+			"self" => Self::SelfValue(rename),
+			"super" => Self::Super(rename),
+			"crate" => Self::Crate(rename),
+			_ if global => Self::Ident(format!("::{name}"), rename),
+			_ => Self::Ident(name, rename),
+		}
+	}
+
+	fn rank(&self) -> u8 {
+		match self {
+			Self::SelfValue(_) => 0,
+			Self::Super(_) => 1,
+			Self::Crate(_) => 2,
+			Self::Ident(..) => 3,
+			Self::Glob => 4,
+			Self::List(_) => 5,
+		}
+	}
+
+	/// rustfmt's `Ord for UseSegment`: with version sorting in style edition 2024, and by case, then by bytes, in
+	/// earlier style editions.
+	fn rustfmt_cmp(&self, other: &Self, version_sorting: bool) -> Ordering {
+		let names = |a: &str, b: &str| match version_sorting {
+			true => rustfmt_version_cmp(unraw(a), unraw(b)),
+			false => a.cmp(b),
+		};
+
+		match (self, other) {
+			(Self::SelfValue(a), Self::SelfValue(b)) | (Self::Super(a), Self::Super(b)) | (Self::Crate(a), Self::Crate(b)) => match (a, b) {
+				(Some(a), Some(b)) => names(a, b),
+				_ => a.cmp(b),
+			},
+			(Self::Glob, Self::Glob) => Ordering::Equal,
+			(Self::Ident(a, a_rename), Self::Ident(b, b_rename)) => {
+				let ordering = match version_sorting {
+					true => rustfmt_version_cmp(unraw(a), unraw(b)),
+					false => case_key(a).cmp(&case_key(b)),
+				};
+
+				ordering.then_with(|| match (a_rename, b_rename) {
+					(None, None) => Ordering::Equal,
+					(None, Some(_)) => Ordering::Less,
+					(Some(_), None) => Ordering::Greater,
+					(Some(a), Some(b)) => names(a, b),
+				})
+			}
+			(Self::List(a), Self::List(b)) => {
+				for (a, b) in a.iter().zip(b) {
+					let ordering = a.rustfmt_cmp(b);
+
+					if ordering.is_ne() {
+						return ordering;
+					}
+				}
+
+				a.len().cmp(&b.len())
+			}
+			_ => self.rank().cmp(&other.rank()),
+		}
+	}
+
+	fn without_rename(&self) -> Self {
+		match self {
+			Self::Ident(name, _) => Self::Ident(name.clone(), None),
+			Self::SelfValue(_) => Self::SelfValue(None),
+			Self::Super(_) => Self::Super(None),
+			Self::Crate(_) => Self::Crate(None),
+			Self::Glob => Self::Glob,
+			Self::List(list) => Self::List(list.clone()),
+		}
+	}
+}
+
+/// The sort key of a `use` item: its normalized use tree.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct UseKey {
+	path: Vec<Segment>,
+
+	/// Whether names are compared by version sorting (style edition 2024), rather than by case, then by bytes.
+	version_sorting: bool,
 }
 
 impl UseKey {
@@ -153,91 +231,6 @@ impl PartialOrd for UseKey {
 	}
 }
 
-impl Segment {
-	fn from_ident(ident: &syn::Ident, global: bool, rename: Option<String>) -> Self {
-		let name = ident.to_string();
-
-		match name.as_str() {
-			"self" => Self::SelfValue(rename),
-			"super" => Self::Super(rename),
-			"crate" => Self::Crate(rename),
-			_ if global => Self::Ident(format!("::{name}"), rename),
-			_ => Self::Ident(name, rename),
-		}
-	}
-
-	fn rank(&self) -> u8 {
-		match self {
-			Self::SelfValue(_) => 0,
-			Self::Super(_) => 1,
-			Self::Crate(_) => 2,
-			Self::Ident(..) => 3,
-			Self::Glob => 4,
-			Self::List(_) => 5,
-		}
-	}
-
-	fn without_rename(&self) -> Self {
-		match self {
-			Self::Ident(name, _) => Self::Ident(name.clone(), None),
-			Self::SelfValue(_) => Self::SelfValue(None),
-			Self::Super(_) => Self::Super(None),
-			Self::Crate(_) => Self::Crate(None),
-			Self::Glob => Self::Glob,
-			Self::List(list) => Self::List(list.clone()),
-		}
-	}
-
-	/// rustfmt's `Ord for UseSegment`: with version sorting in style edition 2024, and by case, then by bytes, in
-	/// earlier style editions.
-	fn rustfmt_cmp(&self, other: &Self, version_sorting: bool) -> Ordering {
-		let names = |a: &str, b: &str| match version_sorting {
-			true => rustfmt_version_cmp(unraw(a), unraw(b)),
-			false => a.cmp(b),
-		};
-
-		match (self, other) {
-			(Self::SelfValue(a), Self::SelfValue(b))
-			| (Self::Super(a), Self::Super(b))
-			| (Self::Crate(a), Self::Crate(b)) => match (a, b) {
-				(Some(a), Some(b)) => names(a, b),
-				_ => a.cmp(b),
-			},
-			(Self::Glob, Self::Glob) => Ordering::Equal,
-			(Self::Ident(a, a_rename), Self::Ident(b, b_rename)) => {
-				let ordering = match version_sorting {
-					true => rustfmt_version_cmp(unraw(a), unraw(b)),
-					false => case_key(a).cmp(&case_key(b)),
-				};
-
-				ordering.then_with(|| match (a_rename, b_rename) {
-					(None, None) => Ordering::Equal,
-					(None, Some(_)) => Ordering::Less,
-					(Some(_), None) => Ordering::Greater,
-					(Some(a), Some(b)) => names(a, b),
-				})
-			}
-			(Self::List(a), Self::List(b)) => {
-				for (a, b) in a.iter().zip(b) {
-					let ordering = a.rustfmt_cmp(b);
-
-					if ordering.is_ne() {
-						return ordering;
-					}
-				}
-
-				a.len().cmp(&b.len())
-			}
-			_ => self.rank().cmp(&other.rank()),
-		}
-	}
-}
-
-/// rustfmt compares identifiers without their `r#` prefix in style edition 2024.
-fn unraw(name: &str) -> &str {
-	name.trim_start_matches("r#")
-}
-
 /// The order of identifiers before style edition 2024 (with their `r#` prefixes): `snake_case`, then `CamelCase`,
 /// then `UPPER_SNAKE_CASE`, and each by bytes.
 fn case_key(name: &str) -> (bool, bool, &str) {
@@ -281,21 +274,30 @@ fn push_tree(path: &mut Vec<Segment>, tree: &syn::UseTree, global: bool, version
 				path.push(Segment::Ident(String::new(), None));
 			}
 
-			path.push(Segment::List(group.items.iter().map(|tree| UseKey::nested(tree, version_sorting)).collect()));
+			path.push(Segment::List(
+				group.items.iter().map(|tree| UseKey::nested(tree, version_sorting)).collect(),
+			));
 		}
 	}
+}
+
+/// rustfmt compares identifiers without their `r#` prefix in style edition 2024.
+fn unraw(name: &str) -> &str {
+	name.trim_start_matches("r#")
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn key_in(style_edition: StyleEdition, tree: &str) -> UseKey {
-		UseKey::new(&syn::parse_str(&format!("use {tree};")).unwrap(), style_edition)
+	#[track_caller]
+	fn assert_equivalent(a: &str, b: &str) {
+		assert_eq!(key(a).cmp(&key(b)), Ordering::Equal, "{a} == {b}");
 	}
 
-	fn key(tree: &str) -> UseKey {
-		key_in(StyleEdition::E2024, tree)
+	#[track_caller]
+	fn assert_less(a: &str, b: &str) {
+		assert_less_in(StyleEdition::E2024, a, b);
 	}
 
 	#[track_caller]
@@ -306,14 +308,40 @@ mod tests {
 		assert_eq!(key_b.cmp(&key_a), Ordering::Greater, "{b} > {a} ({style_edition:?})");
 	}
 
-	#[track_caller]
-	fn assert_less(a: &str, b: &str) {
-		assert_less_in(StyleEdition::E2024, a, b);
+	#[test]
+	fn earlier_style_editions_order_by_case_then_bytes() {
+		for style_edition in [StyleEdition::E2015, StyleEdition::E2018, StyleEdition::E2021] {
+			let assert_less = |a, b| assert_less_in(style_edition, a, b);
+
+			// `snake_case` < `CamelCase` < `UPPER_SNAKE_CASE` (where a single capital letter counts)
+			assert_less("foo", "Foo");
+			assert_less("a::alpha", "a::Zeta");
+			assert_less("a::Zeta", "a::ZETA");
+			assert_less("Ab", "A");
+			assert_less("_b", "a");
+			assert_less("_b", "A");
+
+			// then by bytes, with `r#` prefixes
+			assert_less("x10", "x9");
+			assert_less("x08", "x_1");
+			assert_less("r#type", "s");
+			assert_less("::std::fmt", "Foo");
+			assert_less("::std::fmt", "std::fmt");
+		}
+
+		// the same pairs in style edition 2024
+		assert_less("Foo", "foo");
+		assert_less("a::Zeta", "a::alpha");
+		assert_less("x9", "x10");
+		assert_less("s", "r#type");
 	}
 
-	#[track_caller]
-	fn assert_equivalent(a: &str, b: &str) {
-		assert_eq!(key(a).cmp(&key(b)), Ordering::Equal, "{a} == {b}");
+	fn key(tree: &str) -> UseKey {
+		key_in(StyleEdition::E2024, tree)
+	}
+
+	fn key_in(style_edition: StyleEdition, tree: &str) -> UseKey {
+		UseKey::new(&syn::parse_str(&format!("use {tree};")).unwrap(), style_edition)
 	}
 
 	#[test]
@@ -328,7 +356,10 @@ mod tests {
 		assert_eq!(key("a::{c, b, b}"), key("a::{b, c}"));
 		assert_eq!(key("a as a"), key("a"));
 		assert_eq!(key("a::{}").path, Vec::new());
-		assert_ne!(UseKey::new(&syn::parse_str("#[cfg(x)] use a::{};").unwrap(), StyleEdition::E2024).path, Vec::new());
+		assert_ne!(
+			UseKey::new(&syn::parse_str("#[cfg(x)] use a::{};").unwrap(), StyleEdition::E2024).path,
+			Vec::new()
+		);
 	}
 
 	#[test]
@@ -361,31 +392,13 @@ mod tests {
 	}
 
 	#[test]
-	fn earlier_style_editions_order_by_case_then_bytes() {
-		for style_edition in [StyleEdition::E2015, StyleEdition::E2018, StyleEdition::E2021] {
-			let assert_less = |a, b| assert_less_in(style_edition, a, b);
-
-			// `snake_case` < `CamelCase` < `UPPER_SNAKE_CASE` (where a single capital letter counts)
-			assert_less("foo", "Foo");
-			assert_less("a::alpha", "a::Zeta");
-			assert_less("a::Zeta", "a::ZETA");
-			assert_less("Ab", "A");
-			assert_less("_b", "a");
-			assert_less("_b", "A");
-
-			// then by bytes, with `r#` prefixes
-			assert_less("x10", "x9");
-			assert_less("x08", "x_1");
-			assert_less("r#type", "s");
-			assert_less("::std::fmt", "Foo");
-			assert_less("::std::fmt", "std::fmt");
-		}
-
-		// the same pairs in style edition 2024
-		assert_less("Foo", "foo");
-		assert_less("a::Zeta", "a::alpha");
-		assert_less("x9", "x10");
-		assert_less("s", "r#type");
+	fn renames_are_ignored_except_as_a_last_resort() {
+		// a rename sorts after the unrenamed path when it's shorter
+		assert_less("a as c", "a::b");
+		assert_equivalent("a as c", "a");
+		assert_equivalent("a as c", "a as b");
+		assert_equivalent("a::{b as c}", "a::b");
+		assert_less("a::{b as z, c}", "a::{b, d}");
 	}
 
 	#[test]
@@ -403,15 +416,5 @@ mod tests {
 		assert_less("::std::fmt", "std::fmt");
 		assert_less("::*", "::a");
 		assert_less("_a", "::a");
-	}
-
-	#[test]
-	fn renames_are_ignored_except_as_a_last_resort() {
-		// a rename sorts after the unrenamed path when it's shorter
-		assert_less("a as c", "a::b");
-		assert_equivalent("a as c", "a");
-		assert_equivalent("a as c", "a as b");
-		assert_equivalent("a::{b as c}", "a::b");
-		assert_less("a::{b as z, c}", "a::{b, d}");
 	}
 }

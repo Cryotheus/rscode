@@ -23,6 +23,70 @@ use syn::ExprLit;
 use syn::Lit;
 use syn::Meta;
 
+/// A path in an intra-doc link.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct DocPath {
+	pub(super) leading_colon: bool,
+
+	/// The segments, with their ranges in the link text (including any `r#`).
+	pub(super) segments: Vec<DocSegment>,
+
+	/// The namespace a disambiguator selects (`struct@`, `fn@`, `macro@`, `name()`, `name!`).
+	pub(super) namespace: Option<Namespace>,
+}
+
+impl DocPath {
+	/// Parses a link destination (or the text of a shortcut link) as a path: `path`, `` `path` ``, `kind@path`,
+	/// `path()`, `path!`. `None` for anything else (URLs, prose, generic arguments, ...).
+	pub(super) fn parse(text: &str) -> Option<Self> {
+		let mut start = text.len() - text.trim_start().len();
+		let mut end = text.trim_end().len();
+
+		if start >= end {
+			return None;
+		}
+
+		if end > start + 1 && text[start..].starts_with('`') && text[..end].ends_with('`') {
+			start += 1;
+			end -= 1;
+		}
+
+		let mut namespace = None;
+
+		if let Some(at) = text[start..end].find('@') {
+			namespace = Some(disambiguator(&text[start..start + at])?);
+			start += at + 1;
+		}
+
+		let body = &text[start..end];
+
+		if let Some(stripped) = body.strip_suffix("()") {
+			namespace = Some(Namespace::Value);
+			end = start + stripped.len();
+		} else if let Some(stripped) = ["!()", "![]", "!{}", "!"].iter().find_map(|suffix| body.strip_suffix(suffix)) {
+			namespace = Some(Namespace::Macro);
+			end = start + stripped.len();
+		}
+
+		let mut path = parse_path(&text[start..end])?;
+
+		for segment in &mut path.segments {
+			segment.range = segment.range.start + start..segment.range.end + start;
+		}
+
+		path.namespace = namespace;
+		Some(path)
+	}
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(super) struct DocSegment {
+	/// The name, without `r#`.
+	pub(super) name: SmolStr,
+
+	pub(super) range: Range<usize>,
+}
+
 /// Which doc comments of an item to read.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(super) enum DocStyle {
@@ -31,6 +95,19 @@ pub(super) enum DocStyle {
 
 	/// `//!` and `/*! */` (and `#![doc = ...]`).
 	Inner,
+}
+
+/// A link in a line of Markdown.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum Link {
+	/// `[text](destination)`: the destination.
+	Inline(Range<usize>),
+
+	/// `[text][label]` or `[text][]` (empty label).
+	Reference { text: Range<usize>, label: Range<usize> },
+
+	/// `[text]`
+	Shortcut(Range<usize>),
 }
 
 impl<'ws> FileWalker<'_, 'ws> {
@@ -138,164 +215,41 @@ impl<'ws> FileWalker<'_, 'ws> {
 	}
 }
 
-/// A path in an intra-doc link.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct DocPath {
-	pub(super) leading_colon: bool,
+/// The index of the bracket closing the one at `open`, skipping code spans and escaped characters.
+fn closing(line: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
+	let bytes = line.as_bytes();
+	let mut depth = 0;
+	let mut index = open;
 
-	/// The segments, with their ranges in the link text (including any `r#`).
-	pub(super) segments: Vec<DocSegment>,
+	while index < bytes.len() {
+		match bytes[index] {
+			b'\\' => {
+				index += 2;
+				continue;
+			}
 
-	/// The namespace a disambiguator selects (`struct@`, `fn@`, `macro@`, `name()`, `name!`).
-	pub(super) namespace: Option<Namespace>,
-}
+			b'`' => {
+				index = skip_code_span(line, index);
+				continue;
+			}
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(super) struct DocSegment {
-	/// The name, without `r#`.
-	pub(super) name: SmolStr,
+			byte if byte == opening => depth += 1,
 
-	pub(super) range: Range<usize>,
-}
+			byte if byte == closing => {
+				depth -= 1;
 
-impl DocPath {
-	/// Parses a link destination (or the text of a shortcut link) as a path: `path`, `` `path` ``, `kind@path`,
-	/// `path()`, `path!`. `None` for anything else (URLs, prose, generic arguments, ...).
-	pub(super) fn parse(text: &str) -> Option<Self> {
-		let mut start = text.len() - text.trim_start().len();
-		let mut end = text.trim_end().len();
+				if depth == 0 {
+					return Some(index);
+				}
+			}
 
-		if start >= end {
-			return None;
+			_ => {}
 		}
 
-		if end > start + 1 && text[start..].starts_with('`') && text[..end].ends_with('`') {
-			start += 1;
-			end -= 1;
-		}
-
-		let mut namespace = None;
-
-		if let Some(at) = text[start..end].find('@') {
-			namespace = Some(disambiguator(&text[start..start + at])?);
-			start += at + 1;
-		}
-
-		let body = &text[start..end];
-
-		if let Some(stripped) = body.strip_suffix("()") {
-			namespace = Some(Namespace::Value);
-			end = start + stripped.len();
-		} else if let Some(stripped) = ["!()", "![]", "!{}", "!"].iter().find_map(|suffix| body.strip_suffix(suffix)) {
-			namespace = Some(Namespace::Macro);
-			end = start + stripped.len();
-		}
-
-		let mut path = parse_path(&text[start..end])?;
-
-		for segment in &mut path.segments {
-			segment.range = segment.range.start + start..segment.range.end + start;
-		}
-
-		path.namespace = namespace;
-		Some(path)
-	}
-}
-
-/// The namespace of a disambiguator (`kind@`), or `None` for unknown ones (and fields, which are not items).
-fn disambiguator(kind: &str) -> Option<Namespace> {
-	match kind {
-		"struct" | "enum" | "trait" | "union" | "mod" | "module" | "type" | "tyalias" | "typealias" | "prim" | "primitive" | "variant" => {
-			Some(Namespace::Type)
-		}
-
-		"const" | "constant" | "fn" | "function" | "method" | "tymethod" | "static" | "value" => Some(Namespace::Value),
-		"macro" | "derive" | "attr" => Some(Namespace::Macro),
-		_ => None,
-	}
-}
-
-/// Parses `[::]segment(::segment)*` where a segment is an identifier (possibly raw).
-fn parse_path(text: &str) -> Option<DocPath> {
-	let (leading_colon, body, offset) = match text.strip_prefix("::") {
-		Some(rest) => (true, rest, 2),
-		None => (false, text, 0),
-	};
-
-	let mut segments = Vec::new();
-	let mut position = offset;
-
-	for part in body.split("::") {
-		let bare = part.strip_prefix("r#").unwrap_or(part);
-
-		if !is_identifier(bare) || (bare.len() != part.len() && matches!(bare, "crate" | "self" | "super" | "Self")) {
-			return None;
-		}
-
-		segments.push(DocSegment {
-			name: SmolStr::new(bare),
-			range: position..position + part.len(),
-		});
-
-		position += part.len() + 2;
+		index += 1;
 	}
 
-	Some(DocPath {
-		leading_colon,
-		segments,
-		namespace: None,
-	})
-}
-
-fn is_identifier(text: &str) -> bool {
-	let mut chars = text.chars();
-
-	chars.next().is_some_and(|first| first.is_alphabetic() || first == '_') && chars.all(|char| char.is_alphanumeric() || char == '_') && text != "_"
-}
-
-/// The link destinations (and shortcut link texts) in doc comment lines (with their offsets), outside of code blocks,
-/// with the offset of each.
-pub(super) fn links<'t>(lines: &[(usize, &'t str)]) -> Vec<(usize, &'t str)> {
-	let code = code_lines(lines);
-
-	// labels of reference definitions: links using them are not intra-doc links (their definitions may be)
-	let labels: Vec<String> = (lines.iter().zip(&code))
-		.filter(|&(_, &in_code)| !in_code)
-		.filter_map(|((_, line), _)| reference_definition(line).map(|(label, _)| normalize_label(&line[label])))
-		.collect();
-
-	let is_label = |text: &str| labels.contains(&normalize_label(text));
-	let mut found = Vec::new();
-
-	for (&(offset, line), in_code) in lines.iter().zip(code) {
-		if in_code {
-			continue;
-		}
-
-		if let Some((_, destination)) = reference_definition(line) {
-			found.push((offset + destination.start, &line[destination]));
-			continue;
-		}
-
-		for link in line_links(line) {
-			let destination = match link {
-				Link::Inline(destination) => destination,
-				Link::Reference { text, label } if label.is_empty() && !is_label(&line[text.clone()]) => text,
-				Link::Reference { label, .. } if !label.is_empty() && !is_label(&line[label.clone()]) => label,
-				Link::Shortcut(text) if !is_label(&line[text.clone()]) => text,
-				_ => continue,
-			};
-
-			found.push((offset + destination.start, &line[destination]));
-		}
-	}
-
-	found
-}
-
-/// Case-insensitive, with runs of whitespace as one space (like Markdown compares labels).
-fn normalize_label(label: &str) -> String {
-	label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+	None
 }
 
 /// Which lines are in fenced code blocks (the fences included).
@@ -326,6 +280,32 @@ fn code_lines(lines: &[(usize, &str)]) -> Vec<bool> {
 		.collect()
 }
 
+/// The destination of an inline link, without surrounding whitespace, angle brackets, and a title (`path "title"`).
+fn destination(line: &str, range: Range<usize>) -> Range<usize> {
+	let text = &line[range.clone()];
+	let start = range.start + (text.len() - text.trim_start().len());
+	let text = text.trim();
+	let text = text.split_whitespace().next().unwrap_or_default();
+
+	match text.strip_prefix('<').and_then(|inner| inner.strip_suffix('>')) {
+		Some(inner) => start + 1..start + 1 + inner.len(),
+		None => start..start + text.len(),
+	}
+}
+
+/// The namespace of a disambiguator (`kind@`), or `None` for unknown ones (and fields, which are not items).
+fn disambiguator(kind: &str) -> Option<Namespace> {
+	match kind {
+		"struct" | "enum" | "trait" | "union" | "mod" | "module" | "type" | "tyalias" | "typealias" | "prim" | "primitive" | "variant" => {
+			Some(Namespace::Type)
+		}
+
+		"const" | "constant" | "fn" | "function" | "method" | "tymethod" | "static" | "value" => Some(Namespace::Value),
+		"macro" | "derive" | "attr" => Some(Namespace::Macro),
+		_ => None,
+	}
+}
+
 /// A code fence: three or more backticks or tildes.
 fn fence_marker(line: &str) -> Option<(u8, usize)> {
 	let char = *line.as_bytes().first().filter(|&&char| char == b'`' || char == b'~')?;
@@ -334,17 +314,10 @@ fn fence_marker(line: &str) -> Option<(u8, usize)> {
 	(length >= 3).then_some((char, length))
 }
 
-/// A link in a line of Markdown.
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum Link {
-	/// `[text](destination)`: the destination.
-	Inline(Range<usize>),
+fn is_identifier(text: &str) -> bool {
+	let mut chars = text.chars();
 
-	/// `[text][label]` or `[text][]` (empty label).
-	Reference { text: Range<usize>, label: Range<usize> },
-
-	/// `[text]`
-	Shortcut(Range<usize>),
+	chars.next().is_some_and(|first| first.is_alphabetic() || first == '_') && chars.all(|char| char.is_alphanumeric() || char == '_') && text != "_"
 }
 
 /// The links in a line, skipping code spans and escaped characters.
@@ -392,17 +365,81 @@ fn line_links(line: &str) -> Vec<Link> {
 	links
 }
 
-/// The destination of an inline link, without surrounding whitespace, angle brackets, and a title (`path "title"`).
-fn destination(line: &str, range: Range<usize>) -> Range<usize> {
-	let text = &line[range.clone()];
-	let start = range.start + (text.len() - text.trim_start().len());
-	let text = text.trim();
-	let text = text.split_whitespace().next().unwrap_or_default();
+/// The link destinations (and shortcut link texts) in doc comment lines (with their offsets), outside of code blocks,
+/// with the offset of each.
+pub(super) fn links<'t>(lines: &[(usize, &'t str)]) -> Vec<(usize, &'t str)> {
+	let code = code_lines(lines);
 
-	match text.strip_prefix('<').and_then(|inner| inner.strip_suffix('>')) {
-		Some(inner) => start + 1..start + 1 + inner.len(),
-		None => start..start + text.len(),
+	// labels of reference definitions: links using them are not intra-doc links (their definitions may be)
+	let labels: Vec<String> = (lines.iter().zip(&code))
+		.filter(|&(_, &in_code)| !in_code)
+		.filter_map(|((_, line), _)| reference_definition(line).map(|(label, _)| normalize_label(&line[label])))
+		.collect();
+
+	let is_label = |text: &str| labels.contains(&normalize_label(text));
+	let mut found = Vec::new();
+
+	for (&(offset, line), in_code) in lines.iter().zip(code) {
+		if in_code {
+			continue;
+		}
+
+		if let Some((_, destination)) = reference_definition(line) {
+			found.push((offset + destination.start, &line[destination]));
+			continue;
+		}
+
+		for link in line_links(line) {
+			let destination = match link {
+				Link::Inline(destination) => destination,
+				Link::Reference { text, label } if label.is_empty() && !is_label(&line[text.clone()]) => text,
+				Link::Reference { label, .. } if !label.is_empty() && !is_label(&line[label.clone()]) => label,
+				Link::Shortcut(text) if !is_label(&line[text.clone()]) => text,
+				_ => continue,
+			};
+
+			found.push((offset + destination.start, &line[destination]));
+		}
 	}
+
+	found
+}
+
+/// Case-insensitive, with runs of whitespace as one space (like Markdown compares labels).
+fn normalize_label(label: &str) -> String {
+	label.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Parses `[::]segment(::segment)*` where a segment is an identifier (possibly raw).
+fn parse_path(text: &str) -> Option<DocPath> {
+	let (leading_colon, body, offset) = match text.strip_prefix("::") {
+		Some(rest) => (true, rest, 2),
+		None => (false, text, 0),
+	};
+
+	let mut segments = Vec::new();
+	let mut position = offset;
+
+	for part in body.split("::") {
+		let bare = part.strip_prefix("r#").unwrap_or(part);
+
+		if !is_identifier(bare) || (bare.len() != part.len() && matches!(bare, "crate" | "self" | "super" | "Self")) {
+			return None;
+		}
+
+		segments.push(DocSegment {
+			name: SmolStr::new(bare),
+			range: position..position + part.len(),
+		});
+
+		position += part.len() + 2;
+	}
+
+	Some(DocPath {
+		leading_colon,
+		segments,
+		namespace: None,
+	})
 }
 
 /// `[label]: destination`: the ranges of the label and the destination.
@@ -422,43 +459,6 @@ fn reference_definition(line: &str) -> Option<(Range<usize>, Range<usize>)> {
 	let destination = destination(line, close + 2..line.len());
 
 	(!destination.is_empty()).then_some((start + 1..close, destination))
-}
-
-/// The index of the bracket closing the one at `open`, skipping code spans and escaped characters.
-fn closing(line: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
-	let bytes = line.as_bytes();
-	let mut depth = 0;
-	let mut index = open;
-
-	while index < bytes.len() {
-		match bytes[index] {
-			b'\\' => {
-				index += 2;
-				continue;
-			}
-
-			b'`' => {
-				index = skip_code_span(line, index);
-				continue;
-			}
-
-			byte if byte == opening => depth += 1,
-
-			byte if byte == closing => {
-				depth -= 1;
-
-				if depth == 0 {
-					return Some(index);
-				}
-			}
-
-			_ => {}
-		}
-
-		index += 1;
-	}
-
-	None
 }
 
 /// The index after the code span starting at `start` (a run of backticks closed by a run of the same length), or after
@@ -498,15 +498,68 @@ mod tests {
 
 	#[test]
 	fn finds_links() {
-		assert_eq!(candidates(&[" See [`Foo`] and [Bar](crate::Bar), [text][baz::Qux]."]), ["6:`Foo`", "23:crate::Bar", "43:baz::Qux"]);
+		assert_eq!(
+			candidates(&[" See [`Foo`] and [Bar](crate::Bar), [text][baz::Qux]."]),
+			["6:`Foo`", "23:crate::Bar", "43:baz::Qux"]
+		);
 		assert_eq!(candidates(&[" [Foo][] and [a `[b]` c] `[not]`"]), ["2:Foo", "14:a `[b]` c"]);
 		assert_eq!(candidates(&[" [x]( <a::B> \"title\" ) \\[escaped]"]), ["7:a::B"]);
 		assert_eq!(candidates(&[" [nested [inner]] text"]), ["2:nested [inner]"]);
 	}
 
 	#[test]
+	fn parses_link_paths() {
+		let parse = |text: &str| {
+			DocPath::parse(text).map(|path| {
+				let segments: Vec<String> = path
+					.segments
+					.iter()
+					.map(|segment| format!("{}@{:?}", segment.name, segment.range))
+					.collect();
+
+				(path.leading_colon, segments.join(" "), path.namespace)
+			})
+		};
+
+		assert_eq!(parse("Foo"), Some((false, "Foo@0..3".to_owned(), None)));
+		assert_eq!(
+			parse(" `crate::a::Foo` "),
+			Some((false, "crate@2..7 a@9..10 Foo@12..15".to_owned(), None))
+		);
+		assert_eq!(parse("struct@Foo"), Some((false, "Foo@7..10".to_owned(), Some(Namespace::Type))));
+		assert_eq!(parse("`fn@foo()`"), Some((false, "foo@4..7".to_owned(), Some(Namespace::Value))));
+		assert_eq!(parse("mac!"), Some((false, "mac@0..3".to_owned(), Some(Namespace::Macro))));
+		assert_eq!(parse("::dep::r#type"), Some((true, "dep@2..5 type@7..13".to_owned(), None)));
+		assert_eq!(parse("Self::new"), Some((false, "Self@0..4 new@6..9".to_owned(), None)));
+
+		let invalid = [
+			"https://example.com",
+			"a b",
+			"Vec<T>",
+			"field@x",
+			"x@y",
+			"a::",
+			"::",
+			"1a",
+			"r#crate",
+			"a.b",
+			"#anchor",
+		];
+		let empty = ["", " ", "  ", "`", "``", " ` ", "@"];
+
+		for invalid in invalid.into_iter().chain(empty) {
+			assert_eq!(parse(invalid), None, "{invalid}");
+		}
+	}
+
+	#[test]
 	fn reference_definitions_replace_their_links() {
-		let found = candidates(&[" See [the docs] and [Foo].", "", " [the docs]: crate::Docs", "[other]: https://example.com"]);
+		let found = candidates(&[
+			" See [the docs] and [Foo].",
+			"",
+			" [the docs]: crate::Docs",
+			"[other]: https://example.com",
+		]);
 
 		assert_eq!(found, ["21:Foo", "213:crate::Docs", "309:https://example.com"]);
 	}
@@ -514,35 +567,11 @@ mod tests {
 	#[test]
 	fn skips_code_blocks() {
 		// a fence closes with at least as many of its characters
-		let lines = [" [A]", " ````", " [B]", " ```", " [C]", " ````", " [D]", "~~~text", "[E]", "~~~", " * ```", " * [F]", " * ```", "[G]"];
+		let lines = [
+			" [A]", " ````", " [B]", " ```", " [C]", " ````", " [D]", "~~~text", "[E]", "~~~", " * ```", " * [F]", " * ```", "[G]",
+		];
 		let found = candidates(&lines);
 
 		assert_eq!(found, ["2:A", "602:D", "1301:G"]);
-	}
-
-	#[test]
-	fn parses_link_paths() {
-		let parse = |text: &str| {
-			DocPath::parse(text).map(|path| {
-				let segments: Vec<String> = path.segments.iter().map(|segment| format!("{}@{:?}", segment.name, segment.range)).collect();
-
-				(path.leading_colon, segments.join(" "), path.namespace)
-			})
-		};
-
-		assert_eq!(parse("Foo"), Some((false, "Foo@0..3".to_owned(), None)));
-		assert_eq!(parse(" `crate::a::Foo` "), Some((false, "crate@2..7 a@9..10 Foo@12..15".to_owned(), None)));
-		assert_eq!(parse("struct@Foo"), Some((false, "Foo@7..10".to_owned(), Some(Namespace::Type))));
-		assert_eq!(parse("`fn@foo()`"), Some((false, "foo@4..7".to_owned(), Some(Namespace::Value))));
-		assert_eq!(parse("mac!"), Some((false, "mac@0..3".to_owned(), Some(Namespace::Macro))));
-		assert_eq!(parse("::dep::r#type"), Some((true, "dep@2..5 type@7..13".to_owned(), None)));
-		assert_eq!(parse("Self::new"), Some((false, "Self@0..4 new@6..9".to_owned(), None)));
-
-		let invalid = ["https://example.com", "a b", "Vec<T>", "field@x", "x@y", "a::", "::", "1a", "r#crate", "a.b", "#anchor"];
-		let empty = ["", " ", "  ", "`", "``", " ` ", "@"];
-
-		for invalid in invalid.into_iter().chain(empty) {
-			assert_eq!(parse(invalid), None, "{invalid}");
-		}
 	}
 }

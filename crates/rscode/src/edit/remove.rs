@@ -48,6 +48,91 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// The ranges deleted from each file, with the file.
+type DeletedText<'ws> = BTreeMap<&'ws Path, (&'ws SourceFile, Vec<TextRange>)>;
+
+/// Text to delete, by file.
+#[derive(Debug, Default)]
+struct Deletions<'ws> {
+	files: BTreeMap<&'ws Path, FileDeletions<'ws>>,
+}
+
+impl<'ws> Deletions<'ws> {
+	fn element(&mut self, file: &'ws SourceFile, range: TextRange) {
+		self.file(file).elements.push(range);
+	}
+
+	fn file(&mut self, file: &'ws SourceFile) -> &mut FileDeletions<'ws> {
+		self.files.entry(file.path()).or_insert_with(|| FileDeletions {
+			file,
+			items: Vec::new(),
+			elements: Vec::new(),
+		})
+	}
+
+	fn item(&mut self, file: &'ws SourceFile, range: TextRange) {
+		self.file(file).items.push(range);
+	}
+
+	/// The ranges to delete, sorted, per file. Items separated only by trivia are removed as one block.
+	fn ranges(&self) -> DeletedText<'ws> {
+		(self.files.iter())
+			.map(|(&path, deletions)| {
+				let text = deletions.file.text();
+				let mut ranges = trivia::removal_ranges(text, &deletions.items);
+
+				ranges.extend(element_removal_ranges(text, &deletions.elements));
+				ranges.sort();
+				ranges.dedup();
+
+				(path, (deletions.file, ranges))
+			})
+			.collect()
+	}
+}
+
+#[derive(Debug)]
+struct FileDeletions<'ws> {
+	file: &'ws SourceFile,
+
+	/// Items, removed with their attached comments and a line.
+	items: Vec<TextRange>,
+
+	/// Elements of comma-separated lists (variants, `use` group elements), removed with a comma.
+	elements: Vec<TextRange>,
+}
+
+/// How much of a `use` tree element is pruned.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Pruned {
+	/// All of its leaves (it has at least one).
+	All,
+
+	/// Some of its leaves.
+	Some,
+
+	/// None of its leaves, or it has none (`{}`).
+	Nothing,
+}
+
+/// The planned removal.
+#[derive(Debug, Clone, Serialize)]
+pub struct Removal {
+	/// The edits, to preview or apply.
+	#[serde(skip)]
+	pub edits: EditSet,
+
+	/// The removed items (see [`remove`]).
+	pub removed: Vec<RemovedItem>,
+
+	/// References to the removed items, and through removed imports, that remain (and will no longer compile). The
+	/// target of a reference through an import is the import that bound its name.
+	pub dangling: Vec<Reference>,
+
+	/// Things to know about the removal.
+	pub warnings: Vec<String>,
+}
+
 /// Options for [`remove`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -81,22 +166,338 @@ pub struct RemovedItem {
 	pub end: LineCol,
 }
 
-/// The planned removal.
-#[derive(Debug, Clone, Serialize)]
-pub struct Removal {
-	/// The edits, to preview or apply.
-	#[serde(skip)]
-	pub edits: EditSet,
+/// Imports that break when the removed items are gone, by their `use` item: imports whose targets are all removed,
+/// and imports whose path goes through a removed item.
+fn broken_imports(resolver: &Resolver<'_>, removed: &HashSet<ItemId>) -> BTreeMap<ItemId, Vec<ItemId>> {
+	let ws = resolver.workspace();
+	let is_removed = |res: &Res| matches!(res, Res::Item(item) if removed.contains(item));
+	let mut imports: BTreeSet<ItemId> = BTreeSet::new();
 
-	/// The removed items (see [`remove`]).
-	pub removed: Vec<RemovedItem>,
+	for &item in removed {
+		for import in resolver.imports_of(item) {
+			if !removed.contains(&import) && resolver.import_targets(import).iter().all(is_removed) {
+				imports.insert(import);
+			}
+		}
+	}
 
-	/// References to the removed items, and through removed imports, that remain (and will no longer compile). The
-	/// target of a reference through an import is the import that bound its name.
-	pub dangling: Vec<Reference>,
+	// paths through a removed module or enum break even when they import something else (like a re-export in the
+	// module, or an item that is not resolved)
+	if removed
+		.iter()
+		.any(|&item| matches!(ws.item(item).kind, ItemKind::Module | ItemKind::Enum))
+	{
+		for krate in ws.crates() {
+			for (import, data) in krate.items() {
+				let Some(info) = data.import_info() else {
+					continue;
+				};
 
-	/// Things to know about the removal.
-	pub warnings: Vec<String>,
+				if removed.contains(&import) || imports.contains(&import) {
+					continue;
+				}
+
+				let prefixes = resolver.resolve_prefixes(ws.module_of(import), &info.path, None, PathKind::Use);
+
+				if prefixes
+					.iter()
+					.any(|resolutions| !resolutions.is_empty() && resolutions.iter().all(is_removed))
+				{
+					imports.insert(import);
+				}
+			}
+		}
+	}
+
+	let mut broken: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
+
+	for import in imports {
+		if let Some(use_item) = ws.parent(import) {
+			broken.entry(use_item).or_default().push(import);
+		}
+	}
+
+	broken
+}
+
+/// Refuses a path naming `impl` blocks (or items of them) whose headers differ, such as `impl From<u8> for X` and
+/// `impl From<u16> for X` for `impl From for X`: those are not `cfg` variants of each other, and the path can tell them
+/// apart with generic arguments.
+fn check_impl_headers(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
+	let ws = resolver.workspace();
+
+	if !super::impl_headers_differ(ws, items) {
+		return Ok(());
+	}
+
+	let candidates = items
+		.iter()
+		.map(|&item| {
+			let file = ws.file_of(item);
+			let start = file.line_col(ws.item(item).range.start);
+
+			let path = resolver.canonical_path(item).distinct();
+
+			format!("`{path}` at {}:{start}", ws.display_path(file.path()).display())
+		})
+		.collect();
+
+	Err(Error::Ambiguous {
+		path: path.to_string(),
+		candidates,
+	})
+}
+
+/// Certain references to removed items, and through `lost` bindings (of removed imports), that are not removed
+/// themselves.
+fn dangling(
+	resolver: &Resolver<'_>,
+	removed: &HashSet<ItemId>,
+	(lost, dead): (&[LostBinding], &[DeadName]),
+	deleted: &DeletedText<'_>,
+	deleted_files: &[PathBuf],
+	warnings: &mut Vec<String>,
+) -> Vec<Reference> {
+	let ws = resolver.workspace();
+	let mut targets: Vec<ItemId> = (removed.iter().copied())
+		.filter(|&item| ws.item(item).name.is_some() && ws.item(item).kind != ItemKind::Import)
+		.collect();
+
+	targets.sort();
+
+	let references = match search_references(resolver, &targets, lost, dead) {
+		Ok(references) => references,
+		Err(message) => {
+			warnings.push(format!(
+				"dangling references are not reported: searching for references failed ({message})"
+			));
+			return Vec::new();
+		}
+	};
+
+	warnings.extend(references.notes);
+
+	// the files of removed modules, which their crates no longer compile (even when they are kept)
+	let dropped: HashSet<(CrateId, FileId)> = (removed.iter())
+		.filter_map(|&item| {
+			let info = ws.item(item).module_info().filter(|info| !info.inline)?;
+
+			Some((item.krate(), info.file?))
+		})
+		.collect();
+
+	let is_deleted = |reference: &Reference| {
+		dropped.contains(&(reference.krate, reference.file))
+			|| deleted_files.iter().any(|path| reference.path.starts_with(path))
+			|| deleted
+				.get(reference.path.as_path())
+				.is_some_and(|(_, ranges)| ranges.iter().any(|range| range.contains_range(reference.range)))
+	};
+
+	let mut dangling: Vec<Reference> = references
+		.references
+		.into_iter()
+		.filter(|reference| reference.certain && !is_deleted(reference))
+		.collect();
+
+	dangling.sort_by(|a, b| (&a.path, a.range.start, a.range.end).cmp(&(&b.path, b.range.start, b.range.end)));
+	dangling.dedup_by(|a, b| a.path == b.path && a.range == b.range);
+	dangling
+}
+
+/// What a binding refers to, for messages.
+fn describe_res(resolver: &Resolver<'_>, res: &Res) -> String {
+	match res {
+		Res::Item(item) => resolver.canonical_path(*item).to_string(),
+		Res::External(path) | Res::Builtin(path) => path.to_string(),
+	}
+}
+
+/// The ranges to delete to remove elements of comma-separated lists. Consecutive elements of a list are removed
+/// together, so that the list keeps no trailing comma it did not have.
+fn element_removal_ranges(text: &str, elements: &[TextRange]) -> Vec<TextRange> {
+	let mut elements = elements.to_vec();
+	let mut blocks: Vec<TextRange> = Vec::with_capacity(elements.len());
+
+	elements.sort();
+	elements.dedup();
+
+	for element in elements {
+		match blocks.last_mut() {
+			Some(block) if text.get(block.end..element.start).is_some_and(|between| between.trim() == ",") => {
+				block.end = element.end;
+			}
+			_ => blocks.push(element),
+		}
+	}
+
+	blocks.into_iter().map(|block| trivia::list_item_removal_range(text, block)).collect()
+}
+
+/// The `thread_local!` invocations all of whose statics are removed: they are removed as a whole (with their
+/// attributes), rather than left empty.
+fn emptied_thread_locals(ws: &Workspace, targets: &[ItemId]) -> BTreeSet<ItemId> {
+	let invocations: BTreeSet<ItemId> = targets
+		.iter()
+		.filter_map(|&item| ws.parent(item))
+		.filter(|&parent| ws.item(parent).kind == ItemKind::MacroCall)
+		.collect();
+
+	invocations
+		.into_iter()
+		.filter(|&invocation| ws.children(invocation).all(|child| targets.contains(&child)))
+		.collect()
+}
+
+/// Whether an element is an empty group (`{}` or `a::{}`), which has no leaves.
+fn is_empty_group(tokens: &[TokenTree]) -> bool {
+	matches!(tokens.last(), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace && group.stream().is_empty())
+}
+
+/// The directory where the files of a module's children are, and whether it is the module's own: the directory of a
+/// `mod.rs` file, or the directory named after a module loaded from a non-`mod.rs` file (rather than, for a file loaded
+/// with `#[path]` or an inline module, where the files happen to be).
+fn module_directory(ws: &Workspace, module: ItemId) -> Option<(PathBuf, bool)> {
+	let data = ws.item(module);
+	let info = data.module_info()?;
+
+	if info.inline {
+		// where the files of its out-of-line children (declared without `#[path]`) are
+		return ws.children(module).find_map(|child| {
+			let child_data = ws.item(child);
+			let child_info = child_data.module_info().filter(|info| !info.inline && child_data.attrs.path.is_none())?;
+			let file = ws.krate(child.krate()).file(child_info.file?).path();
+			let parent = file.parent()?;
+			let directory = if file.file_name()? == "mod.rs" { parent.parent()? } else { parent };
+
+			Some((directory.to_path_buf(), false))
+		});
+	}
+
+	let file = ws.krate(module.krate()).file(info.file?).path();
+	let parent = file.parent()?;
+
+	if file.file_name().is_some_and(|name| name == "mod.rs") {
+		return Some((parent.to_path_buf(), true));
+	}
+
+	match info.dir_owner {
+		true => Some((parent.to_path_buf(), false)),
+		false => Some((parent.join(data.name.as_deref().unwrap_or_default()), true)),
+	}
+}
+
+/// Plans deleting the files of removed modules: every module file of their subtrees, except files that kept modules
+/// load too, and the directory of a module when all files in it go. Returns the paths to delete.
+fn module_files(resolver: &Resolver<'_>, targets: &[ItemId], removed: &HashSet<ItemId>, warnings: &mut Vec<String>) -> Vec<PathBuf> {
+	let ws = resolver.workspace();
+	let mut kept: HashMap<&Path, ItemId> = HashMap::new();
+
+	for krate in ws.crates() {
+		for (module, data) in krate.items() {
+			if let Some(file) = data.module_info().and_then(|info| info.file)
+				&& !removed.contains(&module)
+			{
+				kept.entry(krate.file(file).path()).or_insert(module);
+			}
+		}
+	}
+
+	let mut deleted: Vec<PathBuf> = Vec::new();
+
+	for &module in targets.iter().filter(|&&target| ws.item(target).kind == ItemKind::Module) {
+		let mut files: Vec<&Path> = Vec::new();
+
+		for file in subtree_files(ws, module) {
+			match kept.get(file) {
+				Some(&other) => warnings.push(format!(
+					"`{}` is not deleted: the module `{}` loads it too",
+					ws.display_path(file).display(),
+					resolver.canonical_path(other),
+				)),
+				None if !files.contains(&file) => files.push(file),
+				None => {}
+			}
+		}
+
+		match module_directory(ws, module).filter(|(directory, _)| directory.is_dir()) {
+			Some((directory, _)) if only_files_of(&directory, &files) => {
+				deleted.extend(files.iter().filter(|file| !file.starts_with(&directory)).map(|file| file.to_path_buf()));
+				deleted.push(directory);
+			}
+
+			Some((directory, true)) => {
+				warnings.push(format!(
+					"the directory `{}` is not deleted: it has files that are not part of the module `{}`",
+					ws.display_path(&directory).display(),
+					resolver.canonical_path(module),
+				));
+				deleted.extend(files.iter().map(|file| file.to_path_buf()));
+			}
+
+			_ => deleted.extend(files.iter().map(|file| file.to_path_buf())),
+		}
+	}
+
+	let mut unique = Vec::with_capacity(deleted.len());
+
+	for path in deleted {
+		if !unique.contains(&path) {
+			unique.push(path);
+		}
+	}
+
+	unique
+}
+
+/// Whether every file below `directory` is one of `files` (`false` when it cannot be listed).
+fn only_files_of(directory: &Path, files: &[&Path]) -> bool {
+	fn walk(directory: &Path, files: &[&Path]) -> io::Result<bool> {
+		for entry in fs::read_dir(directory)? {
+			let path = entry?.path();
+
+			let only = match fs::symlink_metadata(&path)?.is_dir() {
+				true => walk(&path, files)?,
+				false => files.contains(&path.as_path()),
+			};
+
+			if !only {
+				return Ok(false);
+			}
+		}
+
+		Ok(true)
+	}
+
+	walk(directory, files).unwrap_or(false)
+}
+
+/// Plans removing `imports` (leaves) of a `use` item: the whole item when nothing else is in it.
+fn prune<'ws>(ws: &'ws Workspace, use_item: ItemId, imports: &[ItemId], deletions: &mut Deletions<'ws>) {
+	let file = ws.file_of(use_item);
+	let range = ws.item(use_item).range;
+
+	if ws.children(use_item).all(|leaf| imports.contains(&leaf)) {
+		deletions.item(file, range);
+		return;
+	}
+
+	let leaves: Vec<TextRange> = imports.iter().map(|&import| ws.item(import).range).collect();
+
+	for element in use_elements(file.text(), range, &leaves) {
+		deletions.element(file, element);
+	}
+}
+
+/// Adds an item unless it is listed (the same text is loaded by several crates).
+fn push_removed(removed: &mut Vec<RemovedItem>, item: RemovedItem) {
+	let listed = removed
+		.iter()
+		.any(|known| (&known.path, &known.file, known.start) == (&item.path, &item.file, item.start));
+
+	if !listed {
+		removed.push(item);
+	}
 }
 
 /// Plans the removal of the items named by `paths` (every `cfg` variant), including their attached comments.
@@ -109,7 +510,12 @@ pub struct Removal {
 pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptions) -> Result<Removal, Error> {
 	let ws = resolver.workspace();
 	let targets = targets(resolver, paths, options.active_only)?;
-	let mut plan = Removal { edits: EditSet::new(), removed: Vec::new(), dangling: Vec::new(), warnings: Vec::new() };
+	let mut plan = Removal {
+		edits: EditSet::new(),
+		removed: Vec::new(),
+		dangling: Vec::new(),
+		warnings: Vec::new(),
+	};
 	let mut deletions = Deletions::default();
 	let emptied = emptied_thread_locals(ws, &targets);
 
@@ -238,24 +644,78 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 	Ok(plan)
 }
 
-/// What a binding refers to, for messages.
-fn describe_res(resolver: &Resolver<'_>, res: &Res) -> String {
-	match res {
-		Res::Item(item) => resolver.canonical_path(*item).to_string(),
-		Res::External(path) | Res::Builtin(path) => path.to_string(),
+fn removed_item(resolver: &Resolver<'_>, item: ItemId) -> RemovedItem {
+	let ws = resolver.workspace();
+	let data = ws.item(item);
+	let file = ws.file_of(item);
+	let (start, end) = file.locate(data.range);
+
+	RemovedItem {
+		path: resolver.canonical_path(item).to_string(),
+		kind: data.kind,
+		file: file.path().to_path_buf(),
+		start,
+		end,
 	}
 }
 
-/// The `thread_local!` invocations all of whose statics are removed: they are removed as a whole (with their
-/// attributes), rather than left empty.
-fn emptied_thread_locals(ws: &Workspace, targets: &[ItemId]) -> BTreeSet<ItemId> {
-	let invocations: BTreeSet<ItemId> = targets
-		.iter()
-		.filter_map(|&item| ws.parent(item))
-		.filter(|&parent| ws.item(parent).kind == ItemKind::MacroCall)
-		.collect();
+/// Every item that is gone after the removal: the targets and the items inside of them, and the items of other
+/// crates whose text is deleted (of files that several crates load).
+fn removed_items(ws: &Workspace, targets: &[ItemId], deleted: &DeletedText<'_>) -> HashSet<ItemId> {
+	let mut removed = HashSet::new();
+	let mut stack = targets.to_vec();
 
-	invocations.into_iter().filter(|&invocation| ws.children(invocation).all(|child| targets.contains(&child))).collect()
+	while let Some(item) = stack.pop() {
+		if removed.insert(item) {
+			stack.extend(ws.children(item));
+		}
+	}
+
+	for krate in ws.crates() {
+		// the range of a crate root is its whole file, which a removal may empty without removing the crate
+		for (item, data) in krate.items().filter(|(item, _)| !item.is_crate_root()) {
+			let path = krate.file(data.file).path();
+
+			if deleted
+				.get(path)
+				.is_some_and(|(_, ranges)| ranges.iter().any(|range| range.contains_range(data.range)))
+			{
+				removed.insert(item);
+			}
+		}
+	}
+
+	removed
+}
+
+/// Searches for references, which is only a courtesy of the removal: a failure (a panic, as for syntax the search
+/// does not handle) is reported rather than failing the removal.
+fn search_references(resolver: &Resolver<'_>, targets: &[ItemId], lost: &[LostBinding], dead: &[DeadName]) -> Result<References, String> {
+	let search = || resolver.find_references_through(targets, lost, dead, &ReferenceOptions::default());
+
+	std::panic::catch_unwind(std::panic::AssertUnwindSafe(search)).map_err(|payload| {
+		(payload.downcast_ref::<&str>().map(|message| message.to_string()))
+			.or_else(|| payload.downcast_ref::<String>().cloned())
+			.unwrap_or_else(|| "unknown error".to_owned())
+	})
+}
+
+/// The files of a module and of the out-of-line modules inside of it.
+fn subtree_files(ws: &Workspace, module: ItemId) -> Vec<&Path> {
+	let mut files = Vec::new();
+	let mut stack = vec![module];
+
+	while let Some(module) = stack.pop() {
+		let data = ws.item(module);
+
+		if let Some(file) = data.module_info().filter(|info| !info.inline).and_then(|info| info.file) {
+			files.push(ws.krate(module.krate()).file(file).path());
+		}
+
+		stack.extend(ws.children(module).filter(|&child| ws.item(child).kind == ItemKind::Module));
+	}
+
+	files
 }
 
 /// The items to remove: what the paths name, without items inside of other items to remove.
@@ -301,257 +761,14 @@ fn targets(resolver: &Resolver<'_>, paths: &[ItemPath], active_only: bool) -> Re
 	Ok(targets)
 }
 
-/// Refuses a path naming `impl` blocks (or items of them) whose headers differ, such as `impl From<u8> for X` and
-/// `impl From<u16> for X` for `impl From for X`: those are not `cfg` variants of each other, and the path can tell them
-/// apart with generic arguments.
-fn check_impl_headers(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
-	let ws = resolver.workspace();
+/// The range of tokens (lexed from the text at `offset`).
+fn tokens_range(tokens: &[TokenTree], offset: usize) -> Option<TextRange> {
+	let (first, last) = (tokens.first()?, tokens.last()?);
 
-	if !super::impl_headers_differ(ws, items) {
-		return Ok(());
-	}
-
-	let candidates = items
-		.iter()
-		.map(|&item| {
-			let file = ws.file_of(item);
-			let start = file.line_col(ws.item(item).range.start);
-
-			let path = resolver.canonical_path(item).distinct();
-
-			format!("`{path}` at {}:{start}", ws.display_path(file.path()).display())
-		})
-		.collect();
-
-	Err(Error::Ambiguous { path: path.to_string(), candidates })
-}
-
-/// Every item that is gone after the removal: the targets and the items inside of them, and the items of other
-/// crates whose text is deleted (of files that several crates load).
-fn removed_items(ws: &Workspace, targets: &[ItemId], deleted: &DeletedText<'_>) -> HashSet<ItemId> {
-	let mut removed = HashSet::new();
-	let mut stack = targets.to_vec();
-
-	while let Some(item) = stack.pop() {
-		if removed.insert(item) {
-			stack.extend(ws.children(item));
-		}
-	}
-
-	for krate in ws.crates() {
-		// the range of a crate root is its whole file, which a removal may empty without removing the crate
-		for (item, data) in krate.items().filter(|(item, _)| !item.is_crate_root()) {
-			let path = krate.file(data.file).path();
-
-			if deleted.get(path).is_some_and(|(_, ranges)| ranges.iter().any(|range| range.contains_range(data.range)))
-			{
-				removed.insert(item);
-			}
-		}
-	}
-
-	removed
-}
-
-fn removed_item(resolver: &Resolver<'_>, item: ItemId) -> RemovedItem {
-	let ws = resolver.workspace();
-	let data = ws.item(item);
-	let file = ws.file_of(item);
-	let (start, end) = file.locate(data.range);
-
-	RemovedItem {
-		path: resolver.canonical_path(item).to_string(),
-		kind: data.kind,
-		file: file.path().to_path_buf(),
-		start,
-		end,
-	}
-}
-
-/// Adds an item unless it is listed (the same text is loaded by several crates).
-fn push_removed(removed: &mut Vec<RemovedItem>, item: RemovedItem) {
-	let listed =
-		removed.iter().any(|known| (&known.path, &known.file, known.start) == (&item.path, &item.file, item.start));
-
-	if !listed {
-		removed.push(item);
-	}
-}
-
-/// Text to delete, by file.
-#[derive(Debug, Default)]
-struct Deletions<'ws> {
-	files: BTreeMap<&'ws Path, FileDeletions<'ws>>,
-}
-
-#[derive(Debug)]
-struct FileDeletions<'ws> {
-	file: &'ws SourceFile,
-
-	/// Items, removed with their attached comments and a line.
-	items: Vec<TextRange>,
-
-	/// Elements of comma-separated lists (variants, `use` group elements), removed with a comma.
-	elements: Vec<TextRange>,
-}
-
-/// The ranges deleted from each file, with the file.
-type DeletedText<'ws> = BTreeMap<&'ws Path, (&'ws SourceFile, Vec<TextRange>)>;
-
-impl<'ws> Deletions<'ws> {
-	fn file(&mut self, file: &'ws SourceFile) -> &mut FileDeletions<'ws> {
-		self.files.entry(file.path()).or_insert_with(|| FileDeletions { file, items: Vec::new(), elements: Vec::new() })
-	}
-
-	fn item(&mut self, file: &'ws SourceFile, range: TextRange) {
-		self.file(file).items.push(range);
-	}
-
-	fn element(&mut self, file: &'ws SourceFile, range: TextRange) {
-		self.file(file).elements.push(range);
-	}
-
-	/// The ranges to delete, sorted, per file. Items separated only by trivia are removed as one block.
-	fn ranges(&self) -> DeletedText<'ws> {
-		(self.files.iter())
-			.map(|(&path, deletions)| {
-				let text = deletions.file.text();
-				let mut ranges = trivia::removal_ranges(text, &deletions.items);
-
-				ranges.extend(element_removal_ranges(text, &deletions.elements));
-				ranges.sort();
-				ranges.dedup();
-
-				(path, (deletions.file, ranges))
-			})
-			.collect()
-	}
-}
-
-/// The ranges to delete to remove elements of comma-separated lists. Consecutive elements of a list are removed
-/// together, so that the list keeps no trailing comma it did not have.
-fn element_removal_ranges(text: &str, elements: &[TextRange]) -> Vec<TextRange> {
-	let mut elements = elements.to_vec();
-	let mut blocks: Vec<TextRange> = Vec::with_capacity(elements.len());
-
-	elements.sort();
-	elements.dedup();
-
-	for element in elements {
-		match blocks.last_mut() {
-			Some(block) if text.get(block.end..element.start).is_some_and(|between| between.trim() == ",") => {
-				block.end = element.end;
-			}
-			_ => blocks.push(element),
-		}
-	}
-
-	blocks.into_iter().map(|block| trivia::list_item_removal_range(text, block)).collect()
-}
-
-/// Imports that break when the removed items are gone, by their `use` item: imports whose targets are all removed,
-/// and imports whose path goes through a removed item.
-fn broken_imports(resolver: &Resolver<'_>, removed: &HashSet<ItemId>) -> BTreeMap<ItemId, Vec<ItemId>> {
-	let ws = resolver.workspace();
-	let is_removed = |res: &Res| matches!(res, Res::Item(item) if removed.contains(item));
-	let mut imports: BTreeSet<ItemId> = BTreeSet::new();
-
-	for &item in removed {
-		for import in resolver.imports_of(item) {
-			if !removed.contains(&import) && resolver.import_targets(import).iter().all(is_removed) {
-				imports.insert(import);
-			}
-		}
-	}
-
-	// paths through a removed module or enum break even when they import something else (like a re-export in the
-	// module, or an item that is not resolved)
-	if removed.iter().any(|&item| matches!(ws.item(item).kind, ItemKind::Module | ItemKind::Enum)) {
-		for krate in ws.crates() {
-			for (import, data) in krate.items() {
-				let Some(info) = data.import_info() else {
-					continue;
-				};
-
-				if removed.contains(&import) || imports.contains(&import) {
-					continue;
-				}
-
-				let prefixes = resolver.resolve_prefixes(ws.module_of(import), &info.path, None, PathKind::Use);
-
-				if prefixes.iter().any(|resolutions| !resolutions.is_empty() && resolutions.iter().all(is_removed)) {
-					imports.insert(import);
-				}
-			}
-		}
-	}
-
-	let mut broken: BTreeMap<ItemId, Vec<ItemId>> = BTreeMap::new();
-
-	for import in imports {
-		if let Some(use_item) = ws.parent(import) {
-			broken.entry(use_item).or_default().push(import);
-		}
-	}
-
-	broken
-}
-
-/// Plans removing `imports` (leaves) of a `use` item: the whole item when nothing else is in it.
-fn prune<'ws>(ws: &'ws Workspace, use_item: ItemId, imports: &[ItemId], deletions: &mut Deletions<'ws>) {
-	let file = ws.file_of(use_item);
-	let range = ws.item(use_item).range;
-
-	if ws.children(use_item).all(|leaf| imports.contains(&leaf)) {
-		deletions.item(file, range);
-		return;
-	}
-
-	let leaves: Vec<TextRange> = imports.iter().map(|&import| ws.item(import).range).collect();
-
-	for element in use_elements(file.text(), range, &leaves) {
-		deletions.element(file, element);
-	}
-}
-
-/// The elements of `use` groups to delete to remove the leaves at `leaves` (the ranges of leaves in the model: their
-/// element of the innermost enclosing group): a group element goes as a whole when all leaves in it go.
-///
-/// `use_item` must be a `use` item that keeps some of its leaves.
-fn use_elements(text: &str, use_item: TextRange, leaves: &[TextRange]) -> Vec<TextRange> {
-	let parsed = text.get(use_item.as_range()).and_then(|snippet| snippet.parse::<TokenStream>().ok());
-	let tokens: Vec<TokenTree> = parsed.into_iter().flatten().collect();
-
-	// the tree is between `use` and `;`
-	let Some(start) = tokens.iter().position(|token| matches!(token, TokenTree::Ident(ident) if ident == "use")) else {
-		return leaves.to_vec();
-	};
-
-	let tree = match &tokens[start + 1..] {
-		[tree @ .., TokenTree::Punct(semicolon)] if semicolon.as_char() == ';' => tree,
-		tree => tree,
-	};
-
-	let mut elements = Vec::new();
-
-	match use_element(tree, use_item.start, leaves, &mut elements) {
-		// the caller removes a `use` whose leaves all go as a whole
-		Pruned::All | Pruned::Nothing => leaves.to_vec(),
-		Pruned::Some => elements,
-	}
-}
-
-/// How much of a `use` tree element is pruned.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Pruned {
-	/// All of its leaves (it has at least one).
-	All,
-
-	/// Some of its leaves.
-	Some,
-
-	/// None of its leaves, or it has none (`{}`).
-	Nothing,
+	Some(TextRange::new(
+		offset + first.span().byte_range().start,
+		offset + last.span().byte_range().end,
+	))
 }
 
 /// Finds the pruned elements of a `use` tree element (its tokens), adding those to delete to `elements`.
@@ -599,231 +816,57 @@ fn use_element(tokens: &[TokenTree], offset: usize, leaves: &[TextRange], elemen
 	if pruned { Pruned::Some } else { Pruned::Nothing }
 }
 
-/// Whether an element is an empty group (`{}` or `a::{}`), which has no leaves.
-fn is_empty_group(tokens: &[TokenTree]) -> bool {
-	matches!(tokens.last(), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace && group.stream().is_empty())
-}
+/// The elements of `use` groups to delete to remove the leaves at `leaves` (the ranges of leaves in the model: their
+/// element of the innermost enclosing group): a group element goes as a whole when all leaves in it go.
+///
+/// `use_item` must be a `use` item that keeps some of its leaves.
+fn use_elements(text: &str, use_item: TextRange, leaves: &[TextRange]) -> Vec<TextRange> {
+	let parsed = text.get(use_item.as_range()).and_then(|snippet| snippet.parse::<TokenStream>().ok());
+	let tokens: Vec<TokenTree> = parsed.into_iter().flatten().collect();
 
-/// The range of tokens (lexed from the text at `offset`).
-fn tokens_range(tokens: &[TokenTree], offset: usize) -> Option<TextRange> {
-	let (first, last) = (tokens.first()?, tokens.last()?);
-
-	Some(TextRange::new(offset + first.span().byte_range().start, offset + last.span().byte_range().end))
-}
-
-/// Plans deleting the files of removed modules: every module file of their subtrees, except files that kept modules
-/// load too, and the directory of a module when all files in it go. Returns the paths to delete.
-fn module_files(
-	resolver: &Resolver<'_>,
-	targets: &[ItemId],
-	removed: &HashSet<ItemId>,
-	warnings: &mut Vec<String>,
-) -> Vec<PathBuf> {
-	let ws = resolver.workspace();
-	let mut kept: HashMap<&Path, ItemId> = HashMap::new();
-
-	for krate in ws.crates() {
-		for (module, data) in krate.items() {
-			if let Some(file) = data.module_info().and_then(|info| info.file)
-				&& !removed.contains(&module)
-			{
-				kept.entry(krate.file(file).path()).or_insert(module);
-			}
-		}
-	}
-
-	let mut deleted: Vec<PathBuf> = Vec::new();
-
-	for &module in targets.iter().filter(|&&target| ws.item(target).kind == ItemKind::Module) {
-		let mut files: Vec<&Path> = Vec::new();
-
-		for file in subtree_files(ws, module) {
-			match kept.get(file) {
-				Some(&other) => warnings.push(format!(
-					"`{}` is not deleted: the module `{}` loads it too",
-					ws.display_path(file).display(),
-					resolver.canonical_path(other),
-				)),
-				None if !files.contains(&file) => files.push(file),
-				None => {}
-			}
-		}
-
-		match module_directory(ws, module).filter(|(directory, _)| directory.is_dir()) {
-			Some((directory, _)) if only_files_of(&directory, &files) => {
-				deleted.extend(files.iter().filter(|file| !file.starts_with(&directory)).map(|file| file.to_path_buf()));
-				deleted.push(directory);
-			}
-
-			Some((directory, true)) => {
-				warnings.push(format!(
-					"the directory `{}` is not deleted: it has files that are not part of the module `{}`",
-					ws.display_path(&directory).display(),
-					resolver.canonical_path(module),
-				));
-				deleted.extend(files.iter().map(|file| file.to_path_buf()));
-			}
-
-			_ => deleted.extend(files.iter().map(|file| file.to_path_buf())),
-		}
-	}
-
-	let mut unique = Vec::with_capacity(deleted.len());
-
-	for path in deleted {
-		if !unique.contains(&path) {
-			unique.push(path);
-		}
-	}
-
-	unique
-}
-
-/// The files of a module and of the out-of-line modules inside of it.
-fn subtree_files(ws: &Workspace, module: ItemId) -> Vec<&Path> {
-	let mut files = Vec::new();
-	let mut stack = vec![module];
-
-	while let Some(module) = stack.pop() {
-		let data = ws.item(module);
-
-		if let Some(file) = data.module_info().filter(|info| !info.inline).and_then(|info| info.file) {
-			files.push(ws.krate(module.krate()).file(file).path());
-		}
-
-		stack.extend(ws.children(module).filter(|&child| ws.item(child).kind == ItemKind::Module));
-	}
-
-	files
-}
-
-/// The directory where the files of a module's children are, and whether it is the module's own: the directory of a
-/// `mod.rs` file, or the directory named after a module loaded from a non-`mod.rs` file (rather than, for a file loaded
-/// with `#[path]` or an inline module, where the files happen to be).
-fn module_directory(ws: &Workspace, module: ItemId) -> Option<(PathBuf, bool)> {
-	let data = ws.item(module);
-	let info = data.module_info()?;
-
-	if info.inline {
-		// where the files of its out-of-line children (declared without `#[path]`) are
-		return ws.children(module).find_map(|child| {
-			let child_data = ws.item(child);
-			let child_info = child_data.module_info().filter(|info| !info.inline && child_data.attrs.path.is_none())?;
-			let file = ws.krate(child.krate()).file(child_info.file?).path();
-			let parent = file.parent()?;
-			let directory = if file.file_name()? == "mod.rs" { parent.parent()? } else { parent };
-
-			Some((directory.to_path_buf(), false))
-		});
-	}
-
-	let file = ws.krate(module.krate()).file(info.file?).path();
-	let parent = file.parent()?;
-
-	if file.file_name().is_some_and(|name| name == "mod.rs") {
-		return Some((parent.to_path_buf(), true));
-	}
-
-	match info.dir_owner {
-		true => Some((parent.to_path_buf(), false)),
-		false => Some((parent.join(data.name.as_deref().unwrap_or_default()), true)),
-	}
-}
-
-/// Whether every file below `directory` is one of `files` (`false` when it cannot be listed).
-fn only_files_of(directory: &Path, files: &[&Path]) -> bool {
-	fn walk(directory: &Path, files: &[&Path]) -> io::Result<bool> {
-		for entry in fs::read_dir(directory)? {
-			let path = entry?.path();
-
-			let only = match fs::symlink_metadata(&path)?.is_dir() {
-				true => walk(&path, files)?,
-				false => files.contains(&path.as_path()),
-			};
-
-			if !only {
-				return Ok(false);
-			}
-		}
-
-		Ok(true)
-	}
-
-	walk(directory, files).unwrap_or(false)
-}
-
-/// Certain references to removed items, and through `lost` bindings (of removed imports), that are not removed
-/// themselves.
-fn dangling(
-	resolver: &Resolver<'_>,
-	removed: &HashSet<ItemId>,
-	(lost, dead): (&[LostBinding], &[DeadName]),
-	deleted: &DeletedText<'_>,
-	deleted_files: &[PathBuf],
-	warnings: &mut Vec<String>,
-) -> Vec<Reference> {
-	let ws = resolver.workspace();
-	let mut targets: Vec<ItemId> = (removed.iter().copied())
-		.filter(|&item| ws.item(item).name.is_some() && ws.item(item).kind != ItemKind::Import)
-		.collect();
-
-	targets.sort();
-
-	let references = match search_references(resolver, &targets, lost, dead) {
-		Ok(references) => references,
-		Err(message) => {
-			warnings.push(format!("dangling references are not reported: searching for references failed ({message})"));
-			return Vec::new();
-		}
+	// the tree is between `use` and `;`
+	let Some(start) = tokens.iter().position(|token| matches!(token, TokenTree::Ident(ident) if ident == "use")) else {
+		return leaves.to_vec();
 	};
 
-	warnings.extend(references.notes);
-
-	// the files of removed modules, which their crates no longer compile (even when they are kept)
-	let dropped: HashSet<(CrateId, FileId)> = (removed.iter())
-		.filter_map(|&item| {
-			let info = ws.item(item).module_info().filter(|info| !info.inline)?;
-
-			Some((item.krate(), info.file?))
-		})
-		.collect();
-
-	let is_deleted = |reference: &Reference| {
-		dropped.contains(&(reference.krate, reference.file))
-			|| deleted_files.iter().any(|path| reference.path.starts_with(path))
-			|| deleted
-				.get(reference.path.as_path())
-				.is_some_and(|(_, ranges)| ranges.iter().any(|range| range.contains_range(reference.range)))
+	let tree = match &tokens[start + 1..] {
+		[tree @ .., TokenTree::Punct(semicolon)] if semicolon.as_char() == ';' => tree,
+		tree => tree,
 	};
 
-	let mut dangling: Vec<Reference> =
-		references.references.into_iter().filter(|reference| reference.certain && !is_deleted(reference)).collect();
+	let mut elements = Vec::new();
 
-	dangling.sort_by(|a, b| (&a.path, a.range.start, a.range.end).cmp(&(&b.path, b.range.start, b.range.end)));
-	dangling.dedup_by(|a, b| a.path == b.path && a.range == b.range);
-	dangling
-}
-
-/// Searches for references, which is only a courtesy of the removal: a failure (a panic, as for syntax the search
-/// does not handle) is reported rather than failing the removal.
-fn search_references(
-	resolver: &Resolver<'_>,
-	targets: &[ItemId],
-	lost: &[LostBinding],
-	dead: &[DeadName],
-) -> Result<References, String> {
-	let search = || resolver.find_references_through(targets, lost, dead, &ReferenceOptions::default());
-
-	std::panic::catch_unwind(std::panic::AssertUnwindSafe(search)).map_err(|payload| {
-		(payload.downcast_ref::<&str>().map(|message| message.to_string()))
-			.or_else(|| payload.downcast_ref::<String>().cloned())
-			.unwrap_or_else(|| "unknown error".to_owned())
-	})
+	match use_element(tree, use_item.start, leaves, &mut elements) {
+		// the caller removes a `use` whose leaves all go as a whole
+		Pruned::All | Pruned::Nothing => leaves.to_vec(),
+		Pruned::Some => elements,
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The text without the (sorted, possibly overlapping) ranges.
+	fn delete(text: &str, ranges: &[TextRange]) -> String {
+		let mut out = String::new();
+		let mut position = 0;
+
+		for range in ranges {
+			out.push_str(&text[position..range.start.max(position)]);
+			position = position.max(range.end);
+		}
+
+		out + &text[position..]
+	}
+
+	#[test]
+	fn falls_back_to_leaves() {
+		// no `use` keyword to find the tree after
+		let text = "a::{B, C}";
+
+		assert_eq!(use_elements(text, TextRange::new(0, text.len()), &[find(text, "B")]), [find(text, "B")]);
+	}
 
 	/// The range of the unique occurrence of `needle`.
 	fn find(text: &str, needle: &str) -> TextRange {
@@ -840,41 +883,6 @@ mod tests {
 		let elements = use_elements(text, TextRange::new(0, text.len()), &leaves);
 
 		delete(text, &element_removal_ranges(text, &elements))
-	}
-
-	/// The text without the (sorted, possibly overlapping) ranges.
-	fn delete(text: &str, ranges: &[TextRange]) -> String {
-		let mut out = String::new();
-		let mut position = 0;
-
-		for range in ranges {
-			out.push_str(&text[position..range.start.max(position)]);
-			position = position.max(range.end);
-		}
-
-		out + &text[position..]
-	}
-
-	#[test]
-	fn removes_consecutive_elements_together() {
-		fn remove_elements(text: &str, names: &[&str]) -> String {
-			let elements: Vec<TextRange> = names.iter().map(|name| find(text, name)).collect();
-
-			delete(text, &element_removal_ranges(text, &elements))
-		}
-
-		let text = "enum E { A, B, C, D }";
-
-		assert_eq!(remove_elements(text, &["C", "D"]), "enum E { A, B }");
-		assert_eq!(remove_elements(text, &["B", "C"]), "enum E { A, D }");
-		assert_eq!(remove_elements(text, &["A", "D"]), "enum E { B, C }");
-		assert_eq!(remove_elements(text, &["D", "B"]), "enum E { A, C }");
-		assert_eq!(remove_elements(text, &["A", "B", "C", "D"]), "enum E { }");
-
-		let text = "enum E {\n    A,\n    B,\n    C,\n}\n";
-
-		assert_eq!(remove_elements(text, &["B", "C"]), "enum E {\n    A,\n}\n");
-		assert_eq!(remove_elements(text, &["A", "C"]), "enum E {\n    B,\n}\n");
 	}
 
 	#[test]
@@ -904,14 +912,31 @@ mod tests {
 	#[test]
 	fn prunes_rooted_elements() {
 		assert_eq!(prune_leaves("use {::a::B, c::D};", &["::a::B"]), "use {c::D};");
-		assert_eq!(prune_leaves("#[cfg(x)]\n/// docs\nuse ::a::{B, C};", &["C"]), "#[cfg(x)]\n/// docs\nuse ::a::{B};");
+		assert_eq!(
+			prune_leaves("#[cfg(x)]\n/// docs\nuse ::a::{B, C};", &["C"]),
+			"#[cfg(x)]\n/// docs\nuse ::a::{B};"
+		);
 	}
 
 	#[test]
-	fn falls_back_to_leaves() {
-		// no `use` keyword to find the tree after
-		let text = "a::{B, C}";
+	fn removes_consecutive_elements_together() {
+		fn remove_elements(text: &str, names: &[&str]) -> String {
+			let elements: Vec<TextRange> = names.iter().map(|name| find(text, name)).collect();
 
-		assert_eq!(use_elements(text, TextRange::new(0, text.len()), &[find(text, "B")]), [find(text, "B")]);
+			delete(text, &element_removal_ranges(text, &elements))
+		}
+
+		let text = "enum E { A, B, C, D }";
+
+		assert_eq!(remove_elements(text, &["C", "D"]), "enum E { A, B }");
+		assert_eq!(remove_elements(text, &["B", "C"]), "enum E { A, D }");
+		assert_eq!(remove_elements(text, &["A", "D"]), "enum E { B, C }");
+		assert_eq!(remove_elements(text, &["D", "B"]), "enum E { A, C }");
+		assert_eq!(remove_elements(text, &["A", "B", "C", "D"]), "enum E { }");
+
+		let text = "enum E {\n    A,\n    B,\n    C,\n}\n";
+
+		assert_eq!(remove_elements(text, &["B", "C"]), "enum E {\n    A,\n}\n");
+		assert_eq!(remove_elements(text, &["A", "C"]), "enum E {\n    B,\n}\n");
 	}
 }

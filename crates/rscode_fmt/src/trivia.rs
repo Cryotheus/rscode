@@ -6,6 +6,51 @@ use proc_macro2::TokenTree;
 use std::ops::Range;
 use std::str::FromStr;
 
+/// The length of a (nested) block comment at the start of `text`, including `*/`. `None` if unterminated.
+fn block_comment_len(text: &str) -> Option<usize> {
+	let bytes = text.as_bytes();
+	let mut depth = 0usize;
+	let mut index = 0;
+
+	while index + 1 < bytes.len() {
+		match &bytes[index..index + 2] {
+			b"/*" => {
+				depth += 1;
+				index += 2;
+			}
+			b"*/" => {
+				depth = depth.saturating_sub(1);
+				index += 2;
+
+				if depth == 0 {
+					return Some(index);
+				}
+			}
+			_ => index += 1,
+		}
+	}
+
+	None
+}
+
+/// The length of a character literal at the start of `text` (starting with `'`), or 1 for the quote of a lifetime or
+/// label.
+fn char_or_lifetime_len(text: &str) -> usize {
+	let mut characters = text[1..].chars();
+
+	match (characters.next(), characters.next()) {
+		// an escape: the closing quote follows within the longest escape, `\u{10FFFF}`
+		(Some('\\'), Some(_)) => {
+			let closing_quote = text[1..].char_indices().skip(2).take(10).find(|&(_, character)| character == '\'');
+
+			closing_quote.map_or(1, |(index, _)| index + 2)
+		}
+		(Some('\\'), None) => text.len(),
+		(Some(character), Some('\'')) => 1 + character.len_utf8() + 1,
+		_ => 1,
+	}
+}
+
 /// Whether the source contains any non-doc comments (`//`, `/* */`), which prettyplease would discard.
 ///
 /// Doc comments (`///`, `//!`, `/** */`, `/*! */`) are attributes and are not counted.
@@ -16,18 +61,24 @@ pub fn contains_comments(source: &str) -> bool {
 	lexed_comments(text).unwrap_or_else(|| scanned_comments(text))
 }
 
-/// The length of the text `syn::parse_file` skips before parsing: a byte order mark, and a shebang line (without its
-/// line break).
-pub(crate) fn prefix_len(text: &str) -> usize {
-	let bom = bom_len(text);
-	let rest = &text[bom..];
+/// Whether the text consists only of whitespace, as defined by the Rust lexer.
+fn is_blank(text: &str) -> bool {
+	text.chars().all(is_whitespace)
+}
 
-	// `#![attribute]` is an inner attribute, not a shebang
-	if rest.starts_with("#!") && !skip_trivia(&rest[2..]).starts_with('[') {
-		bom + rest.find('\n').unwrap_or(rest.len())
-	} else {
-		bom
-	}
+/// Whether text starting with `/*` is a doc comment: `/**` (but not `/***` or the empty comment `/**/`) or `/*!`.
+fn is_doc_block_comment(text: &str) -> bool {
+	text.starts_with("/**") && !text.starts_with("/***") && !text.starts_with("/**/") || text.starts_with("/*!")
+}
+
+/// Whether text starting with `//` is a doc comment: `///` (but not `////`) or `//!`.
+fn is_doc_line_comment(text: &str) -> bool {
+	text.starts_with("///") && !text.starts_with("////") || text.starts_with("//!")
+}
+
+fn is_whitespace(character: char) -> bool {
+	// Rust treats the left-to-right and right-to-left marks as whitespace
+	character.is_whitespace() || character == '\u{200e}' || character == '\u{200f}'
 }
 
 /// Finds comments by lexing: every token is covered by its span (the tokens of a doc comment span the whole comment),
@@ -50,27 +101,47 @@ fn lexed_comments(text: &str) -> Option<bool> {
 	Some(!is_blank(&text[covered.min(text.len())..]))
 }
 
-/// The byte ranges of every token, including the delimiters of groups.
-fn token_ranges(tokens: TokenStream) -> Vec<Range<usize>> {
-	let mut ranges = Vec::new();
-	let mut stack = vec![tokens.into_iter()];
+/// The length of the text `syn::parse_file` skips before parsing: a byte order mark, and a shebang line (without its
+/// line break).
+pub(crate) fn prefix_len(text: &str) -> usize {
+	let bom = bom_len(text);
+	let rest = &text[bom..];
 
-	// iterative, as deeply nested groups must not overflow the stack
-	while let Some(tokens) = stack.last_mut() {
-		match tokens.next() {
-			Some(TokenTree::Group(group)) => {
-				ranges.push(group.span_open().byte_range());
-				ranges.push(group.span_close().byte_range());
-				stack.push(group.stream().into_iter());
-			}
-			Some(token) => ranges.push(token.span().byte_range()),
-			None => {
-				stack.pop();
-			}
+	// `#![attribute]` is an inner attribute, not a shebang
+	if rest.starts_with("#!") && !skip_trivia(&rest[2..]).starts_with('[') {
+		bom + rest.find('\n').unwrap_or(rest.len())
+	} else {
+		bom
+	}
+}
+
+/// The length of a string literal at the start of `text` (starting with `"`), including the closing quote.
+fn quoted_len(text: &str) -> usize {
+	let bytes = text.as_bytes();
+	let mut index = 1;
+
+	while index < bytes.len() {
+		match bytes[index] {
+			b'\\' => index += 2,
+			b'"' => return index + 1,
+			_ => index += 1,
 		}
 	}
 
-	ranges
+	text.len()
+}
+
+/// The length of a raw string after its prefix: `#`s, then a quoted string, then the same number of `#`s.
+/// `None` if `text` does not start a raw string (as in the raw identifier `r#match`).
+fn raw_string_len(text: &str) -> Option<usize> {
+	let hashes = text.len() - text.trim_start_matches('#').len();
+	let body = text[hashes..].strip_prefix('"')?;
+	let terminator = format!("\"{}", "#".repeat(hashes));
+
+	Some(match body.find(&terminator) {
+		Some(index) => hashes + 1 + index + terminator.len(),
+		None => text.len(),
+	})
 }
 
 /// Finds comments by scanning, skipping string, byte string, raw string, and character literals.
@@ -128,75 +199,27 @@ fn skip_trivia(mut text: &str) -> &str {
 	}
 }
 
-/// Whether text starting with `//` is a doc comment: `///` (but not `////`) or `//!`.
-fn is_doc_line_comment(text: &str) -> bool {
-	text.starts_with("///") && !text.starts_with("////") || text.starts_with("//!")
-}
+/// The byte ranges of every token, including the delimiters of groups.
+fn token_ranges(tokens: TokenStream) -> Vec<Range<usize>> {
+	let mut ranges = Vec::new();
+	let mut stack = vec![tokens.into_iter()];
 
-/// Whether text starting with `/*` is a doc comment: `/**` (but not `/***` or the empty comment `/**/`) or `/*!`.
-fn is_doc_block_comment(text: &str) -> bool {
-	text.starts_with("/**") && !text.starts_with("/***") && !text.starts_with("/**/") || text.starts_with("/*!")
-}
-
-/// The length of a (nested) block comment at the start of `text`, including `*/`. `None` if unterminated.
-fn block_comment_len(text: &str) -> Option<usize> {
-	let bytes = text.as_bytes();
-	let mut depth = 0usize;
-	let mut index = 0;
-
-	while index + 1 < bytes.len() {
-		match &bytes[index..index + 2] {
-			b"/*" => {
-				depth += 1;
-				index += 2;
+	// iterative, as deeply nested groups must not overflow the stack
+	while let Some(tokens) = stack.last_mut() {
+		match tokens.next() {
+			Some(TokenTree::Group(group)) => {
+				ranges.push(group.span_open().byte_range());
+				ranges.push(group.span_close().byte_range());
+				stack.push(group.stream().into_iter());
 			}
-			b"*/" => {
-				depth = depth.saturating_sub(1);
-				index += 2;
-
-				if depth == 0 {
-					return Some(index);
-				}
+			Some(token) => ranges.push(token.span().byte_range()),
+			None => {
+				stack.pop();
 			}
-			_ => index += 1,
 		}
 	}
 
-	None
-}
-
-/// The length of a string literal at the start of `text` (starting with `"`), including the closing quote.
-fn quoted_len(text: &str) -> usize {
-	let bytes = text.as_bytes();
-	let mut index = 1;
-
-	while index < bytes.len() {
-		match bytes[index] {
-			b'\\' => index += 2,
-			b'"' => return index + 1,
-			_ => index += 1,
-		}
-	}
-
-	text.len()
-}
-
-/// The length of a character literal at the start of `text` (starting with `'`), or 1 for the quote of a lifetime or
-/// label.
-fn char_or_lifetime_len(text: &str) -> usize {
-	let mut characters = text[1..].chars();
-
-	match (characters.next(), characters.next()) {
-		// an escape: the closing quote follows within the longest escape, `\u{10FFFF}`
-		(Some('\\'), Some(_)) => {
-			let closing_quote = text[1..].char_indices().skip(2).take(10).find(|&(_, character)| character == '\'');
-
-			closing_quote.map_or(1, |(index, _)| index + 2)
-		}
-		(Some('\\'), None) => text.len(),
-		(Some(character), Some('\'')) => 1 + character.len_utf8() + 1,
-		_ => 1,
-	}
+	ranges
 }
 
 /// The length of an identifier, keyword, or prefixed literal (`r"…"`, `br#"…"#`, `b"…"`, `c"…"`, `b'…'`) at the start
@@ -212,29 +235,6 @@ fn word_or_literal_len(text: &str) -> usize {
 		"b" if rest.starts_with('\'') => word_len + char_or_lifetime_len(rest),
 		_ => word_len,
 	}
-}
-
-/// The length of a raw string after its prefix: `#`s, then a quoted string, then the same number of `#`s.
-/// `None` if `text` does not start a raw string (as in the raw identifier `r#match`).
-fn raw_string_len(text: &str) -> Option<usize> {
-	let hashes = text.len() - text.trim_start_matches('#').len();
-	let body = text[hashes..].strip_prefix('"')?;
-	let terminator = format!("\"{}", "#".repeat(hashes));
-
-	Some(match body.find(&terminator) {
-		Some(index) => hashes + 1 + index + terminator.len(),
-		None => text.len(),
-	})
-}
-
-/// Whether the text consists only of whitespace, as defined by the Rust lexer.
-fn is_blank(text: &str) -> bool {
-	text.chars().all(is_whitespace)
-}
-
-fn is_whitespace(character: char) -> bool {
-	// Rust treats the left-to-right and right-to-left marks as whitespace
-	character.is_whitespace() || character == '\u{200e}' || character == '\u{200f}'
 }
 
 #[cfg(test)]
@@ -313,6 +313,14 @@ mod tests {
 	];
 
 	#[test]
+	fn block_comments() {
+		assert_eq!(block_comment_len("/**/"), Some(4));
+		assert_eq!(block_comment_len("/* a /* b */ c */ d"), Some(17));
+		assert_eq!(block_comment_len("/*/"), None);
+		assert_eq!(block_comment_len("/* /* */"), None);
+	}
+
+	#[test]
 	fn lexer_detects_comments() {
 		for &(source, expected) in CASES {
 			let text = &source[prefix_len(source)..];
@@ -320,6 +328,38 @@ mod tests {
 			assert_eq!(lexed_comments(text), Some(expected), "{source:?}");
 			assert_eq!(contains_comments(source), expected, "{source:?}");
 		}
+	}
+
+	#[test]
+	fn literals() {
+		assert_eq!(quoted_len("\"a\\\"b\" c"), 6);
+		assert_eq!(quoted_len("\"unterminated"), 13);
+		assert_eq!(char_or_lifetime_len("'a' b"), 3);
+		assert_eq!(char_or_lifetime_len("'a b"), 1);
+		assert_eq!(char_or_lifetime_len("'\\'' b"), 4);
+		assert_eq!(char_or_lifetime_len("'\\u{10FFFF}' b"), 12);
+		assert_eq!(char_or_lifetime_len("'é' b"), 4);
+		assert_eq!(word_or_literal_len("r#\"a\"# b"), 6);
+		assert_eq!(word_or_literal_len("r#match b"), 1);
+		assert_eq!(word_or_literal_len("br\"a\" b"), 5);
+		assert_eq!(word_or_literal_len("b'x' b"), 4);
+		assert_eq!(word_or_literal_len("bar\"x\""), 3);
+		assert_eq!(raw_string_len("##\"a\"# \"##"), Some(10));
+		assert_eq!(raw_string_len("#x"), None);
+	}
+
+	#[test]
+	fn prefix() {
+		assert_eq!(prefix_len(""), 0);
+		assert_eq!(prefix_len("fn a() {}"), 0);
+		assert_eq!(prefix_len("\u{feff}fn a() {}"), 3);
+		assert_eq!(prefix_len("#!/bin/sh\nfn a() {}"), 9);
+		assert_eq!(prefix_len("\u{feff}#!/bin/sh\nfn a() {}"), 12);
+		assert_eq!(prefix_len("#!/bin/sh"), 9);
+		assert_eq!(prefix_len("#![allow(x)]"), 0);
+		assert_eq!(prefix_len("#!\n[allow(x)]"), 0);
+		assert_eq!(prefix_len("#! // c\n /* c */ [allow(x)]"), 0);
+		assert_eq!(prefix_len("#! /// doc\n[allow(x)]"), 10);
 	}
 
 	#[test]
@@ -339,45 +379,5 @@ mod tests {
 			assert_eq!(lexed_comments(text), None, "{source:?} should not be lexable");
 			assert_eq!(contains_comments(source), expected, "{source:?}");
 		}
-	}
-
-	#[test]
-	fn prefix() {
-		assert_eq!(prefix_len(""), 0);
-		assert_eq!(prefix_len("fn a() {}"), 0);
-		assert_eq!(prefix_len("\u{feff}fn a() {}"), 3);
-		assert_eq!(prefix_len("#!/bin/sh\nfn a() {}"), 9);
-		assert_eq!(prefix_len("\u{feff}#!/bin/sh\nfn a() {}"), 12);
-		assert_eq!(prefix_len("#!/bin/sh"), 9);
-		assert_eq!(prefix_len("#![allow(x)]"), 0);
-		assert_eq!(prefix_len("#!\n[allow(x)]"), 0);
-		assert_eq!(prefix_len("#! // c\n /* c */ [allow(x)]"), 0);
-		assert_eq!(prefix_len("#! /// doc\n[allow(x)]"), 10);
-	}
-
-	#[test]
-	fn block_comments() {
-		assert_eq!(block_comment_len("/**/"), Some(4));
-		assert_eq!(block_comment_len("/* a /* b */ c */ d"), Some(17));
-		assert_eq!(block_comment_len("/*/"), None);
-		assert_eq!(block_comment_len("/* /* */"), None);
-	}
-
-	#[test]
-	fn literals() {
-		assert_eq!(quoted_len("\"a\\\"b\" c"), 6);
-		assert_eq!(quoted_len("\"unterminated"), 13);
-		assert_eq!(char_or_lifetime_len("'a' b"), 3);
-		assert_eq!(char_or_lifetime_len("'a b"), 1);
-		assert_eq!(char_or_lifetime_len("'\\'' b"), 4);
-		assert_eq!(char_or_lifetime_len("'\\u{10FFFF}' b"), 12);
-		assert_eq!(char_or_lifetime_len("'é' b"), 4);
-		assert_eq!(word_or_literal_len("r#\"a\"# b"), 6);
-		assert_eq!(word_or_literal_len("r#match b"), 1);
-		assert_eq!(word_or_literal_len("br\"a\" b"), 5);
-		assert_eq!(word_or_literal_len("b'x' b"), 4);
-		assert_eq!(word_or_literal_len("bar\"x\""), 3);
-		assert_eq!(raw_string_len("##\"a\"# \"##"), Some(10));
-		assert_eq!(raw_string_len("#x"), None);
 	}
 }

@@ -38,14 +38,16 @@ pub mod cfg;
 pub mod edit;
 mod error;
 mod load;
-#[cfg(feature = "mcp")]
-pub mod mcp;
 pub mod model;
 pub mod path;
 pub mod pattern;
 pub mod query;
 pub mod resolve;
 pub mod source;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
 #[cfg(feature = "cargo")]
 pub mod workspace;
 
@@ -74,7 +76,9 @@ pub use resolve::Viewpoint;
 pub use rscode_fmt;
 pub use rscode_fmt::Edition;
 pub use rscode_sort;
+
 #[cfg(feature = "cargo")]
 pub use workspace::LoadOptions;
+
 #[cfg(feature = "cargo")]
 pub use workspace::load_workspace;

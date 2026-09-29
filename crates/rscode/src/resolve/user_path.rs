@@ -3,11 +3,11 @@
 use super::Namespace;
 use super::PathKind;
 use super::Resolver;
-use super::walk::Found;
-use super::walk::Walker;
 use super::vis::Vis;
 use super::vis::declared_vis;
 use super::vis::home_module;
+use super::walk::Found;
+use super::walk::Walker;
 use super::walk::Want;
 use crate::model::CrateId;
 use crate::model::ItemId;
@@ -46,28 +46,73 @@ impl Resolver<'_> {
 		items
 	}
 
-	/// `use m::name`: the imports of the module(s) `m` names (every `cfg` variant) that bind `name` (`*`: glob imports,
-	/// `_`: underscore imports), found in the item tree, so that imports that resolve to nothing are named too.
-	fn resolve_import(&self, path: &ItemPath) -> Vec<ItemId> {
-		let Some((name, modules)) = self.split_name(path) else {
-			return Vec::new();
-		};
+	/// Crates named `name`: loaded crates of that name, and dependencies of selected crates known by that name.
+	pub(super) fn crates_named(&self, name: &str) -> Vec<CrateId> {
+		let mut crates: Vec<CrateId> = self
+			.ws
+			.crates()
+			.iter()
+			.filter(|krate| krate.name() == name)
+			.map(|krate| krate.id())
+			.collect();
 
-		(modules.into_iter())
-			.flat_map(|module| self.ws.children(module))
-			.filter(|&child| self.ws.item(child).kind == ItemKind::Use)
-			.flat_map(|use_item| self.ws.children(use_item))
-			.filter(|&import| self.ws.item(import).import_info().is_some_and(|info| info.path_name() == *name))
-			.collect()
+		for krate in self.ws.selected_crates() {
+			crates.extend(
+				krate
+					.dependencies()
+					.iter()
+					.filter(|dependency| dependency.name == name)
+					.filter_map(|dependency| dependency.krate),
+			);
+		}
+
+		crates.sort();
+		crates.dedup();
+		crates
 	}
 
-	/// The last segment of an unqualified path, and the modules its other segments name.
-	fn split_name<'p>(&self, path: &'p ItemPath) -> Option<(&'p SmolStr, Vec<ItemId>)> {
-		let (name, prefix) = path.segments.split_last()?;
-		let prefix = ItemPath { anchor: path.anchor, segments: prefix.to_vec(), ..ItemPath::default() };
-		let modules = self.compute_item_path(&prefix).into_iter().filter(|&item| self.ws.item(item).kind == ItemKind::Module);
+	/// Whether the names of a path as written, or of anything it resolved to, end with the segments of a user path
+	/// without an anchor (or starting with `::`).
+	fn ends_with(&self, written: &PathRef, resolved: &[Res], path: &ItemPath) -> bool {
+		if path.qualifier.is_some() || path.segments.is_empty() || matches!(path.anchor, Anchor::Crate | Anchor::SelfModule | Anchor::Super(_)) {
+			return false;
+		}
 
-		Some((name, modules.collect()))
+		let wanted: Vec<&str> = path.segments.iter().map(SmolStr::as_str).collect();
+		let written: Vec<&str> = written.names().collect();
+
+		ends_with(&written, &wanted)
+			|| resolved.iter().any(|res| match res {
+				Res::External(external) | Res::Builtin(external) => ends_with(&external.split("::").collect::<Vec<_>>(), &wanted),
+				Res::Item(item) => ends_with(&self.flat_path(*item).iter().map(SmolStr::as_str).collect::<Vec<_>>(), &wanted),
+			})
+	}
+
+	/// Whether a trait `impl` implements one of `traits` (the loaded traits the user's trait path names), or, when
+	/// either trait is not a loaded one, whether the `impl`'s trait ends with the segments of `trait_path`.
+	fn implements(&self, impl_block: ItemId, traits: &[ItemId], trait_path: &ItemPath) -> bool {
+		let Some(written) = self.ws.item(impl_block).impl_info().and_then(|info| info.trait_path.as_ref()) else {
+			return false;
+		};
+
+		let loaded = self.impls.traits(impl_block);
+
+		if loaded.iter().any(|trait_item| traits.contains(trait_item)) {
+			return true;
+		}
+
+		if !loaded.is_empty() && !traits.is_empty() {
+			return false;
+		}
+
+		let resolved = self.impls.trait_res.get(&impl_block).map_or(&[][..], Vec::as_slice);
+
+		self.ends_with(written, resolved, trait_path)
+	}
+
+	/// Whether an item is a named import no more visible than its module.
+	fn is_private_import(&self, import: ItemId) -> bool {
+		self.ws.item(import).kind == ItemKind::Import && declared_vis(self.ws, import) == Vis::Module(home_module(self.ws, import))
 	}
 
 	/// How the last segment of a plain path names some of `items` (what the path resolves to) in the module(s) its other
@@ -126,10 +171,81 @@ impl Resolver<'_> {
 		found
 	}
 
-	/// Whether an item is a named import no more visible than its module.
-	fn is_private_import(&self, import: ItemId) -> bool {
-		self.ws.item(import).kind == ItemKind::Import
-			&& declared_vis(self.ws, import) == Vis::Module(home_module(self.ws, import))
+	/// `use m::name`: the imports of the module(s) `m` names (every `cfg` variant) that bind `name` (`*`: glob imports,
+	/// `_`: underscore imports), found in the item tree, so that imports that resolve to nothing are named too.
+	fn resolve_import(&self, path: &ItemPath) -> Vec<ItemId> {
+		let Some((name, modules)) = self.split_name(path) else {
+			return Vec::new();
+		};
+
+		(modules.into_iter())
+			.flat_map(|module| self.ws.children(module))
+			.filter(|&child| self.ws.item(child).kind == ItemKind::Use)
+			.flat_map(|use_item| self.ws.children(use_item))
+			.filter(|&import| self.ws.item(import).import_info().is_some_and(|info| info.path_name() == *name))
+			.collect()
+	}
+
+	/// `<Type as Trait>::name`, `<Type>::name`, or the `impl` blocks themselves when there are no segments.
+	///
+	/// When the type or the trait is not a loaded item (as a presumed absolute path: `<Circle as Shape>` with a trait
+	/// `crate::shapes::Shape`, or `<u8 as Display>`), `impl` blocks whose type or trait ends with its segments match,
+	/// as written or as resolved. Generic arguments of the type or trait keep the `impl` blocks with the same ones, as
+	/// written (`<Wrapper as From<u8>>`).
+	fn resolve_qualified(&self, qualifier: &Qualifier, segments: &[SmolStr]) -> Vec<ItemId> {
+		let types = self.compute_item_path(&qualifier.self_ty);
+
+		let mut impls: Vec<ItemId> = if types.is_empty() {
+			(self.impls.all.iter().copied())
+				.filter(|&impl_block| self.self_type_ends_with(impl_block, &qualifier.self_ty))
+				.collect()
+		} else {
+			types.iter().flat_map(|ty| self.impls.by_self_type.get(ty)).flatten().copied().collect()
+		};
+
+		match &qualifier.trait_path {
+			None => impls.retain(|&impl_block| self.ws.item(impl_block).impl_info().is_some_and(|info| info.trait_path.is_none())),
+
+			Some(trait_path) => {
+				let mut traits = self.compute_item_path(trait_path);
+
+				traits.retain(|&item| self.ws.item(item).kind == ItemKind::Trait);
+
+				impls.retain(|&impl_block| self.implements(impl_block, &traits, trait_path));
+			}
+		}
+
+		// generic arguments select `impl` blocks by their header, as written
+		let arguments_match = |wanted: Option<&String>, written: Option<&str>| {
+			wanted.is_none_or(|wanted| written.and_then(last_segment_arguments).as_ref() == Some(wanted))
+		};
+
+		impls.retain(|&impl_block| {
+			let Some(info) = self.ws.item(impl_block).impl_info() else {
+				return false;
+			};
+
+			arguments_match(qualifier.self_ty.arguments.as_ref(), Some(&info.self_ty_text))
+				&& arguments_match(
+					qualifier.trait_path.as_ref().and_then(|path| path.arguments.as_ref()),
+					info.trait_text.as_deref(),
+				)
+		});
+
+		impls.sort();
+		impls.dedup();
+
+		match segments {
+			[] => impls,
+
+			[name] => impls
+				.iter()
+				.flat_map(|&impl_block| super::impls::named_assoc_items(self.ws, impl_block))
+				.filter(|&item| self.ws.item(item).name.as_ref() == Some(name))
+				.collect(),
+
+			_ => Vec::new(),
+		}
 	}
 
 	fn resolve_unqualified(&self, path: &ItemPath) -> Vec<ItemId> {
@@ -171,17 +287,30 @@ impl Resolver<'_> {
 		items
 	}
 
-	/// Crates named `name`: loaded crates of that name, and dependencies of selected crates known by that name.
-	pub(super) fn crates_named(&self, name: &str) -> Vec<CrateId> {
-		let mut crates: Vec<CrateId> = self.ws.crates().iter().filter(|krate| krate.name() == name).map(|krate| krate.id()).collect();
+	fn self_type_ends_with(&self, impl_block: ItemId, self_ty: &ItemPath) -> bool {
+		let Some(written) = self.ws.item(impl_block).impl_info().and_then(|info| info.self_ty.base_path()) else {
+			return false;
+		};
 
-		for krate in self.ws.selected_crates() {
-			crates.extend(krate.dependencies().iter().filter(|dependency| dependency.name == name).filter_map(|dependency| dependency.krate));
-		}
+		let resolved = self.impls.self_res.get(&impl_block).map_or(&[][..], Vec::as_slice);
 
-		crates.sort();
-		crates.dedup();
-		crates
+		self.ends_with(written, resolved, self_ty)
+	}
+
+	/// The last segment of an unqualified path, and the modules its other segments name.
+	fn split_name<'p>(&self, path: &'p ItemPath) -> Option<(&'p SmolStr, Vec<ItemId>)> {
+		let (name, prefix) = path.segments.split_last()?;
+		let prefix = ItemPath {
+			anchor: path.anchor,
+			segments: prefix.to_vec(),
+			..ItemPath::default()
+		};
+		let modules = self
+			.compute_item_path(&prefix)
+			.into_iter()
+			.filter(|&item| self.ws.item(item).kind == ItemKind::Module);
+
+		Some((name, modules.collect()))
 	}
 
 	/// Items named by `segments` starting at a crate root (all namespaces for the last segment). Visibility is not
@@ -203,112 +332,6 @@ impl Resolver<'_> {
 				_ => None,
 			})
 			.collect()
-	}
-
-	/// `<Type as Trait>::name`, `<Type>::name`, or the `impl` blocks themselves when there are no segments.
-	///
-	/// When the type or the trait is not a loaded item (as a presumed absolute path: `<Circle as Shape>` with a trait
-	/// `crate::shapes::Shape`, or `<u8 as Display>`), `impl` blocks whose type or trait ends with its segments match,
-	/// as written or as resolved. Generic arguments of the type or trait keep the `impl` blocks with the same ones, as
-	/// written (`<Wrapper as From<u8>>`).
-	fn resolve_qualified(&self, qualifier: &Qualifier, segments: &[SmolStr]) -> Vec<ItemId> {
-		let types = self.compute_item_path(&qualifier.self_ty);
-
-		let mut impls: Vec<ItemId> = if types.is_empty() {
-			(self.impls.all.iter().copied()).filter(|&impl_block| self.self_type_ends_with(impl_block, &qualifier.self_ty)).collect()
-		} else {
-			types.iter().flat_map(|ty| self.impls.by_self_type.get(ty)).flatten().copied().collect()
-		};
-
-		match &qualifier.trait_path {
-			None => impls.retain(|&impl_block| self.ws.item(impl_block).impl_info().is_some_and(|info| info.trait_path.is_none())),
-
-			Some(trait_path) => {
-				let mut traits = self.compute_item_path(trait_path);
-
-				traits.retain(|&item| self.ws.item(item).kind == ItemKind::Trait);
-
-				impls.retain(|&impl_block| self.implements(impl_block, &traits, trait_path));
-			}
-		}
-
-		// generic arguments select `impl` blocks by their header, as written
-		let arguments_match = |wanted: Option<&String>, written: Option<&str>| {
-			wanted.is_none_or(|wanted| written.and_then(last_segment_arguments).as_ref() == Some(wanted))
-		};
-
-		impls.retain(|&impl_block| {
-			let Some(info) = self.ws.item(impl_block).impl_info() else {
-				return false;
-			};
-
-			arguments_match(qualifier.self_ty.arguments.as_ref(), Some(&info.self_ty_text))
-				&& arguments_match(qualifier.trait_path.as_ref().and_then(|path| path.arguments.as_ref()), info.trait_text.as_deref())
-		});
-
-		impls.sort();
-		impls.dedup();
-
-		match segments {
-			[] => impls,
-
-			[name] => impls
-				.iter()
-				.flat_map(|&impl_block| super::impls::named_assoc_items(self.ws, impl_block))
-				.filter(|&item| self.ws.item(item).name.as_ref() == Some(name))
-				.collect(),
-
-			_ => Vec::new(),
-		}
-	}
-
-	/// Whether a trait `impl` implements one of `traits` (the loaded traits the user's trait path names), or, when
-	/// either trait is not a loaded one, whether the `impl`'s trait ends with the segments of `trait_path`.
-	fn implements(&self, impl_block: ItemId, traits: &[ItemId], trait_path: &ItemPath) -> bool {
-		let Some(written) = self.ws.item(impl_block).impl_info().and_then(|info| info.trait_path.as_ref()) else {
-			return false;
-		};
-
-		let loaded = self.impls.traits(impl_block);
-
-		if loaded.iter().any(|trait_item| traits.contains(trait_item)) {
-			return true;
-		}
-
-		if !loaded.is_empty() && !traits.is_empty() {
-			return false;
-		}
-
-		let resolved = self.impls.trait_res.get(&impl_block).map_or(&[][..], Vec::as_slice);
-
-		self.ends_with(written, resolved, trait_path)
-	}
-
-	fn self_type_ends_with(&self, impl_block: ItemId, self_ty: &ItemPath) -> bool {
-		let Some(written) = self.ws.item(impl_block).impl_info().and_then(|info| info.self_ty.base_path()) else {
-			return false;
-		};
-
-		let resolved = self.impls.self_res.get(&impl_block).map_or(&[][..], Vec::as_slice);
-
-		self.ends_with(written, resolved, self_ty)
-	}
-
-	/// Whether the names of a path as written, or of anything it resolved to, end with the segments of a user path
-	/// without an anchor (or starting with `::`).
-	fn ends_with(&self, written: &PathRef, resolved: &[Res], path: &ItemPath) -> bool {
-		if path.qualifier.is_some() || path.segments.is_empty() || matches!(path.anchor, Anchor::Crate | Anchor::SelfModule | Anchor::Super(_)) {
-			return false;
-		}
-
-		let wanted: Vec<&str> = path.segments.iter().map(SmolStr::as_str).collect();
-		let written: Vec<&str> = written.names().collect();
-
-		ends_with(&written, &wanted)
-			|| resolved.iter().any(|res| match res {
-				Res::External(external) | Res::Builtin(external) => ends_with(&external.split("::").collect::<Vec<_>>(), &wanted),
-				Res::Item(item) => ends_with(&self.flat_path(*item).iter().map(SmolStr::as_str).collect::<Vec<_>>(), &wanted),
-			})
 	}
 }
 

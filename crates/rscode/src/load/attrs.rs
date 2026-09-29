@@ -65,40 +65,6 @@ impl Walker<'_, '_, '_> {
 		summary
 	}
 
-	/// The range of a doc attribute. (proc-macro2 includes the `\r` of a CRLF line break in a `///` comment's span.)
-	fn doc_range(&self, attr: &Attribute) -> TextRange {
-		let range = self.range_of(attr);
-		let text = self.parsed.slice(range);
-
-		TextRange::new(range.start, range.start + text.trim_end_matches('\r').len())
-	}
-
-	fn meta(&mut self, meta: &Meta, context: &mut MetaContext, summary: &mut AttrSummary) {
-		let Some(name) = meta.path().get_ident() else {
-			return;
-		};
-
-		if name == "cfg" {
-			let cfg = self.cfg(meta);
-
-			summary.cfgs.push(conditional(&context.conditions, cfg));
-		} else if name == "cfg_attr" {
-			self.cfg_attr(meta, context, summary);
-		} else if name == "path" {
-			if context.outer && context.module {
-				self.path_attr(meta, context, summary);
-			}
-		} else if name == "doc" {
-			summary.attrs.doc_hidden |= matches!(meta, Meta::List(list) if has_word(&list.tokens, "hidden"));
-		} else if name == "macro_export" {
-			summary.attrs.macro_export = true;
-		} else if name == "macro_use" {
-			summary.attrs.macro_use = true;
-		} else if name == "test" {
-			summary.attrs.test = true;
-		}
-	}
-
 	/// The predicate of `#[cfg(...)]`; unparsable predicates are kept as [`CfgExpr::Other`] with a warning.
 	fn cfg(&mut self, meta: &Meta) -> CfgExpr {
 		let error = match meta {
@@ -157,6 +123,40 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
+	/// The range of a doc attribute. (proc-macro2 includes the `\r` of a CRLF line break in a `///` comment's span.)
+	fn doc_range(&self, attr: &Attribute) -> TextRange {
+		let range = self.range_of(attr);
+		let text = self.parsed.slice(range);
+
+		TextRange::new(range.start, range.start + text.trim_end_matches('\r').len())
+	}
+
+	fn meta(&mut self, meta: &Meta, context: &mut MetaContext, summary: &mut AttrSummary) {
+		let Some(name) = meta.path().get_ident() else {
+			return;
+		};
+
+		if name == "cfg" {
+			let cfg = self.cfg(meta);
+
+			summary.cfgs.push(conditional(&context.conditions, cfg));
+		} else if name == "cfg_attr" {
+			self.cfg_attr(meta, context, summary);
+		} else if name == "path" {
+			if context.outer && context.module {
+				self.path_attr(meta, context, summary);
+			}
+		} else if name == "doc" {
+			summary.attrs.doc_hidden |= matches!(meta, Meta::List(list) if has_word(&list.tokens, "hidden"));
+		} else if name == "macro_export" {
+			summary.attrs.macro_export = true;
+		} else if name == "macro_use" {
+			summary.attrs.macro_use = true;
+		} else if name == "test" {
+			summary.attrs.test = true;
+		}
+	}
+
 	/// `#[path = "..."]`: the first one applies (like rustc, which warns about the others).
 	fn path_attr(&mut self, meta: &Meta, context: &MetaContext, summary: &mut AttrSummary) {
 		let offset = self.range_of(meta).start;
@@ -169,7 +169,10 @@ impl Walker<'_, '_, '_> {
 		match &summary.attrs.path {
 			None => {
 				if let Some(predicate) = all(&context.conditions) {
-					self.warning(offset, format!("cannot tell whether `cfg_attr({predicate}, path = {path:?})` applies; assuming it does"));
+					self.warning(
+						offset,
+						format!("cannot tell whether `cfg_attr({predicate}, path = {path:?})` applies; assuming it does"),
+					);
 				}
 
 				summary.path_is_definite = context.conditions.is_empty();
@@ -187,9 +190,12 @@ impl Walker<'_, '_, '_> {
 	}
 }
 
-/// A doc comment (`///`, `/** */`) or `#[doc = ...]`.
-fn is_doc_comment(meta: &Meta) -> bool {
-	matches!(meta, Meta::NameValue(name_value) if name_value.path.is_ident("doc"))
+fn all(conditions: &[CfgExpr]) -> Option<CfgExpr> {
+	match conditions {
+		[] => None,
+		[condition] => Some(condition.clone()),
+		conditions => Some(CfgExpr::All(conditions.to_vec())),
+	}
 }
 
 /// A `cfg` that holds when either `conditions` do not or `cfg` does.
@@ -200,12 +206,18 @@ fn conditional(conditions: &[CfgExpr], cfg: CfgExpr) -> CfgExpr {
 	}
 }
 
-fn all(conditions: &[CfgExpr]) -> Option<CfgExpr> {
-	match conditions {
-		[] => None,
-		[condition] => Some(condition.clone()),
-		conditions => Some(CfgExpr::All(conditions.to_vec())),
-	}
+/// Whether a comma-separated list contains `word` on its own (`hidden` in `doc(hidden, alias = "x")`).
+fn has_word(tokens: &TokenStream, word: &str) -> bool {
+	let tokens: Vec<TokenTree> = tokens.clone().into_iter().collect();
+
+	tokens
+		.split(|token| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ','))
+		.any(|part| matches!(part, [TokenTree::Ident(ident)] if ident == word))
+}
+
+/// A doc comment (`///`, `/** */`) or `#[doc = ...]`.
+fn is_doc_comment(meta: &Meta) -> bool {
+	matches!(meta, Meta::NameValue(name_value) if name_value.path.is_ident("doc"))
 }
 
 /// The value of `name = "value"`.
@@ -220,27 +232,9 @@ fn string_value(meta: &Meta) -> Option<String> {
 	}
 }
 
-/// Whether a comma-separated list contains `word` on its own (`hidden` in `doc(hidden, alias = "x")`).
-fn has_word(tokens: &TokenStream, word: &str) -> bool {
-	let tokens: Vec<TokenTree> = tokens.clone().into_iter().collect();
-
-	tokens
-		.split(|token| matches!(token, TokenTree::Punct(punct) if punct.as_char() == ','))
-		.any(|part| matches!(part, [TokenTree::Ident(ident)] if ident == word))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn finds_words_in_lists() {
-		let tokens: TokenStream = "hidden, alias = \"x\"".parse().unwrap();
-
-		assert!(has_word(&tokens, "hidden"));
-		assert!(!has_word(&"alias = \"hidden\"".parse().unwrap(), "hidden"));
-		assert!(!has_word(&"hidden = 1".parse().unwrap(), "hidden"));
-	}
 
 	#[test]
 	fn builds_conditional_cfgs() {
@@ -250,6 +244,18 @@ mod tests {
 
 		assert_eq!(conditional(&[], unix.clone()), unix);
 		assert_eq!(conditional(std::slice::from_ref(&test), unix.clone()).to_string(), "any(not(test), unix)");
-		assert_eq!(conditional(&[test, feature], unix).to_string(), r#"any(not(all(test, feature = "x")), unix)"#);
+		assert_eq!(
+			conditional(&[test, feature], unix).to_string(),
+			r#"any(not(all(test, feature = "x")), unix)"#
+		);
+	}
+
+	#[test]
+	fn finds_words_in_lists() {
+		let tokens: TokenStream = "hidden, alias = \"x\"".parse().unwrap();
+
+		assert!(has_word(&tokens, "hidden"));
+		assert!(!has_word(&"alias = \"hidden\"".parse().unwrap(), "hidden"));
+		assert!(!has_word(&"hidden = 1".parse().unwrap(), "hidden"));
 	}
 }

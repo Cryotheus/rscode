@@ -36,14 +36,24 @@ pub(super) struct Extent {
 	pub(super) after_attrs: usize,
 }
 
-impl Walker<'_, '_, '_> {
-	pub(super) fn range(&self, span: Span) -> TextRange {
-		self.parsed.range(span)
-	}
+/// One token, or one delimiter of a group.
+struct Piece {
+	text: String,
+	range: TextRange,
+	kind: PieceKind,
+}
 
-	/// The range of a syntax node, from its first to its last token.
-	pub(super) fn range_of(&self, node: &dyn ToTokens) -> TextRange {
-		self.extent(node, 0).range
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PieceKind {
+	Open,
+	Close,
+	Punct(char),
+	Word,
+}
+
+impl Walker<'_, '_, '_> {
+	pub(super) fn compact_text(&self, tokens: TokenStream) -> String {
+		compact_text(self.parsed, tokens)
 	}
 
 	/// The extent of an item whose tokens start with `outer_attrs` outer attributes.
@@ -72,24 +82,33 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
+	/// Details of a struct or a variant.
+	pub(super) fn fields_detail(&self, fields: &Fields) -> ItemDetail {
+		let (shape, body) = match fields {
+			Fields::Named(fields) => (DataShape::Named, Some(self.inside(&fields.brace_token.span))),
+			Fields::Unnamed(fields) => (DataShape::Tuple, Some(self.inside(&fields.paren_token.span))),
+			Fields::Unit => (DataShape::Unit, None),
+		};
+
+		ItemDetail::Data { shape, body }
+	}
+
+	pub(super) fn fn_info(&self, signature: &Signature, body: Option<&Block>) -> FnInfo {
+		FnInfo {
+			receiver: signature.receiver().map(receiver),
+			is_const: signature.constness.is_some(),
+			is_async: signature.asyncness.is_some(),
+			is_unsafe: matches!(signature.safety, Safety::Unsafe(_)),
+			body: body.map(|body| self.range(body.brace_token.span.join())),
+		}
+	}
+
 	/// The range strictly inside of a pair of delimiters.
 	pub(super) fn inside(&self, span: &DelimSpan) -> TextRange {
 		let open = self.range(span.open());
 		let close = self.range(span.close());
 
 		TextRange::new(open.end, close.start.max(open.end))
-	}
-
-	pub(super) fn visibility(&self, vis: &syn::Visibility, default: Visibility) -> Visibility {
-		match vis {
-			syn::Visibility::Public(_) => Visibility::Public,
-			syn::Visibility::Restricted(restricted) if restricted.in_token.is_some() => Visibility::InPath(self.path_ref(&restricted.path)),
-			syn::Visibility::Restricted(restricted) if restricted.path.is_ident("crate") => Visibility::Crate,
-			syn::Visibility::Restricted(restricted) if restricted.path.is_ident("super") => Visibility::Super,
-			syn::Visibility::Restricted(restricted) if restricted.path.is_ident("self") => Visibility::SelfModule,
-			syn::Visibility::Restricted(restricted) => Visibility::InPath(self.path_ref(&restricted.path)),
-			syn::Visibility::Inherited => default,
-		}
 	}
 
 	pub(super) fn path_ref(&self, path: &syn::Path) -> PathRef {
@@ -106,6 +125,15 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
+	pub(super) fn range(&self, span: Span) -> TextRange {
+		self.parsed.range(span)
+	}
+
+	/// The range of a syntax node, from its first to its last token.
+	pub(super) fn range_of(&self, node: &dyn ToTokens) -> TextRange {
+		self.extent(node, 0).range
+	}
+
 	/// A path segment without generic arguments.
 	pub(super) fn segment(&self, ident: &Ident) -> PathSegmentRef {
 		PathSegmentRef {
@@ -117,7 +145,11 @@ impl Walker<'_, '_, '_> {
 
 	pub(super) fn type_ref(&self, ty: &Type) -> TypeRef {
 		let inner = match ty {
-			Type::Path(path) if path.qself.is_none() => return TypeRef::Path { path: self.path_ref(&path.path) },
+			Type::Path(path) if path.qself.is_none() => {
+				return TypeRef::Path {
+					path: self.path_ref(&path.path),
+				};
+			}
 			Type::Reference(reference) => &reference.elem,
 			Type::Ptr(pointer) => &pointer.elem,
 			Type::Paren(paren) => &paren.elem,
@@ -132,47 +164,21 @@ impl Walker<'_, '_, '_> {
 		}
 	}
 
-	pub(super) fn fn_info(&self, signature: &Signature, body: Option<&Block>) -> FnInfo {
-		FnInfo {
-			receiver: signature.receiver().map(receiver),
-			is_const: signature.constness.is_some(),
-			is_async: signature.asyncness.is_some(),
-			is_unsafe: matches!(signature.safety, Safety::Unsafe(_)),
-			body: body.map(|body| self.range(body.brace_token.span.join())),
+	pub(super) fn visibility(&self, vis: &syn::Visibility, default: Visibility) -> Visibility {
+		match vis {
+			syn::Visibility::Public(_) => Visibility::Public,
+			syn::Visibility::Restricted(restricted) if restricted.in_token.is_some() => Visibility::InPath(self.path_ref(&restricted.path)),
+			syn::Visibility::Restricted(restricted) if restricted.path.is_ident("crate") => Visibility::Crate,
+			syn::Visibility::Restricted(restricted) if restricted.path.is_ident("super") => Visibility::Super,
+			syn::Visibility::Restricted(restricted) if restricted.path.is_ident("self") => Visibility::SelfModule,
+			syn::Visibility::Restricted(restricted) => Visibility::InPath(self.path_ref(&restricted.path)),
+			syn::Visibility::Inherited => default,
 		}
 	}
-
-	/// Details of a struct or a variant.
-	pub(super) fn fields_detail(&self, fields: &Fields) -> ItemDetail {
-		let (shape, body) = match fields {
-			Fields::Named(fields) => (DataShape::Named, Some(self.inside(&fields.brace_token.span))),
-			Fields::Unnamed(fields) => (DataShape::Tuple, Some(self.inside(&fields.paren_token.span))),
-			Fields::Unit => (DataShape::Unit, None),
-		};
-
-		ItemDetail::Data { shape, body }
-	}
-
-	pub(super) fn compact_text(&self, tokens: TokenStream) -> String {
-		compact_text(self.parsed, tokens)
-	}
 }
 
-/// The name of an identifier, without `r#`.
-pub(super) fn ident_name(ident: &Ident) -> SmolStr {
-	let text = ident.to_string();
-
-	SmolStr::new(text.strip_prefix("r#").unwrap_or(&text))
-}
-
-pub(super) fn receiver(receiver: &syn::Receiver) -> Receiver {
-	let (reference, mutable, typed) = match &receiver.kind {
-		ReceiverKind::Reference(_, _, mutability) => (true, mutability.is_some(), false),
-		ReceiverKind::Typed(..) => (false, receiver.mutability.is_some(), true),
-		_ => (false, receiver.mutability.is_some(), false),
-	};
-
-	Receiver { reference, mutable, typed }
+fn adjacent(first: &Piece, second: &Piece) -> bool {
+	first.range.end == second.range.start
 }
 
 /// The source text of tokens, compacted to one line.
@@ -197,21 +203,6 @@ pub(super) fn compact_text(parsed: &ParsedFile, tokens: TokenStream) -> String {
 	}
 
 	text
-}
-
-/// One token, or one delimiter of a group.
-struct Piece {
-	text: String,
-	range: TextRange,
-	kind: PieceKind,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum PieceKind {
-	Open,
-	Close,
-	Punct(char),
-	Word,
 }
 
 fn flatten(parsed: &ParsedFile, tokens: TokenStream, pieces: &mut Vec<Piece>) {
@@ -258,37 +249,16 @@ fn flatten(parsed: &ParsedFile, tokens: TokenStream, pieces: &mut Vec<Piece>) {
 	}
 }
 
-fn needs_space(pieces: &[Piece], index: usize) -> bool {
-	let previous = &pieces[index - 1];
-	let current = &pieces[index];
+/// The name of an identifier, without `r#`.
+pub(super) fn ident_name(ident: &Ident) -> SmolStr {
+	let text = ident.to_string();
 
-	match (previous.kind, current.kind) {
-		(_, PieceKind::Punct(',' | ';')) | (PieceKind::Punct(','), PieceKind::Close) => false,
-		(PieceKind::Punct(','), _) => true,
-		(PieceKind::Open | PieceKind::Punct('<'), _) | (_, PieceKind::Close) => false,
-
-		// generic arguments (`Vec<T>`, `for<'a>`, `::<T>`), but not qualified paths (`&mut <T as Tr>::A`)
-		(PieceKind::Word | PieceKind::Punct(':'), PieceKind::Punct('<')) if !matches!(previous.text.as_str(), "mut" | "const" | "dyn") => {
-			false
-		}
-
-		_ => {
-			let separated = previous.range.end < current.range.start;
-
-			separated && !is_angle_close(pieces, index) && !is_path_colon(pieces, index) && !is_path_colon(pieces, index - 1)
-		}
-	}
-}
-
-fn adjacent(first: &Piece, second: &Piece) -> bool {
-	first.range.end == second.range.start
+	SmolStr::new(text.strip_prefix("r#").unwrap_or(&text))
 }
 
 /// Whether a piece is a `>` closing generic arguments (rather than part of `->` or `=>`).
 fn is_angle_close(pieces: &[Piece], index: usize) -> bool {
-	let is_arrow = index > 0
-		&& matches!(pieces[index - 1].kind, PieceKind::Punct('-' | '='))
-		&& adjacent(&pieces[index - 1], &pieces[index]);
+	let is_arrow = index > 0 && matches!(pieces[index - 1].kind, PieceKind::Punct('-' | '=')) && adjacent(&pieces[index - 1], &pieces[index]);
 
 	pieces[index].kind == PieceKind::Punct('>') && !is_arrow
 }
@@ -303,10 +273,66 @@ fn is_path_colon(pieces: &[Piece], index: usize) -> bool {
 	is_colon(piece) && (with_previous || with_next)
 }
 
+fn needs_space(pieces: &[Piece], index: usize) -> bool {
+	let previous = &pieces[index - 1];
+	let current = &pieces[index];
+
+	match (previous.kind, current.kind) {
+		(_, PieceKind::Punct(',' | ';')) | (PieceKind::Punct(','), PieceKind::Close) => false,
+		(PieceKind::Punct(','), _) => true,
+		(PieceKind::Open | PieceKind::Punct('<'), _) | (_, PieceKind::Close) => false,
+
+		// generic arguments (`Vec<T>`, `for<'a>`, `::<T>`), but not qualified paths (`&mut <T as Tr>::A`)
+		(PieceKind::Word | PieceKind::Punct(':'), PieceKind::Punct('<')) if !matches!(previous.text.as_str(), "mut" | "const" | "dyn") => false,
+
+		_ => {
+			let separated = previous.range.end < current.range.start;
+
+			separated && !is_angle_close(pieces, index) && !is_path_colon(pieces, index) && !is_path_colon(pieces, index - 1)
+		}
+	}
+}
+
+pub(super) fn receiver(receiver: &syn::Receiver) -> Receiver {
+	let (reference, mutable, typed) = match &receiver.kind {
+		ReceiverKind::Reference(_, _, mutability) => (true, mutability.is_some(), false),
+		ReceiverKind::Typed(..) => (false, receiver.mutability.is_some(), true),
+		_ => (false, receiver.mutability.is_some(), false),
+	};
+
+	Receiver { reference, mutable, typed }
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use syn::Item;
+
+	#[test]
+	fn compacts_token_text() {
+		assert_eq!(impl_texts("impl Foo < T > {}").0, "Foo<T>");
+		assert_eq!(
+			impl_texts("impl<T> fmt :: Display for Vec<Vec<u8> > {}"),
+			("Vec<Vec<u8>>".to_owned(), Some("fmt::Display".to_owned()))
+		);
+		assert_eq!(impl_texts("impl HashMap<K,V> {}").0, "HashMap<K, V>");
+		assert_eq!(impl_texts("impl<'a> Tr for &'a mut [u8; 4] {}").0, "&'a mut [u8; 4]");
+		assert_eq!(
+			impl_texts("impl Tr for dyn Fn( u8 ) -> Box< dyn Error+Send > {}").0,
+			"dyn Fn(u8) -> Box<dyn Error+Send>"
+		);
+		assert_eq!(impl_texts("impl Tr for (A,B,) {}").0, "(A, B,)");
+		assert_eq!(
+			impl_texts("impl ::std::ops::Add<Output = u8> for S {}").1.unwrap(),
+			"::std::ops::Add<Output = u8>"
+		);
+		assert_eq!(impl_texts("impl Tr for <T as\n\tIterator /* c */ >::Item {}").0, "<T as Iterator>::Item");
+		assert_eq!(impl_texts("impl Tr for r#type {}").0, "r#type");
+		assert_eq!(impl_texts("impl Tr for S<{ N + 1 }> {}").0, "S<{N + 1}>");
+		assert_eq!(impl_texts("impl Tr for &mut <T as Tr>::A {}").0, "&mut <T as Tr>::A");
+		assert_eq!(impl_texts("impl Tr for fn() -> <T as Tr>::A {}").0, "fn() -> <T as Tr>::A");
+		assert_eq!(impl_texts("impl Tr for dyn for <'a> Fn(&'a u8) {}").0, "dyn for<'a> Fn(&'a u8)");
+	}
 
 	/// The compact text of the self type and trait of the first item, an `impl` block.
 	fn impl_texts(source: &str) -> (String, Option<String>) {
@@ -320,23 +346,6 @@ mod tests {
 		let trait_ = item.trait_.as_ref().map(|(path, _)| compact_text(&parsed, path.to_token_stream()));
 
 		(self_ty, trait_)
-	}
-
-	#[test]
-	fn compacts_token_text() {
-		assert_eq!(impl_texts("impl Foo < T > {}").0, "Foo<T>");
-		assert_eq!(impl_texts("impl<T> fmt :: Display for Vec<Vec<u8> > {}"), ("Vec<Vec<u8>>".to_owned(), Some("fmt::Display".to_owned())));
-		assert_eq!(impl_texts("impl HashMap<K,V> {}").0, "HashMap<K, V>");
-		assert_eq!(impl_texts("impl<'a> Tr for &'a mut [u8; 4] {}").0, "&'a mut [u8; 4]");
-		assert_eq!(impl_texts("impl Tr for dyn Fn( u8 ) -> Box< dyn Error+Send > {}").0, "dyn Fn(u8) -> Box<dyn Error+Send>");
-		assert_eq!(impl_texts("impl Tr for (A,B,) {}").0, "(A, B,)");
-		assert_eq!(impl_texts("impl ::std::ops::Add<Output = u8> for S {}").1.unwrap(), "::std::ops::Add<Output = u8>");
-		assert_eq!(impl_texts("impl Tr for <T as\n\tIterator /* c */ >::Item {}").0, "<T as Iterator>::Item");
-		assert_eq!(impl_texts("impl Tr for r#type {}").0, "r#type");
-		assert_eq!(impl_texts("impl Tr for S<{ N + 1 }> {}").0, "S<{N + 1}>");
-		assert_eq!(impl_texts("impl Tr for &mut <T as Tr>::A {}").0, "&mut <T as Tr>::A");
-		assert_eq!(impl_texts("impl Tr for fn() -> <T as Tr>::A {}").0, "fn() -> <T as Tr>::A");
-		assert_eq!(impl_texts("impl Tr for dyn for <'a> Fn(&'a u8) {}").0, "dyn for<'a> Fn(&'a u8)");
 	}
 
 	#[test]

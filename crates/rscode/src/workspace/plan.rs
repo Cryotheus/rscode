@@ -30,6 +30,77 @@ use cargo::util::interning::InternedString;
 use smol_str::SmolStr;
 use std::io::Write;
 
+/// A crate to load.
+struct Planned<'a> {
+	candidate: Candidate<'a>,
+	selected: bool,
+}
+
+/// The spec of a planned crate.
+fn crate_spec(
+	planned: &Planned<'_>,
+	package: Option<model::PackageId>,
+	platforms: &Platforms,
+	activation: &Activation,
+	prelude: &Prelude<'_>,
+	cfgs: &[String],
+) -> Result<CrateSpec, Error> {
+	let candidate = &planned.candidate;
+	let platform = platforms.of(candidate.kind);
+	let features = activation.crate_features(candidate.package.package_id(), Build::of(candidate.target));
+	let mut cfg = platform.cfg_context().clone();
+
+	cfg.set_features(features.into_iter().flatten().map(InternedString::as_str));
+	cfg.set_name("test", matches!(candidate.kind, TargetKind::Test | TargetKind::Bench));
+	cfg.set_name("proc_macro", candidate.kind == TargetKind::ProcMacro);
+
+	for spec in cfgs {
+		cfg.enable(spec)?;
+	}
+
+	Ok(CrateSpec {
+		name: candidate.target.crate_name().into(),
+		root: candidate.root.to_path_buf(),
+		kind: candidate.kind,
+		edition: candidate.edition(),
+		package,
+		cfg,
+		dependencies: prelude.of(candidate, platform),
+		selected: planned.selected,
+	})
+}
+
+/// A package as rscode's model describes it.
+fn package_model(ws: &Workspace<'_>, package: &Package, activation: &Activation) -> model::Package {
+	let features = package
+		.summary()
+		.features()
+		.iter()
+		.map(|(name, values)| {
+			(
+				SmolStr::new(name.as_str()),
+				values.iter().map(|value| SmolStr::new(value.to_string())).collect(),
+			)
+		})
+		.collect();
+
+	let enabled_features = activation
+		.crate_features(package.package_id(), Build::of_package(package))
+		.into_iter()
+		.flatten()
+		.map(|feature| SmolStr::new(feature.as_str()))
+		.collect();
+
+	model::Package {
+		name: package.name().as_str().into(),
+		version: package.version().to_string(),
+		manifest_path: package.manifest_path().to_path_buf(),
+		features,
+		enabled_features,
+		is_member: ws.is_member(package),
+	}
+}
+
 /// Plans the workspace, with cargo's messages written to `output`.
 pub(super) fn plan(options: &LoadOptions, output: Box<dyn Write + Send + Sync>) -> Result<WorkspacePlan, Error> {
 	validate_cfgs(&options.cfgs)?;
@@ -38,8 +109,7 @@ pub(super) fn plan(options: &LoadOptions, output: Box<dyn Write + Send + Sync>) 
 	let ws = context::workspace(&gctx, options.manifest_path.as_deref())?;
 	let local = LocalPackages::new(&ws);
 	let selection = context::select_packages(&ws, options)?;
-	let cli_features =
-		CliFeatures::from_command_line(&options.features, options.all_features, !options.no_default_features).map_err(cargo_error)?;
+	let cli_features = CliFeatures::from_command_line(&options.features, options.all_features, !options.no_default_features).map_err(cargo_error)?;
 
 	// validates the requested features, and distributes `member/feature`s, before anything expensive
 	let seeds = ws.members_with_features(&selection.specs, &cli_features).map_err(cargo_error)?;
@@ -135,7 +205,9 @@ pub(super) fn plan(options: &LoadOptions, output: Box<dyn Write + Send + Sync>) 
 	let specs = crates
 		.iter()
 		.map(|planned| {
-			let index = packages.iter().position(|package| package.package_id() == planned.candidate.package.package_id());
+			let index = packages
+				.iter()
+				.position(|package| package.package_id() == planned.candidate.package.package_id());
 			let package = index.map(|index| model::PackageId(index as u32));
 
 			crate_spec(planned, package, &platforms, &activation, &prelude, &options.cfgs)
@@ -177,12 +249,6 @@ fn unloaded_member(package: &Package) -> model::UnloadedMember {
 	}
 }
 
-/// A crate to load.
-struct Planned<'a> {
-	candidate: Candidate<'a>,
-	selected: bool,
-}
-
 /// Checks the `--cfg` specs before doing anything expensive.
 fn validate_cfgs(cfgs: &[String]) -> Result<(), Error> {
 	let mut context = CfgContext::new();
@@ -192,66 +258,6 @@ fn validate_cfgs(cfgs: &[String]) -> Result<(), Error> {
 	}
 
 	Ok(())
-}
-
-/// The spec of a planned crate.
-fn crate_spec(
-	planned: &Planned<'_>,
-	package: Option<model::PackageId>,
-	platforms: &Platforms,
-	activation: &Activation,
-	prelude: &Prelude<'_>,
-	cfgs: &[String],
-) -> Result<CrateSpec, Error> {
-	let candidate = &planned.candidate;
-	let platform = platforms.of(candidate.kind);
-	let features = activation.crate_features(candidate.package.package_id(), Build::of(candidate.target));
-	let mut cfg = platform.cfg_context().clone();
-
-	cfg.set_features(features.into_iter().flatten().map(InternedString::as_str));
-	cfg.set_name("test", matches!(candidate.kind, TargetKind::Test | TargetKind::Bench));
-	cfg.set_name("proc_macro", candidate.kind == TargetKind::ProcMacro);
-
-	for spec in cfgs {
-		cfg.enable(spec)?;
-	}
-
-	Ok(CrateSpec {
-		name: candidate.target.crate_name().into(),
-		root: candidate.root.to_path_buf(),
-		kind: candidate.kind,
-		edition: candidate.edition(),
-		package,
-		cfg,
-		dependencies: prelude.of(candidate, platform),
-		selected: planned.selected,
-	})
-}
-
-/// A package as rscode's model describes it.
-fn package_model(ws: &Workspace<'_>, package: &Package, activation: &Activation) -> model::Package {
-	let features = package
-		.summary()
-		.features()
-		.iter()
-		.map(|(name, values)| (SmolStr::new(name.as_str()), values.iter().map(|value| SmolStr::new(value.to_string())).collect()))
-		.collect();
-
-	let enabled_features = activation
-		.crate_features(package.package_id(), Build::of_package(package))
-		.into_iter()
-		.flatten()
-		.map(|feature| SmolStr::new(feature.as_str()))
-		.collect();
-
-	model::Package {
-		name: package.name().as_str().into(),
-		version: package.version().to_string(),
-		manifest_path: package.manifest_path().to_path_buf(),
-		features,
-		enabled_features,
-		is_member: ws.is_member(package),
-	}
 }
 
 #[cfg(test)]
@@ -273,21 +279,14 @@ mod tests {
 	}
 
 	impl Write for Captured {
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+
 		fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
 			self.0.lock().unwrap().extend_from_slice(bytes);
 
 			Ok(bytes.len())
-		}
-
-		fn flush(&mut self) -> std::io::Result<()> {
-			Ok(())
-		}
-	}
-
-	fn fixture() -> LoadOptions {
-		LoadOptions {
-			manifest_path: Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws_virtual/Cargo.toml")),
-			..LoadOptions::default()
 		}
 	}
 
@@ -297,6 +296,29 @@ mod tests {
 
 		plan(options, Box::new(output.clone())).unwrap();
 		output.text()
+	}
+
+	fn fixture() -> LoadOptions {
+		LoadOptions {
+			manifest_path: Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ws_virtual/Cargo.toml")),
+			..LoadOptions::default()
+		}
+	}
+
+	#[test]
+	fn silences_cargo() {
+		let options = LoadOptions {
+			workspace: true,
+			exclude: vec!["nope".to_owned()],
+			targets: TargetSelection {
+				all_examples: true,
+				..TargetSelection::default()
+			},
+			silent: true,
+			..fixture()
+		};
+
+		assert_eq!(captured(&options), "");
 	}
 
 	#[test]
@@ -318,24 +340,14 @@ mod tests {
 
 		let warning = captured(&unknown_exclude);
 
-		assert!(warning.starts_with("warning: excluded package(s) `nope` not found in workspace `"), "{warning}");
-		assert_eq!(captured(&unmatched_filter), "warning: target filter `examples` specified, but no targets matched; this is a no-op\n");
+		assert!(
+			warning.starts_with("warning: excluded package(s) `nope` not found in workspace `"),
+			"{warning}"
+		);
+		assert_eq!(
+			captured(&unmatched_filter),
+			"warning: target filter `examples` specified, but no targets matched; this is a no-op\n"
+		);
 		assert_eq!(captured(&fixture()), "");
-	}
-
-	#[test]
-	fn silences_cargo() {
-		let options = LoadOptions {
-			workspace: true,
-			exclude: vec!["nope".to_owned()],
-			targets: TargetSelection {
-				all_examples: true,
-				..TargetSelection::default()
-			},
-			silent: true,
-			..fixture()
-		};
-
-		assert_eq!(captured(&options), "");
 	}
 }

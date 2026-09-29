@@ -98,16 +98,6 @@ use syn::VisRestricted;
 use syn::visit;
 use syn::visit::Visit;
 
-/// What `Self` refers to.
-#[derive(Debug, Default, Clone)]
-pub(super) struct SelfTypes {
-	/// The loaded types `Self` names: the self types of an `impl` block, or the type being defined.
-	pub(super) types: Vec<ItemId>,
-
-	/// Traits whose items `Self::item` may name: the trait being defined, or the traits an `impl` block implements.
-	pub(super) traits: Vec<ItemId>,
-}
-
 /// Finds the references to targets in one file, walked as one module of one crate.
 pub(super) struct FileWalker<'a, 'ws> {
 	pub(super) resolver: &'a Resolver<'ws>,
@@ -177,26 +167,11 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 		}
 	}
 
-	/// Records a reference, unless the text at `range` is not the target's name (which only a bug could cause).
-	pub(super) fn report(&mut self, target: ItemId, kind: ReferenceKind, range: TextRange, certain: bool) {
-		if let Some(reference) = self.reference(target, kind, range, certain) {
-			self.out.push(reference);
+	/// Binds a local variable (if it could shadow a target).
+	fn bind(&mut self, ident: &Ident) {
+		if self.targets.tracks(ident) {
+			self.scopes.bind_variable(ident_name(ident));
 		}
-	}
-
-	fn reference(&self, target: ItemId, kind: ReferenceKind, range: TextRange, certain: bool) -> Option<Reference> {
-		let name = self.ws.item(target).name.as_deref().unwrap_or_default();
-
-		is_identifier(self.parsed.text.get(range.as_range()), name).then(|| Reference {
-			target,
-			kind,
-			krate: self.krate,
-			file: self.file,
-			path: self.source.path().to_path_buf(),
-			range,
-			start: self.source.line_col(range.start),
-			certain,
-		})
 	}
 
 	/// Records a reference by a path whose first segment names a target, if a local binding named like
@@ -242,51 +217,6 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 		self.ws.item(child).range.contains(offset).then_some(child)
 	}
 
-	/// The loaded item of kind `kind` named by the identifier, when walking the items of a loaded module.
-	pub(super) fn loaded_item(&self, ident: &Ident, kind: ItemKind) -> Option<ItemId> {
-		if self.body_depth > 0 {
-			return None;
-		}
-
-		let range = self.parsed.range(ident.span());
-		let child = self.child_at(self.module, range.start)?;
-		let data = self.ws.item(child);
-
-		(data.kind == kind && data.name_range == Some(range)).then_some(child)
-	}
-
-	/// Runs `walk` with `Self` referring to `self_types`.
-	fn with_self(&mut self, self_types: SelfTypes, walk: impl FnOnce(&mut Self)) {
-		self.self_types.push(self_types);
-		walk(self);
-		self.self_types.pop();
-	}
-
-	/// Runs `walk` in the scope of an item with generic parameters.
-	fn item_scope(&mut self, generics: Option<&Generics>, walk: impl FnOnce(&mut Self)) {
-		let nested = self.body_depth > 0;
-
-		let scope = match generics {
-			Some(generics) => {
-				let mut scope = Scope::item(nested, generics);
-
-				scope.bounds = (trait_bounds(generics).into_iter())
-					.map(|(parameter, bound)| (parameter, self.path_ref(bound)))
-					.collect();
-				scope
-			}
-
-			None => Scope {
-				barrier: nested,
-				..Scope::default()
-			},
-		};
-
-		self.scopes.push(scope);
-		walk(self);
-		self.scopes.pop();
-	}
-
 	/// A function: generic parameters, parameters (whose patterns bind variables in the body), and body.
 	fn function(&mut self, signature: &Signature, body: Option<&Block>) {
 		self.item_scope(Some(&signature.generics), |this| {
@@ -313,6 +243,25 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 				this.visit_block(body);
 			}
 		});
+	}
+
+	/// An identifier pattern: a path pattern if it names a constant or unit struct or variant, else a binding.
+	fn ident_pattern(&mut self, pattern: &PatIdent) {
+		let targets = self.targets;
+
+		if let Some(target) = targets.named(&pattern.ident) {
+			let simple = pattern.by_ref.is_none() && pattern.mutability.is_none() && pattern.subpat.is_none();
+
+			if !(simple && self.path_pattern(&pattern.ident, target)) {
+				self.scopes.bind_variable(ident_name(&pattern.ident));
+			}
+		} else if targets.tracks(&pattern.ident) {
+			self.scopes.bind_variable(ident_name(&pattern.ident));
+		}
+
+		if let Some((_, subpattern)) = &pattern.subpat {
+			self.pattern(subpattern);
+		}
 	}
 
 	/// What `Self` refers to in an `impl` block (whose generic parameters are in scope), and whether it is loaded.
@@ -379,107 +328,6 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 		}
 	}
 
-	/// The scope of the items of a block (or of a module inside of a body): the names they bind, and imports.
-	pub(super) fn local_items<'i>(&mut self, items: impl Iterator<Item = &'i Item> + Clone) -> Scope {
-		let mut scope = Scope::default();
-
-		for item in items.clone() {
-			for (name, namespace) in local_item_names(item) {
-				scope.declare(name, namespace, LocalBinding::Opaque);
-			}
-
-			scope.members.extend(local_item_members(item));
-		}
-
-		for item in items {
-			if let Item::Use(item) = item {
-				self.local_use(&mut scope, item);
-			}
-		}
-
-		scope
-	}
-
-	/// Declares the bindings of a `use` item of a block.
-	fn local_use(&mut self, scope: &mut Scope, item: &ItemUse) {
-		let leading_colon = item.leading_colon.is_some();
-
-		for leaf in use_leaves(&item.tree) {
-			let binding = leaf.binding();
-
-			let Some(first) = leaf.path.first().map(|ident| ident_name(ident)) else {
-				continue;
-			};
-
-			// a path starting at an item of a block, whose members are only known for enums and modules
-			let local_start = !leading_colon
-				&& !is_path_keyword(&first)
-				&& (scope.items.iter().any(|(name, namespace, _)| *name == first && *namespace == Namespace::Type)
-					|| self.lookup_local(&first, Namespace::Type, Locals::All).is_some_and(|local| !matches!(local, LocalBinding::Imported(_))));
-
-			if local_start {
-				match leaf.kind {
-					LeafKind::Glob if leaf.path.len() == 1 => {
-						let members = scope.members_of(&first).or_else(|| self.scopes.members_of(&first)).map(<[_]>::to_vec);
-
-						scope.globs.extend(members.map(LocalGlob::Names));
-					}
-
-					LeafKind::Glob => {}
-
-					_ => {
-						if let Some(name) = binding {
-							for namespace in Namespace::ALL {
-								scope.declare(name.clone(), namespace, LocalBinding::Opaque);
-							}
-						}
-					}
-				}
-
-				continue;
-			}
-
-			let path = PathRef {
-				leading_colon,
-				segments: leaf.path.iter().map(|ident| self.segment(ident)).collect(),
-			};
-
-			match leaf.kind {
-				LeafKind::Glob => {
-					let sources = self.module_path(self.module, &path, Some(Namespace::Type), PathKind::Use).pop().unwrap_or_default();
-
-					scope.globs.push(LocalGlob::Sources(sources));
-				}
-
-				_ => {
-					let Some(name) = binding else {
-						continue;
-					};
-
-					let wanted = matches!(leaf.kind, LeafKind::SelfImport(_)).then_some(Namespace::Type);
-					let imported = self.module_path(self.module, &path, wanted, PathKind::Use).pop().unwrap_or_default();
-					let mut bound = false;
-
-					for namespace in Namespace::ALL {
-						let found: Vec<Res> = imported.iter().filter(|&res| res_in_namespace(self.ws, res, namespace)).cloned().collect();
-
-						if !found.is_empty() {
-							scope.declare(name.clone(), namespace, LocalBinding::Imported(found));
-							bound = true;
-						}
-					}
-
-					// an import of something unknown still shadows
-					if !bound {
-						for namespace in Namespace::ALL {
-							scope.declare(name.clone(), namespace, LocalBinding::Opaque);
-						}
-					}
-				}
-			}
-		}
-	}
-
 	/// Reports the segments of a leaf of a `use` tree that name targets.
 	fn import(&mut self, leaf: &UseLeaf<'_>, leading_colon: bool) {
 		let targets = self.targets;
@@ -536,6 +384,195 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 		{
 			self.report(target, ReferenceKind::Import, self.parsed.range(alias.span()), true);
 		}
+	}
+
+	/// Runs `walk` in the scope of an item with generic parameters.
+	fn item_scope(&mut self, generics: Option<&Generics>, walk: impl FnOnce(&mut Self)) {
+		let nested = self.body_depth > 0;
+
+		let scope = match generics {
+			Some(generics) => {
+				let mut scope = Scope::item(nested, generics);
+
+				scope.bounds = (trait_bounds(generics).into_iter())
+					.map(|(parameter, bound)| (parameter, self.path_ref(bound)))
+					.collect();
+				scope
+			}
+
+			None => Scope {
+				barrier: nested,
+				..Scope::default()
+			},
+		};
+
+		self.scopes.push(scope);
+		walk(self);
+		self.scopes.pop();
+	}
+
+	/// The loaded item of kind `kind` named by the identifier, when walking the items of a loaded module.
+	pub(super) fn loaded_item(&self, ident: &Ident, kind: ItemKind) -> Option<ItemId> {
+		if self.body_depth > 0 {
+			return None;
+		}
+
+		let range = self.parsed.range(ident.span());
+		let child = self.child_at(self.module, range.start)?;
+		let data = self.ws.item(child);
+
+		(data.kind == kind && data.name_range == Some(range)).then_some(child)
+	}
+
+	/// The scope of the items of a block (or of a module inside of a body): the names they bind, and imports.
+	pub(super) fn local_items<'i>(&mut self, items: impl Iterator<Item = &'i Item> + Clone) -> Scope {
+		let mut scope = Scope::default();
+
+		for item in items.clone() {
+			for (name, namespace) in local_item_names(item) {
+				scope.declare(name, namespace, LocalBinding::Opaque);
+			}
+
+			scope.members.extend(local_item_members(item));
+		}
+
+		for item in items {
+			if let Item::Use(item) = item {
+				self.local_use(&mut scope, item);
+			}
+		}
+
+		scope
+	}
+
+	/// Declares the bindings of a `use` item of a block.
+	fn local_use(&mut self, scope: &mut Scope, item: &ItemUse) {
+		let leading_colon = item.leading_colon.is_some();
+
+		for leaf in use_leaves(&item.tree) {
+			let binding = leaf.binding();
+
+			let Some(first) = leaf.path.first().map(|ident| ident_name(ident)) else {
+				continue;
+			};
+
+			// a path starting at an item of a block, whose members are only known for enums and modules
+			let local_start = !leading_colon
+				&& !is_path_keyword(&first)
+				&& (scope
+					.items
+					.iter()
+					.any(|(name, namespace, _)| *name == first && *namespace == Namespace::Type)
+					|| self
+						.lookup_local(&first, Namespace::Type, Locals::All)
+						.is_some_and(|local| !matches!(local, LocalBinding::Imported(_))));
+
+			if local_start {
+				match leaf.kind {
+					LeafKind::Glob if leaf.path.len() == 1 => {
+						let members = scope.members_of(&first).or_else(|| self.scopes.members_of(&first)).map(<[_]>::to_vec);
+
+						scope.globs.extend(members.map(LocalGlob::Names));
+					}
+
+					LeafKind::Glob => {}
+
+					_ => {
+						if let Some(name) = binding {
+							for namespace in Namespace::ALL {
+								scope.declare(name.clone(), namespace, LocalBinding::Opaque);
+							}
+						}
+					}
+				}
+
+				continue;
+			}
+
+			let path = PathRef {
+				leading_colon,
+				segments: leaf.path.iter().map(|ident| self.segment(ident)).collect(),
+			};
+
+			match leaf.kind {
+				LeafKind::Glob => {
+					let sources = self
+						.module_path(self.module, &path, Some(Namespace::Type), PathKind::Use)
+						.pop()
+						.unwrap_or_default();
+
+					scope.globs.push(LocalGlob::Sources(sources));
+				}
+
+				_ => {
+					let Some(name) = binding else {
+						continue;
+					};
+
+					let wanted = matches!(leaf.kind, LeafKind::SelfImport(_)).then_some(Namespace::Type);
+					let imported = self.module_path(self.module, &path, wanted, PathKind::Use).pop().unwrap_or_default();
+					let mut bound = false;
+
+					for namespace in Namespace::ALL {
+						let found: Vec<Res> = imported
+							.iter()
+							.filter(|&res| res_in_namespace(self.ws, res, namespace))
+							.cloned()
+							.collect();
+
+						if !found.is_empty() {
+							scope.declare(name.clone(), namespace, LocalBinding::Imported(found));
+							bound = true;
+						}
+					}
+
+					// an import of something unknown still shadows
+					if !bound {
+						for namespace in Namespace::ALL {
+							scope.declare(name.clone(), namespace, LocalBinding::Opaque);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	/// A method call, which might call a target method.
+	pub(super) fn method_call(&mut self, method: &Ident) {
+		if !self.options.method_calls {
+			return;
+		}
+
+		if let Some(&target) = self.targets.named(method).and_then(|target| target.methods.first()) {
+			self.report(target, ReferenceKind::MethodCall, self.parsed.range(method.span()), false);
+		}
+	}
+
+	/// Whether an identifier pattern names a constant or unit struct or variant (and reports it if it is a target).
+	fn path_pattern(&mut self, ident: &Ident, target: &TargetName) -> bool {
+		let path = PathRef {
+			leading_colon: false,
+			segments: vec![self.segment(ident)],
+		};
+
+		let res = self.resolve_path(&path, Namespace::Value, Locals::Items);
+
+		let items: Vec<ItemId> = (res.last().iter())
+			.filter_map(|res| match res {
+				Res::Item(item) if is_pattern_item(self.ws.item(*item)) => Some(*item),
+				_ => None,
+			})
+			.collect();
+
+		if items.is_empty() {
+			return false;
+		}
+
+		if let Some(&found) = items.iter().find(|&&item| target.contains(item)) {
+			self.report(found, ReferenceKind::Path, path.segments[0].range, true);
+		}
+
+		true
 	}
 
 	/// Walks a pattern: reports the paths in it, and binds its variables in the innermost scope.
@@ -606,108 +643,150 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 		}
 	}
 
-	/// Binds a local variable (if it could shadow a target).
-	fn bind(&mut self, ident: &Ident) {
-		if self.targets.tracks(ident) {
-			self.scopes.bind_variable(ident_name(ident));
+	fn reference(&self, target: ItemId, kind: ReferenceKind, range: TextRange, certain: bool) -> Option<Reference> {
+		let name = self.ws.item(target).name.as_deref().unwrap_or_default();
+
+		is_identifier(self.parsed.text.get(range.as_range()), name).then(|| Reference {
+			target,
+			kind,
+			krate: self.krate,
+			file: self.file,
+			path: self.source.path().to_path_buf(),
+			range,
+			start: self.source.line_col(range.start),
+			certain,
+		})
+	}
+
+	/// Records a reference, unless the text at `range` is not the target's name (which only a bug could cause).
+	pub(super) fn report(&mut self, target: ItemId, kind: ReferenceKind, range: TextRange, certain: bool) {
+		if let Some(reference) = self.reference(target, kind, range, certain) {
+			self.out.push(reference);
 		}
 	}
 
-	/// An identifier pattern: a path pattern if it names a constant or unit struct or variant, else a binding.
-	fn ident_pattern(&mut self, pattern: &PatIdent) {
-		let targets = self.targets;
-
-		if let Some(target) = targets.named(&pattern.ident) {
-			let simple = pattern.by_ref.is_none() && pattern.mutability.is_none() && pattern.subpat.is_none();
-
-			if !(simple && self.path_pattern(&pattern.ident, target)) {
-				self.scopes.bind_variable(ident_name(&pattern.ident));
-			}
-		} else if targets.tracks(&pattern.ident) {
-			self.scopes.bind_variable(ident_name(&pattern.ident));
-		}
-
-		if let Some((_, subpattern)) = &pattern.subpat {
-			self.pattern(subpattern);
-		}
-	}
-
-	/// Whether an identifier pattern names a constant or unit struct or variant (and reports it if it is a target).
-	fn path_pattern(&mut self, ident: &Ident, target: &TargetName) -> bool {
-		let path = PathRef {
-			leading_colon: false,
-			segments: vec![self.segment(ident)],
-		};
-
-		let res = self.resolve_path(&path, Namespace::Value, Locals::Items);
-
-		let items: Vec<ItemId> = (res.last().iter())
-			.filter_map(|res| match res {
-				Res::Item(item) if is_pattern_item(self.ws.item(*item)) => Some(*item),
-				_ => None,
-			})
-			.collect();
-
-		if items.is_empty() {
-			return false;
-		}
-
-		if let Some(&found) = items.iter().find(|&&item| target.contains(item)) {
-			self.report(found, ReferenceKind::Path, path.segments[0].range, true);
-		}
-
-		true
-	}
-
-	/// A method call, which might call a target method.
-	pub(super) fn method_call(&mut self, method: &Ident) {
-		if !self.options.method_calls {
-			return;
-		}
-
-		if let Some(&target) = self.targets.named(method).and_then(|target| target.methods.first()) {
-			self.report(target, ReferenceKind::MethodCall, self.parsed.range(method.span()), false);
-		}
+	/// Runs `walk` with `Self` referring to `self_types`.
+	fn with_self(&mut self, self_types: SelfTypes, walk: impl FnOnce(&mut Self)) {
+		self.self_types.push(self_types);
+		walk(self);
+		self.self_types.pop();
 	}
 }
 
 impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
+	fn visit_arm(&mut self, arm: &'ast Arm) {
+		self.scopes.push(Scope::default());
+		self.pattern(&arm.pat);
+		self.visit_expr(&arm.body);
+		self.scopes.pop();
+	}
+
+	// attributes are not searched, only doc comments (see `doc_comments`)
+	fn visit_attribute(&mut self, _: &'ast Attribute) {}
+
+	fn visit_block(&mut self, block: &'ast Block) {
+		self.body_depth += 1;
+
+		let items = statement_items(&block.stmts);
+		let scope = self.local_items(items.iter().map(AsRef::as_ref));
+
+		self.scopes.push(scope);
+
+		for stmt in &block.stmts {
+			self.visit_stmt(stmt);
+		}
+
+		self.scopes.pop();
+		self.body_depth -= 1;
+	}
+
+	fn visit_expr_closure(&mut self, closure: &'ast ExprClosure) {
+		self.scopes.push(Scope::default());
+
+		for input in &closure.inputs {
+			self.pattern(input);
+		}
+
+		self.visit_return_type(&closure.output);
+		self.visit_expr(&closure.body);
+		self.scopes.pop();
+	}
+
+	fn visit_expr_for_loop(&mut self, expr: &'ast ExprForLoop) {
+		self.visit_expr(&expr.expr);
+		self.scopes.push(Scope::default());
+		self.pattern(&expr.pat);
+		self.visit_block(&expr.body);
+		self.scopes.pop();
+	}
+
+	fn visit_expr_if(&mut self, expr: &'ast ExprIf) {
+		// variables of `if let` (chains) are visible in the rest of the condition and the `then` block
+		self.scopes.push(Scope::default());
+		self.visit_expr(&expr.cond);
+		self.visit_block(&expr.then_branch);
+		self.scopes.pop();
+
+		if let Some((_, otherwise)) = &expr.else_branch {
+			self.visit_expr(otherwise);
+		}
+	}
+
+	fn visit_expr_let(&mut self, expr: &'ast ExprLet) {
+		self.visit_expr(&expr.expr);
+		self.pattern(&expr.pat);
+	}
+
+	fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+		self.visit_expr(&call.receiver);
+		self.method_call(&call.method);
+
+		if let Some(turbofish) = &call.turbofish {
+			self.visit_angle_bracketed_generic_arguments(turbofish);
+		}
+
+		for argument in &call.args {
+			self.visit_expr(argument);
+		}
+	}
+
+	fn visit_expr_path(&mut self, expr: &'ast ExprPath) {
+		self.code_path(expr.qself.as_ref(), &expr.path, Namespace::Value);
+	}
+
+	fn visit_expr_struct(&mut self, expr: &'ast ExprStruct) {
+		self.code_path(expr.qself.as_ref(), &expr.path, Namespace::Type);
+
+		for field in &expr.fields {
+			// `Struct { name }` is `Struct { name: name }`: renaming `name` would rename the field too
+			if field.colon_token.is_some() {
+				self.visit_expr(&field.expr);
+			}
+		}
+
+		if let Some(rest) = &expr.rest {
+			self.visit_expr(rest);
+		}
+	}
+
+	fn visit_expr_while(&mut self, expr: &'ast ExprWhile) {
+		self.scopes.push(Scope::default());
+		self.visit_expr(&expr.cond);
+		self.visit_block(&expr.body);
+		self.scopes.pop();
+	}
+
+	fn visit_field(&mut self, field: &'ast Field) {
+		self.doc_comments(&field.attrs, DocStyle::Outer);
+		visit::visit_field(self, field);
+	}
+
 	fn visit_file(&mut self, file: &'ast syn::File) {
 		self.doc_comments(&file.attrs, DocStyle::Inner);
 
 		for item in &file.items {
 			self.visit_item(item);
 		}
-	}
-
-	// attributes are not searched, only doc comments (see `doc_comments`)
-	fn visit_attribute(&mut self, _: &'ast Attribute) {}
-
-	fn visit_item(&mut self, item: &'ast Item) {
-		// items that define what `Self` (or the module) is handle their doc comments themselves
-		let defines_scope = matches!(item, Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_) | Item::Impl(_) | Item::Mod(_));
-
-		if !defines_scope && let Some(attrs) = item_attrs(item) {
-			self.doc_comments(attrs, DocStyle::Outer);
-		}
-
-		visit::visit_item(self, item);
-	}
-
-	fn visit_impl_item(&mut self, item: &'ast ImplItem) {
-		if let Some(attrs) = impl_item_attrs(item) {
-			self.doc_comments(attrs, DocStyle::Outer);
-		}
-
-		visit::visit_impl_item(self, item);
-	}
-
-	fn visit_trait_item(&mut self, item: &'ast TraitItem) {
-		if let Some(attrs) = trait_item_attrs(item) {
-			self.doc_comments(attrs, DocStyle::Outer);
-		}
-
-		visit::visit_trait_item(self, item);
 	}
 
 	fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
@@ -718,65 +797,9 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		visit::visit_foreign_item(self, item);
 	}
 
-	fn visit_variant(&mut self, variant: &'ast Variant) {
-		self.doc_comments(&variant.attrs, DocStyle::Outer);
-		visit::visit_variant(self, variant);
-	}
-
-	fn visit_field(&mut self, field: &'ast Field) {
-		self.doc_comments(&field.attrs, DocStyle::Outer);
-		visit::visit_field(self, field);
-	}
-
-	fn visit_item_fn(&mut self, item: &'ast ItemFn) {
-		self.visit_visibility(&item.vis);
-		self.function(&item.sig, Some(&item.block));
-	}
-
-	fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
-		self.visit_visibility(&item.vis);
-		self.function(&item.sig, Some(&item.block));
-	}
-
-	fn visit_trait_item_fn(&mut self, item: &'ast TraitItemFn) {
-		self.function(&item.sig, item.default.as_ref());
-	}
-
 	fn visit_foreign_item_fn(&mut self, item: &'ast ForeignItemFn) {
 		self.visit_visibility(&item.vis);
 		self.function(&item.sig, None);
-	}
-
-	fn visit_item_const(&mut self, item: &'ast ItemConst) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_item_const(this, item));
-	}
-
-	fn visit_item_static(&mut self, item: &'ast ItemStatic) {
-		self.item_scope(None, |this| visit::visit_item_static(this, item));
-	}
-
-	fn visit_item_type(&mut self, item: &'ast ItemType) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_item_type(this, item));
-	}
-
-	fn visit_item_trait_alias(&mut self, item: &'ast ItemTraitAlias) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_item_trait_alias(this, item));
-	}
-
-	fn visit_impl_item_const(&mut self, item: &'ast ImplItemConst) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_impl_item_const(this, item));
-	}
-
-	fn visit_impl_item_type(&mut self, item: &'ast ImplItemType) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_impl_item_type(this, item));
-	}
-
-	fn visit_trait_item_const(&mut self, item: &'ast TraitItemConst) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_trait_item_const(this, item));
-	}
-
-	fn visit_trait_item_type(&mut self, item: &'ast TraitItemType) {
-		self.item_scope(Some(&item.generics), |this| visit::visit_trait_item_type(this, item));
 	}
 
 	fn visit_foreign_item_static(&mut self, item: &'ast ForeignItemStatic) {
@@ -787,16 +810,56 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		self.item_scope(Some(&item.generics), |this| visit::visit_foreign_item_type(this, item));
 	}
 
-	fn visit_item_struct(&mut self, item: &'ast ItemStruct) {
-		let self_types = SelfTypes {
-			types: self.loaded_item(&item.ident, ItemKind::Struct).into_iter().collect(),
-			traits: Vec::new(),
-		};
+	fn visit_generic_argument(&mut self, argument: &'ast GenericArgument) {
+		if let GenericArgument::Type(Type::Path(ty)) = argument
+			&& ty.qself.is_none()
+			&& let Some(ident) = ty.path.get_ident()
+			&& self.targets.named(ident).is_some()
+		{
+			self.type_or_const_argument(ident);
+			return;
+		}
 
-		self.with_self(self_types, |this| {
-			this.doc_comments(&item.attrs, DocStyle::Outer);
-			this.item_scope(Some(&item.generics), |this| visit::visit_item_struct(this, item));
-		});
+		visit::visit_generic_argument(self, argument);
+	}
+
+	fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+		if let Some(attrs) = impl_item_attrs(item) {
+			self.doc_comments(attrs, DocStyle::Outer);
+		}
+
+		visit::visit_impl_item(self, item);
+	}
+
+	fn visit_impl_item_const(&mut self, item: &'ast ImplItemConst) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_impl_item_const(this, item));
+	}
+
+	fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
+		self.visit_visibility(&item.vis);
+		self.function(&item.sig, Some(&item.block));
+	}
+
+	fn visit_impl_item_type(&mut self, item: &'ast ImplItemType) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_impl_item_type(this, item));
+	}
+
+	fn visit_item(&mut self, item: &'ast Item) {
+		// items that define what `Self` (or the module) is handle their doc comments themselves
+		let defines_scope = matches!(
+			item,
+			Item::Struct(_) | Item::Enum(_) | Item::Union(_) | Item::Trait(_) | Item::Impl(_) | Item::Mod(_)
+		);
+
+		if !defines_scope && let Some(attrs) = item_attrs(item) {
+			self.doc_comments(attrs, DocStyle::Outer);
+		}
+
+		visit::visit_item(self, item);
+	}
+
+	fn visit_item_const(&mut self, item: &'ast ItemConst) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_item_const(this, item));
 	}
 
 	fn visit_item_enum(&mut self, item: &'ast ItemEnum) {
@@ -811,28 +874,9 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		});
 	}
 
-	fn visit_item_union(&mut self, item: &'ast ItemUnion) {
-		let self_types = SelfTypes {
-			types: self.loaded_item(&item.ident, ItemKind::Union).into_iter().collect(),
-			traits: Vec::new(),
-		};
-
-		self.with_self(self_types, |this| {
-			this.doc_comments(&item.attrs, DocStyle::Outer);
-			this.item_scope(Some(&item.generics), |this| visit::visit_item_union(this, item));
-		});
-	}
-
-	fn visit_item_trait(&mut self, item: &'ast ItemTrait) {
-		let self_types = SelfTypes {
-			types: Vec::new(),
-			traits: self.loaded_item(&item.ident, ItemKind::Trait).into_iter().collect(),
-		};
-
-		self.with_self(self_types, |this| {
-			this.doc_comments(&item.attrs, DocStyle::Outer);
-			this.item_scope(Some(&item.generics), |this| visit::visit_item_trait(this, item));
-		});
+	fn visit_item_fn(&mut self, item: &'ast ItemFn) {
+		self.visit_visibility(&item.vis);
+		self.function(&item.sig, Some(&item.block));
 	}
 
 	fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -861,6 +905,13 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		});
 	}
 
+	fn visit_item_macro(&mut self, item: &'ast ItemMacro) {
+		match &item.ident {
+			Some(name) if item.mac.path.is_ident("macro_rules") => self.macro_rules(name, &item.mac),
+			_ => self.visit_macro(&item.mac),
+		}
+	}
+
 	fn visit_item_mod(&mut self, item: &'ast ItemMod) {
 		self.doc_comments(&item.attrs, DocStyle::Outer);
 		self.visit_visibility(&item.vis);
@@ -869,8 +920,8 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 			return;
 		};
 
-		let loaded = (self.loaded_item(&item.ident, ItemKind::Module))
-			.filter(|&module| self.ws.item(module).module_info().is_some_and(|info| info.inline));
+		let loaded =
+			(self.loaded_item(&item.ident, ItemKind::Module)).filter(|&module| self.ws.item(module).module_info().is_some_and(|info| info.inline));
 
 		match loaded {
 			Some(module) => {
@@ -908,35 +959,60 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		}
 	}
 
+	fn visit_item_static(&mut self, item: &'ast ItemStatic) {
+		self.item_scope(None, |this| visit::visit_item_static(this, item));
+	}
+
+	fn visit_item_struct(&mut self, item: &'ast ItemStruct) {
+		let self_types = SelfTypes {
+			types: self.loaded_item(&item.ident, ItemKind::Struct).into_iter().collect(),
+			traits: Vec::new(),
+		};
+
+		self.with_self(self_types, |this| {
+			this.doc_comments(&item.attrs, DocStyle::Outer);
+			this.item_scope(Some(&item.generics), |this| visit::visit_item_struct(this, item));
+		});
+	}
+
+	fn visit_item_trait(&mut self, item: &'ast ItemTrait) {
+		let self_types = SelfTypes {
+			types: Vec::new(),
+			traits: self.loaded_item(&item.ident, ItemKind::Trait).into_iter().collect(),
+		};
+
+		self.with_self(self_types, |this| {
+			this.doc_comments(&item.attrs, DocStyle::Outer);
+			this.item_scope(Some(&item.generics), |this| visit::visit_item_trait(this, item));
+		});
+	}
+
+	fn visit_item_trait_alias(&mut self, item: &'ast ItemTraitAlias) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_item_trait_alias(this, item));
+	}
+
+	fn visit_item_type(&mut self, item: &'ast ItemType) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_item_type(this, item));
+	}
+
+	fn visit_item_union(&mut self, item: &'ast ItemUnion) {
+		let self_types = SelfTypes {
+			types: self.loaded_item(&item.ident, ItemKind::Union).into_iter().collect(),
+			traits: Vec::new(),
+		};
+
+		self.with_self(self_types, |this| {
+			this.doc_comments(&item.attrs, DocStyle::Outer);
+			this.item_scope(Some(&item.generics), |this| visit::visit_item_union(this, item));
+		});
+	}
+
 	fn visit_item_use(&mut self, item: &'ast ItemUse) {
 		self.visit_visibility(&item.vis);
 
 		for leaf in use_leaves(&item.tree) {
 			self.import(&leaf, item.leading_colon.is_some());
 		}
-	}
-
-	fn visit_item_macro(&mut self, item: &'ast ItemMacro) {
-		match &item.ident {
-			Some(name) if item.mac.path.is_ident("macro_rules") => self.macro_rules(name, &item.mac),
-			_ => self.visit_macro(&item.mac),
-		}
-	}
-
-	fn visit_block(&mut self, block: &'ast Block) {
-		self.body_depth += 1;
-
-		let items = statement_items(&block.stmts);
-		let scope = self.local_items(items.iter().map(AsRef::as_ref));
-
-		self.scopes.push(scope);
-
-		for stmt in &block.stmts {
-			self.visit_stmt(stmt);
-		}
-
-		self.scopes.pop();
-		self.body_depth -= 1;
 	}
 
 	fn visit_local(&mut self, local: &'ast Local) {
@@ -952,116 +1028,12 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		self.pattern(&local.pat);
 	}
 
+	fn visit_macro(&mut self, mac: &'ast Macro) {
+		self.macro_call(mac);
+	}
+
 	fn visit_pat(&mut self, pattern: &'ast Pat) {
 		self.pattern(pattern);
-	}
-
-	fn visit_arm(&mut self, arm: &'ast Arm) {
-		self.scopes.push(Scope::default());
-		self.pattern(&arm.pat);
-		self.visit_expr(&arm.body);
-		self.scopes.pop();
-	}
-
-	fn visit_expr_let(&mut self, expr: &'ast ExprLet) {
-		self.visit_expr(&expr.expr);
-		self.pattern(&expr.pat);
-	}
-
-	fn visit_expr_if(&mut self, expr: &'ast ExprIf) {
-		// variables of `if let` (chains) are visible in the rest of the condition and the `then` block
-		self.scopes.push(Scope::default());
-		self.visit_expr(&expr.cond);
-		self.visit_block(&expr.then_branch);
-		self.scopes.pop();
-
-		if let Some((_, otherwise)) = &expr.else_branch {
-			self.visit_expr(otherwise);
-		}
-	}
-
-	fn visit_expr_while(&mut self, expr: &'ast ExprWhile) {
-		self.scopes.push(Scope::default());
-		self.visit_expr(&expr.cond);
-		self.visit_block(&expr.body);
-		self.scopes.pop();
-	}
-
-	fn visit_expr_for_loop(&mut self, expr: &'ast ExprForLoop) {
-		self.visit_expr(&expr.expr);
-		self.scopes.push(Scope::default());
-		self.pattern(&expr.pat);
-		self.visit_block(&expr.body);
-		self.scopes.pop();
-	}
-
-	fn visit_expr_closure(&mut self, closure: &'ast ExprClosure) {
-		self.scopes.push(Scope::default());
-
-		for input in &closure.inputs {
-			self.pattern(input);
-		}
-
-		self.visit_return_type(&closure.output);
-		self.visit_expr(&closure.body);
-		self.scopes.pop();
-	}
-
-	fn visit_expr_path(&mut self, expr: &'ast ExprPath) {
-		self.code_path(expr.qself.as_ref(), &expr.path, Namespace::Value);
-	}
-
-	fn visit_expr_struct(&mut self, expr: &'ast ExprStruct) {
-		self.code_path(expr.qself.as_ref(), &expr.path, Namespace::Type);
-
-		for field in &expr.fields {
-			// `Struct { name }` is `Struct { name: name }`: renaming `name` would rename the field too
-			if field.colon_token.is_some() {
-				self.visit_expr(&field.expr);
-			}
-		}
-
-		if let Some(rest) = &expr.rest {
-			self.visit_expr(rest);
-		}
-	}
-
-	fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
-		self.visit_expr(&call.receiver);
-		self.method_call(&call.method);
-
-		if let Some(turbofish) = &call.turbofish {
-			self.visit_angle_bracketed_generic_arguments(turbofish);
-		}
-
-		for argument in &call.args {
-			self.visit_expr(argument);
-		}
-	}
-
-	fn visit_type_path(&mut self, ty: &'ast TypePath) {
-		self.code_path(ty.qself.as_ref(), &ty.path, Namespace::Type);
-	}
-
-	fn visit_trait_bound(&mut self, bound: &'ast TraitBound) {
-		self.code_path(None, &bound.path, Namespace::Type);
-	}
-
-	fn visit_generic_argument(&mut self, argument: &'ast GenericArgument) {
-		if let GenericArgument::Type(Type::Path(ty)) = argument
-			&& ty.qself.is_none()
-			&& let Some(ident) = ty.path.get_ident()
-			&& self.targets.named(ident).is_some()
-		{
-			self.type_or_const_argument(ident);
-			return;
-		}
-
-		visit::visit_generic_argument(self, argument);
-	}
-
-	fn visit_vis_restricted(&mut self, vis: &'ast VisRestricted) {
-		self.code_path(None, &vis.path, Namespace::Type);
 	}
 
 	// paths are resolved by the nodes containing them, which know their namespace
@@ -1071,27 +1043,47 @@ impl<'ast> Visit<'ast> for FileWalker<'_, '_> {
 		}
 	}
 
-	fn visit_macro(&mut self, mac: &'ast Macro) {
-		self.macro_call(mac);
-	}
-
 	// syntax that syn does not model
 	fn visit_token_stream(&mut self, tokens: &'ast TokenStream) {
 		self.verbatim(tokens);
 	}
-}
 
-/// Whether a path segment is a keyword with a special meaning, which never names an item.
-pub(super) fn is_path_keyword(name: &str) -> bool {
-	matches!(name, "crate" | "self" | "super" | "Self" | "$crate")
-}
+	fn visit_trait_bound(&mut self, bound: &'ast TraitBound) {
+		self.code_path(None, &bound.path, Namespace::Type);
+	}
 
-/// A leaf of a `use` tree.
-pub(super) struct UseLeaf<'t> {
-	/// The imported path: of the imported item, of the module of a `self` import, or of what a glob imports from.
-	pub(super) path: Vec<&'t Ident>,
+	fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+		if let Some(attrs) = trait_item_attrs(item) {
+			self.doc_comments(attrs, DocStyle::Outer);
+		}
 
-	pub(super) kind: LeafKind<'t>,
+		visit::visit_trait_item(self, item);
+	}
+
+	fn visit_trait_item_const(&mut self, item: &'ast TraitItemConst) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_trait_item_const(this, item));
+	}
+
+	fn visit_trait_item_fn(&mut self, item: &'ast TraitItemFn) {
+		self.function(&item.sig, item.default.as_ref());
+	}
+
+	fn visit_trait_item_type(&mut self, item: &'ast TraitItemType) {
+		self.item_scope(Some(&item.generics), |this| visit::visit_trait_item_type(this, item));
+	}
+
+	fn visit_type_path(&mut self, ty: &'ast TypePath) {
+		self.code_path(ty.qself.as_ref(), &ty.path, Namespace::Type);
+	}
+
+	fn visit_variant(&mut self, variant: &'ast Variant) {
+		self.doc_comments(&variant.attrs, DocStyle::Outer);
+		visit::visit_variant(self, variant);
+	}
+
+	fn visit_vis_restricted(&mut self, vis: &'ast VisRestricted) {
+		self.code_path(None, &vis.path, Namespace::Type);
+	}
 }
 
 pub(super) enum LeafKind<'t> {
@@ -1108,6 +1100,24 @@ pub(super) enum LeafKind<'t> {
 	Glob,
 }
 
+/// What `Self` refers to.
+#[derive(Debug, Default, Clone)]
+pub(super) struct SelfTypes {
+	/// The loaded types `Self` names: the self types of an `impl` block, or the type being defined.
+	pub(super) types: Vec<ItemId>,
+
+	/// Traits whose items `Self::item` may name: the trait being defined, or the traits an `impl` block implements.
+	pub(super) traits: Vec<ItemId>,
+}
+
+/// A leaf of a `use` tree.
+pub(super) struct UseLeaf<'t> {
+	/// The imported path: of the imported item, of the module of a `self` import, or of what a glob imports from.
+	pub(super) path: Vec<&'t Ident>,
+
+	pub(super) kind: LeafKind<'t>,
+}
+
 impl UseLeaf<'_> {
 	/// The name the leaf binds (none for globs and `_` imports).
 	fn binding(&self) -> Option<SmolStr> {
@@ -1121,57 +1131,81 @@ impl UseLeaf<'_> {
 	}
 }
 
-/// The leaves of a `use` tree.
-pub(super) fn use_leaves(tree: &UseTree) -> Vec<UseLeaf<'_>> {
-	fn collect<'t>(tree: &'t UseTree, prefix: &mut Vec<&'t Ident>, leaves: &mut Vec<UseLeaf<'t>>) {
-		let leaf = |path: Vec<&'t Ident>, kind| UseLeaf { path, kind };
+fn foreign_item_attrs(item: &ForeignItem) -> Option<&[Attribute]> {
+	let attrs = match item {
+		ForeignItem::Fn(item) => &item.attrs,
+		ForeignItem::Static(item) => &item.attrs,
+		ForeignItem::Type(item) => &item.attrs,
+		ForeignItem::Macro(item) => &item.attrs,
+		_ => return None,
+	};
 
-		match tree {
-			UseTree::Path(path) => {
-				prefix.push(&path.ident);
-				collect(&path.tree, prefix, leaves);
-				prefix.pop();
-			}
-
-			UseTree::Name(name) if name.ident == "self" => leaves.push(leaf(prefix.clone(), LeafKind::SelfImport(None))),
-			UseTree::Name(name) => leaves.push(leaf([&prefix[..], &[&name.ident]].concat(), LeafKind::Name)),
-			UseTree::Rename(rename) if rename.ident == "self" => leaves.push(leaf(prefix.clone(), LeafKind::SelfImport(Some(&rename.rename)))),
-			UseTree::Rename(rename) => leaves.push(leaf([&prefix[..], &[&rename.ident]].concat(), LeafKind::Rename(&rename.rename))),
-			UseTree::Glob(_) => leaves.push(leaf(prefix.clone(), LeafKind::Glob)),
-
-			UseTree::Group(group) => {
-				for tree in &group.items {
-					collect(tree, prefix, leaves);
-				}
-			}
-		}
-	}
-
-	let mut leaves = Vec::new();
-
-	collect(tree, &mut Vec::new(), &mut leaves);
-	leaves
+	Some(attrs)
 }
 
-/// The items of statements, for the scope of their block: item statements, and `thread_local!` invocations in
-/// statement position (which declare statics).
-pub(super) fn statement_items(stmts: &[Stmt]) -> Vec<Cow<'_, Item>> {
-	(stmts.iter())
-		.filter_map(|stmt| match stmt {
-			Stmt::Item(item) => Some(Cow::Borrowed(item)),
+fn impl_item_attrs(item: &ImplItem) -> Option<&[Attribute]> {
+	let attrs = match item {
+		ImplItem::Const(item) => &item.attrs,
+		ImplItem::Fn(item) => &item.attrs,
+		ImplItem::Type(item) => &item.attrs,
+		ImplItem::Macro(item) => &item.attrs,
+		_ => return None,
+	};
 
-			Stmt::Macro(statement) if thread_local::is_thread_local(&statement.mac) => {
-				Some(Cow::Owned(Item::Macro(ItemMacro {
-					attrs: statement.attrs.clone(),
-					ident: None,
-					mac: statement.mac.clone(),
-					semi_token: statement.semi_token,
-				})))
-			}
+	Some(attrs)
+}
 
-			_ => None,
-		})
-		.collect()
+/// Whether a path segment is a keyword with a special meaning, which never names an item.
+pub(super) fn is_path_keyword(name: &str) -> bool {
+	matches!(name, "crate" | "self" | "super" | "Self" | "$crate")
+}
+
+fn item_attrs(item: &Item) -> Option<&[Attribute]> {
+	let attrs = match item {
+		Item::Const(item) => &item.attrs,
+		Item::Enum(item) => &item.attrs,
+		Item::ExternCrate(item) => &item.attrs,
+		Item::Fn(item) => &item.attrs,
+		Item::ForeignMod(item) => &item.attrs,
+		Item::Impl(item) => &item.attrs,
+		Item::Macro(item) => &item.attrs,
+		Item::Mod(item) => &item.attrs,
+		Item::Static(item) => &item.attrs,
+		Item::Struct(item) => &item.attrs,
+		Item::Trait(item) => &item.attrs,
+		Item::TraitAlias(item) => &item.attrs,
+		Item::Type(item) => &item.attrs,
+		Item::Union(item) => &item.attrs,
+		Item::Use(item) => &item.attrs,
+		_ => return None,
+	};
+
+	Some(attrs)
+}
+
+/// The members of an enum or module defined in a block (for glob imports of it).
+fn local_item_members(item: &Item) -> Option<(SmolStr, Vec<(SmolStr, Namespace)>)> {
+	match item {
+		Item::Enum(item) => {
+			let variants = item.variants.iter().flat_map(|variant| {
+				let namespaces: &[Namespace] = match variant.fields {
+					Fields::Named(_) => &[Namespace::Type],
+					_ => &[Namespace::Type, Namespace::Value],
+				};
+
+				namespaces.iter().map(|&namespace| (ident_name(&variant.ident), namespace))
+			});
+
+			Some((ident_name(&item.ident), variants.collect()))
+		}
+
+		Item::Mod(item) => item
+			.content
+			.as_ref()
+			.map(|(_, items)| (ident_name(&item.ident), items.iter().flat_map(local_item_names).collect())),
+
+		_ => None,
+	}
 }
 
 /// The names an item of a block binds, with their namespaces.
@@ -1217,61 +1251,23 @@ fn local_item_names(item: &Item) -> Vec<(SmolStr, Namespace)> {
 	}
 }
 
-/// The members of an enum or module defined in a block (for glob imports of it).
-fn local_item_members(item: &Item) -> Option<(SmolStr, Vec<(SmolStr, Namespace)>)> {
-	match item {
-		Item::Enum(item) => {
-			let variants = item.variants.iter().flat_map(|variant| {
-				let namespaces: &[Namespace] = match variant.fields {
-					Fields::Named(_) => &[Namespace::Type],
-					_ => &[Namespace::Type, Namespace::Value],
-				};
+/// The items of statements, for the scope of their block: item statements, and `thread_local!` invocations in
+/// statement position (which declare statics).
+pub(super) fn statement_items(stmts: &[Stmt]) -> Vec<Cow<'_, Item>> {
+	(stmts.iter())
+		.filter_map(|stmt| match stmt {
+			Stmt::Item(item) => Some(Cow::Borrowed(item)),
 
-				namespaces.iter().map(|&namespace| (ident_name(&variant.ident), namespace))
-			});
+			Stmt::Macro(statement) if thread_local::is_thread_local(&statement.mac) => Some(Cow::Owned(Item::Macro(ItemMacro {
+				attrs: statement.attrs.clone(),
+				ident: None,
+				mac: statement.mac.clone(),
+				semi_token: statement.semi_token,
+			}))),
 
-			Some((ident_name(&item.ident), variants.collect()))
-		}
-
-		Item::Mod(item) => item.content.as_ref().map(|(_, items)| (ident_name(&item.ident), items.iter().flat_map(local_item_names).collect())),
-
-		_ => None,
-	}
-}
-
-fn item_attrs(item: &Item) -> Option<&[Attribute]> {
-	let attrs = match item {
-		Item::Const(item) => &item.attrs,
-		Item::Enum(item) => &item.attrs,
-		Item::ExternCrate(item) => &item.attrs,
-		Item::Fn(item) => &item.attrs,
-		Item::ForeignMod(item) => &item.attrs,
-		Item::Impl(item) => &item.attrs,
-		Item::Macro(item) => &item.attrs,
-		Item::Mod(item) => &item.attrs,
-		Item::Static(item) => &item.attrs,
-		Item::Struct(item) => &item.attrs,
-		Item::Trait(item) => &item.attrs,
-		Item::TraitAlias(item) => &item.attrs,
-		Item::Type(item) => &item.attrs,
-		Item::Union(item) => &item.attrs,
-		Item::Use(item) => &item.attrs,
-		_ => return None,
-	};
-
-	Some(attrs)
-}
-
-fn impl_item_attrs(item: &ImplItem) -> Option<&[Attribute]> {
-	let attrs = match item {
-		ImplItem::Const(item) => &item.attrs,
-		ImplItem::Fn(item) => &item.attrs,
-		ImplItem::Type(item) => &item.attrs,
-		ImplItem::Macro(item) => &item.attrs,
-		_ => return None,
-	};
-
-	Some(attrs)
+			_ => None,
+		})
+		.collect()
 }
 
 fn trait_item_attrs(item: &TraitItem) -> Option<&[Attribute]> {
@@ -1286,21 +1282,61 @@ fn trait_item_attrs(item: &TraitItem) -> Option<&[Attribute]> {
 	Some(attrs)
 }
 
-fn foreign_item_attrs(item: &ForeignItem) -> Option<&[Attribute]> {
-	let attrs = match item {
-		ForeignItem::Fn(item) => &item.attrs,
-		ForeignItem::Static(item) => &item.attrs,
-		ForeignItem::Type(item) => &item.attrs,
-		ForeignItem::Macro(item) => &item.attrs,
-		_ => return None,
-	};
+/// The leaves of a `use` tree.
+pub(super) fn use_leaves(tree: &UseTree) -> Vec<UseLeaf<'_>> {
+	fn collect<'t>(tree: &'t UseTree, prefix: &mut Vec<&'t Ident>, leaves: &mut Vec<UseLeaf<'t>>) {
+		let leaf = |path: Vec<&'t Ident>, kind| UseLeaf { path, kind };
 
-	Some(attrs)
+		match tree {
+			UseTree::Path(path) => {
+				prefix.push(&path.ident);
+				collect(&path.tree, prefix, leaves);
+				prefix.pop();
+			}
+
+			UseTree::Name(name) if name.ident == "self" => leaves.push(leaf(prefix.clone(), LeafKind::SelfImport(None))),
+			UseTree::Name(name) => leaves.push(leaf([&prefix[..], &[&name.ident]].concat(), LeafKind::Name)),
+			UseTree::Rename(rename) if rename.ident == "self" => leaves.push(leaf(prefix.clone(), LeafKind::SelfImport(Some(&rename.rename)))),
+			UseTree::Rename(rename) => leaves.push(leaf([&prefix[..], &[&rename.ident]].concat(), LeafKind::Rename(&rename.rename))),
+			UseTree::Glob(_) => leaves.push(leaf(prefix.clone(), LeafKind::Glob)),
+
+			UseTree::Group(group) => {
+				for tree in &group.items {
+					collect(tree, prefix, leaves);
+				}
+			}
+		}
+	}
+
+	let mut leaves = Vec::new();
+
+	collect(tree, &mut Vec::new(), &mut leaves);
+	leaves
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn flattens_use_trees() {
+		let found = leaves("use a::{b::{self, C as D}, e::*, F, r#type as _};");
+		let expected = [
+			("a::b", "self", Some("b")),
+			("a::b::C", "rename", Some("D")),
+			("a::e", "glob", None),
+			("a::F", "name", Some("F")),
+			("a::r#type", "rename", None),
+		];
+
+		assert_eq!(found.len(), expected.len());
+
+		for (found, expected) in found.iter().zip(expected) {
+			assert_eq!((found.0.as_str(), found.1, found.2.as_deref()), expected);
+		}
+
+		assert_eq!(leaves("use x::{self as y};")[0].2.as_deref(), Some("y"));
+	}
 
 	fn leaves(source: &str) -> Vec<(String, &'static str, Option<String>)> {
 		let item: ItemUse = syn::parse_str(source).unwrap();
@@ -1323,31 +1359,14 @@ mod tests {
 	}
 
 	#[test]
-	fn flattens_use_trees() {
-		let found = leaves("use a::{b::{self, C as D}, e::*, F, r#type as _};");
-		let expected = [
-			("a::b", "self", Some("b")),
-			("a::b::C", "rename", Some("D")),
-			("a::e", "glob", None),
-			("a::F", "name", Some("F")),
-			("a::r#type", "rename", None),
-		];
-
-		assert_eq!(found.len(), expected.len());
-
-		for (found, expected) in found.iter().zip(expected) {
-			assert_eq!((found.0.as_str(), found.1, found.2.as_deref()), expected);
-		}
-
-		assert_eq!(leaves("use x::{self as y};")[0].2.as_deref(), Some("y"));
-	}
-
-	#[test]
 	fn names_of_local_items() {
 		let names = |source: &str| {
 			let item: Item = syn::parse_str(source).unwrap();
 
-			local_item_names(&item).into_iter().map(|(name, namespace)| format!("{name}:{namespace:?}")).collect::<Vec<_>>()
+			local_item_names(&item)
+				.into_iter()
+				.map(|(name, namespace)| format!("{name}:{namespace:?}"))
+				.collect::<Vec<_>>()
 		};
 
 		assert_eq!(names("struct S { a: u8 }"), ["S:Type"]);

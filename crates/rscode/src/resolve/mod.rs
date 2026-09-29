@@ -29,20 +29,17 @@ mod names;
 mod refs;
 mod removal;
 mod scope;
-#[cfg(test)]
-mod test_model;
-#[cfg(test)]
-mod tests;
 mod text;
 mod usable;
 mod user_path;
 mod vis;
 mod walk;
 
-pub use refs::Reference;
-pub use refs::ReferenceKind;
-pub use refs::ReferenceOptions;
-pub use refs::References;
+#[cfg(test)]
+mod test_model;
+
+#[cfg(test)]
+mod tests;
 
 use crate::model::CrateId;
 use crate::model::ItemId;
@@ -52,17 +49,36 @@ use crate::model::Workspace;
 use crate::path::CanonicalPath;
 use crate::path::ItemPath;
 use build::ImportIndex;
-pub(crate) use removal::DeadName;
-pub(crate) use removal::DeadNames;
-pub(crate) use removal::LostBinding;
-use impls::ImplIndex;
 use fxhash::FxHashSet;
+use impls::ImplIndex;
 use scope::Tables;
 use serde::Serialize;
 use smol_str::SmolStr;
 use usable::UsableCache;
 use walk::Walker;
 use walk::Want;
+
+pub use refs::Reference;
+pub use refs::ReferenceKind;
+pub use refs::ReferenceOptions;
+pub use refs::References;
+pub(crate) use removal::DeadName;
+pub(crate) use removal::DeadNames;
+pub(crate) use removal::LostBinding;
+
+/// One binding of a name in a module scope.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]
+pub struct Binding {
+	/// What the name refers to (imports are followed to their final target).
+	pub res: Res,
+
+	/// The [`ItemKind::Import`] that introduced the binding, if not a definition.
+	/// For crates bound by `extern crate`, the [`ItemKind::ExternCrate`] item.
+	pub import: Option<ItemId>,
+
+	/// Whether the binding comes from a glob import.
+	pub glob: bool,
+}
 
 /// A namespace of names.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
@@ -87,6 +103,19 @@ impl Namespace {
 	}
 }
 
+/// How a path is written, which decides where its first segment is looked up.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PathKind {
+	/// A path in code (types, expressions, patterns, macro invocations). Associated items are reachable through
+	/// types and traits (`Type::new`, `Trait::method`).
+	#[default]
+	Code,
+
+	/// A path in a `use` item. In edition 2015, it is relative to the crate root.
+	Use,
+}
+
 /// What a name resolves to.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "kind", content = "target")]
@@ -99,43 +128,6 @@ pub enum Res {
 
 	/// A primitive type (`u8`, `str`, ...) or built-in attribute/macro.
 	Builtin(SmolStr),
-}
-
-/// One binding of a name in a module scope.
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]
-pub struct Binding {
-	/// What the name refers to (imports are followed to their final target).
-	pub res: Res,
-
-	/// The [`ItemKind::Import`] that introduced the binding, if not a definition.
-	/// For crates bound by `extern crate`, the [`ItemKind::ExternCrate`] item.
-	pub import: Option<ItemId>,
-
-	/// Whether the binding comes from a glob import.
-	pub glob: bool,
-}
-
-/// A point of view for computing usable paths.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum Viewpoint {
-	/// Inside of a module (use the crate root module for `--from crate`).
-	Module(ItemId),
-
-	/// From another crate (`--from ::`): only public items through public modules and re-exports.
-	Foreign,
-}
-
-/// How a path is written, which decides where its first segment is looked up.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PathKind {
-	/// A path in code (types, expressions, patterns, macro invocations). Associated items are reachable through
-	/// types and traits (`Type::new`, `Trait::method`).
-	#[default]
-	Code,
-
-	/// A path in a `use` item. In edition 2015, it is relative to the crate root.
-	Use,
 }
 
 /// Name resolution for a [`Workspace`]. Construction resolves every import; queries are cheap.
@@ -156,12 +148,6 @@ impl<'ws> Resolver<'ws> {
 		Self::build(ws, &FxHashSet::default())
 	}
 
-	/// A resolver of the workspace in which `imports` bind nothing, as if they were removed: comparing it with one of the
-	/// whole workspace (see [`Resolver::lost_bindings`]) tells what the removal breaks.
-	pub(crate) fn without_imports(ws: &'ws Workspace, imports: &[ItemId]) -> Self {
-		Self::build(ws, &imports.iter().copied().collect())
-	}
-
 	fn build(ws: &'ws Workspace, excluded: &FxHashSet<ItemId>) -> Self {
 		let (mut tables, imports) = build::build(ws, excluded);
 		let impls = impls::build(ws, &tables);
@@ -177,78 +163,18 @@ impl<'ws> Resolver<'ws> {
 		}
 	}
 
-	/// The workspace names are resolved in.
-	pub fn workspace(&self) -> &'ws Workspace {
-		self.ws
+	/// A resolver of the workspace in which `imports` bind nothing, as if they were removed: comparing it with one of the
+	/// whole workspace (see [`Resolver::lost_bindings`]) tells what the removal breaks.
+	pub(crate) fn without_imports(ws: &'ws Workspace, imports: &[ItemId]) -> Self {
+		Self::build(ws, &imports.iter().copied().collect())
 	}
 
-	/// The definition path of an item.
+	/// Associated items reachable as `Type::name` (from inherent and trait `impl`s) or `Trait::name`.
 	///
-	/// Items of `impl` blocks are owned by the first loaded type the self type resolves to; `#[macro_export]` macros
-	/// live at the crate root; imports are named by the name they bind (`*` for globs, `_` for underscore imports).
-	pub fn canonical_path(&self, item: ItemId) -> CanonicalPath {
-		self.compute_canonical_path(item)
-	}
-
-	/// Items named by a user-given path, in selected crates (and, for `::name` or crate-name-first paths,
-	/// in the named crate). Imports are followed to their definitions, except by `use` paths
-	/// ([`ItemPath::import`]), which name the imports themselves; every `cfg` variant is returned.
-	///
-	/// Visibility is not enforced. Segments after a type or trait name its associated items (`Type::new`), and
-	/// segments after an enum its variants (or its associated items, in namespaces without a variant of that name).
-	/// In `<Type as Trait>::name`, a type or trait path that does not name a loaded item matches the `impl`s whose type
-	/// or trait path ends with its segments (`<Circle as Shape>` for `impl shapes::Shape for Circle`). Results are sorted
-	/// and free of duplicates.
-	pub fn resolve_item_path(&self, path: &ItemPath) -> Vec<ItemId> {
-		self.compute_item_path(path)
-	}
-
-	/// For a path that names nothing, a hint about imports, for messages: what a `use` path names, or the `use` path
-	/// of the imports that a plain path names (when they import items that are not loaded).
-	pub fn import_hint(&self, path: &ItemPath) -> Option<String> {
-		if path.import {
-			let name = path.name().map_or("Name", SmolStr::as_str);
-
-			return Some(format!(
-				"a `use` path names the imports of the module its other segments name (`use crate::m::{name}` names \
-				 `use a::{name};` in `m`), not an import written with that path; the pattern `use *{name}*` finds the \
-				 imports of `{name}`"
-			));
-		}
-
-		let imports = ItemPath { import: true, ..path.clone() };
-
-		(path.qualifier.is_none() && !self.compute_item_path(&imports).is_empty()).then(|| {
-			format!("`{path}` names imports of items that are not loaded: `{imports}` names the imports themselves")
-		})
-	}
-
-	/// Resolves a path as if written inside of `module` (a module item).
-	///
-	/// Single-segment names that are bound nowhere fall back to the standard library prelude ([`Res::External`]) and to
-	/// primitive types and built-in macros ([`Res::Builtin`]). Paths starting with `Self` resolve to nothing.
-	pub fn resolve_path(&self, module: ItemId, path: &PathRef, namespace: Namespace) -> Vec<Res> {
-		self.resolve_prefixes(module, path, Some(namespace), PathKind::Code).pop().unwrap_or_default()
-	}
-
-	/// Resolves every prefix of a path written inside of `module`: element `i` is what `path.segments[..=i]` names,
-	/// looked up in the type namespace, except for the last segment, which is looked up in `namespace` (every
-	/// namespace for `None`, like a `use` does). The result has one element per segment.
-	pub fn resolve_prefixes(&self, module: ItemId, path: &PathRef, namespace: Option<Namespace>, kind: PathKind) -> Vec<Vec<Res>> {
-		let want = namespace.map_or(Want::All, Want::One);
-		let mut walker = Walker::new(self.ws, &self.tables, self.ws.module_of(module), kind);
-
-		walker
-			.prefixes(path, want)
-			.into_iter()
-			.map(|found| {
-				let mut res: Vec<Res> = found.into_iter().map(|found| found.res).collect();
-
-				res.sort();
-				res.dedup();
-				res
-			})
-			.collect()
+	/// Items of inherent `impl`s come first, each group in source order. Enum variants are not included. For a type
+	/// alias, only the items of `impl`s written for the alias itself are known (what it aliases is not resolved).
+	pub fn associated_items(&self, item: ItemId) -> Vec<ItemId> {
+		self.tables.assoc.get(&item).cloned().unwrap_or_default()
 	}
 
 	/// The bindings of `name` in a module's scope (for a non-module item: the scope of its module), including
@@ -277,28 +203,39 @@ impl<'ws> Resolver<'ws> {
 		bindings
 	}
 
-	/// Every name bound in a module's scope, sorted.
-	pub fn names(&self, module: ItemId, namespace: Namespace) -> Vec<SmolStr> {
-		let module = self.ws.module_of(module);
+	/// The definition path of an item.
+	///
+	/// Items of `impl` blocks are owned by the first loaded type the self type resolves to; `#[macro_export]` macros
+	/// live at the crate root; imports are named by the name they bind (`*` for globs, `_` for underscore imports).
+	pub fn canonical_path(&self, item: ItemId) -> CanonicalPath {
+		self.compute_canonical_path(item)
+	}
 
-		let mut names: Vec<SmolStr> = (self.tables.scopes.get(&module).into_iter())
-			.flat_map(|scope| scope.iter())
-			.filter(|&(_, slot_namespace, _)| slot_namespace == namespace)
-			.map(|(name, _, _)| name.clone())
-			.collect();
+	/// The crate root module named `name` from inside of `from` (extern prelude, including renames), if loaded.
+	pub fn crate_by_name(&self, from: CrateId, name: &str) -> Option<CrateId> {
+		let prelude = self.tables.extern_preludes.get(from.index())?;
 
-		if namespace == Namespace::Macro {
-			let mut current = Some(module);
+		prelude.get(name)?.iter().find_map(|res| match res {
+			Res::Item(root) => Some(root.krate()),
+			_ => None,
+		})
+	}
 
-			while let Some(module) = current {
-				names.extend(self.tables.textual.get(&module).into_iter().flat_map(|macros| macros.keys().cloned()));
-				current = vis::parent_module(self.ws, module);
-			}
-		}
+	/// References to the targets across all loaded crates.
+	pub fn find_references(&self, targets: &[ItemId], options: &ReferenceOptions) -> References {
+		refs::find_references(self, targets, options)
+	}
 
-		names.sort();
-		names.dedup();
-		names
+	/// References to the targets, references through `lost` bindings (see [`Resolver::lost_bindings`]), and unresolved
+	/// references to `dead` names (see [`Resolver::dead_names`]), whose target is the import that bound them.
+	pub(crate) fn find_references_through(
+		&self,
+		targets: &[ItemId],
+		lost: &[LostBinding],
+		dead: &[DeadName],
+		options: &ReferenceOptions,
+	) -> References {
+		refs::find_references_through(self, targets, lost, dead, options)
 	}
 
 	/// The loaded item(s) an `impl` block implements (its resolved self type), one per `cfg` variant.
@@ -328,12 +265,118 @@ impl<'ws> Resolver<'ws> {
 		impls
 	}
 
-	/// Associated items reachable as `Type::name` (from inherent and trait `impl`s) or `Trait::name`.
+	/// For a path that names nothing, a hint about imports, for messages: what a `use` path names, or the `use` path
+	/// of the imports that a plain path names (when they import items that are not loaded).
+	pub fn import_hint(&self, path: &ItemPath) -> Option<String> {
+		if path.import {
+			let name = path.name().map_or("Name", SmolStr::as_str);
+
+			return Some(format!(
+				"a `use` path names the imports of the module its other segments name (`use crate::m::{name}` names \
+				 `use a::{name};` in `m`), not an import written with that path; the pattern `use *{name}*` finds the \
+				 imports of `{name}`"
+			));
+		}
+
+		let imports = ItemPath {
+			import: true,
+			..path.clone()
+		};
+
+		(path.qualifier.is_none() && !self.compute_item_path(&imports).is_empty())
+			.then(|| format!("`{path}` names imports of items that are not loaded: `{imports}` names the imports themselves"))
+	}
+
+	/// What an import refers to (for a glob import: the modules and enums it imports from), with imports followed to
+	/// their final targets. Empty for unresolved imports and non-imports.
+	pub fn import_targets(&self, import: ItemId) -> Vec<Res> {
+		let mut targets: Vec<Res> = (self.imports.targets.get(&import).into_iter().flatten())
+			.map(|(_, res)| res.clone())
+			.collect();
+
+		targets.sort();
+		targets.dedup();
+		targets
+	}
+
+	/// Imports (in all loaded crates) that refer to `target`: named imports of it, and glob imports of it (a module
+	/// or enum).
+	pub fn imports_of(&self, target: ItemId) -> Vec<ItemId> {
+		self.imports.by_target.get(&target).cloned().unwrap_or_default()
+	}
+
+	/// Whether `item` is visible from `module` according to its declared visibility.
 	///
-	/// Items of inherent `impl`s come first, each group in source order. Enum variants are not included. For a type
-	/// alias, only the items of `impl`s written for the alias itself are known (what it aliases is not resolved).
-	pub fn associated_items(&self, item: ItemId) -> Vec<ItemId> {
-		self.tables.assoc.get(&item).cloned().unwrap_or_default()
+	/// This only considers the item's own visibility, not whether the modules on the way to it are visible.
+	pub fn is_visible_from(&self, item: ItemId, module: ItemId) -> bool {
+		vis::declared_vis(self.ws, item).is_visible_from(&self.tables.tree, self.ws.module_of(module))
+	}
+
+	/// Every name bound in a module's scope, sorted.
+	pub fn names(&self, module: ItemId, namespace: Namespace) -> Vec<SmolStr> {
+		let module = self.ws.module_of(module);
+
+		let mut names: Vec<SmolStr> = (self.tables.scopes.get(&module).into_iter())
+			.flat_map(|scope| scope.iter())
+			.filter(|&(_, slot_namespace, _)| slot_namespace == namespace)
+			.map(|(name, _, _)| name.clone())
+			.collect();
+
+		if namespace == Namespace::Macro {
+			let mut current = Some(module);
+
+			while let Some(module) = current {
+				names.extend(self.tables.textual.get(&module).into_iter().flat_map(|macros| macros.keys().cloned()));
+				current = vis::parent_module(self.ws, module);
+			}
+		}
+
+		names.sort();
+		names.dedup();
+		names
+	}
+
+	/// Items named by a user-given path, in selected crates (and, for `::name` or crate-name-first paths,
+	/// in the named crate). Imports are followed to their definitions, except by `use` paths
+	/// ([`ItemPath::import`]), which name the imports themselves; every `cfg` variant is returned.
+	///
+	/// Visibility is not enforced. Segments after a type or trait name its associated items (`Type::new`), and
+	/// segments after an enum its variants (or its associated items, in namespaces without a variant of that name).
+	/// In `<Type as Trait>::name`, a type or trait path that does not name a loaded item matches the `impl`s whose type
+	/// or trait path ends with its segments (`<Circle as Shape>` for `impl shapes::Shape for Circle`). Results are sorted
+	/// and free of duplicates.
+	pub fn resolve_item_path(&self, path: &ItemPath) -> Vec<ItemId> {
+		self.compute_item_path(path)
+	}
+
+	/// Resolves a path as if written inside of `module` (a module item).
+	///
+	/// Single-segment names that are bound nowhere fall back to the standard library prelude ([`Res::External`]) and to
+	/// primitive types and built-in macros ([`Res::Builtin`]). Paths starting with `Self` resolve to nothing.
+	pub fn resolve_path(&self, module: ItemId, path: &PathRef, namespace: Namespace) -> Vec<Res> {
+		self.resolve_prefixes(module, path, Some(namespace), PathKind::Code)
+			.pop()
+			.unwrap_or_default()
+	}
+
+	/// Resolves every prefix of a path written inside of `module`: element `i` is what `path.segments[..=i]` names,
+	/// looked up in the type namespace, except for the last segment, which is looked up in `namespace` (every
+	/// namespace for `None`, like a `use` does). The result has one element per segment.
+	pub fn resolve_prefixes(&self, module: ItemId, path: &PathRef, namespace: Option<Namespace>, kind: PathKind) -> Vec<Vec<Res>> {
+		let want = namespace.map_or(Want::All, Want::One);
+		let mut walker = Walker::new(self.ws, &self.tables, self.ws.module_of(module), kind);
+
+		walker
+			.prefixes(path, want)
+			.into_iter()
+			.map(|found| {
+				let mut res: Vec<Res> = found.into_iter().map(|found| found.res).collect();
+
+				res.sort();
+				res.dedup();
+				res
+			})
+			.collect()
 	}
 
 	/// For an item of a trait: the corresponding items in every `impl` of the trait.
@@ -365,26 +408,9 @@ impl<'ws> Resolver<'ws> {
 		counterparts
 	}
 
-	/// Whether `item` is visible from `module` according to its declared visibility.
-	///
-	/// This only considers the item's own visibility, not whether the modules on the way to it are visible.
-	pub fn is_visible_from(&self, item: ItemId, module: ItemId) -> bool {
-		vis::declared_vis(self.ws, item).is_visible_from(&self.tables.tree, self.ws.module_of(module))
-	}
-
-	/// The module whose descendants may see `item` according to its declared visibility (`None` when public).
-	pub fn visibility_scope(&self, item: ItemId) -> Option<ItemId> {
-		vis::declared_vis(self.ws, item).scope()
-	}
-
-	/// The crate root module named `name` from inside of `from` (extern prelude, including renames), if loaded.
-	pub fn crate_by_name(&self, from: CrateId, name: &str) -> Option<CrateId> {
-		let prelude = self.tables.extern_preludes.get(from.index())?;
-
-		prelude.get(name)?.iter().find_map(|res| match res {
-			Res::Item(root) => Some(root.krate()),
-			_ => None,
-		})
+	/// Imports that resolved to nothing (typically paths into items produced by macros).
+	pub fn unresolved_imports(&self) -> &[ItemId] {
+		&self.imports.unresolved
 	}
 
 	/// Paths through which `target` can be named from `viewpoint`, shortest first
@@ -398,41 +424,23 @@ impl<'ws> Resolver<'ws> {
 		self.compute_usable_paths(target, viewpoint)
 	}
 
-	/// What an import refers to (for a glob import: the modules and enums it imports from), with imports followed to
-	/// their final targets. Empty for unresolved imports and non-imports.
-	pub fn import_targets(&self, import: ItemId) -> Vec<Res> {
-		let mut targets: Vec<Res> = (self.imports.targets.get(&import).into_iter().flatten()).map(|(_, res)| res.clone()).collect();
-
-		targets.sort();
-		targets.dedup();
-		targets
+	/// The module whose descendants may see `item` according to its declared visibility (`None` when public).
+	pub fn visibility_scope(&self, item: ItemId) -> Option<ItemId> {
+		vis::declared_vis(self.ws, item).scope()
 	}
 
-	/// Imports (in all loaded crates) that refer to `target`: named imports of it, and glob imports of it (a module
-	/// or enum).
-	pub fn imports_of(&self, target: ItemId) -> Vec<ItemId> {
-		self.imports.by_target.get(&target).cloned().unwrap_or_default()
+	/// The workspace names are resolved in.
+	pub fn workspace(&self) -> &'ws Workspace {
+		self.ws
 	}
+}
 
-	/// Imports that resolved to nothing (typically paths into items produced by macros).
-	pub fn unresolved_imports(&self) -> &[ItemId] {
-		&self.imports.unresolved
-	}
+/// A point of view for computing usable paths.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum Viewpoint {
+	/// Inside of a module (use the crate root module for `--from crate`).
+	Module(ItemId),
 
-	/// References to the targets across all loaded crates.
-	pub fn find_references(&self, targets: &[ItemId], options: &ReferenceOptions) -> References {
-		refs::find_references(self, targets, options)
-	}
-
-	/// References to the targets, references through `lost` bindings (see [`Resolver::lost_bindings`]), and unresolved
-	/// references to `dead` names (see [`Resolver::dead_names`]), whose target is the import that bound them.
-	pub(crate) fn find_references_through(
-		&self,
-		targets: &[ItemId],
-		lost: &[LostBinding],
-		dead: &[DeadName],
-		options: &ReferenceOptions,
-	) -> References {
-		refs::find_references_through(self, targets, lost, dead, options)
-	}
+	/// From another crate (`--from ::`): only public items through public modules and re-exports.
+	Foreign,
 }
