@@ -15,8 +15,7 @@ use rscode_fmt::FormatTarget;
 use rscode_fmt::Formatter;
 use rscode_fmt::RsFormatter;
 
-let formatter = Formatter::new(FormatOptions::new().formatter(RsFormatter::PrettyPlease));
-let source = "fn  a( ) {}\nfn  b( ) {}\n";
+let formatter = Formatter::new(FormatOptions::new().formatter(RsFormatter::PrettyPlease)); let source = "fn  a( ) {}\nfn  b( ) {}\n";
 
 // only `b` is formatted
 let b = source.find("fn  b").unwrap();

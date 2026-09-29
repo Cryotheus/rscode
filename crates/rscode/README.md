@@ -28,30 +28,29 @@ use rscode::LoadOptions;
 use rscode::Resolver;
 use rscode::edit::RenameOptions;
 
-let workspace = rscode::load_workspace(&LoadOptions::default())?;
-let resolver = Resolver::new(&workspace);
+let workspace = rscode::load_workspace( & LoadOptions::default ()) ?; let resolver = Resolver::new( & workspace);
 
-for found in rscode::Find::new().pattern("*Error")?.run_with(&resolver)? {
-	println!("{}  {}  {}:{}", found.path, found.kind, found.file.display(), found.start);
+for found in rscode::Find::new().pattern("*Error") ?.run_with( & resolver)? {
+println ! ("{}  {}  {}:{}", found.path, found.kind, found.file.display(), found.start);
 }
 
-let rename = rscode::edit::rename(&resolver, &ItemPath::parse("crate::shapes::Circle")?, "Disk", &RenameOptions::default())?;
+let rename = rscode::edit::rename( & resolver, & ItemPath::parse("crate::shapes::Circle") ?, "Disk", & RenameOptions::default ()) ?;
 
 println!("{}", rename.edits.diff()?);
-rename.edits.apply()?;
+rename.edits.apply() ?;
 ```
 
 ## Item paths
 
-| path | meaning |
-|---|---|
-| `crate::m::Item` | an item of the selected crates |
-| `::krate::Item` | an item of the crate `krate` |
-| `m::Item` | presumed absolute: `crate::m::Item`, or `::m::Item` |
-| `Type::name` | an associated item, trait item, or enum variant |
-| `<Type as Trait>::name` | an item of a trait `impl` (`<Type>::name`: of an inherent one) |
-| `impl Trait for Type` | an `impl` block |
-| `use m::Name` | the imports of `m` that bind `Name` (`*` for glob imports, `_` for `as _` ones) |
+| path                    | meaning                                                                         |
+|-------------------------|---------------------------------------------------------------------------------|
+| `crate::m::Item`        | an item of the selected crates                                                  |
+| `::krate::Item`         | an item of the crate `krate`                                                    |
+| `m::Item`               | presumed absolute: `crate::m::Item`, or `::m::Item`                             |
+| `Type::name`            | an associated item, trait item, or enum variant                                 |
+| `<Type as Trait>::name` | an item of a trait `impl` (`<Type>::name`: of an inherent one)                  |
+| `impl Trait for Type`   | an `impl` block                                                                 |
+| `use m::Name`           | the imports of `m` that bind `Name` (`*` for glob imports, `_` for `as _` ones) |
 
 One path names every `cfg` variant of an item. Paths go through imports to what they import; `use` paths name the
 imports themselves.

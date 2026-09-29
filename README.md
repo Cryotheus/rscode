@@ -10,12 +10,12 @@ before anything is written.
 
 It comes as:
 
-| crate | what |
-|---|---|
-| [`cargo-rscode`](crates/cargo-rscode) | the `cargo rscode` command, which also serves the Model Context Protocol (`cargo rscode mcp`) for AI agents |
-| [`rscode`](crates/rscode) | the library: loading, name resolution, find, view, rename, remove, replace, insert, format |
-| [`rscode_fmt`](crates/rscode_fmt) | formatting of whole files or single items with rustfmt or prettyplease |
-| [`rscode_sort`](crates/rscode_sort) | deterministic sorting of items (the "Cryotheum" ordering), usable on its own, e.g. for generated `bindgen` output |
+| crate                                 | what                                                                                                              |
+|---------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| [`cargo-rscode`](crates/cargo-rscode) | the `cargo rscode` command, which also serves the Model Context Protocol (`cargo rscode mcp`) for AI agents       |
+| [`rscode`](crates/rscode)             | the library: loading, name resolution, find, view, rename, remove, replace, insert, format                        |
+| [`rscode_fmt`](crates/rscode_fmt)     | formatting of whole files or single items with rustfmt or prettyplease                                            |
+| [`rscode_sort`](crates/rscode_sort)   | deterministic sorting of items (the "Cryotheum" ordering), usable on its own, e.g. for generated `bindgen` output |
 
 ## Installing
 
@@ -57,15 +57,15 @@ Every subcommand accepts cargo's selection flags (`-p`, `--workspace`, `--exclud
 
 ### Item paths
 
-| path | meaning |
-|---|---|
-| `crate::m::Item` | an item of the selected crates |
-| `::krate::Item` | an item of the crate `krate` |
-| `m::Item` | presumed absolute: `crate::m::Item`, or `::m::Item` |
-| `Type::name` | an associated item, trait item, or enum variant |
-| `<Type as Trait>::name` | an item of a trait `impl` (`<Type>::name`: of an inherent one) |
-| `impl Trait for Type` | an `impl` block (also `<Type as Trait>`, `<Type>`) |
-| `use m::Name` | the imports of `m` that bind `Name` (`use m::*`: glob imports, `use m::_`: `as _` imports) |
+| path                    | meaning                                                                                    |
+|-------------------------|--------------------------------------------------------------------------------------------|
+| `crate::m::Item`        | an item of the selected crates                                                             |
+| `::krate::Item`         | an item of the crate `krate`                                                               |
+| `m::Item`               | presumed absolute: `crate::m::Item`, or `::m::Item`                                        |
+| `Type::name`            | an associated item, trait item, or enum variant                                            |
+| `<Type as Trait>::name` | an item of a trait `impl` (`<Type>::name`: of an inherent one)                             |
+| `impl Trait for Type`   | an `impl` block (also `<Type as Trait>`, `<Type>`)                                         |
+| `use m::Name`           | the imports of `m` that bind `Name` (`use m::*`: glob imports, `use m::_`: `as _` imports) |
 
 Paths go through imports and re-exports to what they import. To name an import itself, use its `use` path, quoted as
 one argument (`cargo rscode remove 'use crate::bindings::ItemOrder'`), which is how `find --imports` prints imports.
@@ -82,13 +82,13 @@ ambiguous, even with `--all-variants`.
 
 No regex. `*` matches within an identifier, `**` matches whole path segments:
 
-| pattern | matches |
-|---|---|
-| `foo` / `foo*` / `*foo` / `*foo*` | exactly / starts with / ends with / contains `foo` |
-| `foo*bar`, `*foo*bar*` | several parts, in order |
-| `foo::*` | items directly in `foo` |
-| `foo::**` | everything below `foo` |
-| `**::Blam`, `Blam` | `Blam` anywhere (patterns without `crate::`/`::` are unanchored) |
+| pattern                           | matches                                                          |
+|-----------------------------------|------------------------------------------------------------------|
+| `foo` / `foo*` / `*foo` / `*foo*` | exactly / starts with / ends with / contains `foo`               |
+| `foo*bar`, `*foo*bar*`            | several parts, in order                                          |
+| `foo::*`                          | items directly in `foo`                                          |
+| `foo::**`                         | everything below `foo`                                           |
+| `**::Blam`, `Blam`                | `Blam` anywhere (patterns without `crate::`/`::` are unanchored) |
 
 `-i` ignores case; `--contains`, `--starts-with`, and `--ends-with` are spelled-out alternatives.
 
@@ -120,7 +120,19 @@ claude mcp add rscode -- cargo rscode mcp --manifest-path /abs/path/to/Cargo.tom
 Clients configured with JSON (`.mcp.json`, Claude Desktop, Cursor):
 
 ```json
-{ "mcpServers": { "rscode": { "command": "cargo", "args": ["rscode", "mcp", "--manifest-path", "/abs/path/to/Cargo.toml"] } } }
+{
+  "mcpServers": {
+    "rscode": {
+      "command": "cargo",
+      "args": [
+        "rscode",
+        "mcp",
+        "--manifest-path",
+        "/abs/path/to/Cargo.toml"
+      ]
+    }
+  }
+}
 ```
 
 VS Code uses `.vscode/mcp.json` with a top-level `"servers"` key instead of `"mcpServers"`.
@@ -136,10 +148,14 @@ their `Cargo.toml` (or its directory) and a name of their choice, and then pass 
     "rscode": {
       "command": "cargo",
       "args": [
-        "rscode", "mcp",
-        "--expose", "write=/abs/path/engine",
-        "--expose", "read=/abs/path/references/*",
-        "--expose", "read=/abs/path/references/misc/**"
+        "rscode",
+        "mcp",
+        "--expose",
+        "write=/abs/path/engine",
+        "--expose",
+        "read=/abs/path/references/*",
+        "--expose",
+        "read=/abs/path/references/misc/**"
       ]
     }
   }
