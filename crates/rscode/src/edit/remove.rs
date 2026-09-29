@@ -5,8 +5,13 @@
 //! directory when nothing else is in it. Files that another (kept) module also loads are kept.
 //!
 //! With [`RemoveOptions::prune_imports`], imports that would break are removed too: those that only import removed
-//! items, and those whose path goes through a removed module. A leaf of a `use` group is removed with its comma, a
-//! group whose leaves all go is removed as a whole, and so is the `use` item when nothing is left of it.
+//! items, and those whose path goes through a removed module or import. A leaf of a `use` group is removed with its
+//! comma, a group whose leaves all go is removed as a whole, and so is the `use` item when nothing is left of it.
+//!
+//! References that would no longer compile are reported: to the removed items, and through the removed imports (found
+//! by resolving the workspace again without them, and for imports that resolve to nothing, like imports of items made
+//! by macros, by the names they bound). Method calls are not paths: those of traits that removed imports brought into
+//! scope are only warned about.
 
 use crate::Error;
 use crate::edit::EditSet;
@@ -16,6 +21,9 @@ use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::Workspace;
 use crate::path::ItemPath;
+use crate::resolve::DeadName;
+use crate::resolve::DeadNames;
+use crate::resolve::LostBinding;
 use crate::resolve::PathKind;
 use crate::resolve::Reference;
 use crate::resolve::ReferenceOptions;
@@ -83,7 +91,8 @@ pub struct Removal {
 	/// The removed items (see [`remove`]).
 	pub removed: Vec<RemovedItem>,
 
-	/// References to the removed items that remain (and will no longer compile).
+	/// References to the removed items, and through removed imports, that remain (and will no longer compile). The
+	/// target of a reference through an import is the import that bound its name.
 	pub dangling: Vec<Reference>,
 
 	/// Things to know about the removal.
@@ -125,8 +134,34 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 
 	let removed = removed_items(ws, &targets, &deletions.ranges());
 
+	// what other paths and imports resolve to without the removed imports
+	let removed_imports: Vec<ItemId> = targets.iter().copied().filter(|&item| ws.item(item).kind == ItemKind::Import).collect();
+	let without = (!removed_imports.is_empty()).then(|| Resolver::without_imports(ws, &removed_imports));
+
+	// ... and what that cannot tell, for imports that resolve to nothing: the names they bound, and the imports through
+	// those names
+	let dead = match removed_imports.is_empty() {
+		true => DeadNames::default(),
+		false => resolver.dead_names(&removed_imports),
+	};
+
 	if options.prune_imports {
-		for (use_item, imports) in broken_imports(resolver, &removed) {
+		let mut broken = broken_imports(resolver, &removed);
+
+		// imports through the removed imports (`use super::Foo;` for a removed `use shapes::Foo;`)
+		let through = without.iter().flat_map(|without| resolver.broken_in(without));
+
+		for import in through.chain(dead.broken.iter().copied()) {
+			if let Some(use_item) = ws.parent(import).filter(|_| !removed.contains(&import)) {
+				let leaves = broken.entry(use_item).or_default();
+
+				if !leaves.contains(&import) {
+					leaves.push(import);
+				}
+			}
+		}
+
+		for (use_item, imports) in broken {
 			let leaves = pruned.entry(use_item).or_default();
 
 			for import in imports {
@@ -143,21 +178,22 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 		prune(ws, use_item, imports, &mut deletions);
 	}
 
-	// what named the imported items through them is not searched for
-	for &import in targets.iter().filter(|&&item| ws.item(item).kind == ItemKind::Import) {
+	// method calls are not paths: those of traits that the removed imports brought into scope are not searched for
+	for &import in &removed_imports {
 		let path = resolver.canonical_path(import);
-		let module = resolver.canonical_path(ws.module_of(import));
-		let warning = match path.name.as_deref() {
-			Some("*") => format!("code in `{module}` that uses names that `{path}` imports is not checked"),
-			Some("_") => format!("code in `{module}` that uses methods of the traits `{path}` imports is not checked"),
-			_ => format!(
-				"code in `{module}` that uses `{}` through `{path}` is not checked for dangling references",
-				path.name.as_deref().unwrap_or_default()
-			),
-		};
+		let imports_traits = resolver.import_targets(import).iter().any(|res| match res {
+			Res::Item(item) => ws.item(*item).kind == ItemKind::Trait,
+			Res::External(_) | Res::Builtin(_) => false,
+		});
 
-		if !plan.warnings.contains(&warning) {
-			plan.warnings.push(warning);
+		if imports_traits || matches!(path.name.as_deref(), Some("*" | "_")) {
+			let module = resolver.canonical_path(ws.module_of(import));
+
+			let warning = format!("calls in `{module}` of methods of traits that `{path}` brings into scope are not checked");
+
+			if !plan.warnings.contains(&warning) {
+				plan.warnings.push(warning);
+			}
 		}
 	}
 
@@ -178,9 +214,36 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 		plan.edits.delete_path(path);
 	}
 
-	plan.dangling = dangling(resolver, &removed, &ranges, &deleted_files, &mut plan.warnings);
+	let lost = without.map(|without| resolver.lost_bindings(&without)).unwrap_or_default();
+
+	// what still compiles, but names something else
+	for binding in lost.iter().filter(|binding| !binding.now.is_empty()) {
+		let module = resolver.canonical_path(binding.module);
+		let now: Vec<String> = binding.now.iter().map(|res| format!("`{}`", describe_res(resolver, res))).collect();
+		let warning = format!(
+			"without `{}`, `{}` in `{module}` names {} instead of `{}`",
+			resolver.canonical_path(binding.import),
+			binding.name,
+			now.join(" and "),
+			describe_res(resolver, &binding.res),
+		);
+
+		if !plan.warnings.contains(&warning) {
+			plan.warnings.push(warning);
+		}
+	}
+
+	plan.dangling = dangling(resolver, &removed, (&lost, &dead.names), &ranges, &deleted_files, &mut plan.warnings);
 
 	Ok(plan)
+}
+
+/// What a binding refers to, for messages.
+fn describe_res(resolver: &Resolver<'_>, res: &Res) -> String {
+	match res {
+		Res::Item(item) => resolver.canonical_path(*item).to_string(),
+		Res::External(path) | Res::Builtin(path) => path.to_string(),
+	}
 }
 
 /// The `thread_local!` invocations all of whose statics are removed: they are removed as a whole (with their
@@ -207,6 +270,9 @@ fn targets(resolver: &Resolver<'_>, paths: &[ItemPath], active_only: bool) -> Re
 			return Err(Error::NotFound(path.to_string()));
 		}
 
+		// (before `active_only`: an inactive private import still makes the path name what it imports)
+		super::check_private_imports(resolver, path, &mut items)?;
+
 		if active_only {
 			items.retain(|&item| ws.is_active(item).is_possible());
 
@@ -216,7 +282,6 @@ fn targets(resolver: &Resolver<'_>, paths: &[ItemPath], active_only: bool) -> Re
 		}
 
 		check_impl_headers(resolver, path, &items)?;
-		super::check_private_imports(resolver, path, &items)?;
 
 		for item in items {
 			if item.is_crate_root() {
@@ -687,10 +752,12 @@ fn only_files_of(directory: &Path, files: &[&Path]) -> bool {
 	walk(directory, files).unwrap_or(false)
 }
 
-/// Certain references to removed items that are not removed themselves.
+/// Certain references to removed items, and through `lost` bindings (of removed imports), that are not removed
+/// themselves.
 fn dangling(
 	resolver: &Resolver<'_>,
 	removed: &HashSet<ItemId>,
+	(lost, dead): (&[LostBinding], &[DeadName]),
 	deleted: &DeletedText<'_>,
 	deleted_files: &[PathBuf],
 	warnings: &mut Vec<String>,
@@ -702,7 +769,7 @@ fn dangling(
 
 	targets.sort();
 
-	let references = match search_references(resolver, &targets) {
+	let references = match search_references(resolver, &targets, lost, dead) {
 		Ok(references) => references,
 		Err(message) => {
 			warnings.push(format!("dangling references are not reported: searching for references failed ({message})"));
@@ -739,8 +806,13 @@ fn dangling(
 
 /// Searches for references, which is only a courtesy of the removal: a failure (a panic, as for syntax the search
 /// does not handle) is reported rather than failing the removal.
-fn search_references(resolver: &Resolver<'_>, targets: &[ItemId]) -> Result<References, String> {
-	let search = || resolver.find_references(targets, &ReferenceOptions::default());
+fn search_references(
+	resolver: &Resolver<'_>,
+	targets: &[ItemId],
+	lost: &[LostBinding],
+	dead: &[DeadName],
+) -> Result<References, String> {
+	let search = || resolver.find_references_through(targets, lost, dead, &ReferenceOptions::default());
 
 	std::panic::catch_unwind(std::panic::AssertUnwindSafe(search)).map_err(|payload| {
 		(payload.downcast_ref::<&str>().map(|message| message.to_string()))

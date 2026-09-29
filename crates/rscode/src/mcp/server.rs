@@ -66,9 +66,12 @@ every cfg variant of an item: items under disabled cfgs are included, and marked
 
 Paths go through imports and re-exports to what they import. To name an import itself (a leaf of a `use` item), write \
 `use module::Name`: the imports of `module` that bind `Name` (`use module::*` for glob imports, `use module::_` for \
-`as _` ones). find_items lists imports as such paths (with `include_imports`), and remove_items, replace_item, \
-format_items, and view_items take them. remove_items and replace_item refuse a plain path whose last segment is bound \
-by a private import, since it could mean the import or what it imports; the error lists both paths.
+`as _` ones). find_items lists imports as such paths (with `include_imports`), and view_items, remove_items, \
+replace_item, and insert_items (as `anchor`) take them. find_items and format_items take patterns, in which `*` is a \
+wildcard: `use module::*` matches every import of `module`. remove_items and replace_item refuse a plain path whose \
+last segment is bound only by an import no more visible than its module (`use`, or `pub(crate) use` in a crate root), \
+since it could mean the import or what it imports; the error lists both paths. When the module also defines an item \
+of that name (under other cfgs, or in another namespace), the path names that item.
 
 find_items takes glob patterns: `*` matches within one path segment (`parse_*`, `*Error`), `**` any number of \
 segments (`crate::config::**`, `**::tests::*`). A pattern that does not start with `crate::` or `::` matches anywhere: \

@@ -137,11 +137,13 @@ fn find_summary(pattern: &str, shown: usize, page: Page) -> String {
 		let mut summary = format!("no items match `{pattern}`");
 
 		if !pattern.contains('*') {
-			let name = pattern.trim();
-			let name = name.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace)).unwrap_or(name);
+			let trimmed = pattern.trim();
+			let rest = trimmed.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace));
+			let name = rest.unwrap_or(trimmed);
 			let name = name.rsplit("::").next().unwrap_or(name).trim();
+			let suggestion = if rest.is_some() { format!("use *{name}*") } else { format!("*{name}*") };
 
-			write!(summary, " (without `*`, names must match exactly: try `*{name}*`, or `ignore_case`)").unwrap();
+			write!(summary, " (without `*`, names must match exactly: try `{suggestion}`, or `ignore_case`)").unwrap();
 		}
 
 		return summary;
@@ -1101,6 +1103,7 @@ mod tests {
 		let inserted = Insertion {
 			edits: EditSet::new(),
 			inserted: vec![(ItemKind::AssocFn, Some("new".to_owned())), (ItemKind::MacroCall, None)],
+			imports: Vec::new(),
 			file: PathBuf::from("/ws/src/lib.rs"),
 			warnings: Vec::new(),
 		};

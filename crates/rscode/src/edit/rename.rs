@@ -114,6 +114,9 @@ pub fn rename(resolver: &Resolver<'_>, path: &ItemPath, new_name: &str, options:
 		return Err(Error::NotFound(path.to_string()));
 	}
 
+	// a path through private imports renames what they import, unless its module also binds the name otherwise
+	super::narrow_private_imports(resolver, path, &mut targets);
+
 	for &target in &targets {
 		check_supported(resolver, target)?;
 	}

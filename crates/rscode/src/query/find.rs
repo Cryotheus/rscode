@@ -45,12 +45,15 @@ pub struct FindOptions {
 }
 
 impl FindOptions {
+	/// Whether imports are asked for (by [`FindOptions::imports`] or the kinds), for every pattern.
+	fn searches_imports(&self) -> bool {
+		self.imports || self.kinds.contains(&ItemKind::Import)
+	}
+
 	/// Whether items of a kind are searched.
 	fn wants_kind(&self, kind: ItemKind) -> bool {
 		match kind {
-			ItemKind::Import => {
-				self.imports || self.kinds.contains(&ItemKind::Import) || self.patterns.iter().any(PathPattern::is_import)
-			}
+			ItemKind::Import => self.searches_imports() || self.patterns.iter().any(PathPattern::is_import),
 			kind => self.kinds.is_empty() || self.kinds.contains(&kind),
 		}
 	}
@@ -201,10 +204,13 @@ impl Find {
 		let path = resolver.canonical_path(item);
 		let selected = workspace.krate(item.krate()).is_selected();
 
+		// imports searched only for `use` patterns are only matched by those
+		let use_patterns_only = data.kind == ItemKind::Import && !self.options.searches_imports();
+
 		let matched = self.options.patterns.is_empty()
 			|| named.contains(&item)
 			|| (patterns.iter())
-				.filter(|(pattern, _)| may_match(pattern, data.kind, name))
+				.filter(|(pattern, _)| (pattern.is_import() || !use_patterns_only) && may_match(pattern, data.kind, name))
 				.any(|(pattern, resolved)| {
 					matches(workspace, pattern, item, &path, selected) || resolved.matches_owner(resolver, item, &path, selected)
 				});

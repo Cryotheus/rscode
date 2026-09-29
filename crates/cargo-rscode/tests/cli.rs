@@ -508,6 +508,15 @@ fn names_imports_by_use_paths() {
 	let split = run(&fixture(), &["view", "use", "demo::Circle"]);
 
 	assert!(split.stderr.contains("expected a path after `use` (quote the whole path, `use` included)"), "{split:#?}");
+
+	let split_pattern = run(&fixture(), &["find", "use", "Circle"]);
+
+	assert!(split_pattern.stderr.contains("expected a pattern after `use` (quote the whole pattern"), "{split_pattern:#?}");
+
+	// an import's own text is not the path of the import
+	let pasted = run(&fixture(), &["remove", "--bin", "demo", "use demo::shapes::Shape", "--dry-run"]);
+
+	assert!(pasted.stderr.contains("hint: a `use` path names the imports of the module"), "{pasted:#?}");
 }
 
 #[test]

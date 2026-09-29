@@ -69,8 +69,10 @@ Every subcommand accepts cargo's selection flags (`-p`, `--workspace`, `--exclud
 
 Paths go through imports and re-exports to what they import. To name an import itself, use its `use` path, quoted as
 one argument (`cargo rscode remove 'use crate::bindings::ItemOrder'`), which is how `find --imports` prints imports.
-`remove` and `replace` refuse a plain path whose last segment is bound by a private `use`, because it could mean
-either. Items behind `cfg`s are loaded regardless of the enabled features and target; one path
+`remove` and `replace` refuse a plain path whose last segment is bound only by an import no more visible than its
+module (`use`, or `pub(crate) use` in a crate root), because it could mean either; when the module also defines an item
+of that name (under other `cfg`s, or in another namespace), the path names that item, so every item keeps a path.
+Patterns (`find`, `fmt`) treat `*` as a wildcard: `'use m::*'` matches every import of `m`. Items behind `cfg`s are loaded regardless of the enabled features and target; one path
 names every `cfg` variant (renaming renames all of them), and disabled variants are marked inactive. Generic arguments
 of the type and trait pick `impl` blocks by their headers as written (`impl From<u8> for Wrapper`,
 `<Wrapper<u16>>::get`): removing or replacing the items of several `impl` blocks whose headers differ fails as

@@ -2107,6 +2107,18 @@ pub fn global() -> u8 {
 		cargo_check(&dir);
 	}
 
+	/// A thread-local static named as an anchor stands for its invocation.
+	#[test]
+	fn anchor_insertions() {
+		let dir = crate_dir("thread-local-anchor");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let options = rscode::edit::InsertOptions { position: InsertPosition::Before("DEPTH".to_owned()), force: false };
+		let insertion = rscode::edit::insert(&resolver, &path("crate::state"), "pub fn f() {}", &options).unwrap();
+
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("\tpub fn f() {}\n\n\tthread_local! {"));
+	}
+
 	/// Statics declared by `thread_local!` are formatted with their invocation, and only it: rustfmt re-indents a braced
 	/// body without formatting it, and leaves a parenthesized one alone.
 	#[test]
@@ -2284,7 +2296,27 @@ pub fn total() -> f64 {
 
 		assert!(edited(&dir, &one.edits, "src/lib.rs").contains("#[allow(unused_imports)]\nuse shapes::{Square as Block};\n"));
 		assert_eq!(one.removed[0].path, "use fixture::Round");
-		assert!(one.warnings.iter().any(|warning| warning.contains("uses `Round` through `use fixture::Round`")), "{:?}", one.warnings);
+		assert!(one.dangling.is_empty() && one.warnings.is_empty(), "{one:#?}");
+
+		// what used the imported names through the imports is left dangling
+		let circle = remove(&["use crate::Circle"]);
+		let lines = |removal: &rscode::edit::Removal| removal.dangling.iter().map(|reference| reference.start.line).collect::<Vec<_>>();
+
+		assert_eq!(lines(&circle), [32]);
+		assert!(circle.warnings.is_empty(), "{:?}", circle.warnings);
+
+		let all = remove(&["use crate::*", "use crate::assist"]);
+
+		assert_eq!(lines(&all), [32, 32]);
+
+		// method calls of traits in scope are not paths
+		let trait_import = remove(&["use crate::_"]);
+
+		assert!(trait_import.dangling.is_empty());
+		assert_eq!(
+			trait_import.warnings,
+			["calls in `fixture` of methods of traits that `use fixture::_` brings into scope are not checked"]
+		);
 
 		// every leaf: the whole `use` item goes, with its attributes
 		let both = remove(&["use crate::Round", "use crate::Block"]);
@@ -2341,5 +2373,323 @@ pub fn total() -> f64 {
 
 		replaced.edits.apply().unwrap();
 		cargo_check(&dir);
+	}
+
+	/// Imports under `cfg`s and several imports of one name.
+	const VARIANTS: &str = "\
+pub mod shapes {
+	pub struct Circle;
+
+	pub struct Square;
+
+	pub trait T1 {}
+
+	pub trait T2 {}
+}
+
+pub mod alt {
+	pub struct Qux;
+}
+
+#[cfg(feature = \"a\")]
+pub struct Qux;
+
+#[cfg(not(feature = \"a\"))]
+use alt::Qux;
+
+#[cfg(feature = \"a\")]
+use shapes::Circle as Pick;
+#[cfg(not(feature = \"a\"))]
+use shapes::Square as Pick;
+
+use shapes::T1 as _;
+use shapes::T2 as _;
+
+mod traits {
+	use crate::shapes::{T1 as _, T2 as _};
+}
+
+#[allow(unused_imports)]
+mod globs {
+	use crate::{alt::*, shapes::*};
+}
+
+pub fn make() -> (Qux, Pick) {
+	todo!()
+}
+";
+
+	fn variants_dir(name: &str) -> TempDir {
+		let manifest = format!("{MANIFEST}\n[features]\na = []\n");
+
+		TempDir::with_files(name, &[("Cargo.toml", manifest.as_str()), ("src/lib.rs", VARIANTS)])
+	}
+
+	/// A private import of an item's name does not hide the item: its path names it (the import is `use crate::Qux`).
+	#[test]
+	fn items_keep_their_paths_next_to_private_imports() {
+		let dir = variants_dir("imports-own-items");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let removal = rscode::edit::remove(&resolver, &paths(&["crate::Qux"]), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(removal.removed.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(), ["fixture::Qux"]);
+
+		let removal = rscode::edit::remove(&resolver, &paths(&["use crate::Qux"]), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(removal.removed.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(), ["use fixture::Qux"]);
+	}
+
+	#[test]
+	fn replacing_several_imports() {
+		let dir = variants_dir("imports-replace-several");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let replace = |path: &str, source: &str, all_variants: bool| {
+			let options = ReplaceOptions { all_variants, ..ReplaceOptions::default() };
+
+			rscode::edit::replace(&resolver, &self::path(path), source, &options)
+		};
+		let candidates = |result: Result<_, Error>| match result {
+			Err(Error::Ambiguous { candidates, .. }) => candidates,
+			other => panic!("{other:?}"),
+		};
+
+		// `as _` imports of one module with the same `cfg`s are not `cfg` variants of each other
+		let unnamed = candidates(replace("use crate::_", "use shapes::T1 as _;", true));
+
+		assert_eq!(unnamed.len(), 2, "{unnamed:?}");
+		assert!(unnamed.iter().all(|candidate| candidate.starts_with("`use fixture::_` (import) at src/lib.rs:")), "{unnamed:?}");
+		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("use crate::_")));
+
+		// `cfg` variants are, and are listed as the imports
+		let picks = candidates(replace("use crate::Pick", "use shapes::Circle as Pick;", false));
+
+		assert!(picks.iter().all(|candidate| candidate.starts_with("`use fixture::Pick` (import) at src/lib.rs:")), "{picks:?}");
+		assert!(rscode::edit::replaces_all_variants(&resolver, &path("use crate::Pick")));
+
+		// a `use` item all of whose imports the path names
+		let traits = replace("use crate::traits::_", "use crate::shapes::T1 as _;", false).unwrap();
+
+		assert!(edited(&dir, &traits.edits, "src/lib.rs").contains("mod traits {\n\tuse crate::shapes::T1 as _;\n}"));
+
+		// a replacement that no longer imports the name
+		let other = replace("use crate::Qux", "use crate::shapes::Circle;", false).unwrap();
+
+		assert!(other.warnings.iter().any(|warning| warning.contains("does not import `Qux`")), "{:?}", other.warnings);
+
+		let renamed = replace("use crate::Qux", "use crate::shapes::Circle as Qux;", false).unwrap();
+
+		assert!(renamed.warnings.is_empty(), "{:?}", renamed.warnings);
+	}
+
+	#[test]
+	fn anchors_by_name_and_views_and_finds() {
+		let dir = variants_dir("imports-anchors");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+
+		// a single name stands for the `use` items that bind it
+		let options = InsertOptions { position: InsertPosition::After("Pick".to_owned()), force: false };
+		let insertion = rscode::edit::insert(&resolver, &path("crate"), "pub struct Anchored;", &options).unwrap();
+		let text = edited(&dir, &insertion.edits, "src/lib.rs");
+
+		assert!(text.contains("use shapes::Square as Pick;\n\npub struct Anchored;\n"), "{text}");
+
+		// the glob imports of one `use` item are shown once
+		let views = rscode::View::new().path("use crate::globs::*").unwrap().run_with(&resolver).unwrap();
+
+		assert_eq!(views.len(), 1, "{views:#?}");
+
+		// a `use` pattern does not make other patterns match imports
+		let find = |patterns: &[&str]| {
+			let mut find = rscode::Find::new();
+
+			for pattern in patterns {
+				find = find.pattern(pattern).unwrap();
+			}
+
+			find.run_with(&resolver).unwrap().into_iter().map(|found| found.path).collect::<Vec<_>>()
+		};
+
+		assert_eq!(find(&["Circle", "use Nothing"]), find(&["Circle"]));
+		assert_eq!(find(&["Circle", "use Pick"]).len(), find(&["Circle"]).len() + 2);
+	}
+
+	/// Imports through removed imports break: they are left dangling, or pruned.
+	#[test]
+	fn removing_imports_that_other_imports_go_through() {
+		const CHAINS: &str = "\
+macro_rules! make {
+	($name:ident) => {
+		pub struct $name;
+	};
+}
+
+pub mod shapes {
+	pub struct Foo;
+
+	pub mod inner {
+		pub struct Deep;
+	}
+}
+
+pub mod generated {
+	make!(Made);
+}
+
+pub use generated::Made;
+pub use shapes::inner;
+use shapes::Foo;
+
+mod reexported {
+	use crate::inner::Deep;
+
+	pub fn h() -> Deep {
+		Deep
+	}
+}
+
+mod chained {
+	use super::Foo;
+
+	pub fn f() -> Foo {
+		Foo
+	}
+}
+
+mod unresolved {
+	use crate::Made;
+
+	pub fn g() -> Made {
+		Made
+	}
+}
+";
+		let dir = TempDir::with_files("imports-chains", &[("Cargo.toml", MANIFEST), ("src/lib.rs", CHAINS)]);
+
+		cargo_check(&dir);
+
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let remove = |target: &str, prune_imports: bool| {
+			let options = RemoveOptions { prune_imports, ..RemoveOptions::default() };
+
+			rscode::edit::remove(&resolver, &paths(&[target]), &options).unwrap()
+		};
+		let lines = |removal: &rscode::edit::Removal| removal.dangling.iter().map(|reference| reference.start.line).collect::<Vec<_>>();
+		let removed = |removal: &rscode::edit::Removal| removal.removed.iter().map(|item| item.path.clone()).collect::<Vec<_>>();
+
+		// a re-export of a module, a private import, and a re-export of an item that is not loaded (made by a macro)
+		assert_eq!(lines(&remove("use crate::inner", false)), [24, 26, 27]);
+		assert_eq!(lines(&remove("use crate::Foo", false)), [32, 34, 35]);
+		assert_eq!(lines(&remove("use crate::Made", false)), [40, 42, 43]);
+
+		// pruned, the imports through them go too
+		let inner = remove("use crate::inner", true);
+
+		assert_eq!(removed(&inner), ["use fixture::inner", "use fixture::reexported::Deep"]);
+		assert_eq!(lines(&inner), [26, 27]);
+
+		let made = remove("use crate::Made", true);
+
+		assert_eq!(removed(&made), ["use fixture::Made", "use fixture::unresolved::Made"]);
+		assert_eq!(lines(&made), [42, 43]);
+	}
+
+	/// Names of items made by macros die through glob imports too, unless a glob import might still provide them; a
+	/// removed import that shadowed a prelude name or a glob import is told about too.
+	#[test]
+	fn removing_imports_that_glob_imports_and_preludes_go_through() {
+		const GLOBS: &str = "\
+macro_rules! make {
+	($name:ident) => {
+		pub struct $name;
+	};
+}
+
+pub mod made {
+	make!(Made);
+
+	pub type Result<T> = std::result::Result<T, ()>;
+}
+
+pub mod a {
+	pub struct Foo;
+}
+
+pub mod b {
+	pub struct Foo;
+}
+
+pub mod user {
+	use crate::made::Made;
+
+	pub fn f() -> Made {
+		Made
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use super::*;
+
+		fn g() -> Made {
+			Made
+		}
+	}
+}
+
+pub mod still {
+	use crate::made::*;
+	use crate::made::Made;
+
+	pub fn f() -> Made {
+		Made
+	}
+}
+
+pub mod prelude {
+	use crate::made::Result;
+
+	pub fn f() -> Result<()> {
+		Ok(())
+	}
+}
+
+pub mod shadowing {
+	use crate::a::*;
+	use crate::b::Foo;
+
+	pub fn f() -> Foo {
+		Foo
+	}
+}
+";
+		let dir = TempDir::with_files("imports-globs", &[("Cargo.toml", MANIFEST), ("src/lib.rs", GLOBS)]);
+
+		cargo_check(&dir);
+
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let remove = |target: &str| rscode::edit::remove(&resolver, &paths(&[target]), &RemoveOptions::default()).unwrap();
+		let lines = |removal: &rscode::edit::Removal| removal.dangling.iter().map(|reference| reference.start.line).collect::<Vec<_>>();
+
+		// through `use super::*`
+		assert_eq!(lines(&remove("use crate::user::Made")), [24, 25, 32, 33]);
+
+		// a glob import of a module with macro invocations might provide it
+		assert!(remove("use crate::still::Made").dangling.is_empty());
+
+		// the prelude's `Result` does not replace it
+		assert_eq!(lines(&remove("use crate::prelude::Result")), [50]);
+
+		// a glob import does, which is warned about
+		let shadowing = remove("use crate::shadowing::Foo");
+
+		assert!(shadowing.dangling.is_empty(), "{:?}", shadowing.dangling);
+		assert_eq!(
+			shadowing.warnings,
+			["without `use fixture::shadowing::Foo`, `Foo` in `fixture::shadowing` names `fixture::a::Foo` instead of `fixture::b::Foo`"]
+		);
 	}
 }

@@ -51,21 +51,31 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-/// Whether items are (or are in) `impl` blocks whose headers differ, apart from `cfg`s: such as `impl From<u8> for X`
-/// and `impl From<u16> for X`, which are not `cfg` variants of each other.
-/// Refuses a plain path whose last segment names `items` through private imports of its module, like `crate::Foo`
-/// with `use shapes::Foo;` in the crate root: it could mean what they import as well as the imports themselves (named
-/// `use crate::Foo`). Re-exports (`pub use`) are paths to what they export.
-pub(crate) fn check_private_imports(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
-	let imports = resolver.private_imports_of(path, items);
-
-	if imports.is_empty() {
+/// Refuses a plain path whose last segment names `items` (what it resolves to) only through private imports of its
+/// module, like `crate::Foo` with `use shapes::Foo;` in the crate root: it could mean what they import as well as the
+/// imports themselves (named `use crate::Foo`). Re-exports (`pub use`) are paths to what they export.
+///
+/// When the module also binds the name otherwise (it defines an item of that name under other `cfg`s, or in another
+/// namespace), the path names that instead: `items` loses what is named only through the private imports. So the path
+/// of every item names it (and imports are named by `use` paths).
+pub(crate) fn check_private_imports(resolver: &Resolver<'_>, path: &ItemPath, items: &mut Vec<ItemId>) -> Result<(), Error> {
+	let Some(imports) = narrow_private_imports(resolver, path, items) else {
 		return Ok(());
-	}
-
-	let candidates = imports.iter().chain(items).map(|&item| describe(resolver, item)).collect();
+	};
+	let candidates = imports.iter().chain(items.iter()).map(|&item| describe(resolver, item)).collect();
 
 	Err(Error::Ambiguous { path: path.to_string(), candidates })
+}
+
+/// Drops from `items` what the last segment of a plain path names only through private imports of its module, when
+/// the module also binds it otherwise (see [`check_private_imports`]). Returns the private imports of the modules that
+/// bind it only through them, if any (each module decides on its own: those of a library and a binary, and `cfg`
+/// variants).
+pub(crate) fn narrow_private_imports(resolver: &Resolver<'_>, path: &ItemPath, items: &mut Vec<ItemId>) -> Option<Vec<ItemId>> {
+	let found = resolver.private_imports_of(path, items);
+
+	items.retain(|item| !found.shadowed.contains(item));
+	(!found.imports.is_empty()).then_some(found.imports)
 }
 
 /// An item for messages: its canonical path (imports as `use` paths), kind (for crate roots, the kind of the crate),
@@ -92,6 +102,8 @@ pub(crate) fn describe(resolver: &Resolver<'_>, item: ItemId) -> String {
 	text
 }
 
+/// Whether items are (or are in) `impl` blocks whose headers differ, apart from `cfg`s: such as `impl From<u8> for X`
+/// and `impl From<u16> for X`, which are not `cfg` variants of each other.
 pub(crate) fn impl_headers_differ(ws: &Workspace, items: &[ItemId]) -> bool {
 	let mut headers = Vec::new();
 

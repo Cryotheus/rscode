@@ -32,7 +32,7 @@ use crate::edit::EditSet;
 use crate::edit::FileChange;
 use crate::edit::FmtOptions;
 use crate::model::UnloadedMember;
-use crate::path::is_keyword;
+use crate::query::shown_item;
 use crate::rscode_fmt::FormatOptions;
 use crate::rscode_fmt::RsFormatter;
 use crate::workspace::LoadOptions;
@@ -194,8 +194,10 @@ pub(crate) fn view(load: &LoadOptions, params: &ViewParams) -> Output {
 			.and_then(|path| View::with_options(options.clone()).item_path(path).run_with(&resolver));
 
 		match viewed {
-			Ok(viewed) => views.extend(viewed.into_iter().filter(|view| seen.insert(view.item))),
-			Err(error) => errors.push(describe_in(&error, &workspace, text)),
+			Ok(viewed) => {
+				views.extend(viewed.into_iter().filter(|view| seen.insert((shown_item(&workspace, view.item), view.path.clone()))));
+			}
+			Err(error) => errors.push(describe_in(&error, &resolver)),
 		}
 	}
 
@@ -226,7 +228,7 @@ pub(crate) fn rename(load: &LoadOptions, params: &RenameParams, permit: &Permit<
 			Error::InvalidIdent(_) => {
 				format!("{error}\nhint: `new_name` is the new identifier alone (e.g. `parse_config`), not a path")
 			}
-			error => describe_in(&error, &workspace, &params.path),
+			error => describe_in(&error, &resolver),
 		})?;
 	let root = workspace.root();
 	let mut text = render::rename(root, &plan, params.new_name.trim(), params.dry_run);
@@ -244,7 +246,7 @@ pub(crate) fn remove(load: &LoadOptions, params: &RemoveParams, permit: &Permit<
 	let paths = params.paths.iter().map(|path| parse_path(path)).collect::<Result<Vec<_>, _>>()?;
 	let workspace = self::load(load)?;
 	let resolver = Resolver::new(&workspace);
-	let plan = edit::remove(&resolver, &paths, &params.options()).map_err(|error| describe(&error))?;
+	let plan = edit::remove(&resolver, &paths, &params.options()).map_err(|error| describe_in(&error, &resolver))?;
 	let root = workspace.root();
 	let mut text = render::removal(root, &plan, params.dry_run);
 
@@ -267,7 +269,7 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 			Error::Ambiguous { .. } if all_variants => {
 				format!("{error}\nhint: set `all_variants` to replace every one of them")
 			}
-			error => describe_in(&error, &workspace, &params.path),
+			error => describe_in(&error, &resolver),
 		}
 	})?;
 	let root = workspace.root();
@@ -296,7 +298,7 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 	let resolver = Resolver::new(&workspace);
 	let plan = edit::insert(&resolver, &parent, &params.source, &options).map_err(|error| match error {
 		Error::Ambiguous { .. } if in_several_crates(&resolver, &parent) => format!("{error}\nhint: {SELECT_ONE_CRATE}"),
-		error => describe_in(&error, &workspace, &params.parent),
+		error => describe_in(&error, &resolver),
 	})?;
 	let root = workspace.root();
 	let mut text = render::insertion(root, &plan, &params.parent, params.dry_run);
@@ -308,19 +310,27 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 
 	if params.format && !params.dry_run {
-		let targets: Vec<(String, ItemPath)> = plan
-			.inserted
-			.iter()
-			.filter_map(|(_, name)| name.as_deref())
-			.map(|name| {
-				let mut path = parent.clone();
+		let child = |name: &str, import: bool| {
+			let mut path = ItemPath { import, ..parent.clone() };
 
-				path.segments.push(name.into());
-				(name.to_owned(), path)
-			})
-			.collect();
+			path.segments.push(name.into());
 
-		if targets.len() < plan.inserted.len() {
+			let label = if import { format!("use {name}") } else { name.to_owned() };
+
+			(label, path)
+		};
+
+		let named = plan.inserted.iter().filter_map(|(_, name)| name.as_deref()).map(|name| child(name, false));
+
+		// `use` items, by their imports (not in `impl` blocks: `use` items are not items of those)
+		let imports = plan.imports.iter().filter(|_| parent.qualifier.is_none()).map(|(_, name)| child(name, true));
+		let targets: Vec<(String, ItemPath)> = named.chain(imports).collect();
+
+		let unnamed = (plan.inserted.iter().enumerate())
+			.filter(|(index, (_, name))| name.is_none() && !plan.imports.iter().any(|(import_of, _)| import_of == index))
+			.count();
+
+		if unnamed > 0 {
 			text.push_str(
 				"note: unnamed items (like `impl` blocks) are not formatted; use `format_items` on the parent\n",
 			);
@@ -398,20 +408,26 @@ fn in_several_crates(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 	crates.len() > 1
 }
 
-/// [`describe`], for an error about the path (or pattern) `path`: when nothing was found, workspace members that are
-/// not loaded may have it.
-fn describe_in(error: &Error, workspace: &Workspace, path: &str) -> String {
-	let Error::NotFound(_) = error else {
+/// [`describe`], for an error of an operation: when a path names nothing, workspace members that are not loaded may
+/// have it, or it may name imports (of items that are not loaded) or be a `use` path.
+fn describe_in(error: &Error, resolver: &Resolver<'_>) -> String {
+	let Error::NotFound(path) = error else {
 		return describe(error);
 	};
 
-	let member = ItemPath::parse(path).ok().and_then(|path| workspace.unloaded_member_of(&path));
+	let workspace = resolver.workspace();
+	let path = ItemPath::parse(path).ok();
+	let member = path.as_ref().and_then(|path| workspace.unloaded_member_of(path));
 
 	match (member, unloaded_hint(workspace, member)) {
 		// the crate is known: searching the loaded crates would not help
 		(Some(_), Some(hint)) => format!("{error}\nhint: {hint}"),
 		(None, Some(hint)) => format!("{}\nhint: {hint}", describe(error)),
-		(_, None) => describe(error),
+
+		(_, None) => match path.and_then(|path| resolver.import_hint(&path)) {
+			Some(hint) => format!("{error}\nhint: {hint}"),
+			None => describe(error),
+		},
 	}
 }
 
@@ -447,7 +463,14 @@ fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMember>) -> Opti
 fn describe(error: &Error) -> String {
 	let hint = match error {
 		Error::NotFound(_) => {
-			"search with `find_items` (e.g. the pattern `*name*` with `ignore_case`) for the exact path"
+			"search with `find_items` (e.g. the pattern `*name*` with `ignore_case`, and `include_imports` for imports) \
+			 for the exact path"
+		}
+
+		// several imports of a module (`use` paths are never ambiguous through imports)
+		Error::Ambiguous { path, .. } if path.starts_with("use ") => {
+			"the `use` path names several imports of its module: remove them with `remove_items`, and insert the new \
+			 `use` item with `insert_items`"
 		}
 
 		// a path through a private import (see `edit::remove`)
@@ -562,9 +585,8 @@ fn try_format_written(
 			continue;
 		}
 
-		let pattern = exact_pattern(path);
-
-		patterns.push(PathPattern::parse(&pattern, MatchOptions::default()).map_err(|error| error.to_string())?);
+		// (not a parsed pattern: `*` is a wildcard in those)
+		patterns.push(PathPattern::exact(path));
 	}
 
 	if patterns.is_empty() {
@@ -601,53 +623,10 @@ fn try_format_written(
 	Ok(report)
 }
 
-/// A path pattern matching exactly what an item path names (`impl` sugar becomes a `<Type as Trait>` qualifier).
-fn exact_pattern(path: &ItemPath) -> String {
-	let Some(qualifier) = &path.qualifier else {
-		return path.to_string();
-	};
-
-	let trait_path = qualifier.trait_path.as_ref().map(ToString::to_string);
-	let segments: Vec<String> = path
-		.segments
-		.iter()
-		.map(|segment| if is_keyword(segment) { format!("r#{segment}") } else { segment.to_string() })
-		.collect();
-
-	qualified_pattern(&qualifier.self_ty.to_string(), trait_path.as_deref(), &segments)
-}
-
-/// `<Type as Trait>::a::b`, or `<Type>::a::b` without a trait.
-fn qualified_pattern(self_ty: &str, trait_path: Option<&str>, segments: &[String]) -> String {
-	let mut pattern = match trait_path {
-		Some(trait_path) => format!("<{self_ty} as {trait_path}>"),
-		None => format!("<{self_ty}>"),
-	};
-
-	for segment in segments {
-		pattern.push_str("::");
-		pattern.push_str(segment);
-	}
-
-	pattern
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::path::PathParseError;
-
-	#[test]
-	fn qualified_patterns() {
-		let segments = |segments: &[&str]| segments.iter().map(ToString::to_string).collect::<Vec<_>>();
-
-		assert_eq!(qualified_pattern("Foo", Some("fmt::Display"), &segments(&["fmt"])), "<Foo as fmt::Display>::fmt");
-		assert_eq!(
-			qualified_pattern("crate::a::Foo", None, &segments(&["new", "r#type"])),
-			"<crate::a::Foo>::new::r#type"
-		);
-		assert_eq!(qualified_pattern("Foo", Some("Bar"), &[]), "<Foo as Bar>");
-	}
 
 	#[test]
 	fn errors_come_with_hints() {

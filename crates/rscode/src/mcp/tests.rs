@@ -873,6 +873,45 @@ mod end_to_end {
 
 		assert!(!failed, "{text}");
 		assert_contains(&text, &["-use shapes::Circle;", "nothing was written"]);
+
+		// a `use` path of an import's own text names nothing, with a hint
+		let (failed, text) = client.call("remove_items", json!({ "paths": "use crate::shapes::Circle", "dry_run": true })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no item found for `use crate::shapes::Circle`", "hint: a `use` path names the imports of"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "use Circl" })).await;
+
+		assert_contains(&text, &["try `use *Circl*`"]);
+		client.close().await.unwrap();
+	}
+
+	/// Formatting after an edit formats what the edit touched: a replaced glob import, and an inserted `use` item.
+	#[tokio::test]
+	async fn formats_edited_imports() {
+		let fixture = Fixture::with_files(
+			"format-imports",
+			&[
+				("Cargo.toml", "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
+				("rustfmt.toml", "hard_tabs = true\n"),
+				(
+					"src/lib.rs",
+					"pub mod shapes {\n\tpub struct Circle;\n}\n\nuse   shapes::{Circle};\nuse shapes::*;\n\npub fn make() -> Circle {\n\tCircle\n}\n",
+				),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let replaced = json!({ "path": "use crate::*", "source": "use   crate::shapes::*;", "format": true });
+		let (failed, text) = client.call("replace_item", replaced).await;
+
+		assert!(!failed, "{text}");
+		assert!(fixture.read("src/lib.rs").contains("use   shapes::{Circle};\nuse crate::shapes::*;\n"), "{}", fixture.read("src/lib.rs"));
+
+		let inserted = json!({ "parent": "crate", "source": "use   std::fmt::Debug;", "position": "start", "format": true });
+		let (failed, text) = client.call("insert_items", inserted).await;
+
+		assert!(!failed, "{text}");
+		assert!(fixture.read("src/lib.rs").starts_with("use std::fmt::Debug;\n"), "{}", fixture.read("src/lib.rs"));
 		client.close().await.unwrap();
 	}
 

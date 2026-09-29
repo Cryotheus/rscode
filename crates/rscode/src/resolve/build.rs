@@ -59,8 +59,8 @@ pub(super) struct ImportIndex {
 	pub(super) unresolved: Vec<ItemId>,
 }
 
-/// Builds the scopes of every module of every loaded crate.
-pub(super) fn build(ws: &Workspace) -> (Tables, ImportIndex) {
+/// Builds the scopes of every module of every loaded crate; the `excluded` imports bind nothing, as if removed.
+pub(super) fn build(ws: &Workspace, excluded: &FxHashSet<ItemId>) -> (Tables, ImportIndex) {
 	let mut tables = Tables {
 		tree: ModuleTree::new(ws),
 		extern_preludes: ws.crates().iter().map(|krate| extern_prelude(ws, krate)).collect(),
@@ -75,7 +75,7 @@ pub(super) fn build(ws: &Workspace) -> (Tables, ImportIndex) {
 
 	tables.macro_preludes = ws.crates().iter().map(|krate| macro_prelude(ws, krate, &tables)).collect();
 
-	let mut fixpoint = Fixpoint::new(ws);
+	let mut fixpoint = Fixpoint::new(ws, excluded);
 
 	fixpoint.run(ws, &mut tables);
 	(tables, fixpoint.finish())
@@ -540,13 +540,13 @@ struct Fixpoint {
 }
 
 impl Fixpoint {
-	fn new(ws: &Workspace) -> Self {
+	fn new(ws: &Workspace, excluded: &FxHashSet<ItemId>) -> Self {
 		let mut imports = Vec::new();
 		let mut det = Determinacy::default();
 
 		for krate in ws.crates() {
 			for (id, data) in krate.items() {
-				let Some(info) = data.import_info() else {
+				let Some(info) = data.import_info().filter(|_| !excluded.contains(&id)) else {
 					continue;
 				};
 

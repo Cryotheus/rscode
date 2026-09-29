@@ -79,9 +79,28 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 		// rustfmt may merge or split imports (`imports_granularity`), which changes how they sort: sort and format
 		// again until they settle, so that formatting the result changes nothing
 		if let (Some(sort), RsFormatter::RustFmt) = (&options.sort, options.formatter) {
+			// targeted containers that sorting the file does not reach (it is not recursive), found again after each
+			// pass (their positions change)
+			let containers: Vec<Identity> = match sort.recursive {
+				true => Vec::new(),
+				false => items.iter().filter(|item| item.container).map(|item| identity(&parsed, item)).collect(),
+			};
+
 			for _ in 0..MAX_RESORTS {
-				match sort_containers(&formatted, true, &[], sort)? {
-					Some(resorted) if resorted != formatted => formatted = format_file(&resorted, true, options)?,
+				let targets = relocate(&formatted, &containers)?;
+
+				match sort_containers(&formatted, true, &targets, sort)? {
+					Some(resorted) if resorted != formatted => {
+						let reformatted = format_file(&resorted, true, options)?;
+
+						// rustfmt restored the text (it groups imports differently, `group_imports`): more passes would
+						// repeat it
+						if reformatted == formatted {
+							break;
+						}
+
+						formatted = reformatted;
+					}
 					_ => break,
 				}
 			}
@@ -142,6 +161,65 @@ fn locate(parsed: &Parsed, targets: &[FormatTarget]) -> Result<Vec<Target>, Form
 				kind: item.node.kind(),
 				name: item.node.name(),
 				container: item.node.is_container(),
+			})
+		})
+		.collect()
+}
+
+/// What identifies an item in a file whose items may move: the kinds, names, and headers (see [`Node::header`]) of the
+/// item and of its ancestors, outermost first, and how many items with the same ones precede it (identical twins).
+type Identity = (Vec<Link>, usize);
+
+/// The kind, name, and header of an item.
+type Link = (&'static str, Option<String>, String);
+
+/// The [`Link`]s of the item at `path` and of its ancestors, outermost first.
+fn chain(parsed: &Parsed, path: &[usize]) -> Vec<Link> {
+	(1..=path.len())
+		.filter_map(|length| Node::at(&parsed.file, &path[..length]))
+		.map(|node| (node.kind(), node.name(), node.header()))
+		.collect()
+}
+
+/// The [`Identity`] of a target of `parsed`.
+fn identity(parsed: &Parsed, target: &Target) -> Identity {
+	let chain = chain(parsed, &target.path);
+	let preceding = (tree::index(parsed).into_iter())
+		.take_while(|item| item.path != target.path)
+		.filter(|item| item.node.is_container() && self::chain(parsed, &item.path) == chain)
+		.count();
+
+	(chain, preceding)
+}
+
+/// The containers with these identities in `text`.
+fn relocate(text: &str, identities: &[Identity]) -> Result<Vec<Target>, FormatError> {
+	if identities.is_empty() {
+		return Ok(Vec::new());
+	}
+
+	let parsed = Parsed::parse(text)?;
+	let items: Vec<_> = tree::index(&parsed).into_iter().filter(|item| item.node.is_container()).collect();
+	let chains: Vec<_> = items.iter().map(|item| chain(&parsed, &item.path)).collect();
+
+	identities
+		.iter()
+		.map(|(chain, preceding)| {
+			let (item, _) = (items.iter().zip(&chains))
+				.filter(|(_, candidate)| *candidate == chain)
+				.nth(*preceding)
+				.ok_or_else(|| {
+					let name = chain.last().map(|(kind, name, _)| (kind, name));
+
+					FormatError::StructureMismatch(format!("{name:?} is gone after formatting"))
+				})?;
+
+			Ok(Target {
+				path: item.path.clone(),
+				range: item.range.clone(),
+				kind: item.node.kind(),
+				name: item.node.name(),
+				container: true,
 			})
 		})
 		.collect()

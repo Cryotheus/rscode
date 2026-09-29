@@ -15,6 +15,7 @@ use rscode::ItemKind;
 use rscode::LoadOptions;
 use rscode::Resolver;
 use rscode::Workspace;
+use rscode::model::ImportInfo;
 use rscode::model::Visibility;
 use rscode::resolve::Namespace;
 use rscode::resolve::Res;
@@ -283,11 +284,47 @@ pub(crate) trait PathTree {
 
 	/// The items nameable as `<node path>::<name>`.
 	fn children(&self, node: Self::Node) -> Vec<Child<Self::Node>>;
+
+	/// For a module: the names its imports bind, as written in `use` paths (`*` for glob imports, `_` for `as _` ones),
+	/// whatever their visibility.
+	fn imports(&self, node: Self::Node) -> Vec<String>;
 }
 
 /// Candidates for a typed path, one `::` segment at a time: `crate` and crate names first, then the children of the
-/// items the typed segments name. Qualified paths and patterns (`<`, `*`) are not completed.
+/// items the typed segments name. Qualified paths and patterns (`<`, `*`) are not completed. `use` paths (typed as one
+/// word, which shells may pass with its opening quote, or with escaped spaces) complete modules and imports.
 pub(crate) fn complete_path<T: PathTree>(tree: &T, typed: &str, filter: Filter) -> Vec<CompletionCandidate> {
+	let word = typed.trim_start_matches(['\'', '"']).replace("\\ ", " ");
+
+	if filter == Filter::Any
+		&& let Some(rest) = word.strip_prefix("use").filter(|rest| rest.starts_with(char::is_whitespace))
+	{
+		return complete_use_path(tree, rest.trim_start());
+	}
+
+	complete_plain_path(tree, typed, filter, |_| Vec::new())
+}
+
+/// Candidates for a `use` path: the modules on the way, and the names the imports of the last module bind.
+fn complete_use_path<T: PathTree>(tree: &T, typed: &str) -> Vec<CompletionCandidate> {
+	let imports = |node| tree.imports(node).into_iter().map(|name| (name, "import")).collect();
+
+	(complete_plain_path(tree, typed, Filter::Modules, imports).into_iter())
+		.map(|candidate| {
+			let value = format!("use {}", candidate.get_value().to_string_lossy());
+
+			CompletionCandidate::new(value).help(candidate.get_help().cloned())
+		})
+		.collect()
+}
+
+/// [`complete_path`] of a path without `use`, offering `extra` names (and their help) of the nodes the head names too.
+fn complete_plain_path<T: PathTree>(
+	tree: &T,
+	typed: &str,
+	filter: Filter,
+	extra: impl Fn(T::Node) -> Vec<(String, &'static str)>,
+) -> Vec<CompletionCandidate> {
 	if typed.contains(|char: char| char.is_whitespace() || matches!(char, '<' | '>' | '*')) {
 		return Vec::new();
 	}
@@ -336,6 +373,14 @@ pub(crate) fn complete_path<T: PathTree>(tree: &T, typed: &str, filter: Filter) 
 					.filter(|child| same_ident(&child.name, segment))
 					.map(|child| child.node)
 					.collect();
+			}
+
+			for &node in &nodes {
+				for (name, help) in extra(node) {
+					if matches_prefix(&name, partial) {
+						found.entry(format!("{prefix}{name}")).or_insert(help);
+					}
+				}
 			}
 
 			for child in nodes.into_iter().flat_map(|node| tree.children(node)) {
@@ -494,6 +539,23 @@ impl PathTree for WorkspaceTree<'_> {
 
 		children
 	}
+
+	fn imports(&self, node: ItemId) -> Vec<String> {
+		if self.workspace.item(node).kind != ItemKind::Module {
+			return Vec::new();
+		}
+
+		let uses = self.workspace.children(node).filter(|&id| self.workspace.item(id).kind == ItemKind::Use);
+		let imports = uses.flat_map(|id| self.workspace.children(id));
+		let mut names: Vec<String> = imports
+			.filter_map(|import| self.workspace.item(import).import_info().map(ImportInfo::path_name))
+			.map(|name| if rscode::path::is_keyword(&name) { format!("r#{name}") } else { name.to_string() })
+			.collect();
+
+		names.sort();
+		names.dedup();
+		names
+	}
 }
 
 #[cfg(test)]
@@ -505,6 +567,9 @@ mod tests {
 	struct FakeTree {
 		crates: Vec<(String, usize)>,
 		nodes: Vec<(String, ItemKind, Vec<usize>)>,
+
+		/// The names the imports of modules bind.
+		imports: Vec<(usize, Vec<&'static str>)>,
 	}
 
 	impl FakeTree {
@@ -541,6 +606,7 @@ mod tests {
 			Self {
 				crates: vec![("demo".to_owned(), 0), ("demo".to_owned(), 10)],
 				nodes,
+				imports: vec![(0, vec!["*", "Circle", "_"]), (1, vec!["Rc"])],
 			}
 		}
 	}
@@ -561,6 +627,13 @@ mod tests {
 					kind: self.nodes[child].1,
 					node: child,
 				})
+				.collect()
+		}
+
+		fn imports(&self, node: usize) -> Vec<String> {
+			(self.imports.iter())
+				.filter(|(module, _)| *module == node)
+				.flat_map(|(_, names)| names.iter().map(ToString::to_string))
 				.collect()
 		}
 	}
@@ -635,11 +708,28 @@ mod tests {
 		assert_eq!(help, ["struct", "enum", "trait"]);
 	}
 
+	/// `use` paths complete the modules on the way and the imports of the last one (all of them, whatever their
+	/// visibility), whether the shell passes the word with its opening quote or with escaped spaces.
+	#[test]
+	fn completes_use_paths() {
+		assert_eq!(complete("use "), ["use crate", "use demo"]);
+		assert_eq!(
+			complete("use crate::"),
+			["use crate::*", "use crate::Circle", "use crate::_", "use crate::r#type", "use crate::shapes"]
+		);
+		assert_eq!(complete("'use crate::C"), ["use crate::Circle"]);
+		assert_eq!(complete("use\\ crate::sh"), ["use crate::shapes"]);
+		assert_eq!(complete("use crate::shapes::"), ["use crate::shapes::Rc"]);
+		assert_eq!(complete("use crate::shapes::Circle::"), Vec::<String>::new());
+		assert_eq!(complete("user"), Vec::<String>::new());
+	}
+
 	#[test]
 	fn caps_the_number_of_candidates() {
 		let mut tree = FakeTree {
 			crates: vec![("big".to_owned(), 0)],
 			nodes: vec![("big".to_owned(), ItemKind::Module, (1..=300).collect())],
+			imports: Vec::new(),
 		};
 
 		tree.nodes.extend((1..=300).map(|index| (format!("f{index:03}"), ItemKind::Fn, Vec::new())));

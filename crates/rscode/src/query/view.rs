@@ -165,19 +165,31 @@ impl View {
 		self.items(resolver, &items)
 	}
 
-	/// Views specific items, in order, without duplicates.
+	/// Views specific items, in order, without duplicates (imports of one `use` item with the same path, like its glob
+	/// imports, are shown once).
 	pub fn items(&self, resolver: &Resolver<'_>, items: &[ItemId]) -> Result<Vec<ItemView>, Error> {
 		let mut renderer = Renderer { resolver, options: &self.options, syntax: HashMap::new() };
 		let mut seen = HashSet::new();
 		let mut views = Vec::with_capacity(items.len());
 
 		for &item in items {
-			if seen.insert(item) && renderer.is_wanted(item) {
+			let key = (shown_item(resolver.workspace(), item), resolver.canonical_path(item));
+
+			if seen.insert(key) && renderer.is_wanted(item) {
 				views.push(renderer.view(item));
 			}
 		}
 
 		Ok(views)
+	}
+}
+
+/// The item whose text is shown for an item: the item, or for an import its `use` item (of which its own text is
+/// only a part).
+pub(crate) fn shown_item(workspace: &Workspace, item: ItemId) -> ItemId {
+	match workspace.item(item).kind {
+		ItemKind::Import => workspace.parent(item).unwrap_or(item),
+		_ => item,
 	}
 }
 
@@ -260,11 +272,7 @@ impl Renderer<'_, '_> {
 		let workspace = self.resolver.workspace();
 		let data = workspace.item(item);
 
-		// an import is shown as its `use` item, of which its own text is only a part
-		let shown = match data.kind {
-			ItemKind::Import => workspace.parent(item).unwrap_or(item),
-			_ => item,
-		};
+		let shown = shown_item(workspace, item);
 		let file = workspace.file_of(shown);
 		let (start, end) = file.locate(workspace.item(shown).range);
 

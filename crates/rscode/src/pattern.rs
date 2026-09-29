@@ -135,12 +135,12 @@ impl IdentPattern {
 		self.ignore_case
 	}
 
-	/// The identifier an exact, case-sensitive pattern matches, if it can name an item.
 	/// Whether the pattern is exactly `_` (the name of underscore imports).
 	fn is_exact_underscore(&self) -> bool {
 		self.is_exact() && self.parts.as_slice() == ["_"]
 	}
 
+	/// The identifier an exact, case-sensitive pattern matches, if it can name an item.
 	fn exact_ident(&self) -> Option<SmolStr> {
 		let [part] = self.parts.as_slice() else {
 			return None;
@@ -280,6 +280,23 @@ impl PathPattern {
 	pub fn parse(pattern: &str, options: MatchOptions) -> Result<Self, PathParseError> {
 		parse_path_pattern(pattern.trim(), options, false)
 			.map_err(|message| PathParseError { text: pattern.to_owned(), message })
+	}
+
+	/// A pattern matching exactly what an item path names (its segments are compared literally: `use a::*` matches the
+	/// glob imports of `a` only, unlike the parsed pattern).
+	pub fn exact(path: &ItemPath) -> Self {
+		let exact = |path: &ItemPath| Box::new(Self::exact(path));
+
+		Self {
+			anchor: path.anchor,
+			qualifier: (path.qualifier.as_ref())
+				.map(|qualifier| (exact(&qualifier.self_ty), qualifier.trait_path.as_deref().map(exact))),
+			segments: (path.segments.iter())
+				.map(|segment| SegmentPattern::Ident(IdentPattern::exact(segment, MatchOptions::default())))
+				.collect(),
+			arguments: path.arguments.clone(),
+			import: path.import,
+		}
 	}
 
 	/// A pattern matching items named by `name` anywhere.
@@ -551,6 +568,11 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 		return Err("the pattern is empty".to_owned());
 	}
 
+	// (items named `use` are matched by `r#use`)
+	if text == "use" {
+		return Err(EXPECTED_AFTER_USE.to_owned());
+	}
+
 	if let Some(rest) = strip_word(text, "use") {
 		if nested {
 			return Err("`use` cannot appear inside of a qualifier".to_owned());
@@ -559,7 +581,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 		let rest = rest.trim();
 
 		if rest.is_empty() {
-			return Err("expected a pattern after `use`".to_owned());
+			return Err(EXPECTED_AFTER_USE.to_owned());
 		}
 
 		let mut pattern = parse_path_pattern(rest, options, false)?;
@@ -697,6 +719,9 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 
 	Ok(PathPattern { anchor, qualifier: None, segments, arguments, import: false })
 }
+
+/// The error for `use` without a pattern after it (usually a shell splitting an unquoted pattern).
+const EXPECTED_AFTER_USE: &str = "expected a pattern after `use` (quote the whole pattern, `use` included)";
 
 /// The error for generic arguments where patterns cannot have them.
 const ONLY_QUALIFIER_ARGUMENTS: &str =
@@ -1231,14 +1256,14 @@ mod tests {
 		assert_eq!(pattern("crate::a::_").to_item_path(), None);
 
 		for (text, message) in [
-			("use", "the pattern is empty"),
+			("use", "expected a pattern after `use` (quote the whole pattern, `use` included)"),
 			("use <A as B>", "`use` patterns match the imports of modules, and cannot be qualified"),
 			("use use a", "`use` patterns match the imports of modules, and cannot be qualified"),
 			("use crate", "expected a pattern of the names imports bind after `use crate`"),
 			("impl use a", "`use` cannot appear inside of a qualifier"),
+			("impl use", "expected a pattern after `use` (quote the whole pattern, `use` included)"),
 		] {
 			match PathPattern::parse(text, MatchOptions::default()) {
-				Ok(parsed) if text == "use" => assert!(!parsed.import, "`use` alone is a name"),
 				Ok(parsed) => panic!("`{text}` parsed as {parsed:?}"),
 				Err(error) => assert_eq!(error.message, message, "{text}"),
 			}

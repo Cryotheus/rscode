@@ -458,7 +458,7 @@ impl From<Formatter> for RsFormatter {
 pub(crate) struct FormatParams {
 	/// Path patterns of what to format: `crate` (every loaded crate), modules (`crate::a`: their files, and child
 	/// modules' files unless `skip_children`), or any other items (formatted in place, leaving the rest of the file
-	/// untouched). Globs are allowed (`crate::a::*`).
+	/// untouched). Globs are allowed (`crate::a::*`); `use crate::a::*` matches every import of `a`.
 	#[serde(default = "crate_root", deserialize_with = "string_list")]
 	pub(crate) targets: Vec<String>,
 

@@ -103,6 +103,10 @@ const SELECT_ONE_CRATE: &str = "the path names items of several crates (such as 
 const THROUGH_IMPORT: &str = "the path names an item through a private import: name the import with its `use` path \
 	(quoted as one argument, like `'use crate::a::Name'`), or the item with its own path";
 
+/// How to replace one of several imports that a `use` path names.
+const SEVERAL_IMPORTS: &str = "the `use` path names several imports of its module: remove them and insert the new \
+	`use` item instead";
+
 /// An error of an operation, with a hint naming the options that get past it (see [`hint`]).
 fn hinted(error: rscode::Error, resolver: &Resolver<'_>) -> anyhow::Error {
 	let hint = hint(&error, resolver);
@@ -118,15 +122,19 @@ fn hint(error: &rscode::Error, resolver: &Resolver<'_>) -> Option<String> {
 		rscode::Error::Collision { .. } => Some("pass `--force` to proceed anyway".to_owned()),
 		rscode::Error::Ambiguous { path, .. } if in_several_crates(resolver, path) => Some(SELECT_ONE_CRATE.to_owned()),
 
+		// several imports of a module (`use` paths are never ambiguous through imports)
+		rscode::Error::Ambiguous { path, .. } if path.starts_with("use ") => Some(SEVERAL_IMPORTS.to_owned()),
+
 		// a path through a private import (see `rscode::edit::remove`)
 		rscode::Error::Ambiguous { candidates, .. } if candidates.iter().any(|candidate| candidate.starts_with("`use ")) => {
 			Some(THROUGH_IMPORT.to_owned())
 		}
 
 		rscode::Error::NotFound(path) => {
-			let member = ItemPath::parse(path).ok().and_then(|path| workspace.unloaded_member_of(&path));
+			let path = ItemPath::parse(path).ok();
+			let member = path.as_ref().and_then(|path| workspace.unloaded_member_of(path));
 
-			unloaded_hint(workspace, member)
+			unloaded_hint(workspace, member).or_else(|| path.and_then(|path| resolver.import_hint(&path)))
 		}
 
 		_ => None,

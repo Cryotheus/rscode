@@ -7,6 +7,7 @@
 //! associated items, items of inherent `impl`s shadow items of trait `impl`s, and without either, the provided items of
 //! the implemented traits are found.
 
+use super::Reference;
 use super::ReferenceKind;
 use super::scope::LocalBinding;
 use super::walker::FileWalker;
@@ -20,7 +21,9 @@ use crate::model::PathSegmentRef;
 use crate::resolve::Namespace;
 use crate::resolve::PathKind;
 use crate::resolve::Res;
+use crate::resolve::names::is_path_keyword;
 use proc_macro2::Ident;
+use rscode_fmt::Edition;
 use smol_str::SmolStr;
 use syn::GenericArgument;
 use syn::PathArguments;
@@ -360,7 +363,8 @@ impl FileWalker<'_, '_> {
 		items
 	}
 
-	/// Reports the segments of a resolved path that name targets (by their own name, so not through aliases).
+	/// Reports the segments of a resolved path that name targets (by their own name, so not through aliases), and those
+	/// that name something through lost bindings.
 	pub(super) fn report_path(&mut self, path: &PathRef, res: &PathRes, kind: ReferenceKind) {
 		let targets = self.targets;
 
@@ -370,6 +374,10 @@ impl FileWalker<'_, '_> {
 					if let Some(target) = targets.named_str(&segment.name).and_then(|target| target.find(resolutions)) {
 						self.report(target, kind, segment.range, true);
 					}
+				}
+
+				if !targets.lost.is_empty() || !targets.dead.is_empty() {
+					self.report_lost(path, segments, kind);
 				}
 			}
 
@@ -383,6 +391,89 @@ impl FileWalker<'_, '_> {
 			}
 
 			PathRes::Generic | PathRes::Local => {}
+		}
+	}
+
+	/// Reports the segments of a resolved path that are looked up in a module whose binding of their name is lost (see
+	/// [`Targets::lost`](super::Targets::lost)) and resolve to what it bound, or whose name is dead there and that
+	/// resolve to nothing: they name something through a removed import.
+	fn report_lost(&mut self, path: &PathRef, segments: &[Vec<Res>], kind: ReferenceKind) {
+		let last = path.segments.len().saturating_sub(1);
+		let targets = self.targets;
+
+		for (index, (segment, resolutions)) in path.segments.iter().zip(segments).enumerate() {
+			let lost = targets.lost.get(&segment.name).map_or(&[][..], Vec::as_slice);
+			let dead = targets.dead.get(&segment.name).map_or(&[][..], Vec::as_slice);
+
+			if lost.is_empty() && dead.is_empty() {
+				continue;
+			}
+
+			let scopes: Vec<ItemId> = match index {
+				0 if is_path_keyword(&segment.name) => continue,
+				0 => match self.first_scope(path, &segment.name, kind) {
+					Some(scope) => vec![scope],
+					None => continue,
+				},
+				_ => (segments[index - 1].iter())
+					.filter_map(|res| match res {
+						Res::Item(item) if self.ws.item(*item).kind == ItemKind::Module => Some(*item),
+						_ => None,
+					})
+					.collect(),
+			};
+
+			// (a binding that something else replaces, like a glob import that the removed import shadowed, still
+			// compiles: it is warned about instead)
+			let through = (lost.iter())
+				.find(|binding| {
+					binding.now.is_empty()
+						&& scopes.contains(&binding.module)
+						&& (index == last || binding.namespace == Namespace::Type)
+						&& resolutions.contains(&binding.res)
+				})
+				.map(|binding| binding.import)
+				.or_else(|| {
+					// (the first segment falls back to preludes when its scope does not bind it)
+					let unresolved = resolutions.is_empty()
+						|| (index == 0 && scopes.iter().all(|&scope| !self.resolver.binds(scope, &segment.name)));
+
+					(dead.iter().filter(|_| unresolved)).find(|dead| scopes.contains(&dead.module)).map(|dead| dead.import)
+				});
+
+			if let Some(import) = through {
+				self.out.push(Reference {
+					target: import,
+					kind,
+					krate: self.krate,
+					file: self.file,
+					path: self.source.path().to_path_buf(),
+					range: segment.range,
+					start: self.source.line_col(segment.range.start),
+					certain: true,
+				});
+			}
+		}
+	}
+
+	/// The module whose scope the first segment of a path (`name`) is looked up in, if any: the module of the code,
+	/// or the crate root for crate-relative paths of edition 2015 (`use` paths, and `::a`). `None` when a local binding
+	/// shadows it, or it names a crate (`::a`).
+	fn first_scope(&self, path: &PathRef, name: &str, kind: ReferenceKind) -> Option<ItemId> {
+		let edition_2015 = self.ws.krate(self.krate).edition() == Edition::E2015;
+		let root = ItemId::crate_root(self.krate);
+
+		match path.leading_colon {
+			true => edition_2015.then_some(root),
+			false if kind == ReferenceKind::Import && edition_2015 => Some(root),
+
+			false => {
+				let shadowed = [Namespace::Type, Namespace::Value]
+					.into_iter()
+					.any(|namespace| self.lookup_local(name, namespace, Locals::All).is_some());
+
+				(!shadowed).then_some(self.module)
+			}
 		}
 	}
 

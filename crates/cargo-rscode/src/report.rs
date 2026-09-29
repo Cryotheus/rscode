@@ -611,6 +611,7 @@ mod tests {
 		let plan = Insertion {
 			edits: EditSet::new(),
 			inserted: vec![(ItemKind::Fn, Some("helper".to_owned())), (ItemKind::Impl, None)],
+			imports: Vec::new(),
 			file: PathBuf::from("/ws/src/util.rs"),
 			warnings: Vec::new(),
 		};

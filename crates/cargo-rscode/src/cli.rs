@@ -86,11 +86,11 @@ Item paths are written like Rust paths:
   Type::name             an associated item, a trait item, or a variant
   <Type as Trait>::name  an item of a trait impl (<Type>::name: inherent)
   impl Trait for Type    an impl block (also <Type as Trait>, <Type>)
-  'use m::Name'          the import binding Name in m (use m::*: glob imports, use m::_: `as _` ones)
+  'use m::Name'          the imports binding Name in m (use m::*: globs, use m::_: `as _` ones)
 Generic arguments of the type and trait pick impl blocks: impl From<u8> for W, <W<u16>>::get.
 Every `cfg` variant of an item is addressed by its path. Paths go through imports to what they import, except `use` \
 paths (quoted as one argument), which `find --imports` prints; `remove` and `replace` refuse a path whose last segment \
-is bound by a private import, which could mean either.";
+is bound only by a private import, which could mean either.";
 
 const COMPLETION_HELP: &str = "\
 Run `cargo rscode --help` for how to set up shell completion.";
@@ -415,7 +415,7 @@ fn remove() -> Command {
 			"Remove items (every `cfg` variant) with their attributes, doc comments, and attached comments. Removing an \
 			 out-of-line module also deletes its files. Imports are removed by their `use` paths \
 			 (`'use crate::a::Name'`), leaving the rest of their `use` items; a plain path whose last segment is bound \
-			 by a private import is refused, as it could name the import or what it imports.",
+			 only by a private import is refused, as it could name the import or what it imports.",
 		)
 		.arg(item_paths("paths", "PATH", "Items to remove"))
 		.arg(flag("keep-files", "Keep the files of removed out-of-line modules"))
@@ -433,7 +433,7 @@ fn replace() -> Command {
 			"Replace the source of an item (including its attributes and doc comments) with new source, which must \
 			 parse as an item of the same kind. The new source is re-indented to the item's indentation. An import \
 			 (`'use crate::a::Name'`) is replaced as its `use` item, which must import nothing else; a plain path whose \
-			 last segment is bound by a private import is refused, as it could name the import or what it imports.",
+			 last segment is bound only by a private import is refused, as it could name the import or what it imports.",
 		)
 		.arg(item_path("path", "PATH", "The item to replace"))
 		.arg(source_arg("The new source: a file, or `-` for stdin"))
@@ -598,7 +598,7 @@ fn check_args(command: Command) -> Command {
 fn targets() -> Arg {
 	Arg::new("targets")
 		.value_name("TARGET")
-		.help("Path patterns of the items or modules to process (globs allowed)")
+		.help("Path patterns of the items or modules to process (globs allowed: 'use a::*' is every import in `a`)")
 		.num_args(1..)
 		.action(ArgAction::Append)
 		.default_value("crate")

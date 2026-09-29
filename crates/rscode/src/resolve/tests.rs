@@ -1693,6 +1693,60 @@ fn enum_variants_shadow_associated_items_in_their_namespaces() {
 	assert_eq!(canonical_path_round_trip_failures(&ws, &resolver), Vec::<String>::new());
 }
 
+/// Each module decides on its own whether a path names items only through its private imports: another crate's item of
+/// the same name (a binary's, whose root is also `crate`) does not make the library's import name its own item.
+#[test]
+fn private_imports_are_judged_per_module() {
+	let ws = workspace([
+		TestCrate::new("lib", "mod shapes { pub struct Foo; } use shapes::Foo;"),
+		TestCrate::new("bin", "struct Foo;"),
+	]);
+	let resolver = Resolver::new(&ws);
+	let path = item_path("crate::Foo");
+	let mut items = resolver.resolve_item_path(&path);
+
+	assert_eq!(items.len(), 2);
+	assert!(crate::edit::check_private_imports(&resolver, &path, &mut items).is_err());
+}
+
+/// For edits, a plain path that names items only through private imports of its module is ambiguous (it could mean
+/// the imports, `use` paths); but the path of every item names it, whatever the imports of the same name.
+#[test]
+fn private_imports_leave_every_item_its_path() {
+	let ws = single(concat!(
+		"pub mod alt { pub struct Qux; pub mod inner {} } ",
+		"#[cfg(feature = \"a\")] pub struct Qux; ",
+		"#[cfg(not(feature = \"a\"))] use alt::Qux; ",
+		"pub fn helper() {} use alt::inner as helper; ",
+		"mod shapes { pub struct Deep; pub struct Bar; } ",
+		"use shapes::Bar as Private; ",
+		"pub(crate) use shapes::Deep as CrateDeep; ",
+		"pub mod m { pub(in crate::m) use super::shapes::Bar as InBar; pub(crate) use super::shapes::Bar as CrateBar; }",
+	));
+	let resolver = Resolver::new(&ws);
+	let for_edits = |path: &str| {
+		let path = item_path(path);
+		let mut items = resolver.resolve_item_path(&path);
+
+		crate::edit::check_private_imports(&resolver, &path, &mut items)
+			.map(|()| items.iter().map(|&item| show(&resolver, item)).collect::<Vec<_>>())
+			.map_err(|error| error.to_string())
+	};
+
+	// the module's own items, under other `cfg`s or in another namespace
+	assert_eq!(for_edits("crate::Qux"), Ok(vec!["t::Qux".to_owned()]));
+	assert_eq!(for_edits("crate::helper"), Ok(vec!["t::helper".to_owned()]));
+
+	// imports no more visible than their module
+	for path in ["crate::Private", "crate::CrateDeep", "crate::m::InBar"] {
+		assert!(for_edits(path).is_err_and(|error| error.contains("is ambiguous")), "{path}");
+	}
+
+	// a re-export is a path to what it exports
+	assert_eq!(for_edits("crate::m::CrateBar"), Ok(vec!["t::shapes::Bar".to_owned()]));
+	assert_eq!(canonical_path_round_trip_failures(&ws, &resolver), Vec::<String>::new());
+}
+
 #[test]
 fn long_import_chains_resolve_in_linear_time() {
 	// every link can only be resolved after the next one, in both directions, and through glob imports (whose bindings
@@ -2132,7 +2186,11 @@ fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -
 				import: path.is_import,
 			};
 
-			if !resolver.resolve_item_path(&item_path).contains(&item) {
+			// the path names the item for edits too: no private import of the same name hides it
+			let mut items = resolver.resolve_item_path(&item_path);
+			let edits = crate::edit::check_private_imports(resolver, &item_path, &mut items);
+
+			if edits.is_err() || !items.contains(&item) {
 				failures.push(show(resolver, item));
 			}
 		}

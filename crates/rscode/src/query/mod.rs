@@ -13,3 +13,5 @@ pub use view::ItemView;
 pub use view::View;
 pub use view::ViewMode;
 pub use view::ViewOptions;
+#[cfg(feature = "mcp")]
+pub(crate) use view::shown_item;

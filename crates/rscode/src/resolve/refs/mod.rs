@@ -36,6 +36,9 @@ mod scope;
 mod walker;
 
 use super::Resolver;
+use super::DeadName;
+use super::LostBinding;
+use super::fxhash::FxHashMap;
 use super::fxhash::FxHashSet;
 use crate::model::CrateId;
 use crate::model::ItemData;
@@ -189,6 +192,18 @@ pub(crate) fn find_references(resolver: &Resolver<'_>, targets: &[ItemId], optio
 	search_targets(resolver, &Targets::new(resolver.workspace(), targets), options).0
 }
 
+/// References to the targets, and references through lost bindings and to dead names (see [`Targets::lost`]), whose
+/// target is the import of the binding.
+pub(crate) fn find_references_through(
+	resolver: &Resolver<'_>,
+	targets: &[ItemId],
+	lost: &[LostBinding],
+	dead: &[DeadName],
+	options: &ReferenceOptions,
+) -> References {
+	search_targets(resolver, &Targets::new(resolver.workspace(), targets).with_lost(lost, dead), options).0
+}
+
 fn search_targets(resolver: &Resolver<'_>, targets: &Targets, options: &ReferenceOptions) -> (References, Vec<Capture>) {
 	let ws = resolver.workspace();
 	let mut references = definitions(ws, targets);
@@ -224,6 +239,14 @@ pub(super) struct Targets {
 	/// A name whose local bindings are tracked too (the new name of a rename, without targets), to find references they
 	/// would capture.
 	pub(super) shadow: Option<TargetName>,
+
+	/// Bindings of module scopes that come through removed imports (see [`Resolver::lost_bindings`]), by name: path
+	/// segments that name something through them are references too.
+	pub(super) lost: FxHashMap<SmolStr, Vec<LostBinding>>,
+
+	/// Names that removed imports that resolve to nothing bound in modules (see [`Resolver::dead_names`]), by name:
+	/// path segments that fail to resolve at them are references too.
+	pub(super) dead: FxHashMap<SmolStr, Vec<DeadName>>,
 }
 
 impl Targets {
@@ -270,7 +293,28 @@ impl Targets {
 			target.trait_items.sort();
 		}
 
-		Self { names, shadow: None }
+		Self { names, shadow: None, lost: FxHashMap::default(), dead: FxHashMap::default() }
+	}
+
+	/// Also finds references through `lost` bindings, and to `dead` names.
+	fn with_lost(mut self, lost: &[LostBinding], dead: &[DeadName]) -> Self {
+		let names = lost.iter().map(|binding| &binding.name).chain(dead.iter().map(|dead| &dead.name));
+
+		for name in names {
+			if !self.names.iter().any(|target| target.name == *name) {
+				self.names.push(TargetName::new(name.clone()));
+			}
+		}
+
+		for binding in lost {
+			self.lost.entry(binding.name.clone()).or_default().push(binding.clone());
+		}
+
+		for dead in dead {
+			self.dead.entry(dead.name.clone()).or_default().push(dead.clone());
+		}
+
+		self
 	}
 
 	/// Whether local bindings named like the identifier are tracked: it is named like a target, or like

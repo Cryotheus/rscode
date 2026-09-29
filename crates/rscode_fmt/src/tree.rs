@@ -5,6 +5,7 @@
 
 use crate::source::Parsed;
 use proc_macro2::Span;
+use quote::quote;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -80,6 +81,44 @@ impl<'a> Node<'a> {
 			Self::Item(syn::Item::Impl(_) | syn::Item::Trait(_) | syn::Item::ForeignMod(_)) => true,
 			_ => false,
 		}
+	}
+
+	/// The tokens of a container without its items (attributes, visibility, generics, and for `impl` blocks the trait
+	/// and the type), which sorting and formatting leave as they are: they tell apart containers of the same kind and
+	/// name, like `impl From<u8> for X` and `impl From<u16> for X`, or `cfg` variants of a module. Empty for other items.
+	pub(crate) fn header(self) -> String {
+		let tokens = match self {
+			Self::Item(syn::Item::Mod(module)) => {
+				let syn::ItemMod { attrs, vis, ident, .. } = module;
+
+				quote!(#(#attrs)* #vis mod #ident)
+			}
+
+			Self::Item(syn::Item::Impl(block)) => {
+				let syn::ItemImpl { attrs, unsafety, generics, trait_, self_ty, .. } = block;
+				let where_clause = &generics.where_clause;
+				let trait_ = trait_.as_ref().map(|(path, _)| quote!(#path for));
+
+				quote!(#(#attrs)* #unsafety impl #generics #trait_ #self_ty #where_clause)
+			}
+
+			Self::Item(syn::Item::Trait(item)) => {
+				let syn::ItemTrait { attrs, vis, unsafety, ident, generics, supertraits, .. } = item;
+				let where_clause = &generics.where_clause;
+
+				quote!(#(#attrs)* #vis #unsafety trait #ident #generics : #supertraits #where_clause)
+			}
+
+			Self::Item(syn::Item::ForeignMod(block)) => {
+				let syn::ItemForeignMod { attrs, unsafety, abi, .. } = block;
+
+				quote!(#(#attrs)* #unsafety #abi)
+			}
+
+			_ => return String::new(),
+		};
+
+		tokens.to_string()
 	}
 
 	/// A short description of the kind of item, for comparisons and messages.

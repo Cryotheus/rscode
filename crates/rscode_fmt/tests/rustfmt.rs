@@ -8,6 +8,7 @@ use common::rustfmt_available;
 use rscode_fmt::Edition;
 use rscode_fmt::FormatError;
 use rscode_fmt::FormatOptions;
+use rscode_fmt::FormatTarget;
 use rscode_fmt::Formatter;
 use std::path::PathBuf;
 
@@ -58,6 +59,32 @@ fn settles_when_rustfmt_merges_imports() {
 			assert_eq!(format(options.clone(), &once).unwrap(), once, "{granularity}: {source:?}");
 		}
 	}
+}
+
+/// ... also for a container targeted next to the whole file, when sorting does not reach it (not recursive).
+#[test]
+fn settles_targeted_containers_when_not_sorting_recursively() {
+	if !rustfmt_available() {
+		return;
+	}
+
+	let mut options = rustfmt().sort(Some(rscode_fmt::SortOptions::new().recursive(false)));
+
+	options.rustfmt.config = vec![("imports_granularity".to_owned(), "Crate".to_owned())];
+
+	let formatter = Formatter::new(options);
+	let source = "mod m {\n    use crate::a::d;\n    #[cfg(unix)]\n    use crate::a::c;\n    use crate::a::a;\n    use crate::a::b;\n}\n";
+	let targets = |text: &str| [FormatTarget::File, FormatTarget::Item(text.find("mod m").unwrap())];
+	let once = formatter.format_items(source, &targets(source)).unwrap();
+
+	assert_eq!(formatter.format_items(&once, &targets(&once)).unwrap(), once);
+
+	// the targeted `impl` block, not another one of the same trait and type, however sorting orders them
+	let source = "struct X;\ntrait T<A> {}\nimpl T<u16> for X {\n    fn b() {}\n    fn a() {}\n}\nimpl T<u8> for X {\n    fn b() {}\n    fn a() {}\n}\n";
+	let formatted = formatter.format_items(source, &[FormatTarget::File, FormatTarget::Item(source.find("impl T<u16>").unwrap())]).unwrap();
+
+	assert!(formatted.contains("impl T<u8> for X {\n    fn b() {}\n    fn a() {}\n}"), "{formatted}");
+	assert!(formatted.contains("impl T<u16> for X {\n    fn a() {}\n\n    fn b() {}\n}"), "{formatted}");
 }
 
 #[test]

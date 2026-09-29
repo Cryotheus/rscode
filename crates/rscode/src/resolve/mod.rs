@@ -27,6 +27,7 @@ mod fxhash;
 mod impls;
 mod names;
 mod refs;
+mod removal;
 mod scope;
 #[cfg(test)]
 mod test_model;
@@ -51,7 +52,11 @@ use crate::model::Workspace;
 use crate::path::CanonicalPath;
 use crate::path::ItemPath;
 use build::ImportIndex;
+pub(crate) use removal::DeadName;
+pub(crate) use removal::DeadNames;
+pub(crate) use removal::LostBinding;
 use impls::ImplIndex;
+use fxhash::FxHashSet;
 use scope::Tables;
 use serde::Serialize;
 use smol_str::SmolStr;
@@ -148,7 +153,17 @@ pub struct Resolver<'ws> {
 impl<'ws> Resolver<'ws> {
 	/// Builds the scopes of every module of every loaded crate, resolving all imports, and indexes `impl` blocks.
 	pub fn new(ws: &'ws Workspace) -> Self {
-		let (mut tables, imports) = build::build(ws);
+		Self::build(ws, &FxHashSet::default())
+	}
+
+	/// A resolver of the workspace in which `imports` bind nothing, as if they were removed: comparing it with one of the
+	/// whole workspace (see [`Resolver::lost_bindings`]) tells what the removal breaks.
+	pub(crate) fn without_imports(ws: &'ws Workspace, imports: &[ItemId]) -> Self {
+		Self::build(ws, &imports.iter().copied().collect())
+	}
+
+	fn build(ws: &'ws Workspace, excluded: &FxHashSet<ItemId>) -> Self {
+		let (mut tables, imports) = build::build(ws, excluded);
 		let impls = impls::build(ws, &tables);
 
 		tables.assoc = impls::assoc_index(ws, &impls);
@@ -186,6 +201,26 @@ impl<'ws> Resolver<'ws> {
 	/// and free of duplicates.
 	pub fn resolve_item_path(&self, path: &ItemPath) -> Vec<ItemId> {
 		self.compute_item_path(path)
+	}
+
+	/// For a path that names nothing, a hint about imports, for messages: what a `use` path names, or the `use` path
+	/// of the imports that a plain path names (when they import items that are not loaded).
+	pub fn import_hint(&self, path: &ItemPath) -> Option<String> {
+		if path.import {
+			let name = path.name().map_or("Name", SmolStr::as_str);
+
+			return Some(format!(
+				"a `use` path names the imports of the module its other segments name (`use crate::m::{name}` names \
+				 `use a::{name};` in `m`), not an import written with that path; the pattern `use *{name}*` finds the \
+				 imports of `{name}`"
+			));
+		}
+
+		let imports = ItemPath { import: true, ..path.clone() };
+
+		(path.qualifier.is_none() && !self.compute_item_path(&imports).is_empty()).then(|| {
+			format!("`{path}` names imports of items that are not loaded: `{imports}` names the imports themselves")
+		})
 	}
 
 	/// Resolves a path as if written inside of `module` (a module item).
@@ -387,5 +422,17 @@ impl<'ws> Resolver<'ws> {
 	/// References to the targets across all loaded crates.
 	pub fn find_references(&self, targets: &[ItemId], options: &ReferenceOptions) -> References {
 		refs::find_references(self, targets, options)
+	}
+
+	/// References to the targets, references through `lost` bindings (see [`Resolver::lost_bindings`]), and unresolved
+	/// references to `dead` names (see [`Resolver::dead_names`]), whose target is the import that bound them.
+	pub(crate) fn find_references_through(
+		&self,
+		targets: &[ItemId],
+		lost: &[LostBinding],
+		dead: &[DeadName],
+		options: &ReferenceOptions,
+	) -> References {
+		refs::find_references_through(self, targets, lost, dead, options)
 	}
 }

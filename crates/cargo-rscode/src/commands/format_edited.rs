@@ -13,7 +13,6 @@ use rscode::ItemId;
 use rscode::ItemKind;
 use rscode::ItemPath;
 use rscode::LoadOptions;
-use rscode::MatchOptions;
 use rscode::PathPattern;
 use rscode::Resolver;
 use rscode::Workspace;
@@ -22,8 +21,6 @@ use rscode::path::Anchor;
 use rscode::path::Qualifier;
 use rscode::path::last_segment_arguments;
 use rscode::path::normalize_arguments;
-use rscode::pattern::IdentPattern;
-use rscode::pattern::SegmentPattern;
 use rscode::rscode_fmt::FormatOptions;
 use rscode::rscode_fmt::RsFormatter;
 use std::path::Path;
@@ -81,6 +78,7 @@ pub(super) fn inserted(
 	parent: &ItemPath,
 	file: &Path,
 	inserted: &[(ItemKind, Option<String>)],
+	imports: &[(usize, String)],
 ) -> Targets {
 	let workspace = resolver.workspace();
 	let containers = in_files(workspace, resolver.resolve_item_path(parent), &[file.to_path_buf()], |container| {
@@ -97,9 +95,20 @@ pub(super) fn inserted(
 
 			targets.add(path, in_impl);
 		}
+
+		// `use` items, by their imports
+		for (_, name) in imports.iter().filter(|_| !container.is_impl) {
+			let (path, _) = child_path(&container, name);
+
+			targets.add(CanonicalPath { is_import: true, ..path }, false);
+		}
 	}
 
-	if names.len() < inserted.len() {
+	let unnamed = (inserted.iter().enumerate())
+		.filter(|(index, (_, name))| name.is_none() && !imports.iter().any(|(import_of, _)| import_of == index))
+		.count();
+
+	if unnamed > 0 {
 		targets.warnings.push("unnamed items (like `impl` blocks) are not formatted by `--fmt`".to_owned());
 	}
 
@@ -221,26 +230,6 @@ fn trait_name(written: &str) -> Option<&str> {
 	is_ident.then_some(name)
 }
 
-/// A pattern matching exactly what an item path names.
-fn exact_pattern(path: &ItemPath) -> PathPattern {
-	let exact = |path: &ItemPath| Box::new(exact_pattern(path));
-
-	PathPattern {
-		anchor: path.anchor,
-		qualifier: path
-			.qualifier
-			.as_ref()
-			.map(|qualifier| (exact(&qualifier.self_ty), qualifier.trait_path.as_deref().map(exact))),
-		segments: path
-			.segments
-			.iter()
-			.map(|segment| SegmentPattern::Ident(IdentPattern::exact(segment, MatchOptions::default())))
-			.collect(),
-		arguments: path.arguments.clone(),
-		import: path.import,
-	}
-}
-
 /// What formatting after an edit did.
 #[derive(Debug, Default)]
 struct Formatted {
@@ -281,7 +270,7 @@ fn try_format(options: &LoadOptions, targets: Targets) -> anyhow::Result<Formatt
 	let mut patterns = Vec::new();
 
 	for (path, canonical) in &targets.paths {
-		let pattern = exact_pattern(path);
+		let pattern = PathPattern::exact(path);
 
 		if Find::new().path_pattern(pattern.clone()).run_with(&resolver)?.is_empty() {
 			formatted.warnings.push(format!("`{canonical}` is gone after the edit (renamed?), so `--fmt` leaves it"));

@@ -5,18 +5,33 @@ use super::PathKind;
 use super::Resolver;
 use super::walk::Found;
 use super::walk::Walker;
+use super::vis::Vis;
+use super::vis::declared_vis;
+use super::vis::home_module;
 use super::walk::Want;
 use crate::model::CrateId;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::PathRef;
-use crate::model::Visibility;
 use crate::path::Anchor;
 use crate::path::ItemPath;
 use crate::path::Qualifier;
 use crate::path::last_segment_arguments;
 use crate::resolve::Res;
 use smol_str::SmolStr;
+
+/// See [`Resolver::private_imports_of`]. Each module the path's other segments name (in every crate, every `cfg`
+/// variant) binds the name on its own.
+#[derive(Debug, Default)]
+pub(crate) struct PrivateImports {
+	/// The private imports of the modules that bind the name to some of the items only through them.
+	pub(crate) imports: Vec<ItemId>,
+
+	/// The items that private imports bind the name to in modules that also bind it otherwise (they define it under
+	/// other `cfg`s or in another namespace, or import it by a glob import or a re-export), and that nothing else binds
+	/// it to: the path names what those modules bind otherwise, not these.
+	pub(crate) shadowed: Vec<ItemId>,
+}
 
 impl Resolver<'_> {
 	pub(super) fn compute_item_path(&self, path: &ItemPath) -> Vec<ItemId> {
@@ -55,32 +70,66 @@ impl Resolver<'_> {
 		Some((name, modules.collect()))
 	}
 
-	/// The private named imports (`use a::B;`, not `pub use`) through which the last segment of a plain path names some
-	/// of `items` in the module(s) its other segments name: the path names both what they import (`items`) and, as
-	/// `use m::name`, the imports themselves.
-	pub(crate) fn private_imports_of(&self, path: &ItemPath, items: &[ItemId]) -> Vec<ItemId> {
+	/// How the last segment of a plain path names some of `items` (what the path resolves to) in the module(s) its other
+	/// segments name, through named imports no more visible than their module (`use a::B;`, `pub(crate) use` in a crate
+	/// root, but not re-exports): the path names both what they import and, as `use m::name`, the imports themselves.
+	pub(crate) fn private_imports_of(&self, path: &ItemPath, items: &[ItemId]) -> PrivateImports {
+		let mut found = PrivateImports::default();
+
 		if path.import || path.qualifier.is_some() {
-			return Vec::new();
+			return found;
 		}
 
 		let Some((name, modules)) = self.split_name(path) else {
-			return Vec::new();
+			return found;
 		};
 
-		let mut imports: Vec<ItemId> = (modules.into_iter())
-			.flat_map(|module| Namespace::ALL.into_iter().flat_map(move |namespace| self.bindings(module, name, namespace)))
-			.filter(|binding| !binding.glob && matches!(binding.res, Res::Item(item) if items.contains(&item)))
-			.filter_map(|binding| binding.import)
-			.filter(|&import| {
-				let data = self.ws.item(import);
+		// each module (every crate's, every `cfg` variant) binds the name on its own
+		let mut otherwise = Vec::new();
 
-				data.kind == ItemKind::Import && matches!(data.vis, Visibility::Private | Visibility::SelfModule)
-			})
-			.collect();
+		for module in modules {
+			let (mut imports, mut imported, mut own) = (Vec::new(), Vec::new(), Vec::new());
+			let bindings = Namespace::ALL.into_iter().flat_map(|namespace| self.bindings(module, name, namespace));
 
-		imports.sort();
-		imports.dedup();
-		imports
+			for binding in bindings {
+				let Res::Item(item) = binding.res else {
+					continue;
+				};
+
+				if !items.contains(&item) {
+					continue;
+				}
+
+				match binding.import.filter(|&import| !binding.glob && self.is_private_import(import)) {
+					Some(import) => {
+						imports.push(import);
+						imported.push(item);
+					}
+					None => own.push(item),
+				}
+			}
+
+			match (imports.is_empty(), own.is_empty()) {
+				(true, _) => {}
+				(false, true) => found.imports.append(&mut imports),
+				(false, false) => found.shadowed.append(&mut imported),
+			}
+
+			otherwise.append(&mut own);
+		}
+
+		found.imports.sort();
+		found.imports.dedup();
+		found.shadowed.retain(|item| !otherwise.contains(item));
+		found.shadowed.sort();
+		found.shadowed.dedup();
+		found
+	}
+
+	/// Whether an item is a named import no more visible than its module.
+	fn is_private_import(&self, import: ItemId) -> bool {
+		self.ws.item(import).kind == ItemKind::Import
+			&& declared_vis(self.ws, import) == Vis::Module(home_module(self.ws, import))
 	}
 
 	fn resolve_unqualified(&self, path: &ItemPath) -> Vec<ItemId> {

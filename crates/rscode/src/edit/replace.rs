@@ -11,6 +11,7 @@ use crate::edit::EditSet;
 use crate::edit::describe;
 use crate::edit::trivia;
 use crate::edit::trivia::Placement;
+use crate::model::ImportInfo;
 use crate::model::ItemDetail;
 use crate::model::ItemId;
 use crate::model::ItemKind;
@@ -83,20 +84,23 @@ pub fn replace(
 	options: &ReplaceOptions,
 ) -> Result<Replacement, Error> {
 	let ws = resolver.workspace();
-	let resolved = resolver.resolve_item_path(path);
+	let mut resolved = resolver.resolve_item_path(path);
 
-	super::check_private_imports(resolver, path, &resolved)?;
+	super::check_private_imports(resolver, path, &mut resolved)?;
 
-	let (items, labels) = use_items(resolver, resolved)?;
+	let (items, imports) = use_items(resolver, resolved)?;
 	let items = distinct_places(ws, items);
 
 	if items.is_empty() {
 		return Err(Error::NotFound(path.to_string()));
 	}
 
-	// (`impl` blocks whose headers differ are not `cfg` variants of each other)
-	if items.len() > 1 && (!options.all_variants || super::impl_headers_differ(ws, &items)) {
-		return Err(ambiguous(resolver, path, &items));
+	// (`impl` blocks whose headers differ are not `cfg` variants of each other, and neither are imports of one module
+	// with the same `cfg`s)
+	if items.len() > 1
+		&& (!options.all_variants || super::impl_headers_differ(ws, &items) || same_cfg_imports(ws, &items, &imports))
+	{
+		return Err(ambiguous(resolver, path, &items, &imports));
 	}
 
 	let mut plan = Replacement { edits: EditSet::new(), replaced: Vec::new(), files: Vec::new(), warnings: Vec::new() };
@@ -106,10 +110,7 @@ pub fn replace(
 
 	for &item in &items {
 		let data = ws.item(item);
-		let canonical = match labels.iter().find(|(use_item, _)| *use_item == item) {
-			Some((_, import)) => import.clone(),
-			None => resolver.canonical_path(item).to_string(),
-		};
+		let canonical = resolver.canonical_path(import_of(item, &imports)).to_string();
 		let container = ws
 			.parent(item)
 			.and_then(|parent| Container::of(ws.item(parent).kind))
@@ -224,6 +225,10 @@ pub struct Insertion {
 	/// Kinds and names of the inserted items.
 	pub inserted: Vec<(ItemKind, Option<String>)>,
 
+	/// The names that inserted `use` items import (not `*` and `_`), with the index of the `use` item in
+	/// [`Insertion::inserted`]: their imports are named by `use` paths.
+	pub imports: Vec<(usize, String)>,
+
 	/// The edited file.
 	pub file: PathBuf,
 
@@ -291,6 +296,10 @@ pub fn insert(
 	Ok(Insertion {
 		edits,
 		inserted: parsed.items.iter().map(|item| (item.kind, item.name.as_ref().map(ToString::to_string))).collect(),
+		imports: (parsed.items.iter().enumerate())
+			.filter(|(_, item)| item.kind == ItemKind::Use)
+			.flat_map(|(index, item)| item.bindings.iter().map(move |binding| (index, binding.name.to_string())))
+			.collect(),
 		file: target.file.path().to_path_buf(),
 		warnings,
 	})
@@ -383,7 +392,7 @@ fn target<'ws>(resolver: &Resolver<'ws>, parent: &ItemPath, anchor: Option<&Item
 	match targets.as_slice() {
 		[] => Err(unsupported.unwrap_or_else(|| Error::NotFound(parent.to_string()))),
 		[target] => Ok(*target),
-		_ => Err(ambiguous(resolver, parent, &targets.iter().map(|target| target.item).collect::<Vec<_>>())),
+		_ => Err(ambiguous(resolver, parent, &targets.iter().map(|target| target.item).collect::<Vec<_>>(), &[])),
 	}
 }
 
@@ -432,7 +441,7 @@ fn placement(
 	})
 }
 
-/// The items of the container named by `anchor`, in source order: those with that name when it is a single
+/// The items of the container named by `anchor`, in source order: those that bind that name when it is a single
 /// identifier, else those it resolves to. An import stands for its `use` item, and an item of an `extern` block or a
 /// static of a `thread_local!` for the block or invocation.
 fn siblings(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> Vec<ItemId> {
@@ -442,17 +451,22 @@ fn siblings(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> 
 	if let (Anchor::None, None, false, [name]) =
 		(anchor.anchor, &anchor.qualifier, anchor.import, anchor.segments.as_slice())
 	{
-		let named: Vec<ItemId> =
-			children.iter().copied().filter(|&child| ws.item(child).name.as_ref() == Some(name)).collect();
+		let named: Vec<ItemId> = children.iter().copied().filter(|&child| binds_name(ws, child, name)).collect();
 
 		if !named.is_empty() {
 			return named;
 		}
 	}
 
-	// the resolved items may be those of another crate that loads the same file
-	let mut siblings: Vec<ItemId> = resolver
-		.resolve_item_path(anchor)
+	// the resolved items may be those of another crate that loads the same file; a path that names nothing may name
+	// imports (of items that are not loaded) as a `use` path
+	let mut resolved = resolver.resolve_item_path(anchor);
+
+	if resolved.is_empty() && !anchor.import && anchor.qualifier.is_none() {
+		resolved = resolver.resolve_item_path(&ItemPath { import: true, ..anchor.clone() });
+	}
+
+	let mut siblings: Vec<ItemId> = resolved
 		.into_iter()
 		.map(|item| item_of_container(ws, item))
 		.filter_map(|item| children.iter().copied().find(|&child| same_place(ws, child, item)))
@@ -640,6 +654,21 @@ fn replacement_warnings(ws: &Workspace, item: ItemId, path: &str, items: &[NewIt
 			.push(format!("the replacement of `{path}` does not define `{name}`; references to it are not updated"));
 	}
 
+	// a `use` item replaced for its imports: the names they bound
+	if data.kind == ItemKind::Use {
+		let imported = |name: &SmolStr| items.iter().flat_map(|item| &item.bindings).any(|binding| binding.name == *name);
+
+		for leaf in ws.children(item) {
+			if let Some(name) = ws.item(leaf).import_info().and_then(ImportInfo::binding_name)
+				&& !imported(name)
+			{
+				warnings.push(format!(
+					"the replacement of `{path}` does not import `{name}`; code that uses `{name}` through it is not updated"
+				));
+			}
+		}
+	}
+
 	warnings
 }
 
@@ -661,7 +690,18 @@ fn distinct_places(ws: &Workspace, items: Vec<ItemId>) -> Vec<ItemId> {
 		.collect()
 }
 
-/// Whether two items are the same text (of a file loaded by several crates).
+/// Whether an item of a container is named `name`, or (a `use` item, an `extern` block, or a `thread_local!`) holds an
+/// import or item that binds it.
+fn binds_name(ws: &Workspace, item: ItemId, name: &str) -> bool {
+	let data = ws.item(item);
+
+	match data.kind {
+		ItemKind::Import => data.import_info().and_then(ImportInfo::binding_name).is_some_and(|bound| bound == name),
+		ItemKind::Use | ItemKind::ExternBlock | ItemKind::MacroCall => ws.children(item).any(|child| binds_name(ws, child, name)),
+		_ => data.name.as_deref() == Some(name),
+	}
+}
+
 /// The item an anchor stands for among the items of its container: the item, or for an import its `use` item, and for
 /// an item of an `extern` block or a static of a `thread_local!` the block or invocation (they are transparent).
 fn item_of_container(ws: &Workspace, mut item: ItemId) -> ItemId {
@@ -674,6 +714,7 @@ fn item_of_container(ws: &Workspace, mut item: ItemId) -> ItemId {
 	item
 }
 
+/// Whether two items are the same text (of a file loaded by several crates).
 fn same_place(ws: &Workspace, a: ItemId, b: ItemId) -> bool {
 	a == b || (ws.item(a).range == ws.item(b).range && ws.file_of(a).path() == ws.file_of(b).path())
 }
@@ -683,30 +724,30 @@ fn same_place(ws: &Workspace, a: ItemId, b: ItemId) -> bool {
 /// differ, which generic arguments in the path tell apart.
 pub fn replaces_all_variants(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 	let ws = resolver.workspace();
-	let resolved = resolver.resolve_item_path(path);
+	let mut resolved = resolver.resolve_item_path(path);
 
-	if !resolver.private_imports_of(path, &resolved).is_empty() {
+	if super::check_private_imports(resolver, path, &mut resolved).is_err() {
 		return false;
 	}
 
-	let Ok((items, _)) = use_items(resolver, resolved) else {
+	let Ok((items, imports)) = use_items(resolver, resolved) else {
 		return false;
 	};
 	let items = distinct_places(ws, items);
 
-	items.len() > 1 && !super::impl_headers_differ(ws, &items)
+	items.len() > 1 && !super::impl_headers_differ(ws, &items) && !same_cfg_imports(ws, &items, &imports)
 }
 
-/// The items to replace, and the `use` paths of the imports they replace by `use` item (for messages).
-type UseItems = (Vec<ItemId>, Vec<(ItemId, String)>);
+/// The items to replace, and the imports named by the path by the `use` items replaced for them.
+type UseItems = (Vec<ItemId>, Vec<(ItemId, ItemId)>);
 
-/// Imports are replaced as their `use` items, which must import nothing else.
+/// Imports are replaced as their `use` items, which must import nothing that the path does not name.
 fn use_items(resolver: &Resolver<'_>, items: Vec<ItemId>) -> Result<UseItems, Error> {
 	let ws = resolver.workspace();
 	let mut replaced = Vec::with_capacity(items.len());
-	let mut labels = Vec::new();
+	let mut imports = Vec::new();
 
-	for item in items {
+	for &item in &items {
 		if ws.item(item).kind != ItemKind::Import {
 			replaced.push(item);
 			continue;
@@ -715,31 +756,49 @@ fn use_items(resolver: &Resolver<'_>, items: Vec<ItemId>) -> Result<UseItems, Er
 		let Some(use_item) = ws.parent(item) else {
 			continue;
 		};
-		let import = resolver.canonical_path(item).to_string();
-		let imports = ws.children(use_item).count();
+		let leaves = ws.children(use_item).count();
 
-		if imports > 1 {
+		if ws.children(use_item).any(|leaf| !items.contains(&leaf)) {
 			let file = ws.file_of(use_item);
 
 			return Err(Error::Unsupported(format!(
-				"`{import}` is one of the {imports} imports of the `use` item at {}:{}, which only replaces as a whole: \
+				"`{}` is one of the {leaves} imports of the `use` item at {}:{}, which only replaces as a whole: \
 				 insert a new `use` item and remove this import instead",
+				resolver.canonical_path(item),
 				ws.display_path(file.path()).display(),
 				file.line_col(ws.item(use_item).range.start),
 			)));
 		}
 
-		labels.push((use_item, import));
+		imports.push((use_item, item));
 		replaced.push(use_item);
 	}
 
-	Ok((replaced, labels))
+	Ok((replaced, imports))
 }
 
-fn ambiguous(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Error {
+/// The item that replacing `item` replaces for the path: the import, when `item` is its `use` item.
+fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
+	imports.iter().find(|(use_item, _)| *use_item == item).map_or(item, |&(_, import)| import)
+}
+
+/// Whether two of the `use` items replaced for imports are in the same crate and have the same `cfg`s: they are not
+/// `cfg` variants of each other (like two `use a::Trait as _;` of one module), so they do not get the same text.
+fn same_cfg_imports(ws: &Workspace, items: &[ItemId], imports: &[(ItemId, ItemId)]) -> bool {
+	let use_items: Vec<ItemId> =
+		items.iter().copied().filter(|item| imports.iter().any(|(use_item, _)| use_item == item)).collect();
+
+	use_items.iter().enumerate().any(|(index, &a)| {
+		(use_items[index + 1..].iter())
+			.any(|&b| a.krate() == b.krate() && ws.effective_cfg(a) == ws.effective_cfg(b))
+	})
+}
+
+/// Candidates for [`Error::Ambiguous`]; `use` items replaced for imports are described as the imports (`use` paths).
+fn ambiguous(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId], imports: &[(ItemId, ItemId)]) -> Error {
 	Error::Ambiguous {
 		path: path.to_string(),
-		candidates: items.iter().map(|&item| describe(resolver, item)).collect(),
+		candidates: items.iter().map(|&item| describe(resolver, import_of(item, imports))).collect(),
 	}
 }
 
@@ -770,7 +829,8 @@ fn describe_binding(resolver: &Resolver<'_>, binding: &Binding) -> String {
 /// `a fn`, `an enum`, ...
 fn article(kind: ItemKind) -> String {
 	let name = kind.name();
-	let vowel = name.starts_with(['a', 'e', 'i', 'o', 'u']);
+	// (the kinds that start with `u`, `union` and `use`, take "a")
+	let vowel = name.starts_with(['a', 'e', 'i', 'o']);
 
 	format!("{} {name}", if vowel { "an" } else { "a" })
 }
@@ -801,6 +861,8 @@ mod tests {
 		assert_eq!(article(ItemKind::Enum), "an enum");
 		assert_eq!(article(ItemKind::AssocFn), "an assoc-fn");
 		assert_eq!(article(ItemKind::Impl), "an impl");
+		assert_eq!(article(ItemKind::Use), "a use");
+		assert_eq!(article(ItemKind::Union), "a union");
 	}
 
 	#[test]
