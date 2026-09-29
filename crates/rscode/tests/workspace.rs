@@ -1154,17 +1154,28 @@ fn enables_extra_cfgs() {
 
 #[test]
 fn honors_rustflags_from_cargo_configuration() {
+	// rustflags of a `[target]` table: cargo joins them with those of the other matching `[target]` tables (like ones
+	// of the user's configuration), which would replace `build.rustflags`
+	let config = r#"target.'cfg(all())'.rustflags = ["--cfg", "from_config", "--cfg", 'flag="on"']"#;
+
+	// like cargo, `CARGO_ENCODED_RUSTFLAGS` and `RUSTFLAGS` replace the rustflags of cargo's configuration
+	let replaced = ["CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"].iter().any(|name| std::env::var_os(name).is_some());
+	let (set, unset) = match replaced {
+		true => (Tristate::Unknown, Tristate::Unknown),
+		false => (Tristate::True, Tristate::False),
+	};
+
 	for exact_features in [false, true] {
 		let plan = plan(&with(packages(virtual_ws(), &["real-core"]), |options| {
-			options.config = vec![r#"build.rustflags = ["--cfg", "from_config", "--cfg", 'flag="on"']"#.to_owned()];
+			options.config = vec![config.to_owned()];
 			options.exact_features = exact_features;
 		}));
 
 		let core = krate(&plan, "real_core", TargetKind::Lib);
 
-		assert_eq!(eval(core, "from_config"), Tristate::True);
-		assert_eq!(eval(core, r#"flag = "on""#), Tristate::True);
-		assert_eq!(eval(core, r#"flag = "off""#), Tristate::False);
+		assert_eq!(eval(core, "from_config"), set);
+		assert_eq!(eval(core, r#"flag = "on""#), set);
+		assert_eq!(eval(core, r#"flag = "off""#), unset);
 	}
 
 	let message = cargo_error(&with(virtual_ws(), |options| options.config = vec!["not valid toml [".to_owned()]));

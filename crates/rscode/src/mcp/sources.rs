@@ -6,6 +6,7 @@
 
 use super::render;
 use crate::edit::EditSet;
+use crate::load::without_verbatim_prefix;
 use crate::workspace::LoadOptions;
 use crate::workspace::plan_workspace;
 use glob::MatchOptions;
@@ -17,7 +18,6 @@ use std::path::Component;
 use std::path::MAIN_SEPARATOR;
 use std::path::Path;
 use std::path::PathBuf;
-use std::path::Prefix;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -227,7 +227,7 @@ pub(crate) fn resolve(path: &Path) -> PathBuf {
 		let prefix: PathBuf = components[..split].iter().collect();
 
 		if let Ok(canonical) = std::fs::canonicalize(&prefix) {
-			return normalized(simplify(canonical), &components[split..]);
+			return normalized(without_verbatim_prefix(canonical), &components[split..]);
 		}
 	}
 
@@ -248,24 +248,6 @@ fn normalized(mut base: PathBuf, components: &[Component<'_>]) -> PathBuf {
 	}
 
 	base
-}
-
-/// `path` without the `\\?\` that canonicalizing gives Windows paths on disks, as they are usually written.
-fn simplify(path: PathBuf) -> PathBuf {
-	let mut components = path.components();
-
-	let Some(Component::Prefix(prefix)) = components.next() else {
-		return path;
-	};
-
-	let Prefix::VerbatimDisk(disk) = prefix.kind() else {
-		return path;
-	};
-
-	let mut simple = PathBuf::from(format!("{}:{MAIN_SEPARATOR}", char::from(disk)));
-
-	simple.extend(components.filter(|component| matches!(component, Component::Normal(_))));
-	simple
 }
 
 /// The best access the exposures give the workspace or package whose manifest is in `directory` (resolved).
@@ -310,7 +292,7 @@ impl Source {
 	/// Checks that the source's manifest is still where it was attached (e.g. that no symbolic link now leads
 	/// elsewhere), so that it is still exposed.
 	pub(crate) fn check(&self, name: &str) -> Result<(), String> {
-		match std::fs::canonicalize(&self.manifest).map(simplify) {
+		match std::fs::canonicalize(&self.manifest).map(without_verbatim_prefix) {
 			Ok(path) if path == self.manifest => Ok(()),
 
 			Ok(path) => Err(format!(
@@ -389,7 +371,9 @@ pub(crate) fn manifest(text: &str) -> Result<PathBuf, String> {
 		true => path.join("Cargo.toml"),
 		false => path.to_path_buf(),
 	};
-	let manifest = std::fs::canonicalize(&path).map(simplify).map_err(|error| format!("{}: {error}", path.display()))?;
+	let manifest = std::fs::canonicalize(&path)
+		.map(without_verbatim_prefix)
+		.map_err(|error| format!("{}: {error}", path.display()))?;
 
 	match manifest.is_file() && manifest.file_name().is_some_and(|name| name == "Cargo.toml") {
 		true => Ok(manifest),

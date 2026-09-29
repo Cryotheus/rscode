@@ -46,7 +46,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		// what to format is decided before the edit changes the items
 		let targets = args.format.then(|| format_edited::replaced(&resolver, &path, &plan.files));
 
-		plan.edits.apply()?;
+		report.warnings.extend(plan.edits.apply()?.warnings);
 
 		if let Some(targets) = targets {
 			let (formatted, warnings) = format_edited::format(&options, targets, &paths);

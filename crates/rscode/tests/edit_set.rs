@@ -207,6 +207,98 @@ fn moves_in_a_cycle_through_a_temporary_name() {
 }
 
 #[test]
+fn moves_to_names_in_another_case() {
+	let dir = TempDir::new("case");
+	let lib = dir.file("src/lib.rs", "mod Shapes;\n");
+
+	dir.file("src/Shapes.rs", "mod Round;\n");
+	dir.file("src/Shapes/Round.rs", "struct Circle;\n");
+
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(4, 10), "shapes");
+	edits.move_path(dir.path("src/Shapes.rs"), dir.path("src/shapes.rs"));
+	edits.move_path(dir.path("src/Shapes"), dir.path("src/shapes"));
+
+	// (on file systems that ignore case, as on Windows and macOS, the new paths name the moved ones)
+	let applied = edits.apply().unwrap();
+
+	assert_eq!(dir.listing(), ["src/lib.rs", "src/shapes.rs", "src/shapes/Round.rs"]);
+	assert_eq!(dir.read("src/lib.rs"), "mod shapes;\n");
+	assert_eq!(applied.moved.len(), 2);
+}
+
+#[test]
+fn undoes_everything_when_a_step_fails() {
+	let dir = TempDir::new("undo");
+	let lib = dir.file("src/lib.rs", "mod a;\nmod c;\nmod d;\n");
+	let a = dir.file("src/a.rs", "struct A;\n");
+
+	dir.file("src/c.rs", "struct C;\n");
+	dir.file("src/d.rs", "struct D;\n");
+	dir.file("blocker", "a file where a directory is needed\n");
+
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(4, 5), "b");
+	edits.replace(&a, range(7, 8), "B");
+	edits.move_path(dir.path("src/a.rs"), dir.path("src/b.rs"));
+	edits.move_path(dir.path("src/d.rs"), dir.path("src/new/d.rs"));
+	edits.move_path(dir.path("src/c.rs"), dir.path("blocker/c.rs"));
+
+	// files are written, `src/a.rs` and `src/d.rs` moved (into the new directory `src/new`), and then moving
+	// `src/c.rs` fails: all of it is undone
+	let error = edits.apply().unwrap_err();
+
+	assert!(
+		matches!(&error, Error::Apply { path, kept, .. } if *path == dir.path("src/c.rs") && kept.is_empty()),
+		"{error:?}"
+	);
+	assert!(error.to_string().ends_with("; nothing was changed"), "{error}");
+	assert_eq!(dir.listing(), ["blocker", "src/a.rs", "src/c.rs", "src/d.rs", "src/lib.rs"]);
+	assert_eq!(dir.read("src/lib.rs"), "mod a;\nmod c;\nmod d;\n");
+	assert_eq!(dir.read("src/a.rs"), "struct A;\n");
+	assert!(!dir.path("src/new").exists());
+}
+
+/// On Windows, a file that another process has open (without sharing its deletion) cannot be moved or deleted.
+#[cfg(windows)]
+#[test]
+fn undoes_everything_when_a_file_is_in_use() {
+	use std::os::windows::fs::OpenOptionsExt;
+
+	let dir = TempDir::new("in-use");
+	let lib = dir.file("src/lib.rs", "mod a;\nmod gone;\n");
+
+	dir.file("src/a.rs", "struct A;\n");
+	dir.file("src/gone.rs", "struct Gone;\n");
+
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(0, 17), "mod b;\n");
+	edits.move_path(dir.path("src/a.rs"), dir.path("src/b.rs"));
+	edits.delete_path(dir.path("src/gone.rs"));
+
+	// opened without sharing anything
+	let open = fs::OpenOptions::new().read(true).share_mode(0).open(dir.path("src/gone.rs")).unwrap();
+	let error = edits.apply().unwrap_err();
+
+	drop(open);
+
+	assert!(
+		matches!(&error, Error::Apply { path, kept, .. } if *path == dir.path("src/gone.rs") && kept.is_empty()),
+		"{error:?}"
+	);
+	assert_eq!(dir.listing(), ["src/a.rs", "src/gone.rs", "src/lib.rs"]);
+	assert_eq!(dir.read("src/lib.rs"), "mod a;\nmod gone;\n");
+
+	// once it is closed
+	edits.apply().unwrap();
+
+	assert_eq!(dir.listing(), ["src/b.rs", "src/lib.rs"]);
+}
+
+#[test]
 fn refuses_to_overwrite_with_a_move() {
 	let dir = TempDir::new("overwrite");
 	let lib = dir.file("src/lib.rs", "mod a;\n");

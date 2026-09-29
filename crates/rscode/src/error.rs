@@ -78,6 +78,21 @@ pub enum Error {
 		second: std::ops::Range<usize>,
 	},
 
+	/// Applying an edit failed partway (see [`EditSet::apply`](crate::EditSet::apply)), such as on a file or directory
+	/// that another process has open (on Windows). What the edit changed before was undone, except for what `kept`
+	/// lists.
+	#[error("{}: {source}; {}", path.display(), undo_summary(kept))]
+	Apply {
+		/// The file or directory whose change failed.
+		path: PathBuf,
+
+		/// What failed.
+		source: std::io::Error,
+
+		/// The changes made before the failure that could not be undone, one line each (with why).
+		kept: Vec<String>,
+	},
+
 	/// An edited file would no longer parse, so nothing is written.
 	#[error("the edit would leave {} unparsable ({location}: {message}); nothing was written", path.display())]
 	EditBreaksSyntax {
@@ -123,5 +138,13 @@ pub enum Error {
 impl Error {
 	pub(crate) fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
 		Self::Io { path: path.into(), source }
+	}
+}
+
+/// The end of the message of [`Error::Apply`].
+fn undo_summary(kept: &[String]) -> String {
+	match kept.is_empty() {
+		true => "nothing was changed".to_owned(),
+		false => format!("undoing the edit failed, so these changes stay:\n{}", kept.join("\n")),
 	}
 }

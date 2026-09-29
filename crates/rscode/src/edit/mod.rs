@@ -1,7 +1,8 @@
 //! Modifying operations: removing, renaming, replacing, inserting, and formatting items.
 //!
 //! Operations produce an [`EditSet`] describing every change, which can be previewed (as new file contents or a
-//! diff) or applied. Applying is all-or-nothing: every edited file must still parse before anything is written.
+//! diff) or applied. Applying is all-or-nothing: every edited file must still parse before anything is written, and
+//! when writing fails partway, what was changed before is undone.
 
 mod format;
 mod remove;
@@ -42,6 +43,7 @@ use crate::source::TextRange;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -394,9 +396,15 @@ impl EditSet {
 	///
 	/// Before anything is written, this also checks that every edited file still has the contents its edits were
 	/// computed from (so changes made after loading are not overwritten), that moved and deleted paths exist, and
-	/// that no move would overwrite an existing path. Files are written atomically: every new content is written to
-	/// a temporary file next to its file first, and only when all of them are written are they renamed over the
-	/// originals (symbolic links are written through, and permissions are preserved).
+	/// that no move would overwrite an existing path. (A move to the path of the moved file or directory in another
+	/// case, which names it already on file systems that ignore case, as on Windows and macOS, changes the case of its
+	/// name.)
+	///
+	/// Applying is all-or-nothing: new contents are written to temporary files next to their files first, and deleted
+	/// paths are moved to temporary names, to be removed once everything else succeeded. When a step fails (such as on
+	/// Windows, on a file that another process has open, or on a directory with such a file), the steps before it are
+	/// undone, and [`Error::Apply`] tells what failed (and what could not be undone, if anything). Symbolic links are
+	/// written through, and permissions are preserved.
 	pub fn apply(&self) -> Result<Applied, Error> {
 		let changes = self.preview()?;
 		let to_write: Vec<&FileChange> = changes.iter().filter(|change| change.is_changed()).collect();
@@ -409,22 +417,18 @@ impl EditSet {
 
 		self.check_moves_and_deletions(&deletions)?;
 
-		let written = write_files(&to_write)?;
-		let mut moved = Vec::with_capacity(self.moves.len());
+		let mut transaction = Transaction::default();
 
-		for (from, to) in &self.moves {
-			move_path(from, to)?;
-			moved.push((from.clone(), to.clone()));
+		if let Err(Failure { path, source }) = transaction.perform(&to_write, &self.moves, &deletions) {
+			return Err(Error::Apply { path, source, kept: transaction.undo() });
 		}
 
-		let mut deleted = Vec::with_capacity(deletions.len());
-
-		for path in deletions {
-			delete_path(path)?;
-			deleted.push(path.to_path_buf());
-		}
-
-		Ok(Applied { written, moved, deleted })
+		Ok(Applied {
+			written: to_write.iter().map(|change| change.path.clone()).collect(),
+			moved: self.moves.clone(),
+			deleted: deletions.iter().map(|path| path.to_path_buf()).collect(),
+			warnings: transaction.commit(),
+		})
 	}
 
 	/// Deletions that are not inside of another deleted directory.
@@ -456,7 +460,10 @@ impl EditSet {
 				));
 			}
 
-			if exists(&events, to) {
+			// (on file systems that ignore case, a path of `from` in another case names it: the move changes the case)
+			let on_disk = |path: &Path| !events.iter().any(|(event, _)| path.starts_with(event));
+
+			if exists(&events, to) && !(on_disk(from) && on_disk(to) && names_same_entry(from, to)) {
 				let message = format!("cannot move `{}` here: the destination exists", from.display());
 
 				return Err(Error::io(to, io::Error::new(io::ErrorKind::AlreadyExists, message)));
@@ -499,6 +506,10 @@ pub struct Applied {
 
 	/// Paths that were deleted (not repeating paths inside of deleted directories).
 	pub deleted: Vec<PathBuf>,
+
+	/// Problems that did not keep the edit from being applied (such as a deleted path that could not be removed from
+	/// the temporary name it was moved to).
+	pub warnings: Vec<String>,
 }
 
 fn overlap(path: &Path, first: TextRange, second: TextRange) -> Error {
@@ -556,6 +567,243 @@ fn check_unmodified(change: &FileChange) -> Result<(), Error> {
 	Ok(())
 }
 
+/// Whether moving `from` to `to` would overwrite an existing file or directory: whether `to` names one, other than
+/// `from` itself in another case (see [`names_same_entry`]).
+pub(crate) fn destination_exists(from: &Path, to: &Path) -> bool {
+	fs::symlink_metadata(to).is_ok() && !names_same_entry(from, to)
+}
+
+/// Whether `to` (which exists) names the entry of its directory that `from` names: whether their names differ only in
+/// case, the directory has a single entry of that name in any case (so the file system ignores case in it, as on
+/// Windows and macOS), and both paths lead to the same file (and not to two files whose names differ otherwise, such
+/// as in how their accents are encoded, on file systems that ignore that but not case).
+fn names_same_entry(from: &Path, to: &Path) -> bool {
+	let key = to.file_name().and_then(case_key);
+
+	if from == to || from.parent() != to.parent() || key.is_none() || from.file_name().and_then(case_key) != key {
+		return false;
+	}
+
+	let directory = to.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+	let Ok(entries) = fs::read_dir(directory) else {
+		return false;
+	};
+
+	entries.filter_map(Result::ok).filter(|entry| case_key(&entry.file_name()) == key).count() == 1
+		&& same_file::is_same_file(from, to).unwrap_or(false)
+}
+
+/// A file name in upper case (as Windows compares names), to compare names ignoring case.
+fn case_key(name: &OsStr) -> Option<String> {
+	name.to_str().map(str::to_uppercase)
+}
+
+/// A step of [`EditSet::apply`] that failed: the path it failed on, and why.
+#[derive(Debug)]
+struct Failure {
+	path: PathBuf,
+	source: io::Error,
+}
+
+impl Failure {
+	fn at(path: &Path, source: io::Error) -> Self {
+		Self { path: path.to_path_buf(), source }
+	}
+}
+
+/// The steps [`EditSet::apply`] performed, which are undone when a later one fails.
+#[derive(Default)]
+struct Transaction<'a> {
+	steps: Vec<Step<'a>>,
+}
+
+/// A step of [`EditSet::apply`].
+enum Step<'a> {
+	/// A file was replaced with its new contents (the file of `path`, or the file a symbolic link at `path` points to);
+	/// undone by writing its original contents back, unless it changed since.
+	Written { path: &'a Path, original: &'a str, written: &'a str },
+
+	/// A directory was created to move a path into; undone by removing it (if it is empty).
+	Created(PathBuf),
+
+	/// A file or directory was moved, maybe through a temporary name (to change the case of its name); undone by moving
+	/// it back (through that name again).
+	Moved { from: PathBuf, to: PathBuf, through: Option<PathBuf> },
+
+	/// A file or directory to delete was moved to a temporary name, to be removed once every step succeeded; undone by
+	/// moving it back.
+	Deleted { path: &'a Path, temporary: PathBuf },
+}
+
+impl<'a> Transaction<'a> {
+	/// Writes files, then moves paths, then moves the paths to delete to temporary names, until a step fails.
+	fn perform(
+		&mut self,
+		changes: &[&'a FileChange],
+		moves: &[(PathBuf, PathBuf)],
+		deletions: &[&'a Path],
+	) -> Result<(), Failure> {
+		self.write(changes)?;
+
+		for (from, to) in moves {
+			self.move_path(from, to)?;
+		}
+
+		for &path in deletions {
+			let temporary = unused_temporary_path(path);
+
+			fs::rename(path, &temporary).map_err(|source| Failure::at(path, source))?;
+			self.steps.push(Step::Deleted { path, temporary });
+		}
+
+		Ok(())
+	}
+
+	/// Writes every change to a temporary file, then renames them all over their files (so that failing to write one
+	/// changes nothing).
+	fn write(&mut self, changes: &[&'a FileChange]) -> Result<(), Failure> {
+		let mut staged = Vec::with_capacity(changes.len());
+
+		for change in changes {
+			match stage(&change.path, &change.formatted) {
+				Ok(file) => staged.push(file),
+				Err(failure) => {
+					remove_temporaries(&staged);
+					return Err(failure);
+				}
+			}
+		}
+
+		for (index, (file, change)) in staged.iter().zip(changes).enumerate() {
+			if let Err(source) = fs::rename(&file.temporary, &file.target) {
+				remove_temporaries(&staged[index..]);
+				return Err(Failure::at(file.path, source));
+			}
+
+			self.steps.push(Step::Written {
+				path: &change.path,
+				original: &change.original,
+				written: &change.formatted,
+			});
+		}
+
+		Ok(())
+	}
+
+	/// Moves a path, creating the directories it moves into. A move that only changes the case of the name goes through
+	/// a temporary name: moving a path to a name it has already (ignoring case) changes nothing on some file systems
+	/// that ignore case (Linux's, and under Wine).
+	fn move_path(&mut self, from: &Path, to: &Path) -> Result<(), Failure> {
+		self.create_parents(to)?;
+
+		if fs::symlink_metadata(to).is_err() {
+			return self.rename(from, to);
+		}
+
+		if !names_same_entry(from, to) {
+			let message = format!("cannot move `{}` here: the destination exists", from.display());
+
+			return Err(Failure::at(to, io::Error::new(io::ErrorKind::AlreadyExists, message)));
+		}
+
+		let temporary = unused_temporary_path(from);
+
+		fs::rename(from, &temporary).map_err(|source| Failure::at(from, source))?;
+
+		let moved = fs::rename(&temporary, to);
+		let step = match moved {
+			Ok(()) => Step::Moved { from: from.to_path_buf(), to: to.to_path_buf(), through: Some(temporary) },
+
+			// (undone like a move to the temporary name)
+			Err(_) => Step::Moved { from: from.to_path_buf(), to: temporary, through: None },
+		};
+
+		self.steps.push(step);
+		moved.map_err(|source| Failure::at(from, source))
+	}
+
+	fn rename(&mut self, from: &Path, to: &Path) -> Result<(), Failure> {
+		fs::rename(from, to).map_err(|source| Failure::at(from, source))?;
+		self.steps.push(Step::Moved { from: from.to_path_buf(), to: to.to_path_buf(), through: None });
+		Ok(())
+	}
+
+	/// Creates the missing directories a path is in.
+	fn create_parents(&mut self, path: &Path) -> Result<(), Failure> {
+		let missing: Vec<&Path> = (path.ancestors().skip(1))
+			.take_while(|directory| !directory.as_os_str().is_empty() && fs::symlink_metadata(directory).is_err())
+			.collect();
+
+		// the outermost first
+		for &directory in missing.iter().rev() {
+			match fs::create_dir(directory) {
+				Ok(()) => self.steps.push(Step::Created(directory.to_path_buf())),
+
+				// (created by someone else in the meantime)
+				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+				Err(source) => return Err(Failure::at(directory, source)),
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Undoes every step, the last first. Returns the changes that stay because undoing them failed, one line each.
+	fn undo(self) -> Vec<String> {
+		self.steps.into_iter().rev().filter_map(|step| step.undo().err()).collect()
+	}
+
+	/// Removes the paths moved to temporary names for deletion. The edit is applied by then, so failing to remove one
+	/// is only a warning (returned).
+	fn commit(self) -> Vec<String> {
+		let mut warnings = Vec::new();
+
+		for step in self.steps {
+			if let Step::Deleted { path, temporary } = step
+				&& let Err(error) = delete_path(&temporary)
+			{
+				warnings.push(format!(
+					"`{}` was deleted, but removing it from its temporary name `{}` failed: {error}",
+					path.display(),
+					temporary.display()
+				));
+			}
+		}
+
+		warnings
+	}
+}
+
+impl Step<'_> {
+	/// Undoes the step, or tells what stays changed.
+	fn undo(&self) -> Result<(), String> {
+		match self {
+			Step::Written { path, original, written } => restore(path, original, written)
+				.map_err(|error| format!("`{}` was not restored to its original contents ({error})", path.display())),
+
+			Step::Created(directory) => fs::remove_dir(directory)
+				.map_err(|error| format!("the new directory `{}` stays ({error})", directory.display())),
+
+			Step::Moved { from, to, through } => match through {
+				None => move_back(to, from).map_err(|error| stays_moved(from, to, error)),
+				Some(temporary) => {
+					move_back(to, temporary).map_err(|error| stays_moved(from, to, error))?;
+					move_back(temporary, from).map_err(|error| stays_moved(from, temporary, error))
+				}
+			},
+
+			Step::Deleted { path, temporary } => {
+				move_back(temporary, path).map_err(|error| stays_moved(path, temporary, error))
+			}
+		}
+	}
+}
+
+/// That a moved path stays where it was moved (as undoing the move failed), for [`Error::Apply`].
+fn stays_moved(path: &Path, at: &Path, error: io::Error) -> String {
+	format!("`{}` stays moved to `{}` ({error})", path.display(), at.display())
+}
+
 /// A file written next to the file it will replace.
 struct Staged<'a> {
 	/// The path the edits are keyed by.
@@ -567,34 +815,6 @@ struct Staged<'a> {
 	temporary: PathBuf,
 }
 
-/// Writes every change to a temporary file, then renames them all over their files.
-fn write_files(changes: &[&FileChange]) -> Result<Vec<PathBuf>, Error> {
-	let mut staged: Vec<Staged<'_>> = Vec::with_capacity(changes.len());
-
-	for change in changes {
-		match stage(change) {
-			Ok(file) => staged.push(file),
-			Err(error) => {
-				remove_temporaries(&staged);
-				return Err(error);
-			}
-		}
-	}
-
-	let mut written = Vec::with_capacity(staged.len());
-
-	for (index, file) in staged.iter().enumerate() {
-		if let Err(source) = fs::rename(&file.temporary, &file.target) {
-			remove_temporaries(&staged[index..]);
-			return Err(Error::io(file.path, source));
-		}
-
-		written.push(file.path.to_path_buf());
-	}
-
-	Ok(written)
-}
-
 fn remove_temporaries(staged: &[Staged<'_>]) {
 	for file in staged {
 		// best effort: the temporary file may not exist anymore
@@ -602,28 +822,23 @@ fn remove_temporaries(staged: &[Staged<'_>]) {
 	}
 }
 
-/// Writes a change to a new temporary file in the directory of the file it replaces, with the file's permissions.
-fn stage(change: &FileChange) -> Result<Staged<'_>, Error> {
-	static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-	let path = change.path.as_path();
-	let io_error = |source| Error::io(path, source);
-	let is_link = fs::symlink_metadata(path).map_err(io_error)?.file_type().is_symlink();
-	let target = if is_link { fs::canonicalize(path).map_err(io_error)? } else { path.to_path_buf() };
-	let permissions = fs::metadata(&target).map_err(io_error)?.permissions();
-	let directory = target.parent().unwrap_or(Path::new("."));
-	let name = target.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy());
+/// Writes contents to a new temporary file in the directory of the file of `path` (which may be a symbolic link to it),
+/// with the file's permissions.
+fn stage<'a>(path: &'a Path, contents: &str) -> Result<Staged<'a>, Failure> {
+	let failure = |source| Failure::at(path, source);
+	let is_link = fs::symlink_metadata(path).map_err(failure)?.file_type().is_symlink();
+	let target = if is_link { fs::canonicalize(path).map_err(failure)? } else { path.to_path_buf() };
+	let permissions = fs::metadata(&target).map_err(failure)?.permissions();
 
 	loop {
-		let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-		let temporary = directory.join(format!(".{name}.rscode-{}-{count}.tmp", std::process::id()));
+		let temporary = temporary_path(&target);
 		let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&temporary) {
 			Ok(file) => file,
 			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-			Err(error) => return Err(io_error(error)),
+			Err(error) => return Err(failure(error)),
 		};
 		let written = file
-			.write_all(change.formatted.as_bytes())
+			.write_all(contents.as_bytes())
 			.and_then(|()| file.set_permissions(permissions.clone()))
 			.and_then(|()| file.sync_all());
 
@@ -633,32 +848,60 @@ fn stage(change: &FileChange) -> Result<Staged<'_>, Error> {
 			// best effort: the error that matters is the write error
 			let _ = fs::remove_file(&temporary);
 
-			return Err(io_error(error));
+			return Err(failure(error));
 		}
 
 		return Ok(Staged { path, target, temporary });
 	}
 }
 
-fn move_path(from: &Path, to: &Path) -> Result<(), Error> {
-	if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-		fs::create_dir_all(parent).map_err(|source| Error::io(parent, source))?;
+/// Writes a file's original contents back (like new contents are written), unless it does not have the contents
+/// written to it anymore: someone else's changes are not undone.
+fn restore(path: &Path, original: &str, written: &str) -> io::Result<()> {
+	if fs::read(path)? != written.as_bytes() {
+		return Err(io::Error::other("it changed after the edit wrote it"));
 	}
 
-	if fs::symlink_metadata(to).is_ok() {
-		let message = format!("cannot move `{}` here: the destination exists", from.display());
+	let file = stage(path, original).map_err(|failure| failure.source)?;
 
-		return Err(Error::io(to, io::Error::new(io::ErrorKind::AlreadyExists, message)));
-	}
-
-	fs::rename(from, to).map_err(|source| Error::io(from, source))
+	fs::rename(&file.temporary, &file.target).inspect_err(|_| remove_temporaries(std::slice::from_ref(&file)))
 }
 
-fn delete_path(path: &Path) -> Result<(), Error> {
-	let metadata = fs::symlink_metadata(path).map_err(|source| Error::io(path, source))?;
-	let result = if metadata.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+/// Moves a path back to where it was, unless something else is there now.
+fn move_back(from: &Path, to: &Path) -> io::Result<()> {
+	if fs::symlink_metadata(to).is_ok() {
+		return Err(io::Error::new(io::ErrorKind::AlreadyExists, "something else is there now"));
+	}
 
-	result.map_err(|source| Error::io(path, source))
+	fs::rename(from, to)
+}
+
+fn delete_path(path: &Path) -> io::Result<()> {
+	match fs::symlink_metadata(path)?.is_dir() {
+		true => fs::remove_dir_all(path),
+		false => fs::remove_file(path),
+	}
+}
+
+/// A new path next to `path`, for a temporary file or name: `.<name>.rscode-<process>-<count>.tmp`.
+fn temporary_path(path: &Path) -> PathBuf {
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+	let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let name = path.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy());
+
+	path.with_file_name(format!(".{name}.rscode-{}-{count}.tmp", std::process::id()))
+}
+
+/// A temporary path next to `path` (see [`temporary_path`]) that names nothing yet.
+fn unused_temporary_path(path: &Path) -> PathBuf {
+	loop {
+		let temporary = temporary_path(path);
+
+		if fs::symlink_metadata(&temporary).is_err() {
+			return temporary;
+		}
+	}
 }
 
 #[cfg(test)]
@@ -955,5 +1198,186 @@ mod tests {
 
 		assert_eq!(edits.deletions().len(), 3);
 		assert_eq!(edits.effective_deletions(), [Path::new("/x/a"), Path::new("/x/ab.rs")]);
+	}
+
+	/// A new directory for temporary test data, removed when dropped.
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new(name: &str) -> Self {
+			let path = std::env::temp_dir().join(format!("rscode-edit-{}-{name}", std::process::id()));
+
+			let _ = fs::remove_dir_all(&path);
+			fs::create_dir_all(&path).unwrap();
+			Self(path)
+		}
+
+		fn path(&self, relative: &str) -> PathBuf {
+			self.0.join(relative)
+		}
+
+		/// Writes a file (creating its directory).
+		fn write(&self, relative: &str, text: &str) -> PathBuf {
+			let path = self.path(relative);
+
+			fs::create_dir_all(path.parent().unwrap()).unwrap();
+			fs::write(&path, text).unwrap();
+			path
+		}
+
+		/// Every directory and file (with its contents) below the directory, with `/` separators, sorted.
+		fn snapshot(&self) -> Vec<(String, Option<String>)> {
+			fn walk(directory: &Path, root: &Path, entries: &mut Vec<(String, Option<String>)>) {
+				for entry in fs::read_dir(directory).unwrap() {
+					let path = entry.unwrap().path();
+					let name = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+
+					if path.is_dir() {
+						entries.push((name, None));
+						walk(&path, root, entries);
+					} else {
+						entries.push((name, Some(fs::read_to_string(&path).unwrap())));
+					}
+				}
+			}
+
+			let mut entries = Vec::new();
+
+			walk(&self.0, &self.0, &mut entries);
+			entries.sort();
+			entries
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn change(path: &Path, original: &str, formatted: &str) -> FileChange {
+		FileChange { path: path.to_path_buf(), original: original.to_owned(), formatted: formatted.to_owned() }
+	}
+
+	#[test]
+	fn undoes_what_was_applied() {
+		let dir = TempDir::new("undo");
+		let lib = dir.write("src/lib.rs", "mod a;\nmod gone;\n");
+		let a = dir.write("src/a.rs", "struct A;\n");
+
+		dir.write("src/Case.rs", "struct Case;\n");
+		dir.write("src/moved/x.rs", "struct X;\n");
+		dir.write("src/gone.rs", "struct Gone;\n");
+		dir.write("src/gone/inner.rs", "struct Inner;\n");
+
+		let changes = [change(&lib, "mod a;\nmod gone;\n", "mod b;\n"), change(&a, "struct A;\n", "struct B;\n")];
+		let changes: Vec<&FileChange> = changes.iter().collect();
+		let moves = [
+			(a.clone(), dir.path("src/b.rs")),
+			// (only the case changes, on file systems that ignore case)
+			(dir.path("src/Case.rs"), dir.path("src/case.rs")),
+			// into directories that do not exist yet
+			(dir.path("src/moved"), dir.path("src/deep/er/moved")),
+		];
+		let deletions = [dir.path("src/gone.rs"), dir.path("src/gone")];
+		let deletions: Vec<&Path> = deletions.iter().map(PathBuf::as_path).collect();
+		let before = dir.snapshot();
+
+		// undone after writing, after each move, and after each deletion
+		let prefixes = (0..=moves.len())
+			.map(|moved| (moved, 0))
+			.chain((1..=deletions.len()).map(|deleted| (moves.len(), deleted)));
+
+		for (moved, deleted) in prefixes {
+			let mut transaction = Transaction::default();
+
+			transaction.perform(&changes, &moves[..moved], &deletions[..deleted]).unwrap();
+
+			assert_ne!(dir.snapshot(), before);
+			assert!(transaction.undo().is_empty());
+			assert_eq!(dir.snapshot(), before, "after {moved} moves and {deleted} deletions");
+		}
+
+		// committed, the deleted paths are removed from their temporary names
+		let mut transaction = Transaction::default();
+
+		transaction.perform(&changes, &moves, &deletions).unwrap();
+
+		assert!(transaction.commit().is_empty());
+
+		let file = |name: &str, text: &str| (name.to_owned(), Some(text.to_owned()));
+		let directory = |name: &str| (name.to_owned(), None);
+
+		assert_eq!(
+			dir.snapshot(),
+			[
+				directory("src"),
+				file("src/b.rs", "struct B;\n"),
+				file("src/case.rs", "struct Case;\n"),
+				directory("src/deep"),
+				directory("src/deep/er"),
+				directory("src/deep/er/moved"),
+				file("src/deep/er/moved/x.rs", "struct X;\n"),
+				file("src/lib.rs", "mod b;\n"),
+			]
+		);
+	}
+
+	#[test]
+	fn undoing_keeps_what_others_changed() {
+		let dir = TempDir::new("undo-conflict");
+		let a = dir.write("a.rs", "struct A;\n");
+		let c = dir.write("c.rs", "struct C;\n");
+		let changes = [change(&a, "struct A;\n", "struct B;\n"), change(&c, "struct C;\n", "struct D;\n")];
+		let changes: Vec<&FileChange> = changes.iter().collect();
+		let mut transaction = Transaction::default();
+
+		transaction.perform(&changes, &[(a.clone(), dir.path("b.rs"))], &[]).unwrap();
+
+		// someone else creates `a.rs` again, and changes `c.rs`: moving `b.rs` back, or writing `c.rs` back, would
+		// overwrite what they wrote
+		dir.write("a.rs", "struct Other;\n");
+		dir.write("c.rs", "struct Changed;\n");
+
+		let stays_moved =
+			format!("`{}` stays moved to `{}` (something else is there now)", a.display(), dir.path("b.rs").display());
+		let not_restored = |path: &Path| {
+			let reason = "it changed after the edit wrote it";
+
+			format!("`{}` was not restored to its original contents ({reason})", path.display())
+		};
+
+		assert_eq!(transaction.undo(), [stays_moved, not_restored(&c), not_restored(&a)]);
+		assert_eq!(fs::read_to_string(&a).unwrap(), "struct Other;\n");
+		assert_eq!(fs::read_to_string(dir.path("b.rs")).unwrap(), "struct B;\n");
+		assert_eq!(fs::read_to_string(&c).unwrap(), "struct Changed;\n");
+	}
+
+	#[test]
+	fn names_the_same_entry_only_in_another_case() {
+		let dir = TempDir::new("case");
+		let upper = dir.write("Name.rs", "");
+		let lower = dir.path("name.rs");
+
+		dir.write("sub/name.rs", "");
+
+		assert!(!names_same_entry(&upper, &upper));
+		assert!(!names_same_entry(&upper, &dir.path("sub/name.rs")));
+		assert!(destination_exists(&upper, &dir.path("sub/name.rs")));
+
+		// `name.rs` names `Name.rs` on file systems that ignore case (and nothing on others)
+		assert!(!destination_exists(&upper, &lower));
+
+		match fs::symlink_metadata(&lower).is_ok() {
+			true => assert!(names_same_entry(&upper, &lower)),
+
+			// where names in another case name other files
+			false => {
+				dir.write("name.rs", "");
+
+				assert!(!names_same_entry(&upper, &lower));
+				assert!(destination_exists(&upper, &lower));
+			}
+		}
 	}
 }

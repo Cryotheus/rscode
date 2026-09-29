@@ -515,7 +515,9 @@ fn finish(
 		}
 
 		false => {
-			write(root, edits, permit)?;
+			for warning in write(root, edits, permit)?.warnings {
+				writeln!(text, "warning: {warning}").unwrap();
+			}
 		}
 	}
 

@@ -30,7 +30,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 
 	match args.dry_run {
 		true => report.diff = Some(render::edit_diff(&plan.edits, &paths)?),
-		false => drop(plan.edits.apply()?),
+		false => report.warnings.extend(plan.edits.apply()?.warnings),
 	}
 
 	super::print_report(ui, output.format, &report)?;

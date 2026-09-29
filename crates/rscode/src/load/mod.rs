@@ -70,6 +70,7 @@ use std::collections::HashMap;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::path::Prefix;
 use std::sync::Arc;
 
 /// Index of the crate root module in [`Crate::items`].
@@ -551,7 +552,7 @@ fn parent(path: &mut PathBuf) {
 			if path.is_symlink()
 				&& let Ok(target) = std::fs::canonicalize(&path)
 			{
-				*path = target;
+				*path = without_verbatim_prefix(target);
 			}
 
 			path.pop();
@@ -563,6 +564,52 @@ fn parent(path: &mut PathBuf) {
 	}
 }
 
+/// `path` without the `\\?\` that canonicalizing gives Windows paths, as they are usually written: `\\?\C:\a` as
+/// `C:\a`, and `\\?\UNC\server\share\a` (on a network share) as `\\server\share\a`. Paths that mean something else
+/// without it keep it (see [`is_plain_name`]).
+pub(crate) fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+	plain_form(&path).unwrap_or(path)
+}
+
+/// `path` without its `\\?\` (see [`without_verbatim_prefix`]), if it has one it can do without.
+fn plain_form(path: &Path) -> Option<PathBuf> {
+	let mut components = path.components();
+
+	let Some(Component::Prefix(prefix)) = components.next() else {
+		return None;
+	};
+
+	let prefix = match prefix.kind() {
+		Prefix::VerbatimDisk(disk) => format!("{}:", char::from(disk)),
+		Prefix::VerbatimUNC(server, share) => format!(r"\\{}\{}", server.to_str()?, share.to_str()?),
+		_ => return None,
+	};
+	let mut names = Vec::new();
+
+	for component in components {
+		match component {
+			Component::RootDir => {}
+			Component::Normal(name) => names.push(name.to_str().filter(|name| is_plain_name(name))?),
+			_ => return None,
+		}
+	}
+
+	Some(PathBuf::from(format!(r"{prefix}\{}", names.join(r"\"))))
+}
+
+/// Whether a file name means the same in a path without `\\?\`: Windows takes names like `NUL` and `nul.txt` for
+/// devices, drops the `.` and ` ` that names end with, and does not allow some characters in them.
+fn is_plain_name(name: &str) -> bool {
+	// (the name before its first `.`, without the spaces it ends with: `nul .tar.gz` names `NUL` too)
+	let base = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+	let numbered = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{b9}", "\u{b2}", "\u{b3}"];
+	let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+		|| ((base.starts_with("COM") || base.starts_with("LPT")) && numbered.contains(&&base[3..]));
+	let invalid = |char: char| char < ' ' || "<>:\"/\\|?*".contains(char);
+
+	!(device || name.is_empty() || name.ends_with(['.', ' ']) || name.contains(invalid))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -571,6 +618,50 @@ mod tests {
 	/// starting with `/` has no drive.
 	fn abs(path: &str) -> PathBuf {
 		std::path::absolute(path).unwrap()
+	}
+
+	#[test]
+	fn plain_names() {
+		for name in ["lib.rs", "a b.rs", "console.rs", "com10.rs", "comx.rs", "nul_check.rs", ".hidden", "ünï.rs"] {
+			assert!(is_plain_name(name), "{name}");
+		}
+
+		// devices, names that Windows drops the end of, and names it does not allow
+		let devices = ["NUL", "nul.rs", "Con.tar.gz", "aux .rs", "COM1.rs", "lpt\u{b9}", "CONIN$"];
+
+		for name in devices.into_iter().chain(["a.", "a ", ".", "..", "a:b", "a?"]) {
+			assert!(!is_plain_name(name), "{name}");
+		}
+	}
+
+	#[cfg(windows)]
+	#[test]
+	fn verbatim_prefixes_are_removed_where_they_change_nothing() {
+		let plain = |path: &str| without_verbatim_prefix(PathBuf::from(path)).display().to_string();
+
+		assert_eq!(plain(r"\\?\C:\a\b.rs"), r"C:\a\b.rs");
+		assert_eq!(plain(r"\\?\c:\"), r"C:\");
+		assert_eq!(plain(r"\\?\UNC\server\share\a\b.rs"), r"\\server\share\a\b.rs");
+		assert_eq!(plain(r"\\?\UNC\server\share"), r"\\server\share\");
+
+		// paths without it, and paths that mean something else without it
+		for path in [
+			r"C:\a",
+			r"\\server\share\a",
+			r"\\?\C:\a\nul.rs",
+			r"\\?\C:\a.\b",
+			r"\\?\UNC\server\share\aux",
+			r"\\?\Volume{a2b8b2b6-0000-0000-0000-100000000000}\a",
+			r"\\?\GLOBALROOT\Device\HarddiskVolume1\a",
+		] {
+			assert_eq!(plain(path), path);
+		}
+	}
+
+	#[cfg(not(windows))]
+	#[test]
+	fn paths_have_no_verbatim_prefixes() {
+		assert_eq!(without_verbatim_prefix(PathBuf::from(r"/a/\\?\C:")), Path::new(r"/a/\\?\C:"));
 	}
 
 	#[test]

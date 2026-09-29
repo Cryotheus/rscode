@@ -503,7 +503,8 @@ fn collisions(resolver: &Resolver<'_>, targets: &[ItemId], name: &NewName, moves
 	}
 
 	for (from, to) in moves {
-		if std::fs::symlink_metadata(to).is_ok() {
+		// (on file systems that ignore case, the path of a module's file in another case names the file itself)
+		if super::destination_exists(from, to) {
 			// the module whose file or directory moves
 			let moves_from = |target: ItemId| {
 				let file = ws.item(target).module_info().and_then(|info| info.file_path.as_deref());

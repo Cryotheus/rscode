@@ -218,6 +218,16 @@ impl TempCopy {
 	fn exists(&self, file: &str) -> bool {
 		self.0.join(file).exists()
 	}
+
+	/// The names of the entries of a directory, as the file system has them, sorted.
+	fn names(&self, directory: &str) -> Vec<String> {
+		let mut names: Vec<String> = (std::fs::read_dir(self.0.join(directory)).unwrap())
+			.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+			.collect();
+
+		names.sort();
+		names
+	}
 }
 
 impl Drop for TempCopy {
@@ -882,6 +892,34 @@ fn modules_are_renamed_with_their_files() {
 	}
 
 	cargo_check(copy.path());
+}
+
+#[test]
+fn modules_are_renamed_to_names_in_another_case() {
+	let copy = TempCopy::new("rename_modules", "case");
+	let modules = [("plain", "Plain"), ("nested", "Nested"), ("dir", "Dir"), ("inline", "Inline")];
+
+	// on file systems that ignore case (as on Windows and macOS), the new file names name the old files already
+	for (old, new) in modules {
+		apply(&copy, load_modules, &format!("crate::{old}"), new, &RenameOptions::default());
+	}
+
+	let upper = ["Dir", "Inline", "Nested", "Nested.rs", "Plain.rs", "custom_file.rs", "lib.rs", "occupied.rs"];
+
+	assert_eq!(copy.names("src"), upper);
+	assert_eq!(copy.names("src/Nested"), ["child.rs"]);
+	assert!(copy.read("src/Nested/child.rs").contains("pub(in crate::Nested) fn restricted()"));
+
+	cargo_check(copy.path());
+
+	for (old, new) in modules {
+		apply(&copy, load_modules, &format!("crate::{new}"), old, &RenameOptions::default());
+	}
+
+	let lower = ["custom_file.rs", "dir", "inline", "lib.rs", "nested", "nested.rs", "occupied.rs", "plain.rs"];
+
+	assert_eq!(copy.names("src"), lower);
+	assert_eq!(copy.read("src/lib.rs"), std::fs::read_to_string(fixture("rename_modules/src/lib.rs")).unwrap());
 }
 
 #[test]
