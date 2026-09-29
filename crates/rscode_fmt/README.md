@@ -1,4 +1,4 @@
-# rscode_fmt
+# .rs Code: Fmt
 
 Formatting of Rust source files, or of only some items within them, with rustfmt or prettyplease. Items can be sorted
 with [`rscode_sort`](../rscode_sort) first.

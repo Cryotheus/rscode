@@ -1,4 +1,4 @@
-# rscode_sort
+# .rs Code: Sort
 
 Deterministic sorting of the items in Rust source files.
 

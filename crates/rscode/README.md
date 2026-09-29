@@ -1,4 +1,4 @@
-# rscode
+# .rs Code
 
 Viewing, searching, and editing Rust source files by item path. This is the library behind
 [`cargo rscode`](../cargo-rscode).
