@@ -33,6 +33,6 @@ clap = "4.6.0"
 clap_complete = { version = "4.6.0", features = ["unstable-dynamic"] }
 glob = "0.3.3"
 
-rscode = { path = "crates/rscode", version = "0.1.0" }
-rscode_fmt = { path = "crates/rscode_fmt", version = "0.1.0" }
-rscode_sort = { path = "crates/rscode_sort", version = "0.1.0" }
+rscode = { path = "crates/rscode", version = "1.0.0" }
+rscode_fmt = { path = "crates/rscode_fmt", version = "1.0.0" }
+rscode_sort = { path = "crates/rscode_sort", version = "1.0.0" }
