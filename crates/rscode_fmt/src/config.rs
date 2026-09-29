@@ -1,4 +1,5 @@
-//! The style edition rustfmt formats with, which decides how it orders `use` items.
+//! What rustfmt is configured with that rscode needs to know: the style edition rustfmt formats with, which decides
+//! how it orders `use` items, and its style of line breaks.
 //!
 //! rustfmt takes its style edition from (highest precedence first): a `--config style_edition=..` override,
 //! `--style-edition`, the `style_edition` of its configuration file, the deprecated `version` of that file (`Two` is
@@ -43,6 +44,21 @@ pub(crate) fn style_edition(options: &RustFmtOptions) -> Edition {
 	}
 
 	options.edition.unwrap_or_default()
+}
+
+/// Whether rustfmt's `newline_style` is `Auto`, its default: set to it or to nothing, by a `--config` override or else
+/// by the configuration file.
+pub(crate) fn newline_style_is_auto(options: &RustFmtOptions) -> bool {
+	let overridden = options.config.iter().rev().find(|(key, _)| key == "newline_style");
+	let style = match overridden {
+		Some((_, style)) => Some(style.clone()),
+		None => config_file(options.config_path.as_deref())
+			.and_then(|path| std::fs::read_to_string(path).ok())
+			.and_then(|text| toml_string(&text, "newline_style").map(str::to_owned)),
+	};
+
+	// rustfmt reads the values of its options ignoring case
+	style.is_none_or(|style| style.eq_ignore_ascii_case("Auto"))
 }
 
 /// The configuration file rustfmt reads, given its `config_path` option (see [`RustFmtOptions::config_path`]).
@@ -212,5 +228,31 @@ mod tests {
 		options.config.push(("style_edition".to_owned(), "2024".to_owned()));
 
 		assert_eq!(style_edition(&options), Edition::E2024);
+	}
+
+	#[test]
+	fn newline_style_is_auto_unless_configured() {
+		let tree = Tree::new("newline");
+		let nested = "project/src/nested";
+
+		// without configuration (unless the user has some)
+		if !user_directories().any(|directory| in_directory(&directory).is_some()) {
+			assert!(newline_style_is_auto(&tree.options(nested, None)));
+		}
+
+		tree.write("project/rustfmt.toml", "newline_style = \"Unix\"\n");
+
+		assert!(!newline_style_is_auto(&tree.options(nested, None)));
+
+		tree.write("project/rustfmt.toml", "newline_style = \"auto\"\n");
+
+		assert!(newline_style_is_auto(&tree.options(nested, None)));
+
+		// `--config` overrides over the file
+		let mut options = tree.options(nested, None);
+
+		options.config.push(("newline_style".to_owned(), "Native".to_owned()));
+
+		assert!(!newline_style_is_auto(&options));
 	}
 }

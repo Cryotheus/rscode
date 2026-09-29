@@ -77,13 +77,10 @@ impl Rustfmt {
 		std::fs::write(&config, "").ok()?;
 
 		[Some("+nightly"), None].into_iter().find_map(|toolchain| {
-			let mut command = Command::new("rustfmt");
+			let rustfmt = Self { toolchain, config: config.clone() };
 
-			command.args(toolchain).arg("--version").stdout(Stdio::null()).stderr(Stdio::null());
-
-			let status = command.status().ok()?;
-
-			status.success().then(|| Self { toolchain, config: config.clone() })
+			// by formatting: `--version` succeeds even when no rustup proxy takes the `+toolchain` argument
+			rustfmt.format("").is_ok().then_some(rustfmt)
 		})
 	}
 

@@ -2,7 +2,11 @@
 
 use crate::FormatError;
 use crate::RustFmtOptions;
+use crate::config;
 use crate::source::BOM;
+use crate::source::uses_crlf;
+use crate::source::with_line_breaks;
+use std::borrow::Cow;
 use std::io;
 use std::io::Write;
 use std::path::Path;
@@ -112,6 +116,15 @@ fn run(source: &str, options: &RustFmtOptions, forced: &[(&str, &str)]) -> Resul
 	// rustfmt drops a byte order mark from its input, but keeps it when it formats files
 	if source.starts_with(BOM) && !formatted.starts_with(BOM) {
 		formatted.insert_str(0, BOM);
+	}
+
+	// `newline_style = "Auto"` means the line breaks of the input, but rustfmt sees its input with `\r\n` turned into
+	// `\n`, and gives input without line breaks those of the platform: keep the input's (`\n` if it has none, so that
+	// the output is the same on every platform)
+	if config::newline_style_is_auto(options)
+		&& let Cow::Owned(converted) = with_line_breaks(&formatted, uses_crlf(source))
+	{
+		formatted = converted;
 	}
 
 	Ok(formatted)
@@ -247,7 +260,7 @@ mod tests {
 		assert!(!is_relative_path(Path::new("rustfmt")));
 		assert!(is_relative_path(Path::new("./rustfmt")));
 		assert!(is_relative_path(Path::new("bin/rustfmt")));
-		assert!(!is_relative_path(Path::new("/usr/bin/rustfmt")));
+		assert!(!is_relative_path(&std::path::absolute("bin/rustfmt").unwrap()));
 	}
 
 	#[test]

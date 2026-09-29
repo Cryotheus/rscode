@@ -110,11 +110,16 @@ fn path(text: &str) -> ItemPath {
 	ItemPath::parse(text).unwrap_or_else(|error| panic!("{error}"))
 }
 
-/// References as `file:line:column Kind`, with `?` for uncertain ones.
+/// `text` with `/` replaced by the platform's path separator, which the paths in messages have.
+fn native(text: &str) -> String {
+	text.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// References as `file:line:column Kind` (with `/` separators), with `?` for uncertain ones.
 fn summary(ws: &Workspace, references: &[Reference]) -> Vec<String> {
 	(references.iter())
 		.map(|reference| {
-			let file = ws.display_path(&reference.path).display().to_string();
+			let file = ws.display_path(&reference.path).display().to_string().replace(std::path::MAIN_SEPARATOR, "/");
 			let certain = if reference.certain { "" } else { "?" };
 
 			format!("{file}:{}:{} {:?}{certain}", reference.start.line, reference.start.column, reference.kind)
@@ -569,7 +574,11 @@ fn unparsable_files_are_noted() {
 	let found = resolver.find_references(&targets, &ReferenceOptions::all());
 
 	assert_eq!(found.notes.len(), 1, "{:?}", found.notes);
-	assert!(found.notes[0].starts_with("src/keywords.rs:1:12: references in this file were not searched"), "{:?}", found.notes);
+	assert!(
+		found.notes[0].starts_with(&native("src/keywords.rs:1:12: references in this file were not searched")),
+		"{:?}",
+		found.notes
+	);
 	assert_eq!(found.references.len(), 26);
 }
 
@@ -689,8 +698,11 @@ fn collisions_are_refused_unless_forced() {
 	let refused = |item_path: &str, new_name: &str| collision(plan(&ws, item_path, new_name, &RenameOptions::default()));
 
 	// an item of the same module, and one of a module importing the item by name
-	assert!(refused("crate::shapes::Circle", "Kind").contains("`rename_items::shapes::Kind` in `rename_items::shapes` (src/shapes.rs:33:10)"));
-	assert!(refused("crate::shapes::Circle", "Disc").contains("`rename_items::docs::Disc` in `rename_items::docs` (src/docs.rs:10:12)"));
+	let kind = native("`rename_items::shapes::Kind` in `rename_items::shapes` (src/shapes.rs:33:10)");
+	let disc = native("`rename_items::docs::Disc` in `rename_items::docs` (src/docs.rs:10:12)");
+
+	assert!(refused("crate::shapes::Circle", "Kind").contains(&kind));
+	assert!(refused("crate::shapes::Circle", "Disc").contains(&disc));
 
 	// an item of a module glob-importing the item's module
 	assert!(refused("crate::util::helper", "unit_circle").contains("`rename_items::unit_circle` in `rename_items`"));
@@ -704,13 +716,15 @@ fn collisions_are_refused_unless_forced() {
 	let message = refused("crate::shapes", "util");
 
 	assert!(message.contains("`rename_items::util` in `rename_items`"), "{message}");
-	assert!(message.contains("`src/util.rs` in `rename_items::shapes`"), "{message}");
+	assert!(message.contains(&native("`src/util.rs` in `rename_items::shapes`")), "{message}");
 
 	// forced: the binary imports both `Circle` and `Kind` by name
 	let rename = plan_ok(&ws, "crate::shapes::Circle", "Kind", &forced());
 	let collisions: Vec<(&str, &str, String)> = (rename.collisions.iter())
 		.map(|collision| {
-			let location = format!("{}:{}", ws.display_path(&collision.file).display(), collision.start);
+			// (with `/` separators)
+			let file = ws.display_path(&collision.file).display().to_string().replace(std::path::MAIN_SEPARATOR, "/");
+			let location = format!("{file}:{}", collision.start);
 
 			(collision.scope.as_str(), collision.existing.as_str(), location)
 		})
@@ -806,10 +820,13 @@ fn modules_are_renamed_with_their_files() {
 	let ws = load_modules(copy.path());
 	let message = collision(plan(&ws, "crate::plain", "occupied", &RenameOptions::default()));
 
-	assert!(message.contains("`src/occupied.rs` in `rename_modules::plain`"), "{message}");
+	assert!(message.contains(&native("`src/occupied.rs` in `rename_modules::plain`")), "{message}");
 
+	// (with `/` separators)
 	let moves = |rename: &Rename| -> Vec<(String, String)> {
-		let relative = |path: &Path| path.strip_prefix(copy.path()).unwrap().display().to_string();
+		let relative = |path: &Path| {
+			path.strip_prefix(copy.path()).unwrap().display().to_string().replace(std::path::MAIN_SEPARATOR, "/")
+		};
 
 		rename.edits.moves().iter().map(|(from, to)| (relative(from), relative(to))).collect()
 	};
@@ -932,7 +949,7 @@ fn renames_in_loaded_cargo_workspaces() {
 /// Finds references in `syn` (about 30k lines), if its source is in the cargo registry.
 #[test]
 fn searches_large_crates_quickly() {
-	let home = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo"));
+	let home = std::env::home_dir().map(|home| home.join(".cargo"));
 	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home).map(|home| home.join("registry/src"));
 
 	let Some(root) = (registry.and_then(|registry| std::fs::read_dir(registry).ok()).into_iter().flatten().flatten())
@@ -1057,13 +1074,19 @@ fn local_bindings_would_capture_references() {
 	let message = collision(plan(&ws, "crate::captures::step", "next", &RenameOptions::default()));
 
 	assert_eq!(message.matches("local variable").count(), 1, "{message}");
-	assert!(message.contains("`local variable next` in `rename_more::captures` (src/captures.rs:12:3)"), "{message}");
+	assert!(
+		message.contains(&native("`local variable next` in `rename_more::captures` (src/captures.rs:12:3)")),
+		"{message}"
+	);
 
 	// the generic parameter `Item` would capture the type, but not the constructor
 	let message = collision(plan(&ws, "crate::captures::Unit", "Item", &RenameOptions::default()));
 
 	assert_eq!(message.matches("generic parameter").count(), 1, "{message}");
-	assert!(message.contains("`generic parameter Item` in `rename_more::captures` (src/captures.rs:15:24)"), "{message}");
+	assert!(
+		message.contains(&native("`generic parameter Item` in `rename_more::captures` (src/captures.rs:15:24)")),
+		"{message}"
+	);
 
 	// other names are fine, and forced renames report the captures
 	plan_ok(&ws, "crate::captures::step", "advance", &RenameOptions::default());

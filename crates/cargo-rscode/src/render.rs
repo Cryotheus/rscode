@@ -29,8 +29,10 @@ pub(crate) struct PathDisplay {
 }
 
 impl PathDisplay {
+	/// With the current directory as the process has it, like the paths of the loaded workspace (not canonicalized:
+	/// on Windows that gives verbatim paths, `\\?\C:\...`, which no other path starts with).
 	pub(crate) fn new(root: &Path, absolute: bool) -> Self {
-		let cwd = std::env::current_dir().ok().map(|cwd| cwd.canonicalize().unwrap_or(cwd));
+		let cwd = std::env::current_dir().ok();
 
 		Self::with_cwd(root, cwd.as_deref(), absolute)
 	}
@@ -389,7 +391,8 @@ mod tests {
 
 		assert_eq!(below.display(Path::new("crates/a/src/lib.rs")), "src/lib.rs");
 		assert_eq!(below.display(Path::new("/ws/crates/a/src/lib.rs")), "src/lib.rs");
-		assert_eq!(below.display(Path::new("crates/b/src/lib.rs")), "/ws/crates/b/src/lib.rs");
+		// (compared as paths where the root is joined, which on Windows is with a `\`)
+		assert_eq!(below.path(Path::new("crates/b/src/lib.rs")), Path::new("/ws/crates/b/src/lib.rs"));
 		assert_eq!(below.display(Path::new("/elsewhere/x.rs")), "/elsewhere/x.rs");
 		assert_eq!(below.display(Path::new("/ws/crates/a")), ".");
 
@@ -404,11 +407,11 @@ mod tests {
 
 		let absolute = PathDisplay::with_cwd(Path::new("/ws"), Some(Path::new("/ws")), true);
 
-		assert_eq!(absolute.display(Path::new("src/lib.rs")), "/ws/src/lib.rs");
+		assert_eq!(absolute.path(Path::new("src/lib.rs")), Path::new("/ws/src/lib.rs"));
 
 		let unknown_cwd = PathDisplay::with_cwd(Path::new("/ws"), None, false);
 
-		assert_eq!(unknown_cwd.display(Path::new("src/lib.rs")), "/ws/src/lib.rs");
+		assert_eq!(unknown_cwd.path(Path::new("src/lib.rs")), Path::new("/ws/src/lib.rs"));
 	}
 
 	#[test]

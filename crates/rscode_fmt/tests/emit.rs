@@ -38,10 +38,11 @@ fn rustfmt_emit(emit: &str, paths: &[PathBuf]) -> String {
 	String::from_utf8(output.stdout).unwrap()
 }
 
-/// The change of a sample file as rscode_fmt computes it, named like rustfmt names it.
+/// The change of a sample file as rscode_fmt computes it, named like rustfmt names it: canonicalized (on Windows,
+/// `\\?\C:\...`).
 fn change(path: &Path, original: &str) -> FileChange {
 	FileChange {
-		path: std::path::absolute(path).unwrap(),
+		path: std::fs::canonicalize(path).unwrap(),
 		original: original.to_owned(),
 		formatted: Formatter::new(rustfmt()).format_str(original).unwrap(),
 	}

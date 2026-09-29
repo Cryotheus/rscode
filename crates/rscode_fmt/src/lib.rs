@@ -343,8 +343,9 @@ impl Formatter {
 
 	/// Sorts (if enabled) then formats a whole source file.
 	///
-	/// A shebang and a byte order mark are preserved, as are `\r\n` line breaks (going by the first line break).
-	/// Otherwise, the output of rustfmt is exactly what rustfmt prints for the source.
+	/// A shebang and a byte order mark are preserved, as are `\r\n` line breaks (going by the first line break) unless
+	/// rustfmt's `newline_style` is set to something other than `Auto`. Otherwise, the output of rustfmt is exactly
+	/// what rustfmt prints for the source.
 	pub fn format_str(&self, source: &str) -> Result<String, FormatError> {
 		self.format_items(source, &[FormatTarget::File])
 	}

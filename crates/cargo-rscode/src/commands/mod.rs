@@ -194,7 +194,9 @@ fn read_source(source: &SourceArg, ui: &Ui) -> anyhow::Result<String> {
 			let mut stdin = std::io::stdin().lock();
 
 			if stdin.is_terminal() {
-				ui.note("reading the source from stdin (end it with Ctrl-D)");
+				let end = if cfg!(windows) { "Ctrl-Z" } else { "Ctrl-D" };
+
+				ui.note(format!("reading the source from stdin (end it with {end})"));
 			}
 
 			let mut text = String::new();

@@ -18,6 +18,12 @@ fn fixture() -> PathBuf {
 	Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/demo")
 }
 
+/// `text` with `/` replaced by the platform's path separator, which the paths in the output have (except in the
+/// headers of diffs).
+fn native(text: &str) -> String {
+	text.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// The outcome of running the binary.
 #[derive(Debug)]
 struct Run {
@@ -103,9 +109,12 @@ fn registration(shell: &str) -> Run {
 	finish(command, None)
 }
 
-/// Whether `bash` can run the completion script (bash 4 or newer).
+/// Whether `bash` can run the completion script (bash 4 or newer) and the binary. (On Windows, `Command` finds WSL's
+/// `bash` before others, and it cannot run Windows binaries.)
 fn has_bash() -> bool {
-	Command::new("bash").args(["-c", "(( BASH_VERSINFO[0] >= 4 ))"]).status().is_ok_and(|status| status.success())
+	let script = format!("(( BASH_VERSINFO[0] >= 4 )) && {} --version", sh_quote(BIN));
+
+	Command::new("bash").args(["-c", &script]).output().is_ok_and(|output| output.status.success())
 }
 
 fn sh_quote(text: &str) -> String {
@@ -334,7 +343,7 @@ fn runs_as_a_cargo_subcommand() {
 	let bin_dir = Path::new(BIN).parent().unwrap().to_path_buf();
 	let cargo_home = std::env::var_os("CARGO_HOME")
 		.map(PathBuf::from)
-		.or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo")))
+		.or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
 		.unwrap_or_default();
 	let path = std::env::var_os("PATH").unwrap_or_default();
 	let path = std::env::join_paths([bin_dir, cargo_home.join("bin")].into_iter().chain(std::env::split_paths(&path)))
@@ -462,7 +471,10 @@ fn registers_completion_scripts() {
 	let bash = registration("bash").success();
 
 	assert!(bash.stdout.contains("-F _clap_complete_cargo_rscode cargo-rscode"), "{}", bash.stdout);
-	assert!(bash.stdout.contains(&format!("{BIN} -- ")), "{}", bash.stdout);
+	// quoted when it has characters special to the shell (like `\` on Windows)
+	let invocation = [format!("{BIN} -- "), format!("{} -- ", sh_quote(BIN))];
+
+	assert!(invocation.iter().any(|invocation| bash.stdout.contains(invocation)), "{}", bash.stdout);
 
 	let zsh = registration("zsh").success();
 
@@ -489,7 +501,11 @@ fn registers_completion_scripts() {
 fn names_imports_by_use_paths() {
 	let view = run(&fixture(), &["view", "use demo::Circle"]).success();
 
-	assert!(view.stdout.starts_with("// use demo::Circle (import) src/lib.rs:6"), "{}", view.stdout);
+	assert!(
+		view.stdout.starts_with(&format!("// {}", native("use demo::Circle (import) src/lib.rs:6"))),
+		"{}",
+		view.stdout
+	);
 	assert!(view.stdout.contains("pub use shapes::Circle;"), "{}", view.stdout);
 
 	let removal = run(&fixture(), &["remove", "--bin", "demo", "use crate::Shape", "--dry-run"]).success();
@@ -500,8 +516,8 @@ fn names_imports_by_use_paths() {
 	let ambiguous = run(&fixture(), &["remove", "--bin", "demo", "crate::Shape", "--dry-run"]);
 
 	assert_ne!(ambiguous.code, Some(0), "{ambiguous:#?}");
-	assert!(ambiguous.stderr.contains("`use demo::Shape` (import) at src/main.rs:1:5"), "{ambiguous:#?}");
-	assert!(ambiguous.stderr.contains("`demo::shapes::Shape` (trait) at src/shapes.rs"), "{ambiguous:#?}");
+	assert!(ambiguous.stderr.contains(&native("`use demo::Shape` (import) at src/main.rs:1:5")), "{ambiguous:#?}");
+	assert!(ambiguous.stderr.contains(&native("`demo::shapes::Shape` (trait) at src/shapes.rs")), "{ambiguous:#?}");
 	assert!(ambiguous.stderr.contains("hint: the path names an item through a private import"), "{ambiguous:#?}");
 
 	// unquoted, the shell splits the path
@@ -523,7 +539,7 @@ fn names_imports_by_use_paths() {
 fn finds_items() {
 	let circle = run(&fixture(), &["find", "Circle"]).success();
 
-	assert_eq!(circle.stdout, "demo::shapes::Circle  struct  src/shapes.rs:3:1\n");
+	assert_eq!(circle.stdout, native("demo::shapes::Circle  struct  src/shapes.rs:3:1\n"));
 
 	let imports = run(&fixture(), &["find", "Circle", "--imports", "--show", "kind"]).success();
 
@@ -538,7 +554,9 @@ fn finds_items() {
 
 	let methods = run(&fixture(), &["find", "--starts-with", "ar", "-k", "assoc-fn", "--show", "location"]).success();
 
-	assert!(methods.lines().contains(&"demo::shapes::Shape::area  src/shapes.rs:30:2"), "{}", methods.stdout);
+	let area = native("demo::shapes::Shape::area  src/shapes.rs:30:2");
+
+	assert!(methods.lines().contains(&area.as_str()), "{}", methods.stdout);
 
 	let nothing = run(&fixture(), &["find", "Nothing*"]).success();
 
@@ -568,7 +586,7 @@ fn finds_cfg_variants() {
 
 	let active = run(&fixture(), &["find", "crate::extra", "--active-only", "--show", "location"]).success();
 
-	assert_eq!(active.stdout, "demo::extra  src/lib.rs:19:1\n");
+	assert_eq!(active.stdout, native("demo::extra  src/lib.rs:19:1\n"));
 }
 
 #[test]
@@ -599,23 +617,24 @@ fn finds_as_json_and_file_lines() {
 	assert_eq!(found[0]["path"], "demo::add");
 	assert_eq!(found[0]["kind"], "fn");
 	assert_eq!(found[0]["crate"], "demo");
-	assert_eq!(found[0]["file"], "src/lib.rs");
+	assert_eq!(found[0]["file"], native("src/lib.rs"));
 	assert_eq!(found[0]["start"], json!({"line": 8, "column": 1}));
 	assert_eq!(found[0]["end"], json!({"line": 11, "column": 2}));
 	assert_eq!(found[0]["visibility"], "pub");
 	assert_eq!(found[0]["active"], "true");
 
 	let lines = run(&fixture(), &["find", "crate::add", "crate::twice", "--message-format", "file-lines"]).success();
+	let lib = serde_json::to_string(&native("src/lib.rs")).unwrap();
 
-	assert_eq!(
-		lines.stdout,
-		"[{\"file\":\"src/lib.rs\",\"range\":[8,11]},{\"file\":\"src/lib.rs\",\"range\":[25,28]}]\n"
-	);
+	assert_eq!(lines.stdout, format!("[{{\"file\":{lib},\"range\":[8,11]}},{{\"file\":{lib},\"range\":[25,28]}}]\n"));
 
 	let absolute = run(&fixture(), &["find", "crate::add", "--absolute-paths"]).success();
-	let lib = fixture().join("src/lib.rs").canonicalize().unwrap();
+	let printed = absolute.stdout.strip_prefix("demo::add  fn  ").and_then(|rest| rest.strip_suffix(":8:1\n"));
+	let printed = Path::new(printed.unwrap_or_else(|| panic!("{}", absolute.stdout)));
 
-	assert_eq!(absolute.stdout, format!("demo::add  fn  {}:8:1\n", lib.display()));
+	// compared canonicalized, which on Windows gives verbatim paths (`\\?\C:\...`), not how they are printed
+	assert!(printed.is_absolute(), "{}", absolute.stdout);
+	assert_eq!(printed.canonicalize().unwrap(), fixture().join("src/lib.rs").canonicalize().unwrap());
 
 	// relative to the current directory when below it
 	let from_src = run(&fixture().join("src"), &["find", "crate::add"]).success();
@@ -629,7 +648,10 @@ fn views_items() {
 
 	assert_eq!(
 		add.stdout,
-		"// demo::add (fn) src/lib.rs:8-11\n/// Adds two numbers.\npub fn add(left: i32, right: i32) -> i32 {\n\tleft + right\n}\n"
+		format!(
+			"// {}\n/// Adds two numbers.\npub fn add(left: i32, right: i32) -> i32 {{\n\tleft + right\n}}\n",
+			native("demo::add (fn) src/lib.rs:8-11")
+		)
 	);
 
 	let no_docs = run(&fixture(), &["view", "crate::add", "--no-docs"]).success();
@@ -655,7 +677,7 @@ fn views_items() {
 			.unwrap();
 
 	assert_eq!(json[0]["path"], "demo::add");
-	assert_eq!(json[0]["file"], "src/lib.rs");
+	assert_eq!(json[0]["file"], native("src/lib.rs"));
 	assert!(json[0]["text"].as_str().unwrap().contains("left + right"), "{json}");
 
 	let missing = run(&fixture(), &["view", "crate::missing"]);
@@ -668,7 +690,11 @@ fn views_items() {
 fn views_outlines_and_impls() {
 	let shapes = run(&fixture(), &["view", "crate::shapes"]).success();
 
-	assert!(shapes.stdout.starts_with("// demo::shapes (mod) src/lib.rs:3-3\n"), "{}", shapes.stdout);
+	assert!(
+		shapes.stdout.starts_with(&format!("// {}\n", native("demo::shapes (mod) src/lib.rs:3-3"))),
+		"{}",
+		shapes.stdout
+	);
 	assert!(shapes.stdout.contains("pub fn new(radius: f64) -> Self { ... }"), "{}", shapes.stdout);
 	assert!(!shapes.stdout.contains("Self { radius }"), "{}", shapes.stdout);
 
@@ -678,12 +704,15 @@ fn views_outlines_and_impls() {
 
 	let outline = run(&fixture(), &["view", "crate::shapes::Circle", "--impls"]).success();
 
-	assert!(outline.stdout.contains("// impl demo::shapes::Circle (impl) src/shapes.rs:9-14\n"), "{}", outline.stdout);
-	assert!(
-		outline.stdout.contains("// impl Shape for demo::shapes::Circle (impl) src/shapes.rs:16-20\n"),
-		"{}",
-		outline.stdout
-	);
+	let impls = [
+		native("impl demo::shapes::Circle (impl) src/shapes.rs:9-14"),
+		native("impl Shape for demo::shapes::Circle (impl) src/shapes.rs:16-20"),
+	];
+
+	for header in impls {
+		assert!(outline.stdout.contains(&format!("// {header}\n")), "{}", outline.stdout);
+	}
+
 	assert!(outline.stdout.contains("fn area(&self) -> f64 { ... }"), "{}", outline.stdout);
 }
 
@@ -706,7 +735,7 @@ fn checks_formatting() {
 
 	let mismatches: Value = serde_json::from_str(&json.stdout).unwrap();
 
-	assert_eq!(mismatches[0]["name"], "src/util.rs", "{mismatches}");
+	assert_eq!(mismatches[0]["name"], native("src/util.rs"), "{mismatches}");
 
 	let stdout = run(&fixture(), &["fmt", "--emit", "stdout", "crate::util::alpha"]).success();
 
@@ -733,7 +762,7 @@ fn formats_files() {
 	let copy = TempCopy::new("fmt");
 	let formatted = run(copy.path(), &["fmt", "crate::util::alpha"]).success();
 
-	assert_eq!(formatted.stdout, "formatted src/util.rs\n");
+	assert_eq!(formatted.stdout, native("formatted src/util.rs\n"));
 	assert_eq!(
 		copy.read("src/util.rs"),
 		"pub(crate) fn zeta() -> u8 {\n\t1\n}\n\npub(crate) fn alpha() -> u8 {\n\t2\n}\n\npub(crate) fn double(value: i32) -> i32 {\n\tvalue * 2\n}\n"
@@ -749,7 +778,7 @@ fn sorts_items() {
 	let copy = TempCopy::new("sort");
 
 	assert_eq!(run(copy.path(), &["sort", "--check", "crate::util"]).code, Some(1));
-	assert_eq!(run(copy.path(), &["sort", "crate::util"]).success().stdout, "sorted src/util.rs\n");
+	assert_eq!(run(copy.path(), &["sort", "crate::util"]).success().stdout, native("sorted src/util.rs\n"));
 
 	let util = copy.read("src/util.rs");
 	let position = |text: &str| util.find(text).unwrap_or_else(|| panic!("{text}: {util}"));
@@ -841,15 +870,19 @@ fn errors_name_the_options_that_get_past_them() {
 	let variants = run_with_stdin(impls.path(), &args, "fn get() {}\n");
 
 	assert_eq!(variants.code, Some(1));
-	assert!(variants.stderr.contains("`<impls::W<u16>>::get` (assoc-fn) at src/lib.rs:8:2"), "{}", variants.stderr);
+	assert!(
+		variants.stderr.contains(&native("`<impls::W<u16>>::get` (assoc-fn) at src/lib.rs:8:2")),
+		"{}",
+		variants.stderr
+	);
 	assert!(!variants.stderr.contains("hint"), "{}", variants.stderr);
 
 	// `crate` is the root of the library and of the binary
 	let crates = run_with_stdin(&fixture(), &["insert", "crate", "--dry-run"], "pub fn q() {}\n");
 
 	assert_eq!(crates.code, Some(1));
-	assert!(crates.stderr.contains("`demo` (lib crate root) at src/lib.rs:1:1"), "{}", crates.stderr);
-	assert!(crates.stderr.contains("`demo` (bin crate root) at src/main.rs:1:1"), "{}", crates.stderr);
+	assert!(crates.stderr.contains(&native("`demo` (lib crate root) at src/lib.rs:1:1")), "{}", crates.stderr);
+	assert!(crates.stderr.contains(&native("`demo` (bin crate root) at src/main.rs:1:1")), "{}", crates.stderr);
 	assert!(crates.stderr.contains("select one with `--lib` or `--bin NAME`"), "{}", crates.stderr);
 
 	let lib = run_with_stdin(&fixture(), &["insert", "crate", "--dry-run", "--lib"], "pub fn q() {}\n").success();
@@ -893,13 +926,13 @@ fn removes_items() {
 	let dry = run(&fixture(), &["remove", "crate::twice", "--dry-run"]).success();
 
 	assert!(dry.stdout.contains("-pub fn twice(value: i32) -> i32 {"), "{}", dry.stdout);
-	assert!(dry.stderr.contains("warning: dangling reference at src/main.rs:7:"), "{}", dry.stderr);
-	assert!(dry.stderr.contains("would remove demo::twice (fn) src/lib.rs:25:1"), "{}", dry.stderr);
+	assert!(dry.stderr.contains(&native("warning: dangling reference at src/main.rs:7:")), "{}", dry.stderr);
+	assert!(dry.stderr.contains(&native("would remove demo::twice (fn) src/lib.rs:25:1")), "{}", dry.stderr);
 
 	let copy = TempCopy::new("remove");
 	let removed = run(copy.path(), &["remove", "crate::util::zeta"]).success();
 
-	assert_eq!(removed.stdout, "removed demo::util::zeta (fn) src/util.rs:1:1\n");
+	assert_eq!(removed.stdout, native("removed demo::util::zeta (fn) src/util.rs:1:1\n"));
 
 	let util = copy.read("src/util.rs");
 
@@ -933,7 +966,7 @@ fn replaces_items() {
 
 	let formatted = run(copy.path(), &["replace", "crate::twice", "new.rs", "--fmt"]).success();
 
-	assert_eq!(formatted.stdout, "replaced demo::twice\nformatted src/lib.rs\n");
+	assert_eq!(formatted.stdout, native("replaced demo::twice\nformatted src/lib.rs\n"));
 	assert!(copy.read("src/lib.rs").ends_with("pub fn twice(value: i32) -> i32 {\n\tutil::double(value)\n}\n"));
 	cargo_check(copy.path());
 
@@ -949,7 +982,7 @@ fn inserts_items() {
 		run_with_stdin(copy.path(), &["insert", "crate::util", "--position", "start"], "pub(crate) fn first() {}\n")
 			.success();
 
-	assert_eq!(first.stdout, "inserted fn first into crate::util (src/util.rs)\n");
+	assert_eq!(first.stdout, native("inserted fn first into crate::util (src/util.rs)\n"));
 	assert!(copy.read("src/util.rs").starts_with("pub(crate) fn first() {}\n\npub(crate) fn zeta()"));
 
 	let method = "pub fn unit() -> Self {\n\tSelf::new(1.0)\n}\n";
@@ -961,7 +994,7 @@ fn inserts_items() {
 	let last =
 		run_with_stdin(copy.path(), &["insert", "crate::util", "--fmt"], "pub(crate) fn last()->u8{3}").success();
 
-	assert_eq!(last.stdout, "inserted fn last into crate::util (src/util.rs)\nformatted src/util.rs\n");
+	assert_eq!(last.stdout, native("inserted fn last into crate::util (src/util.rs)\nformatted src/util.rs\n"));
 	assert!(copy.read("src/util.rs").ends_with("pub(crate) fn last() -> u8 {\n\t3\n}\n"));
 	cargo_check(copy.path());
 
@@ -986,7 +1019,8 @@ fn formats_edited_items_by_their_canonical_paths() {
 	let inserted = run_with_stdin(copy.path(), &["insert", "<crate::Circle>", "--fmt"], unit).success();
 
 	assert_eq!(
-		inserted.stdout, "inserted assoc-fn unit into <crate::Circle> (src/shapes.rs)\nformatted src/shapes.rs\n",
+		inserted.stdout,
+		native("inserted assoc-fn unit into <crate::Circle> (src/shapes.rs)\nformatted src/shapes.rs\n"),
 		"{inserted:#?}"
 	);
 	assert_eq!(inserted.stderr, "");
@@ -996,7 +1030,11 @@ fn formats_edited_items_by_their_canonical_paths() {
 	let new = "pub fn new(radius:f64)->Self{Self{radius}}";
 	let replaced = run_with_stdin(copy.path(), &["replace", "<Circle>::new", "--fmt"], new).success();
 
-	assert_eq!(replaced.stdout, "replaced demo::shapes::Circle::new\nformatted src/shapes.rs\n", "{replaced:#?}");
+	assert_eq!(
+		replaced.stdout,
+		native("replaced demo::shapes::Circle::new\nformatted src/shapes.rs\n"),
+		"{replaced:#?}"
+	);
 	assert!(copy.read("src/shapes.rs").contains("\tpub fn new(radius: f64) -> Self {\n\t\tSelf { radius }\n\t}\n"));
 	assert_eq!(copy.read("src/other.rs"), other);
 

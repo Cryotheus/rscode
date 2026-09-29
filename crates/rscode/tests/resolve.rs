@@ -236,7 +236,7 @@ fn robustness_on_this_repository_and_syn() {
 		}
 	}
 
-	let home = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo"));
+	let home = std::env::home_dir().map(|home| home.join(".cargo"));
 	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home).map(|home| home.join("registry/src"));
 
 	let syn = (registry.and_then(|registry| std::fs::read_dir(registry).ok()).into_iter().flatten().flatten())

@@ -104,6 +104,11 @@ fn at(line: usize, column: usize) -> LineCol {
 	LineCol { line, column }
 }
 
+/// `text` with `/` replaced by the platform's path separator, which the paths of views have.
+fn native(text: &str) -> String {
+	text.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// Lines of a rendered view.
 fn lines(lines: &[&str]) -> String {
 	lines.join("\n")
@@ -512,7 +517,7 @@ fn fills_every_field() {
 			"kind": "fn",
 			"crate": "query_basic",
 			"package": null,
-			"file": "query_basic/src/lib.rs",
+			"file": native("query_basic/src/lib.rs"),
 			"start": {"line": 11, "column": 1},
 			"end": {"line": 16, "column": 2},
 			"visibility": "pub",
@@ -597,7 +602,7 @@ fn views_without_docs() {
 	assert_eq!(
 		text(&resolver, "crate::shapes", no_docs.clone()),
 		lines(&[
-			"// file: query_basic/src/shapes.rs",
+			&format!("// file: {}", native("query_basic/src/shapes.rs")),
 			"#[derive(Debug, Clone, Copy)]",
 			"pub struct Circle {",
 			"\tpub radius: f64,",
@@ -648,7 +653,7 @@ fn views_with_line_numbers() {
 	assert_eq!(
 		text(&resolver, "crate::impls", numbered.clone()),
 		lines(&[
-			"     │ // file: query_basic/src/impls.rs",
+			&format!("     │ // file: {}", native("query_basic/src/impls.rs")),
 			"   1 │ //! Implementations, away from their types.",
 			"   2 │",
 			"   3 │ use crate::shapes::Circle;",
@@ -679,8 +684,12 @@ fn views_with_line_numbers() {
 
 	// the file of a module in full
 	let full = text(&resolver, "crate::shapes", ViewOptions { mode: ViewMode::Full, ..numbered });
-	let head =
-		lines(&["     │ // file: query_basic/src/shapes.rs", "   1 │ //! Shapes.", "   2 │", "   3 │ /// A circle."]);
+	let head = lines(&[
+		&format!("     │ // file: {}", native("query_basic/src/shapes.rs")),
+		"   1 │ //! Shapes.",
+		"   2 │",
+		"   3 │ /// A circle.",
+	]);
 
 	assert!(full.starts_with(&head), "{full}");
 	assert!(full.ends_with(&lines(&["  28 │ \t}", "  29 │ }"])), "{full}");
@@ -700,7 +709,7 @@ fn outlines_modules() {
 	assert_eq!(
 		shapes[0].text,
 		lines(&[
-			"// file: query_basic/src/shapes.rs",
+			&format!("// file: {}", native("query_basic/src/shapes.rs")),
 			"//! Shapes.",
 			"",
 			"/// A circle.",
@@ -735,7 +744,7 @@ fn outlines_modules() {
 	assert_eq!(
 		text(&resolver, "crate::nested", auto.clone()),
 		lines(&[
-			"// file: query_basic/src/nested.rs",
+			&format!("// file: {}", native("query_basic/src/nested.rs")),
 			"//! Nesting, macros, constants, and raw identifiers.",
 			"",
 			"/// An outer module.",
@@ -806,7 +815,7 @@ fn outlines_modules() {
 	assert_eq!(
 		text(&resolver, "crate", ViewOptions { docs: false, ..ViewOptions::default() }),
 		lines(&[
-			"// file: query_basic/src/lib.rs",
+			&format!("// file: {}", native("query_basic/src/lib.rs")),
 			"pub mod shapes;",
 			"mod impls;",
 			"pub mod nested;",
@@ -1072,7 +1081,7 @@ fn serializes_views() {
 		serde_json::json!({
 			"path": "query_basic::nested::r#type::Unit",
 			"kind": "struct",
-			"file": "query_basic/src/nested.rs",
+			"file": native("query_basic/src/nested.rs"),
 			"start": {"line": 59, "column": 2},
 			"end": {"line": 60, "column": 18},
 			"cfg": null,
@@ -1110,7 +1119,7 @@ fn views_crlf_files() {
 	assert_eq!(
 		text(&resolver, "crate", options(ViewMode::Full)),
 		lines(&[
-			"// file: query_crlf/lib.rs",
+			&format!("// file: {}", native("query_crlf/lib.rs")),
 			"//! CRLF line breaks and a byte order mark.",
 			"",
 			"pub mod inline {",
@@ -1124,7 +1133,7 @@ fn views_crlf_files() {
 	);
 	assert_eq!(
 		text(&resolver, "crate", ViewOptions { docs: false, ..ViewOptions::default() }),
-		lines(&["// file: query_crlf/lib.rs", "pub mod inline { ... }"])
+		lines(&[&format!("// file: {}", native("query_crlf/lib.rs")), "pub mod inline { ... }"])
 	);
 
 	let f = one(&resolver, "f");
@@ -1157,7 +1166,8 @@ fn line_numbers(text: &str) -> Vec<Option<usize>> {
 #[test]
 #[ignore = "slow; needs large crates in the cargo registry"]
 fn robustness_on_large_registry_crates() {
-	let registry = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo/registry/src"));
+	let home = std::env::home_dir().map(|home| home.join(".cargo"));
+	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home).map(|home| home.join("registry/src"));
 	let indices: Vec<PathBuf> = (registry.and_then(|registry| std::fs::read_dir(registry).ok()).into_iter().flatten())
 		.flatten()
 		.map(|index| index.path())

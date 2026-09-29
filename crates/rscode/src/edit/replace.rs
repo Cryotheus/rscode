@@ -899,7 +899,7 @@ mod tests {
 	fn registry_crate(name_version: &str) -> Option<PathBuf> {
 		let cargo_home = std::env::var_os("CARGO_HOME")
 			.map(PathBuf::from)
-			.or_else(|| std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".cargo")))?;
+			.or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))?;
 
 		(std::fs::read_dir(cargo_home.join("registry/src")).ok()?.filter_map(Result::ok))
 			.map(|index| index.path().join(name_version))

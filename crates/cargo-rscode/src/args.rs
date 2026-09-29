@@ -736,7 +736,8 @@ mod tests {
 		assert_eq!(
 			options,
 			LoadOptions {
-				manifest_path: Some(PathBuf::from("/abs/Cargo.toml")),
+				// made absolute (on Windows, `/abs` has no drive: it is `C:\abs` on drive `C:`)
+				manifest_path: Some(std::path::absolute("/abs/Cargo.toml").unwrap()),
 				packages: vec![],
 				workspace: true,
 				exclude: vec!["a".to_owned(), "b".to_owned()],
@@ -1071,7 +1072,7 @@ mod tests {
 					program: None,
 					edition: Some(Edition::E2021),
 					style_edition: Some(Edition::E2024),
-					config_path: Some(PathBuf::from("/cfg/rustfmt.toml")),
+					config_path: Some(std::path::absolute("/cfg/rustfmt.toml").unwrap()),
 					config: vec![
 						("max_width".to_owned(), "80".to_owned()),
 						("hard_tabs".to_owned(), "true".to_owned()),

@@ -534,7 +534,8 @@ mod tests {
 				std::fs::create_dir_all(root.join(directory)).unwrap();
 			}
 
-			Self(std::fs::canonicalize(&root).unwrap())
+			// resolved like the paths the functions compare: on Windows, `C:\...` rather than `\\?\C:\...`
+			Self(resolve(&root))
 		}
 
 		fn path(&self, path: &str) -> PathBuf {

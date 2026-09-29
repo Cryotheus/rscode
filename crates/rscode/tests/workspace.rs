@@ -21,8 +21,9 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+/// A fixture's path, with the platform's separators only (like cargo prints paths).
 fn fixture(path: &str) -> PathBuf {
-	Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(path)
+	Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(path).components().collect()
 }
 
 /// This repository's root manifest.
@@ -532,9 +533,10 @@ fn describes_crates() {
 	let plan = plan(&targets(with(virtual_ws(), |options| options.workspace = true), |targets| targets.all_targets = true));
 	let describe = |name: &str, kind: TargetKind| {
 		let spec = krate(&plan, name, kind);
-		let root = spec.root.strip_prefix(fixture("ws_virtual")).unwrap();
+		let root = spec.root.strip_prefix(fixture("ws_virtual")).unwrap().display().to_string();
+		let root = root.replace(std::path::MAIN_SEPARATOR, "/");
 
-		format!("{} {} {}", root.display(), spec.edition, plan.packages[spec.package.unwrap().index()].name)
+		format!("{root} {} {}", spec.edition, plan.packages[spec.package.unwrap().index()].name)
 	};
 
 	assert_eq!(describe("app", TargetKind::Lib), "app/src/lib.rs 2024 app");
@@ -674,8 +676,11 @@ fn enables_features_of_dependencies() {
 	assert_eq!(enabled_features(&plan, "real-core"), ["alloc", "default", "serde", "std"]);
 	assert_eq!(enabled_features(&plan, "tool"), Vec::<&str>::new());
 
-	// its own default features, and `shiny` from `tool`'s dependency `weird-name`
-	assert_eq!(enabled_features(&plan, "extra"), ["basic", "default", "shiny"]);
+	// its own default features, `shiny` from `tool`'s dependency `weird-name`, and on Windows `windows` from `tool`
+	let extra =
+		if cfg!(windows) { vec!["basic", "default", "shiny", "windows"] } else { vec!["basic", "default", "shiny"] };
+
+	assert_eq!(enabled_features(&plan, "extra"), extra);
 
 	// without being selected itself, `extra` only gets what `real-core` enables (no default features)
 	let plan = self::plan(&with(features(packages(virtual_ws(), &["app"]), &["json"]), |options| options.load_all_members = true));

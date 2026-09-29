@@ -91,8 +91,9 @@ fn body_text(workspace: &Workspace, id: ItemId) -> &str {
 	slice(workspace, id, workspace.item(id).body().expect("a body"))
 }
 
+/// A path relative to the workspace root, with `/` separators.
 fn relative(workspace: &Workspace, path: &Path) -> String {
-	workspace.display_path(path).display().to_string()
+	workspace.display_path(path).display().to_string().replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// The item tree of a crate, one item per line.
@@ -152,9 +153,10 @@ fn label(workspace: &Workspace, id: ItemId) -> String {
 	}
 }
 
-/// Diagnostics as `severity file:line:column: message`, with paths relative to the fixture.
+/// Diagnostics as `severity file:line:column: message`, with paths relative to the fixture (and `/` separators).
 fn diagnostics(workspace: &Workspace, krate: CrateId) -> Vec<String> {
-	let root = format!("{}/", workspace.root().display());
+	// messages have paths as the loader makes them: absolute and normalized (on Windows, with `\` only)
+	let root = format!("{}{}", std::path::absolute(workspace.root()).unwrap().display(), std::path::MAIN_SEPARATOR);
 
 	workspace
 		.krate(krate)
@@ -169,7 +171,9 @@ fn diagnostics(workspace: &Workspace, krate: CrateId) -> Vec<String> {
 			let file = diagnostic.file.as_deref().map(|file| relative(workspace, file)).unwrap_or_default();
 			let location = diagnostic.location.map(|location| format!(":{location}")).unwrap_or_default();
 
-			format!("{severity} {file}{location}: {}", diagnostic.message.replace(&root, ""))
+			let message = diagnostic.message.replace(&root, "").replace(std::path::MAIN_SEPARATOR, "/");
+
+			format!("{severity} {file}{location}: {message}")
 		})
 		.collect()
 }
@@ -1283,7 +1287,7 @@ fn loads_this_repository() {
 fn registry_crate(name_version: &str) -> Option<PathBuf> {
 	let cargo_home = std::env::var_os("CARGO_HOME")
 		.map(PathBuf::from)
-		.or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo")))?;
+		.or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))?;
 
 	std::fs::read_dir(cargo_home.join("registry/src"))
 		.ok()?

@@ -1,0 +1,3 @@
+# Text files are checked out with `\n` line breaks on every platform, as the tests compare file contents byte for byte.
+# (The fixtures with `\r\n` line breaks keep them: their own `.gitattributes` unset `text`.)
+* text=auto eol=lf

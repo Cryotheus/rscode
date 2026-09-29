@@ -550,6 +550,28 @@ fn formats_whole_files_with_rustfmt() {
 }
 
 #[test]
+fn whole_files_keep_their_line_breaks() {
+	if !rustfmt_available() {
+		return;
+	}
+
+	let formatter = Formatter::new(rustfmt());
+
+	// rustfmt itself gives `\n`: it sees its input with `\r\n` turned into `\n`
+	assert_eq!(formatter.format_str("fn  a( ) {}\r\nfn b() {}\r\n").unwrap(), "fn a() {}\r\nfn b() {}\r\n");
+
+	// without line breaks, `\n` (rustfmt would give the platform's)
+	assert_eq!(formatter.format_str("fn  a( ) {}").unwrap(), "fn a() {}\n");
+
+	// unless rustfmt is configured otherwise
+	let mut options = rustfmt();
+
+	options.rustfmt.config.push(("newline_style".to_owned(), "Unix".to_owned()));
+
+	assert_eq!(Formatter::new(options).format_str("fn  a( ) {}\r\n").unwrap(), "fn a() {}\n");
+}
+
+#[test]
 fn whole_files_keep_their_bom() {
 	if !rustfmt_available() {
 		return;

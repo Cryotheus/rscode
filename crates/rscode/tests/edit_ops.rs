@@ -196,6 +196,11 @@ fn at(line: usize, column: usize) -> LineCol {
 	LineCol { line, column }
 }
 
+/// `text` with `/` replaced by the platform's path separator, which the paths in messages have.
+fn native(text: &str) -> String {
+	text.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 /// Proves that the edited crate in `dir` still compiles.
 #[track_caller]
 fn cargo_check(dir: &TempDir) {
@@ -313,7 +318,11 @@ impl G<u16> {
 		match rscode::edit::remove(&resolver, &paths(&["impl From for crate::Wrapper"]), &RemoveOptions::default()) {
 			Err(Error::Ambiguous { candidates, .. }) => assert_eq!(
 				candidates,
-				["`impl From<u8> for fixture::Wrapper` at src/lib.rs:3:1", "`impl From<u16> for fixture::Wrapper` at src/lib.rs:9:1"]
+				[
+					"`impl From<u8> for fixture::Wrapper` at src/lib.rs:3:1",
+					"`impl From<u16> for fixture::Wrapper` at src/lib.rs:9:1"
+				]
+				.map(native)
 			),
 			other => panic!("{other:?}"),
 		}
@@ -334,7 +343,11 @@ impl G<u16> {
 
 		match rscode::edit::remove(&resolver, &paths(&["crate::G::get"]), &RemoveOptions::default()) {
 			Err(Error::Ambiguous { candidates, .. }) => {
-				assert_eq!(candidates, ["`<fixture::G<u8>>::get` at src/lib.rs:34:2", "`<fixture::G<u16>>::get` at src/lib.rs:40:2"]);
+				assert_eq!(
+					candidates,
+					["`<fixture::G<u8>>::get` at src/lib.rs:34:2", "`<fixture::G<u16>>::get` at src/lib.rs:40:2"]
+						.map(native)
+				);
 			}
 			other => panic!("{other:?}"),
 		}
@@ -496,28 +509,19 @@ pub enum Trailing {
 		// a directory with other files: only the module files go
 		let removal = remove(&ws, &["crate::docs"], &RemoveOptions::default());
 
+		let kept =
+			"the directory `src/docs` is not deleted: it has files that are not part of the module `edit_ops::docs`";
+
 		assert_eq!(dir.relative(removal.edits.deletions()), ["src/docs/mod.rs"]);
-		assert!(
-			removal.warnings.iter().any(|warning| {
-				warning
-					== "the directory `src/docs` is not deleted: it has files that are not part of the module `edit_ops::docs`"
-			}),
-			"{:?}",
-			removal.warnings
-		);
+		assert!(removal.warnings.contains(&native(kept)), "{:?}", removal.warnings);
 
 		// a file another crate loads too
 		let removal = remove(&ws, &["crate::util"], &RemoveOptions::default());
 
+		let kept = native("`src/util.rs` is not deleted: the module `edit_ops::util` loads it too");
+
 		assert!(removal.edits.deletions().is_empty());
-		assert!(
-			removal
-				.warnings
-				.iter()
-				.any(|warning| warning == "`src/util.rs` is not deleted: the module `edit_ops::util` loads it too"),
-			"{:?}",
-			removal.warnings
-		);
+		assert!(removal.warnings.contains(&kept), "{:?}", removal.warnings);
 
 		// or none at all
 		let options = RemoveOptions { keep_files: true, ..RemoveOptions::default() };
@@ -939,6 +943,7 @@ pub mod out;
 						"`fixture::v` (fn) at src/lib.rs:20:1 with #[cfg(feature = \"x\")]",
 						"`fixture::v` (fn) at src/lib.rs:25:1 with #[cfg(not(feature = \"x\"))]",
 					]
+					.map(native)
 				);
 			}
 			other => panic!("{other:?}"),
@@ -995,10 +1000,10 @@ pub mod out;
 		let replacement = replace(&ws, "crate::out", "pub mod out {}", &ReplaceOptions::default()).unwrap();
 
 		assert!(edited(&dir, &replacement.edits, "src/lib.rs").ends_with("\npub mod out {}\n"));
-		assert_eq!(
-			replacement.warnings,
-			["only the declaration of the module `fixture::out` is replaced; its file `src/out.rs` is left as it is"]
-		);
+		let kept =
+			"only the declaration of the module `fixture::out` is replaced; its file `src/out.rs` is left as it is";
+
+		assert_eq!(replacement.warnings, [native(kept)]);
 	}
 
 	#[test]
@@ -1233,7 +1238,7 @@ pub mod out;
 		match insert(&ws, "crate::util", "pub fn a() {}", &InsertOptions::default()) {
 			Err(Error::Collision { name, collisions }) => {
 				assert_eq!(name, "a");
-				assert_eq!(collisions, ["`a`: `fixture::util::a` (fn) at src/lib.rs:6:2"]);
+				assert_eq!(collisions, [native("`a`: `fixture::util::a` (fn) at src/lib.rs:6:2")]);
 			}
 			other => panic!("{other:?}"),
 		}
@@ -1242,8 +1247,10 @@ pub mod out;
 		match insert(&ws, "crate::util", "pub mod fmt {}\npub fn b() {}", &InsertOptions::default()) {
 			Err(error @ Error::Collision { .. }) => assert_eq!(
 				error.to_string(),
-				"`fmt`, `b` collides with existing names:\n`fmt`: the import of `std::fmt` at \
-				 src/lib.rs:4:6\n`b`: `fixture::util::b` (fn) at src/lib.rs:8:2"
+				native(
+					"`fmt`, `b` collides with existing names:\n`fmt`: the import of `std::fmt` at src/lib.rs:4:6\n`b`: \
+					 `fixture::util::b` (fn) at src/lib.rs:8:2"
+				)
 			),
 			other => panic!("{other:?}"),
 		}
@@ -1267,7 +1274,9 @@ pub mod out;
 			insert(&ws, "crate::util", "pub fn a() {}", &InsertOptions { force: true, ..InsertOptions::default() })
 				.unwrap();
 
-		assert_eq!(insertion.warnings, ["inserted `a`, which collides with `fixture::util::a` (fn) at src/lib.rs:6:2"]);
+		let collision = native("inserted `a`, which collides with `fixture::util::a` (fn) at src/lib.rs:6:2");
+
+		assert_eq!(insertion.warnings, [collision]);
 	}
 
 	#[test]
@@ -1278,7 +1287,7 @@ pub mod out;
 		// in the namespaces their paths resolve in
 		match insert(&ws, "crate::util", "use std::fmt;", &InsertOptions::default()) {
 			Err(Error::Collision { collisions, .. }) => {
-				assert_eq!(collisions, ["`fmt`: the import of `std::fmt` at src/lib.rs:4:6"])
+				assert_eq!(collisions, [native("`fmt`: the import of `std::fmt` at src/lib.rs:4:6")])
 			}
 			other => panic!("{other:?}"),
 		}
@@ -1398,6 +1407,7 @@ pub mod out;
 				assert_eq!(
 					candidates,
 					["`impl fixture::S` (impl) at src/lib.rs:3:1", "`impl fixture::S` (impl) at src/lib.rs:7:1"]
+						.map(native)
 				)
 			}
 			other => panic!("{other:?}"),
@@ -2270,8 +2280,14 @@ pub fn total() -> f64 {
 			match result {
 				Err(Error::Ambiguous { candidates, .. }) => {
 					assert_eq!(candidates.len(), 2, "{candidates:?}");
-					assert!(candidates[0].starts_with("`use fixture::Circle` (import) at src/lib.rs:"), "{candidates:?}");
-					assert!(candidates[1].starts_with("`fixture::shapes::Circle` (struct) at src/lib.rs:"), "{candidates:?}");
+					assert!(
+						candidates[0].starts_with(&native("`use fixture::Circle` (import) at src/lib.rs:")),
+						"{candidates:?}"
+					);
+					assert!(
+						candidates[1].starts_with(&native("`fixture::shapes::Circle` (struct) at src/lib.rs:")),
+						"{candidates:?}"
+					);
 				}
 				other => panic!("{other:?}"),
 			}
@@ -2459,13 +2475,17 @@ pub fn make() -> (Qux, Pick) {
 		let unnamed = candidates(replace("use crate::_", "use shapes::T1 as _;", true));
 
 		assert_eq!(unnamed.len(), 2, "{unnamed:?}");
-		assert!(unnamed.iter().all(|candidate| candidate.starts_with("`use fixture::_` (import) at src/lib.rs:")), "{unnamed:?}");
+		let import = native("`use fixture::_` (import) at src/lib.rs:");
+
+		assert!(unnamed.iter().all(|candidate| candidate.starts_with(&import)), "{unnamed:?}");
 		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("use crate::_")));
 
 		// `cfg` variants are, and are listed as the imports
 		let picks = candidates(replace("use crate::Pick", "use shapes::Circle as Pick;", false));
 
-		assert!(picks.iter().all(|candidate| candidate.starts_with("`use fixture::Pick` (import) at src/lib.rs:")), "{picks:?}");
+		let import = native("`use fixture::Pick` (import) at src/lib.rs:");
+
+		assert!(picks.iter().all(|candidate| candidate.starts_with(&import)), "{picks:?}");
 		assert!(rscode::edit::replaces_all_variants(&resolver, &path("use crate::Pick")));
 
 		// a `use` item all of whose imports the path names

@@ -567,38 +567,44 @@ fn parent(path: &mut PathBuf) {
 mod tests {
 	use super::*;
 
+	/// An absolute path on every platform: `/c` on Unix, `C:\c` (on the current drive) on Windows, where a path
+	/// starting with `/` has no drive.
+	fn abs(path: &str) -> PathBuf {
+		std::path::absolute(path).unwrap()
+	}
+
 	#[test]
 	fn normalizes_paths_lexically() {
-		assert_eq!(normalize_path(Path::new("/a/./b/../c.rs")), Path::new("/a/c.rs"));
-		assert_eq!(normalize_path(Path::new("/a/b/../../../c")), Path::new("/c"));
-		assert_eq!(normalize_path(Path::new("/a//b/")), Path::new("/a/b"));
+		assert_eq!(normalize_path(Path::new("/a/./b/../c.rs")), abs("/a/c.rs"));
+		assert_eq!(normalize_path(Path::new("/a/b/../../../c")), abs("/c"));
+		assert_eq!(normalize_path(Path::new("/a//b/")), abs("/a/b"));
 		assert!(normalize_path(Path::new("relative/x.rs")).is_absolute());
 		assert!(normalize_path(Path::new("relative/x.rs")).ends_with("relative/x.rs"));
 	}
 
 	#[test]
 	fn module_directories_follow_rustc() {
-		let root = ModDir::of_file(Path::new("/c/src/lib.rs"), None);
+		let root = ModDir::of_file(&abs("/c/src/lib.rs"), None);
 
-		assert_eq!(root.child_dir(), Path::new("/c/src"));
-		assert_eq!(root.inline("m", None).child_dir(), Path::new("/c/src/m"));
-		assert_eq!(root.inline("m", Some("p")).child_dir(), Path::new("/c/src/p"));
+		assert_eq!(root.child_dir(), abs("/c/src"));
+		assert_eq!(root.inline("m", None).child_dir(), abs("/c/src/m"));
+		assert_eq!(root.inline("m", Some("p")).child_dir(), abs("/c/src/p"));
 
 		// `src/a.rs`, loaded by `mod a;`
-		let a = ModDir::of_file(Path::new("/c/src/a.rs"), Some("a".into()));
+		let a = ModDir::of_file(&abs("/c/src/a.rs"), Some("a".into()));
 
-		assert_eq!(a.child_dir(), Path::new("/c/src/a"));
-		assert_eq!(a.inline("inl", None), ModDir { dir: "/c/src/a/inl".into(), relative: None });
-		assert_eq!(a.inline("inl", Some("x")), ModDir { dir: "/c/src/x".into(), relative: None });
+		assert_eq!(a.child_dir(), abs("/c/src/a"));
+		assert_eq!(a.inline("inl", None), ModDir { dir: abs("/c/src/a/inl"), relative: None });
+		assert_eq!(a.inline("inl", Some("x")), ModDir { dir: abs("/c/src/x"), relative: None });
 
 		let missing = a.resolve("b", None);
 
-		assert_eq!(missing.path, Path::new("/c/src/a/b.rs"));
-		assert_eq!(missing.dir, ModDir { dir: "/c/src/a".into(), relative: Some("b".into()) });
+		assert_eq!(missing.path, abs("/c/src/a/b.rs"));
+		assert_eq!(missing.dir, ModDir { dir: abs("/c/src/a"), relative: Some("b".into()) });
 		assert!(!missing.exists);
-		assert_eq!(a.resolve("c", Some("c.rs")).path, Path::new("/c/src/c.rs"));
-		assert_eq!(a.resolve("c", Some("c.rs")).dir, ModDir { dir: "/c/src".into(), relative: None });
-		assert_eq!(a.resolve("c", Some("/abs/c.rs")).path, Path::new("/abs/c.rs"));
-		assert_eq!(a.resolve("c", Some("../up.rs")).path, Path::new("/c/up.rs"));
+		assert_eq!(a.resolve("c", Some("c.rs")).path, abs("/c/src/c.rs"));
+		assert_eq!(a.resolve("c", Some("c.rs")).dir, ModDir { dir: abs("/c/src"), relative: None });
+		assert_eq!(a.resolve("c", Some("/abs/c.rs")).path, abs("/abs/c.rs"));
+		assert_eq!(a.resolve("c", Some("../up.rs")).path, abs("/c/up.rs"));
 	}
 }

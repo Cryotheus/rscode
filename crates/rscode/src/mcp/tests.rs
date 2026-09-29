@@ -117,10 +117,12 @@ fn source_tools() {
 	}
 
 	let instructions = server.get_info().instructions.unwrap();
+	// patterns are listed resolved: on Windows, with a drive and `\`
+	let resolved = |exposure: &str| exposure.parse::<Exposure>().unwrap().resolved_pattern().to_owned();
 
 	assert!(instructions.contains("attach_source"), "{instructions}");
 	assert!(instructions.contains("pass that name as `attached`"), "{instructions}");
-	assert!(instructions.ends_with("\n- read: /nonexistent/refs/*"), "{instructions}");
+	assert!(instructions.ends_with(&format!("\n- read: {}", resolved("read=/nonexistent/refs/*"))), "{instructions}");
 	assert!(!Server::new(ServerOptions::default()).get_info().instructions.unwrap().contains("attach_source"));
 
 	// a read-only server does not offer writing
@@ -129,9 +131,10 @@ fn source_tools() {
 	let read_only = Server::new(ServerOptions { exposed, read_only: true, ..ServerOptions::default() });
 	let writable = writable.get_info().instructions.unwrap();
 	let read_only = read_only.get_info().instructions.unwrap();
+	let engine = resolved("write=/nonexistent/engine");
 
-	assert!(writable.contains("`write` if you need to edit them") && writable.ends_with("- write: /nonexistent/engine"));
-	assert!(!read_only.contains("`write`") && read_only.ends_with("- read: /nonexistent/engine"), "{read_only}");
+	assert!(writable.contains("`write` if you need to edit them") && writable.ends_with(&format!("- write: {engine}")));
+	assert!(!read_only.contains("`write`") && read_only.ends_with(&format!("- read: {engine}")), "{read_only}");
 }
 
 #[test]
@@ -637,6 +640,12 @@ mod end_to_end {
 		}
 	}
 
+	/// `text` with `/` replaced by the platform's path separator, which the tools write paths with (except in the
+	/// headers of diffs).
+	fn native(text: &str) -> String {
+		text.replace('/', std::path::MAIN_SEPARATOR_STR)
+	}
+
 	#[tokio::test]
 	async fn queries() {
 		let fixture = Fixture::new("queries");
@@ -647,7 +656,7 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&["demo 0.1.0  Cargo.toml", "extra", "demo  lib  src/lib.rs  edition 2024", "load problems: none"],
+			&["demo 0.1.0  Cargo.toml", "extra", &native("demo  lib  src/lib.rs  edition 2024"), "load problems: none"],
 		);
 
 		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "kinds": ["fn", "assoc-fn"] })).await;
@@ -656,9 +665,9 @@ mod end_to_end {
 		assert_contains(
 			&text,
 			&[
-				"demo::add  fn  src/lib.rs:7:1-10:2",
-				"demo::extra  fn  src/lib.rs:12:1-13:18  cfg: feature = \"extra\"  inactive",
-				"demo::shapes::Circle::new  assoc-fn  src/shapes.rs:",
+				&native("demo::add  fn  src/lib.rs:7:1-10:2"),
+				&native("demo::extra  fn  src/lib.rs:12:1-13:18  cfg: feature = \"extra\"  inactive"),
+				&native("demo::shapes::Circle::new  assoc-fn  src/shapes.rs:"),
 				"5 matches",
 			],
 		);
@@ -682,7 +691,12 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&["// error: no item found for `crate::nope`", "// demo::add (fn) src/lib.rs:7-10", "a + b", "│"],
+			&[
+				"// error: no item found for `crate::nope`",
+				&format!("// {}", native("demo::add (fn) src/lib.rs:7-10")),
+				"a + b",
+				"│",
+			],
 		);
 
 		let (failed, text) = client.call("view_items", json!({ "paths": "crate::nope" })).await;
@@ -775,7 +789,10 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&["helper 0.2.0  helper/Cargo.toml  (not selected, so not loaded; crates: helper)", "set `workspace` to true"],
+			&[
+				&native("helper 0.2.0  helper/Cargo.toml  (not selected, so not loaded; crates: helper)"),
+				"set `workspace` to true",
+			],
 		);
 
 		// and named when paths or patterns match nothing
@@ -800,7 +817,11 @@ mod end_to_end {
 		assert!(failed);
 		assert_contains(
 			&text,
-			&["(lib crate root) at src/lib.rs:1:1", "(bin crate root) at src/main.rs:1:1", "select one with `lib`"],
+			&[
+				&native("(lib crate root) at src/lib.rs:1:1"),
+				&native("(bin crate root) at src/main.rs:1:1"),
+				"select one with `lib`",
+			],
 		);
 
 		let (failed, text) = client
@@ -829,7 +850,10 @@ mod end_to_end {
 		let (failed, text) = client.call("replace_item", replace).await;
 
 		assert!(failed);
-		assert_contains(&text, &["`<demo::W<u16>>::get` (assoc-fn) at src/lib.rs:10:2", "hint: use one of the candidates'"]);
+		assert_contains(
+			&text,
+			&[&native("`<demo::W<u16>>::get` (assoc-fn) at src/lib.rs:10:2"), "hint: use one of the candidates'"],
+		);
 		assert!(!text.contains("all_variants"), "{text}");
 		client.close().await.unwrap();
 	}
@@ -849,12 +873,15 @@ mod end_to_end {
 		let (failed, text) = client.call("find_items", json!({ "pattern": "use *" })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &["use demo::Circle  import  src/lib.rs:5:5-5:19  -> demo::shapes::Circle"]);
+		assert_contains(&text, &[&native("use demo::Circle  import  src/lib.rs:5:5-5:19  -> demo::shapes::Circle")]);
 
 		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Circle" })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &["// use demo::Circle (import) src/lib.rs:5", "use shapes::Circle;"]);
+		assert_contains(
+			&text,
+			&[&format!("// {}", native("use demo::Circle (import) src/lib.rs:5")), "use shapes::Circle;"],
+		);
 
 		let (failed, text) = client.call("remove_items", json!({ "paths": "crate::Circle", "dry_run": true })).await;
 
@@ -863,8 +890,8 @@ mod end_to_end {
 			&text,
 			&[
 				"`crate::Circle` is ambiguous",
-				"`use demo::Circle` (import) at src/lib.rs:5:5",
-				"`demo::shapes::Circle` (struct) at src/lib.rs:2:2",
+				&native("`use demo::Circle` (import) at src/lib.rs:5:5"),
+				&native("`demo::shapes::Circle` (struct) at src/lib.rs:2:2"),
 				"hint: the path names an item through a private import",
 			],
 		);
@@ -935,18 +962,18 @@ mod end_to_end {
 				("secret/src/lib.rs", "pub fn hidden() {}\n"),
 			],
 		);
-		let root = std::fs::canonicalize(&fixture.root).unwrap();
+		// resolved like the manifests of attached sources: on Windows, `C:\...` rather than `\\?\C:\...`
+		let root = sources::resolve(&fixture.root);
 		let pattern = |pattern: &str| root.join(pattern).to_str().unwrap().to_owned();
+		let project = Exposure::new(Access::Write, &pattern("project")).unwrap();
+		let refs = Exposure::new(Access::Read, &pattern("refs/*")).unwrap();
 		let options = ServerOptions {
 			load: LoadOptions {
 				manifest_path: Some(root.join("own/Cargo.toml")),
 				silent: true,
 				..LoadOptions::default()
 			},
-			exposed: vec![
-				Exposure::new(Access::Write, &pattern("project")).unwrap(),
-				Exposure::new(Access::Read, &pattern("refs/*")).unwrap(),
-			],
+			exposed: vec![project.clone(), refs.clone()],
 			..ServerOptions::default()
 		};
 		let mut client = Client::connect(options).await;
@@ -959,13 +986,13 @@ mod end_to_end {
 			&[
 				&format!("the server's own workspace (used without `attached`): {}", root.join("own/Cargo.toml").display()),
 				"no sources are attached",
-				&format!("write  {}", pattern("project")),
-				&format!("read   {}", pattern("refs/*")),
+				&format!("write  {}", project.resolved_pattern()),
+				&format!("read   {}", refs.resolved_pattern()),
 			],
 		);
 
 		// reading
-		let log = root.join("refs/log/Cargo.toml");
+		let log = root.join(native("refs/log/Cargo.toml"));
 		let (failed, text) =
 			client.call("attach_source", json!({ "manifest_path": log.to_str().unwrap(), "name": "log" })).await;
 
@@ -982,7 +1009,7 @@ mod end_to_end {
 		let (failed, text) = client.call("find_items", json!({ "pattern": "info", "attached": "log" })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &["log::info  fn  src/lib.rs:1:1"]);
+		assert_contains(&text, &[&native("log::info  fn  src/lib.rs:1:1")]);
 
 		let (_, text) = client.call("workspace_info", json!({ "attached": "log" })).await;
 
@@ -1046,12 +1073,12 @@ mod end_to_end {
 		let (failed, text) = client.call("attach_source", attach("refs/log", "log", true)).await;
 
 		assert!(failed);
-		assert_contains(&text, &["is only exposed for reading", &format!("read={}", pattern("refs/*"))]);
+		assert_contains(&text, &["is only exposed for reading", &refs.to_string()]);
 
 		let (failed, text) = client.call("attach_source", attach("secret", "secret", false)).await;
 
 		assert!(failed);
-		assert_contains(&text, &["is not in a directory exposed by this server", &pattern("refs/*")]);
+		assert_contains(&text, &["is not in a directory exposed by this server", refs.resolved_pattern()]);
 
 		let (failed, text) = client.call("attach_source", attach("project", "no good", true)).await;
 

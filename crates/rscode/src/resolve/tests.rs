@@ -1973,7 +1973,7 @@ fn real_crates() -> Vec<TestCrate> {
 		}
 	}
 
-	let home = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo"));
+	let home = std::env::home_dir().map(|home| home.join(".cargo"));
 	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home);
 
 	let syn = (registry.and_then(|home| std::fs::read_dir(home.join("registry/src")).ok()).into_iter().flatten().flatten())
@@ -1990,7 +1990,8 @@ fn real_crates() -> Vec<TestCrate> {
 #[test]
 #[ignore = "slow; needs large crates in the cargo registry"]
 fn robustness_on_large_registry_crates() {
-	let registry = std::env::var_os("HOME").map(|home| Path::new(&home).join(".cargo/registry/src"));
+	let home = std::env::home_dir().map(|home| home.join(".cargo"));
+	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home).map(|home| home.join("registry/src"));
 	let indices: Vec<PathBuf> = registry.and_then(|registry| std::fs::read_dir(registry).ok()).into_iter().flatten().flatten().map(|index| index.path()).collect();
 
 	let crates = [

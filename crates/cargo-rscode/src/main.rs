@@ -88,13 +88,14 @@ fn main() -> ExitCode {
 	CompleteEnv::with_factory(cli::cli).var(complete::COMPLETE_VAR).shells(shells::SHELLS).complete();
 
 	let (args, via_cargo) = cli::normalize_args(std::env::args_os().collect());
-	let mut command = cli::cli().color(cli::color_choice(&args));
 
-	if via_cargo {
-		// only the usage, help, and error texts change
-		command = command.bin_name(format!("cargo {}", cli::CARGO_SUBCOMMAND));
-	}
-
+	// only the usage, help, and error texts change (clap would take the name the binary was started with, like
+	// `cargo-rscode.exe`)
+	let bin_name = match via_cargo {
+		true => format!("cargo {}", cli::CARGO_SUBCOMMAND),
+		false => cli::BIN_NAME.to_owned(),
+	};
+	let command = cli::cli().color(cli::color_choice(&args)).bin_name(bin_name);
 	let matches = command.try_get_matches_from(args).unwrap_or_else(|error| error.exit());
 
 	// `subcommand_required` has clap refuse a missing subcommand

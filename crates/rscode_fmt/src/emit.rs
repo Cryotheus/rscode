@@ -9,6 +9,8 @@ mod lines;
 use lines::Line;
 use serde::Serialize;
 use similar::TextDiff;
+use std::path::Component;
+use std::path::Path;
 use std::path::PathBuf;
 
 /// A file whose contents changed (or would change) by formatting.
@@ -115,15 +117,16 @@ pub fn mismatches(original: &str, formatted: &str) -> Vec<Mismatch> {
 
 /// A unified diff (`--- a/path`, `+++ b/path` headers) of every changed file, with `context` lines of context.
 ///
-/// Absolute paths are not prefixed (`--- /path`, `+++ /path`).
+/// Relative paths are written with `/` on every platform, as `git apply` and `patch -p1` expect. Paths with a root or a
+/// drive (absolute paths, and on Windows also `\path` and `C:path`) are written as they are, without a prefix
+/// (`--- /path`, `+++ /path`).
 pub fn unified_diff(changes: &[FileChange], context: usize) -> String {
 	let mut diff = String::new();
 
 	for change in changes.iter().filter(|change| change.is_changed()) {
-		let path = change.path.display();
-		let (old, new) = match change.path.is_absolute() {
-			true => (path.to_string(), path.to_string()),
-			false => (format!("a/{path}"), format!("b/{path}")),
+		let (old, new) = match relative_with_slashes(&change.path) {
+			Some(path) => (format!("a/{path}"), format!("b/{path}")),
+			None => (change.path.display().to_string(), change.path.display().to_string()),
 		};
 		let text_diff = TextDiff::from_lines(change.original.as_str(), change.formatted.as_str());
 		let unified = text_diff.unified_diff().context_radius(context).header(&old, &new).to_string();
@@ -132,6 +135,20 @@ pub fn unified_diff(changes: &[FileChange], context: usize) -> String {
 	}
 
 	diff
+}
+
+/// A relative path (without a root or a drive) written with `/`.
+fn relative_with_slashes(path: &Path) -> Option<String> {
+	let mut components = Vec::new();
+
+	for component in path.components() {
+		match component {
+			Component::Prefix(_) | Component::RootDir => return None,
+			component => components.push(component.as_os_str().to_string_lossy()),
+		}
+	}
+
+	Some(components.join("/"))
 }
 
 /// JSON in the format of `rustfmt --emit json`: an array with an entry for every file with [`mismatches`],
@@ -385,6 +402,21 @@ mod tests {
 		let path = path.display();
 
 		assert_eq!(unified_diff(&changes, 0), format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-a\n+b\n"));
+
+		// on Windows, a path with a root but no drive is not absolute, but it is not relative either
+		let path = PathBuf::from("/x.rs");
+		let changes = [FileChange { path, original: "a\n".to_owned(), formatted: "b\n".to_owned() }];
+
+		assert_eq!(unified_diff(&changes, 0), "--- /x.rs\n+++ /x.rs\n@@ -1 +1 @@\n-a\n+b\n");
+	}
+
+	#[test]
+	fn unified_diff_of_native_paths() {
+		// `src\a.rs` on Windows
+		let path = Path::new("src").join("a.rs");
+		let changes = [FileChange { path, original: "a\n".to_owned(), formatted: "b\n".to_owned() }];
+
+		assert_eq!(unified_diff(&changes, 0), "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n");
 	}
 
 	#[test]
