@@ -1,6 +1,6 @@
 [package]
 name = "cargo-rscode"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -22,8 +22,10 @@ tokio = { workspace = true, optional = true }
 
 [features]
 default = ["mcp"]
+
 ## `cargo rscode mcp`: serve rscode's operations over the Model Context Protocol (stdio).
 mcp = ["rscode/mcp", "dep:tokio"]
+
 ## Build OpenSSL from source and link it statically (used for release binaries), instead of linking the system's.
 vendored-openssl = ["cargo/vendored-openssl"]
 

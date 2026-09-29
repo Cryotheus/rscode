@@ -8,6 +8,7 @@ authors = ["Cryotheum"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
 repository = "https://github.com/Cryotheus/rscode"
+version = "1.0.0"
 
 [workspace.dependencies]
 anyhow = "1.0.104"

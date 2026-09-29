@@ -1,6 +1,6 @@
 [package]
 name = "rscode_fmt"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -24,5 +24,6 @@ thiserror.workspace = true
 
 [features]
 default = []
+
 ## Implements `clap::ValueEnum` for the public option enums.
 clap = ["dep:clap", "rscode_sort/clap"]
