@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 
+/// What `--version` prints.
+const VERSION_LINE: &str = concat!("cargo-rscode ", env!("CARGO_PKG_VERSION"), "\n");
+
 const BIN: &str = env!("CARGO_BIN_EXE_cargo-rscode");
 
 fn fixture() -> PathBuf {
@@ -266,8 +269,8 @@ fn prints_help_and_version() {
 
 	assert_eq!(help.stdout.contains("\n  mcp "), cfg!(feature = "mcp"), "{}", help.stdout);
 	assert!(help.stdout.contains("source <(COMPLETE=bash cargo-rscode)"), "{}", help.stdout);
-	assert_eq!(run(&fixture(), &["--version"]).success().stdout, "cargo-rscode 0.1.0\n");
-	assert_eq!(run(&fixture(), &["rscode", "--version"]).success().stdout, "cargo-rscode 0.1.0\n");
+	assert_eq!(run(&fixture(), &["--version"]).success().stdout, VERSION_LINE);
+	assert_eq!(run(&fixture(), &["rscode", "--version"]).success().stdout, VERSION_LINE);
 }
 
 #[test]
@@ -355,7 +358,7 @@ fn runs_as_a_cargo_subcommand() {
 		finish(command, None)
 	};
 
-	assert_eq!(cargo(&["rscode", "--version"]).success().stdout, "cargo-rscode 0.1.0\n");
+	assert_eq!(cargo(&["rscode", "--version"]).success().stdout, VERSION_LINE);
 
 	let help = cargo(&["rscode", "view", "--help"]).success();
 
