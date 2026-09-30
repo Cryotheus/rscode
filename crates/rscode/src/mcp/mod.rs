@@ -41,6 +41,12 @@
 //! (or break) each other's names. Attaching is cheap, since it only records the name for the canonical path of the
 //! `Cargo.toml` (after checking that cargo can plan loading it); every call loads its source anyway.
 //!
+//! A name keeps its source until `detach_source` forgets it, since clients work on a source by its name. Attaching
+//! under a taken name changes nothing, and the response says what the name has: an ordinary result when it is the same
+//! `Cargo.toml` with the access asked for or more (a read-only request meets a writable attachment: the response says
+//! that a writable source is active), a tool error when it is another `Cargo.toml`, with a hint to detach the name
+//! first. The one change is attaching the same `Cargo.toml` for writing, which makes a read-only attachment writable.
+//!
 //! Every call loads the workspace from disk again, so the server never works with stale source, and runs on a
 //! fresh thread: `proc_macro2` keeps the locations of everything parsed on a thread in a thread-local map that only
 //! ever grows, until the thread exits. Editing calls run one at a time. Failures are reported to the client as tool

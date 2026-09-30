@@ -38,11 +38,13 @@ pub(crate) struct AttachParams {
 	pub(crate) manifest_path: String,
 
 	/// The name to refer to the source by: pass it as `attached` to the other tools. ASCII letters, digits, `_`, `-`,
-	/// and `.`. Attaching under a name that is taken replaces that source.
+	/// and `.`. A name that is attached already keeps its source: the response says what it is, and `detach_source`
+	/// frees the name.
 	pub(crate) name: String,
 
 	/// Attach for writing, so that the editing tools can change its files. Refused unless its directory is exposed
-	/// for writing. Without it, the source is read-only (the editing tools can still preview changes with `dry_run`).
+	/// for writing. Without it, the source is read-only (the editing tools can still preview changes with `dry_run`),
+	/// but a writable source attached under the name stays writable.
 	#[serde(default)]
 	pub(crate) write: bool,
 }

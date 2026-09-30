@@ -17,6 +17,7 @@ use super::sources::Access;
 use super::sources::Exposure;
 use super::sources::Source;
 use super::sources::Sources;
+use super::sources::Verdict;
 use super::sources::WriteScope;
 use super::tools;
 use super::tools::Output;
@@ -238,8 +239,10 @@ impl Server {
 	/// Attach a cargo workspace or package, by the path of its Cargo.toml, under a name of your choice: afterwards,
 	/// pass that name as `attached` to any other tool to work on it instead of the server's own workspace. Only
 	/// workspaces and packages in the directories the server exposes can be attached, and only those exposed for
-	/// writing can be attached with `write` (see `list_sources`). Attaching is cheap: every call loads its source from
-	/// disk anyway. Names are only known in this session.
+	/// writing can be attached with `write` (see `list_sources`). A name that is attached already keeps its source: the
+	/// response says what is attached under it (in particular, that a writable source is active when a read-only one
+	/// was asked for), and `detach_source` frees the name; attaching the same Cargo.toml again with `write` makes it
+	/// writable. Attaching is cheap: every call loads its source from disk anyway. Names are only known in this session.
 	#[tool(annotations(
 		title = "Attach a source",
 		read_only_hint = false,
@@ -267,22 +270,46 @@ impl Server {
 			);
 		}
 
+		let access = if params.write { Access::Write } else { Access::Read };
+		let source = match sources::manifest(&params.manifest_path) {
+			Ok(manifest) => Source { manifest, access },
+			Err(message) => return respond(TOOL, Err(message)),
+		};
+
+		// a taken name keeps its source: say what it has, before cargo plans anything
+		let verdict = sources::verdict(&name, self.sources().get(&name), &source);
+
+		match verdict {
+			Verdict::Keep(text) => return respond(TOOL, Ok(text)),
+			Verdict::Refuse(message) => return respond(TOOL, Err(message)),
+			Verdict::Attach | Verdict::Upgrade => {}
+		}
+
 		let exposed = self.exposed.clone();
 		let own = self.options.load.clone();
 		let cap = self.access_cap();
-		let job = move || sources::attach(&params.manifest_path, params.write, &exposed, cap, &own);
-		let (source, summary) = match worker::run(TOOL, job).await.and_then(identity) {
-			Ok(attached) => attached,
+		let job = {
+			let source = source.clone();
+
+			move || sources::attach(&source, &exposed, cap, &own)
+		};
+		let summary = match worker::run(TOOL, job).await.and_then(identity) {
+			Ok(summary) => summary,
 			Err(message) => return respond(TOOL, Err(message)),
 		};
-		let replaced = self.sources().insert(name.clone(), source.clone());
-		let mut text = format!("attached `{name}` ({}): {}", source.access.describe(), source.manifest.display());
 
-		if let Some(previous) = replaced.filter(|previous| *previous != source) {
-			write!(text, ", replacing {} ({})", previous.manifest.display(), previous.access.describe()).unwrap();
+		// the name may have been attached meanwhile (calls run concurrently): decide again, as the name is attached
+		let verdict = sources::register(&mut self.sources(), &name, &source);
+		let mut text = format!("attached `{name}` ({}): {}\n", source.access.describe(), source.manifest.display());
+
+		match verdict {
+			Verdict::Keep(kept) => return respond(TOOL, Ok(kept)),
+			Verdict::Refuse(message) => return respond(TOOL, Err(message)),
+			Verdict::Attach => {}
+			Verdict::Upgrade => text.push_str("it was attached read-only before: the editing tools can write to it now\n"),
 		}
 
-		write!(text, "\n{summary}pass `\"attached\": \"{name}\"` to the other tools to work on it\n").unwrap();
+		writeln!(text, "{summary}pass `\"attached\": \"{name}\"` to the other tools to work on it").unwrap();
 		respond(TOOL, Ok(text))
 	}
 
@@ -678,9 +705,10 @@ fn sources_instructions(read_only: bool) -> String {
 	format!(
 		"\n\nOther cargo workspaces and packages can be attached with attach_source: the path of their Cargo.toml, a \
 		 name of your choice{write}. Then pass that name as `attached` to any other tool to work on the source instead \
-		 of the server's own workspace. Names are only known in this session; list_sources lists them. Workspaces and \
-		 packages can be attached when the directory of their Cargo.toml matches one of these patterns (`*` matches \
-		 within one path component, `**` any number of components){writing}:"
+		 of the server's own workspace. Names are only known in this session; list_sources lists them. A name keeps its \
+		 source until detach_source forgets it. Workspaces and packages can be attached when the directory of their \
+		 Cargo.toml matches one of these patterns (`*` matches within one path component, `**` any number of \
+		 components){writing}:"
 	)
 }
 

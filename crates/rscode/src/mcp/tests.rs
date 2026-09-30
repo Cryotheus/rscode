@@ -892,6 +892,194 @@ mod end_to_end {
 
 	/// `text` with `/` replaced by the platform's path separator, which the tools write paths with (except in the
 	/// headers of diffs).
+	/// A name keeps its source: attaching under it again says what it has and changes nothing (except that attaching
+	/// the same `Cargo.toml` for writing makes a read-only attachment writable), and a read-only attachment never
+	/// replaces a writable one.
+	#[tokio::test]
+	async fn names_keep_their_sources() {
+		let package = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n");
+		let fixture = Fixture::with_files(
+			"names",
+			&[
+				("own/Cargo.toml", &package("own")),
+				("own/src/lib.rs", "pub fn mine() {}\n"),
+				("project/Cargo.toml", &package("engine")),
+				("project/src/lib.rs", "pub fn run() {}\n"),
+				("refs/log/Cargo.toml", &package("log")),
+				("refs/log/src/lib.rs", "pub fn info() {}\n"),
+			],
+		);
+		let root = sources::resolve(&fixture.root);
+		let pattern = |pattern: &str| root.join(pattern).to_str().unwrap().to_owned();
+		let options = ServerOptions {
+			load: LoadOptions {
+				manifest_path: Some(root.join("own/Cargo.toml")),
+				silent: true,
+				..LoadOptions::default()
+			},
+			exposed: vec![
+				Exposure::new(Access::Write, &pattern("project")).unwrap(),
+				Exposure::new(Access::Read, &pattern("refs/*")).unwrap(),
+			],
+			..ServerOptions::default()
+		};
+		let mut client = Client::connect(options).await;
+		let attach =
+			|path: &str, name: &str, write: bool| json!({ "manifest_path": root.join(path).to_str().unwrap(), "name": name, "write": write });
+		let insert = |function: &str, name: &str| json!({ "parent": "crate", "source": format!("pub fn {function}() {{}}"), "attached": name });
+		let project = root.join(native("project/Cargo.toml")).display().to_string();
+		let log = root.join(native("refs/log/Cargo.toml")).display().to_string();
+
+		let (failed, text) = client.call("attach_source", attach("project", "engine", true)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[&format!("attached `engine` (read and write): {project}"), "packages loaded by default: engine 0.1.0"],
+		);
+
+		// asking for what the name has says so, and plans nothing
+		let (failed, text) = client.call("attach_source", attach("project", "engine", true)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&format!("source `engine` is already attached (read and write): {project}"),
+				"nothing changed",
+				"pass `\"attached\": \"engine\"`",
+			],
+		);
+		assert!(!text.contains("packages loaded by default"), "{text}");
+
+		// a writable source that is active is not made read-only: the same Cargo.toml is answered with it
+		let (failed, text) = client.call("attach_source", attach("project", "engine", false)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&format!("there is already a writable source attached as `engine` (read and write): {project}"),
+				"nothing changed",
+				"the editing tools can write to it",
+				"attach the same Cargo.toml under another name",
+			],
+		);
+
+		// and another Cargo.toml is refused, read-only or not, whatever the directory is exposed for
+		for write in [false, true] {
+			let (failed, text) = client.call("attach_source", attach("refs/log", "engine", write)).await;
+			let already = match write {
+				false => "there is already a writable source attached as `engine`",
+				true => "source `engine` is already attached",
+			};
+
+			assert!(failed, "{text}");
+			assert_contains(
+				&text,
+				&[
+					&format!("{already} (read and write): {project}"),
+					"nothing was attached",
+					&format!("attach {log} under another name, or detach `engine` first with `detach_source`"),
+				],
+			);
+		}
+
+		// the writable source is still there, and still writable
+		let (_, text) = client.call("list_sources", json!({})).await;
+
+		assert_contains(&text, &[&format!("engine  read and write  {project}")]);
+		assert!(!text.contains(&log), "{text}");
+
+		let (failed, text) = client.call("insert_items", insert("halt", "engine")).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&fixture.read("project/src/lib.rs"), &["pub fn halt() {}"]);
+
+		// a name of a read-only source keeps it, too
+		let (failed, text) = client.call("attach_source", attach("refs/log", "log", false)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&format!("attached `log` (read-only): {log}")]);
+
+		let (failed, text) = client.call("attach_source", attach("refs/log", "log", false)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&format!("source `log` is already attached (read-only): {log}"), "nothing changed"]);
+
+		let (failed, text) = client.call("attach_source", attach("project", "log", false)).await;
+
+		assert!(failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&format!("source `log` is already attached (read-only): {log}"),
+				"nothing was attached",
+				&format!("attach {project} under another name, or detach `log` first with `detach_source`"),
+			],
+		);
+
+		// writing is checked like for any attachment, and the read-only source stays as it is
+		let (failed, text) = client.call("attach_source", attach("refs/log", "log", true)).await;
+
+		assert!(failed, "{text}");
+		assert_contains(&text, &["is only exposed for reading"]);
+
+		let (failed, text) = client.call("insert_items", insert("warn", "log")).await;
+
+		assert!(failed, "{text}");
+		assert_contains(&text, &["source `log` is attached read-only"]);
+
+		// attaching the same Cargo.toml for writing makes a read-only source writable
+		let (failed, text) = client.call("attach_source", attach("project", "p", false)).await;
+
+		assert!(!failed, "{text}");
+
+		let (failed, text) = client.call("insert_items", insert("freeze", "p")).await;
+
+		assert!(failed, "{text}");
+		assert_contains(&text, &["source `p` is attached read-only"]);
+
+		let (failed, text) = client.call("attach_source", attach("project", "p", true)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&format!("attached `p` (read and write): {project}"),
+				"it was attached read-only before",
+				"packages loaded by default: engine 0.1.0",
+			],
+		);
+
+		let (failed, text) = client.call("insert_items", insert("freeze", "p")).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&fixture.read("project/src/lib.rs"), &["pub fn halt() {}", "pub fn freeze() {}"]);
+
+		// but never back
+		let (failed, text) = client.call("attach_source", attach("project", "p", false)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["there is already a writable source attached as `p` (read and write)"]);
+
+		let (failed, text) = client.call("insert_items", insert("thaw", "p")).await;
+
+		assert!(!failed, "{text}");
+
+		// detaching frees the name
+		let (failed, text) = client.call("detach_source", json!({ "name": "engine" })).await;
+
+		assert!(!failed, "{text}");
+
+		let (failed, text) = client.call("attach_source", attach("refs/log", "engine", false)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&format!("attached `engine` (read-only): {log}")]);
+		assert!(!text.contains("already"), "{text}");
+		client.close().await.unwrap();
+	}
+
 	fn native(text: &str) -> String {
 		text.replace('/', std::path::MAIN_SEPARATOR_STR)
 	}
@@ -1282,11 +1470,11 @@ mod end_to_end {
 
 		assert!(failed);
 
-		// attaching again under a name replaces the source
+		// a read-only attachment does not replace a writable one
 		let (failed, text) = client.call("attach_source", attach("refs/log", "engine", false)).await;
 
-		assert!(!failed, "{text}");
-		assert_contains(&text, &["attached `engine` (read-only)", "replacing", "(read and write)"]);
+		assert!(failed, "{text}");
+		assert_contains(&text, &["there is already a writable source attached as `engine` (read and write)", "nothing was attached"]);
 		client.close().await.unwrap();
 	}
 }

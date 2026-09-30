@@ -181,7 +181,10 @@ their `Cargo.toml` (or its directory) and a name of their choice, and then pass 
 - Names are scoped to the client that attached them. Over stdio each client has its own server process, so clients
   never see or break each other's names. Attaching checks that cargo can plan loading the source (so it fails for
   manifests cargo rejects), and then only records the name: every tool call loads its source from disk anyway.
-  `detach_source` forgets a name, and `list_sources` shows the attached sources and the exposed directories.
+  A name keeps its source until `detach_source` forgets it: attaching under a taken name changes nothing and answers
+  with what the name has (a read-only request never replaces a writable attachment, and says that a writable one is
+  active), except that attaching the same `Cargo.toml` for writing makes a read-only attachment writable.
+  `list_sources` shows the attached sources and the exposed directories.
 - The server's own workspace (`--manifest-path`, or the one containing the working directory) remains the default
   when a tool call names no `attached` source, and `--expose` does not restrict its edits, like on the command line.
 

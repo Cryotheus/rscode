@@ -182,7 +182,7 @@ impl Source {
 			Ok(path) if path == self.manifest => Ok(()),
 
 			Ok(path) => Err(format!(
-				"the path of source `{name}` ({}) now leads to {} (through a symbolic link): attach it again",
+				"the path of source `{name}` ({}) now leads to {} (through a symbolic link): detach it and attach it again",
 				self.manifest.display(),
 				path.display()
 			)),
@@ -190,6 +190,22 @@ impl Source {
 			Err(error) => Err(format!("source `{name}`: {}: {error}", self.manifest.display())),
 		}
 	}
+}
+
+/// What attaching a source under a name comes to, given what the name has attached already (see [`verdict`]).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum Verdict {
+	/// The name is free: the source is attached.
+	Attach,
+
+	/// The name has the same `Cargo.toml`, attached read-only, and the source asks for writing: it takes its place.
+	Upgrade,
+
+	/// The name keeps its source, which is what was asked for, or more: the text tells what the name has.
+	Keep(String),
+
+	/// The name keeps its source, which is not what was asked for: the text tells what the name has, and what to do.
+	Refuse(String),
 }
 
 /// Where the edits of a tool call may be written.
@@ -238,11 +254,10 @@ pub(crate) fn access(exposed: &[Exposure], directory: &Path) -> Option<Access> {
 	exposed.iter().filter(|exposure| exposure.matches(directory)).map(Exposure::access).max()
 }
 
-/// Checks that a client may attach the workspace or package of `manifest` (as given), with write access if `write`,
-/// and that cargo can plan loading it. Returns the source and a summary of its packages. `cap` is the most access the
-/// server gives, for messages.
-pub(crate) fn attach(manifest: &str, write: bool, exposed: &[Exposure], cap: Access, own: &LoadOptions) -> Result<(Source, String), String> {
-	let manifest = self::manifest(manifest)?;
+/// Checks that a client may attach `source` (with the access the client asks for), and that cargo can plan loading it.
+/// Returns a summary of its packages. `cap` is the most access the server gives, for messages.
+pub(crate) fn attach(source: &Source, exposed: &[Exposure], cap: Access, own: &LoadOptions) -> Result<String, String> {
+	let manifest = &source.manifest;
 	let directory = manifest.parent().unwrap_or(Path::new(""));
 	let matching: Vec<String> = exposed
 		.iter()
@@ -259,7 +274,7 @@ pub(crate) fn attach(manifest: &str, write: bool, exposed: &[Exposure], cap: Acc
 			));
 		}
 
-		Some(Access::Read) if write => {
+		Some(Access::Read) if source.access == Access::Write => {
 			return Err(format!(
 				"{} is only exposed for reading ({}): attach it without `write` to read it",
 				directory.display(),
@@ -270,8 +285,7 @@ pub(crate) fn attach(manifest: &str, write: bool, exposed: &[Exposure], cap: Acc
 		Some(_) => {}
 	}
 
-	let access = if write { Access::Write } else { Access::Read };
-	let plan = plan_workspace(&load_options(own, &manifest)).map_err(|error| format!("failed to load {}: {error}", manifest.display()))?;
+	let plan = plan_workspace(&load_options(own, manifest)).map_err(|error| format!("failed to load {}: {error}", manifest.display()))?;
 	let mut summary = format!("workspace root: {}\n", plan.root.display());
 	let packages: Vec<String> = plan
 		.packages
@@ -293,7 +307,7 @@ pub(crate) fn attach(manifest: &str, write: bool, exposed: &[Exposure], cap: Acc
 		.unwrap();
 	}
 
-	Ok((Source { manifest, access }, summary))
+	Ok(summary)
 }
 
 /// Checks a name for a source.
@@ -465,6 +479,18 @@ fn normalized(mut base: PathBuf, components: &[Component<'_>]) -> PathBuf {
 	base
 }
 
+/// Attaches `source` as `name`, unless the name keeps what it has (see [`verdict`]). Deciding and attaching are one
+/// step on `sources`, so that two calls for the same name at once cannot both attach.
+pub(crate) fn register(sources: &mut Sources, name: &str, source: &Source) -> Verdict {
+	let outcome = verdict(name, sources.get(name), source);
+
+	if matches!(outcome, Verdict::Attach | Verdict::Upgrade) {
+		sources.insert(name.to_owned(), source.clone());
+	}
+
+	outcome
+}
+
 /// `path` (absolute) with symbolic links resolved: canonicalized as far as it exists, with the rest appended (and
 /// `.` and `..` in it resolved textually, which is exact where nothing exists).
 pub(crate) fn resolve(path: &Path) -> PathBuf {
@@ -495,6 +521,44 @@ pub(crate) fn unknown(name: &str, sources: &Sources) -> String {
 	}
 
 	message
+}
+
+/// What attaching `requested` under `name` comes to, when `existing` is attached as `name` (if anything is).
+///
+/// A name keeps its source until it is detached, since clients work on a source by its name: no other `Cargo.toml` is
+/// attached under a taken name, and a read-only attachment never takes the place of a writable one, which stays
+/// active. Asking again for what the name has changes nothing, except that attaching the same `Cargo.toml` for writing
+/// upgrades a read-only attachment.
+pub(crate) fn verdict(name: &str, existing: Option<&Source>, requested: &Source) -> Verdict {
+	let Some(existing) = existing else {
+		return Verdict::Attach;
+	};
+	let current = format!("({}): {}", existing.access.describe(), existing.manifest.display());
+	let already = match (existing.access, requested.access) {
+		(Access::Write, Access::Read) => format!("there is already a writable source attached as `{name}` {current}"),
+		_ => format!("source `{name}` is already attached {current}"),
+	};
+
+	if existing.manifest != requested.manifest {
+		return Verdict::Refuse(format!(
+			"{already}\nnothing was attached: a name keeps its source until it is detached\nhint: attach {} under another \
+			 name, or detach `{name}` first with `detach_source`",
+			requested.manifest.display()
+		));
+	}
+
+	match (existing.access, requested.access) {
+		(Access::Read, Access::Write) => Verdict::Upgrade,
+
+		(Access::Write, Access::Read) => Verdict::Keep(format!(
+			"{already}\nnothing changed: a read-only attachment does not replace it, so the editing tools can write to it \
+			 through `{name}`\nhint: to work on it read-only, attach the same Cargo.toml under another name\n"
+		)),
+
+		_ => Verdict::Keep(format!(
+			"{already}\nnothing changed; pass `\"attached\": \"{name}\"` to the other tools to work on it\n"
+		)),
+	}
 }
 
 /// Whether the editing tools may write to the file `path`: whether a directory above it matches a pattern exposed for
@@ -622,6 +686,36 @@ mod tests {
 		}
 	}
 
+	/// Attaching decides and attaches in one step: only what the name allows is attached.
+	#[test]
+	fn registering_attaches_only_what_the_name_allows() {
+		let a = |access| Source { manifest: PathBuf::from("/a/Cargo.toml"), access };
+		let b = |access| Source { manifest: PathBuf::from("/b/Cargo.toml"), access };
+		let mut sources = Sources::new();
+
+		assert_eq!(register(&mut sources, "n", &a(Access::Read)), Verdict::Attach);
+		assert_eq!(sources["n"], a(Access::Read));
+
+		// what the name has stays, whatever is asked
+		assert!(matches!(register(&mut sources, "n", &a(Access::Read)), Verdict::Keep(_)));
+		assert!(matches!(register(&mut sources, "n", &b(Access::Read)), Verdict::Refuse(_)));
+		assert!(matches!(register(&mut sources, "n", &b(Access::Write)), Verdict::Refuse(_)));
+		assert_eq!(sources["n"], a(Access::Read));
+
+		assert_eq!(register(&mut sources, "n", &a(Access::Write)), Verdict::Upgrade);
+		assert_eq!(sources["n"], a(Access::Write));
+
+		// a writable source is never made read-only, nor replaced
+		assert!(matches!(register(&mut sources, "n", &a(Access::Read)), Verdict::Keep(_)));
+		assert!(matches!(register(&mut sources, "n", &b(Access::Read)), Verdict::Refuse(_)));
+		assert!(matches!(register(&mut sources, "n", &b(Access::Write)), Verdict::Refuse(_)));
+		assert_eq!(sources["n"], a(Access::Write));
+
+		// other names are free
+		assert_eq!(register(&mut sources, "m", &b(Access::Read)), Verdict::Attach);
+		assert_eq!(sources.len(), 2);
+	}
+
 	#[test]
 	fn relative_patterns_are_absolute() {
 		let exposure = Exposure::new(Access::Read, "references/*").unwrap();
@@ -661,6 +755,54 @@ mod tests {
 
 		// a link in an exposed directory does not expose what it leads to
 		assert!(!writable(&[exposure], &tree.path("real/refs/escape/lib.rs")));
+	}
+
+	/// What attaching under a taken name comes to, for every combination of access and `Cargo.toml`.
+	#[test]
+	fn taken_names_keep_their_sources() {
+		let a = |access| Source { manifest: PathBuf::from("/a/Cargo.toml"), access };
+		let b = |access| Source { manifest: PathBuf::from("/b/Cargo.toml"), access };
+		let (read, write) = (Access::Read, Access::Write);
+
+		assert_eq!(verdict("n", None, &a(read)), Verdict::Attach);
+		assert_eq!(verdict("n", None, &a(write)), Verdict::Attach);
+
+		// the same Cargo.toml: what the name has is enough, unless writing is asked for
+		let keep = |has, asked| match verdict("n", Some(&a(has)), &a(asked)) {
+			Verdict::Keep(text) => text,
+			other => panic!("{has} {asked}: {other:?}"),
+		};
+		let text = keep(read, read);
+
+		assert!(text.starts_with("source `n` is already attached (read-only): /a/Cargo.toml\nnothing changed"), "{text}");
+
+		let text = keep(write, write);
+
+		assert!(text.starts_with("source `n` is already attached (read and write): /a/Cargo.toml\nnothing changed"), "{text}");
+
+		let text = keep(write, read);
+
+		assert!(
+			text.starts_with("there is already a writable source attached as `n` (read and write): /a/Cargo.toml\nnothing changed"),
+			"{text}"
+		);
+		assert!(text.contains("a read-only attachment does not replace it"), "{text}");
+		assert_eq!(verdict("n", Some(&a(read)), &a(write)), Verdict::Upgrade);
+
+		// another Cargo.toml: the name keeps what it has
+		for (has, asked) in [(read, read), (read, write), (write, read), (write, write)] {
+			let Verdict::Refuse(text) = verdict("n", Some(&a(has)), &b(asked)) else {
+				panic!("{has} {asked}");
+			};
+			let already = match (has, asked) {
+				(Access::Write, Access::Read) => "there is already a writable source attached as `n`",
+				_ => "source `n` is already attached",
+			};
+
+			assert!(text.starts_with(&format!("{already} ({}): /a/Cargo.toml\n", has.describe())), "{has} {asked}: {text}");
+			assert!(text.contains("nothing was attached"), "{text}");
+			assert!(text.contains("hint: attach /b/Cargo.toml under another name, or detach `n` first with `detach_source`"), "{text}");
+		}
 	}
 
 	#[test]
