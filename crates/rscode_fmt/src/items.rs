@@ -8,12 +8,14 @@ use crate::FormatError;
 use crate::FormatOptions;
 use crate::FormatTarget;
 use crate::RsFormatter;
+use crate::arms::separate_match_arms;
 use crate::contains_comments;
 use crate::prettyplease_fmt;
 use crate::rustfmt;
 use crate::source::Parsed;
 use crate::source::ensure_parses;
 use crate::source::indentation_start;
+use crate::source::parse_output;
 use crate::source::uses_crlf;
 use crate::source::with_line_breaks;
 use crate::tree;
@@ -32,7 +34,8 @@ type Identity = (Vec<Link>, usize);
 /// The kind, name, and header of an item.
 type Link = (&'static str, Option<String>, String);
 
-/// How often a whole file is sorted and formatted again when rustfmt changed how its items sort.
+/// How often a file or its targeted containers are sorted and formatted again when rustfmt changed how their items
+/// sort or lay out.
 const MAX_RESORTS: usize = 3;
 
 /// Finds the items of a source in the formatted source.
@@ -196,21 +199,23 @@ fn children<'a>(file: &'a syn::File, container: Option<Node<'a>>) -> Vec<Node<'a
 	}
 }
 
+/// Formats the whole text, then lays out its `match` arms (see [`separate_match_arms`]). Without a formatter, the text
+/// is only checked to parse if it was sorted.
 fn format_file(text: &str, sorted: bool, options: &FormatOptions) -> Result<String, FormatError> {
 	let formatted = match options.formatter {
 		RsFormatter::RustFmt => rustfmt::format(text, &options.rustfmt)?,
 		RsFormatter::PrettyPlease => prettyplease_fmt::format_str(text, options.allow_comment_loss)?,
-		RsFormatter::None if sorted => text.to_owned(),
-		RsFormatter::None => return Ok(text.to_owned()),
-	};
-	let produced_by = match options.formatter {
-		RsFormatter::None => "sorting",
-		formatter => formatter.name(),
+
+		RsFormatter::None => {
+			if sorted {
+				ensure_parses(text, "sorting")?;
+			}
+
+			return Ok(text.to_owned());
+		}
 	};
 
-	ensure_parses(&formatted, produced_by)?;
-
-	Ok(formatted)
+	separate_match_arms(&formatted, options.formatter.name())
 }
 
 pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &FormatOptions) -> Result<String, FormatError> {
@@ -231,7 +236,8 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 	if whole_file {
 		let mut formatted = format_file(text, sorted.is_some(), options)?;
 
-		// rustfmt may merge or split imports (`imports_granularity`), which changes how they sort: sort and format
+		// rustfmt may wrap a one-liner or join an item spanning lines, which changes the blank lines sorting puts
+		// around it, and merge or split imports (`imports_granularity`), which changes how they sort: sort and format
 		// again until they settle, so that formatting the result changes nothing
 		if let (Some(sort), RsFormatter::RustFmt) = (&options.sort, options.formatter) {
 			// targeted containers that sorting the file does not reach (it is not recursive), found again after each
@@ -264,6 +270,17 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 		return Ok(formatted);
 	}
 
+	// every targeted container, nested ones included: sorting again after formatting must reach all of them, while
+	// only the outermost targets are formatted (formatting them formats the nested ones)
+	let containers: Vec<Identity> = match (&options.sort, options.formatter) {
+		(Some(_), RsFormatter::RustFmt) => items
+			.iter()
+			.filter(|item| item.container)
+			.map(|item| identity(&parsed, item))
+			.collect(),
+
+		_ => Vec::new(),
+	};
 	let items = outermost(items);
 
 	if options.formatter == RsFormatter::None {
@@ -274,18 +291,49 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 		return Ok(text.to_owned());
 	}
 
-	match &sorted {
+	let mut formatted = match &sorted {
 		Some(sorted) => {
-			let parsed = parse_output(sorted, "sorting")?;
+			let sorted_parsed = parse_output(sorted, "sorting")?;
 
-			check_unmoved(&parsed, &items)?;
-			format_targets(sorted, &parsed, &items, options)
+			check_unmoved(&sorted_parsed, &items)?;
+			format_targets(sorted, &sorted_parsed, &items, options)?
 		}
-		None => format_targets(source, &parsed, &items, options),
+
+		None => format_targets(source, &parsed, &items, options)?,
+	};
+
+	// like a whole file, the targeted containers are sorted and formatted again until they settle (only containers
+	// are sorted, and they stay where they are, so only their positions need finding again)
+	if let (Some(sort), RsFormatter::RustFmt) = (&options.sort, options.formatter) {
+		for _ in 0..MAX_RESORTS {
+			let targets = relocate(&formatted, &containers)?;
+
+			match sort_containers(&formatted, false, &targets, sort)? {
+				Some(resorted) if resorted != formatted => {
+					let resorted_parsed = parse_output(&resorted, "sorting")?;
+
+					check_unmoved(&resorted_parsed, &items)?;
+
+					let reformatted = format_targets(&resorted, &resorted_parsed, &items, options)?;
+
+					// rustfmt restored the text: more passes would repeat it
+					if reformatted == formatted {
+						break;
+					}
+
+					formatted = reformatted;
+				}
+
+				_ => break,
+			}
+		}
 	}
+
+	Ok(formatted)
 }
 
-/// Formats the whole text, then splices the formatted text of each target into the text.
+/// Formats the whole text and lays out its `match` arms (see [`separate_match_arms`]), then splices the formatted text
+/// of each target into the text.
 fn format_targets(text: &str, parsed: &Parsed, targets: &[Target], options: &FormatOptions) -> Result<String, FormatError> {
 	let before: Vec<Range<usize>> = targets
 		.iter()
@@ -307,6 +355,7 @@ fn format_targets(text: &str, parsed: &Parsed, targets: &[Target], options: &For
 	};
 
 	let produced_by = options.formatter.name();
+	let formatted = separate_match_arms(&formatted, produced_by)?;
 	let formatted_parsed = parse_output(&formatted, produced_by)?;
 	let mut matcher = Matcher::new(parsed, &formatted_parsed, produced_by);
 	let after: Vec<Option<Range<usize>>> = targets.iter().map(|target| matcher.find(&target.path)).collect::<Result<_, _>>()?;
@@ -376,11 +425,6 @@ fn outermost(targets: Vec<Target>) -> Vec<Target> {
 	}
 
 	kept
-}
-
-/// Parses text produced by sorting or formatting; failing to parse is a [`FormatError::StructureMismatch`].
-fn parse_output(text: &str, produced_by: &str) -> Result<Parsed, FormatError> {
-	Parsed::parse(text).map_err(|error| FormatError::StructureMismatch(format!("the output of {produced_by} does not parse: {error}")))
 }
 
 /// The containers with these identities in `text`.

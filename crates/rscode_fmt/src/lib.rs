@@ -25,6 +25,18 @@
 //! assert_eq!(formatter.format_items(source, &[FormatTarget::Item(b)]).unwrap(), "fn  a( ) {}\nfn b() {}\n");
 //! ```
 //!
+//! # Layout
+//!
+//! Sorting lays out imports, module declarations, `extern crate` items, type aliases, constants, and statics (and
+//! associated types and constants, and the items of `extern` blocks) so that one-line items of a group follow each
+//! other directly, and an item spanning several lines, or with attributes, doc comments, or comments above it, gets a
+//! blank line on both sides; other items are always separated by a blank line (see [`rscode_sort`]). After
+//! formatting, the arms of every `match` are laid out the same way: one-line arms follow each other directly, and an
+//! arm spanning several lines (or with attributes or comments above it) is separated from its neighbours by a blank
+//! line; code under `#[rustfmt::skip]` is left as it is. rustfmt keeps blank lines between items and between arms, so
+//! formatting again changes nothing; where rustfmt wraps or joins an item so that its spacing changes, the file or the
+//! targeted containers are sorted and formatted again until they settle.
+//!
 //! # Threads
 //!
 //! Parsing uses `proc_macro2`'s thread-local source map, which grows with every parse: long-running processes should
@@ -48,6 +60,7 @@
 
 #![warn(missing_docs)]
 
+mod arms;
 mod config;
 pub mod emit;
 mod equivalence;
@@ -333,13 +346,16 @@ impl Formatter {
 	/// Sorts (if enabled) then formats a whole source file.
 	///
 	/// A shebang and a byte order mark are preserved, as are `\r\n` line breaks (going by the first line break) unless
-	/// rustfmt's `newline_style` is set to something other than `Auto`. Otherwise, the output of rustfmt is exactly
-	/// what rustfmt prints for the source.
+	/// rustfmt's `newline_style` is set to something other than `Auto`. After formatting, `match` arms spanning several
+	/// lines are separated from their neighbours by a blank line, and one-line arms follow each other directly, except
+	/// under `#[rustfmt::skip]` (see [Layout](crate#layout)); rustfmt keeps that, so formatting again changes nothing.
+	/// Otherwise, the output of rustfmt is what rustfmt prints for the source.
 	pub fn format_str(&self, source: &str) -> Result<String, FormatError> {
 		self.format_items(source, &[FormatTarget::File])
 	}
 
-	/// Sorts (if enabled) then formats a token stream containing a whole file's worth of items.
+	/// Sorts (if enabled) then formats a token stream containing a whole file's worth of items. `match` arms are laid
+	/// out like [`Formatter::format_str`] lays them out.
 	///
 	/// Without a formatter ([`RsFormatter::None`]), the tokens are printed on a single line.
 	///
@@ -353,17 +369,13 @@ impl Formatter {
 			None => tokens,
 		};
 
-		match self.options.formatter {
-			RsFormatter::RustFmt => {
-				let formatted = rustfmt::format(&tokens::to_source(tokens)?, &self.options.rustfmt)?;
+		let formatted = match self.options.formatter {
+			RsFormatter::RustFmt => rustfmt::format(&tokens::to_source(tokens)?, &self.options.rustfmt)?,
+			RsFormatter::PrettyPlease => prettyplease_fmt::format_tokens(tokens)?,
+			RsFormatter::None => return tokens::to_source(tokens),
+		};
 
-				source::ensure_parses(&formatted, "rustfmt")?;
-
-				Ok(formatted)
-			}
-			RsFormatter::PrettyPlease => prettyplease_fmt::format_tokens(tokens),
-			RsFormatter::None => tokens::to_source(tokens),
-		}
+		arms::separate_match_arms(&formatted, self.options.formatter.name())
 	}
 
 	/// The options of the formatter.

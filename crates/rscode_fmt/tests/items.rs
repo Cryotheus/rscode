@@ -482,6 +482,22 @@ fn prettyplease_formats_items() {
 }
 
 #[test]
+fn prettyplease_separates_match_arms_spanning_lines() {
+	// prettyplease drops the blank lines between arms, which are put back after it: formatting again changes nothing
+	let f = "fn f(x: u8) -> u8 { match x { 0 => 1, 1 => { y(); 2 } _ => 3 } }\n";
+	let source = format!("fn  g( ) {{}}\n{f}");
+	let expected = "fn  g( ) {}\nfn f(x: u8) -> u8 {\n    match x {\n        0 => 1,\n\
+		\n        1 => {\n            y();\n            2\n        }\n\n        _ => 3,\n    }\n}\n";
+	let formatter = Formatter::new(prettyplease());
+	let tokens: proc_macro2::TokenStream = f.parse().unwrap();
+
+	assert_eq!(format_items(prettyplease(), &source, &["fn f"]), expected);
+	assert_eq!(formatter.format_str(&source).unwrap(), expected.replace("fn  g( ) {}", "fn g() {}"));
+	assert_eq!(formatter.format_str(expected).unwrap(), expected.replace("fn  g( ) {}", "fn g() {}"));
+	assert_eq!(formatter.format_tokens(tokens).unwrap(), expected.replace("fn  g( ) {}\n", ""));
+}
+
+#[test]
 fn prettyplease_keeps_crlf_line_endings() {
 	assert_eq!(
 		format_items(prettyplease(), "fn  a( ){let x=1;}\r\nfn  b( ) {}\r\n", &["fn  a"]),

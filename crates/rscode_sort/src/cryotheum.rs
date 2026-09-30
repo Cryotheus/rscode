@@ -446,11 +446,12 @@ impl<'a> Sortable<'a> {
 /// How the items of a group are separated from each other in the text engine. Items of different groups are always
 /// separated by a blank line.
 ///
-/// None of these depend on how many lines an item spans, which rustfmt may change: sorting after rustfmt lays out
-/// the items the same way.
+/// Whether an item spans several lines counts, which rustfmt may change by wrapping or joining the item: sorting
+/// after rustfmt then only changes blank lines, which rustfmt keeps, so sorting once more changes nothing.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Spacing {
-	/// A line break, or a blank line next to an item with attributes, doc comments, or comments above it.
+	/// A line break, or a blank line next to an item spanning several lines, or with attributes, doc comments, or
+	/// comments above it.
 	Compact,
 
 	/// A blank line.

@@ -139,12 +139,14 @@
 //! different groups are separated by one blank line, except that consecutive macros keep the blank line between
 //! them, or the lack of one, unless one of them has attributes, doc comments, or comments above it. Within a group:
 //! - `use` items, `mod foo;` declarations, `extern crate` items, type aliases, constants, statics, associated types
-//!   and constants, and the items of `extern` blocks are separated by a line break, or by a blank line next to an
-//!   item with attributes, doc comments, or comments above it,
+//!   and constants, and the items of `extern` blocks follow each other directly when each fits on one line; an item
+//!   spanning several lines (not counting the comments above it), or with attributes, doc comments, or comments
+//!   above it, gets a blank line on both sides,
 //! - other items are separated by a blank line.
 //!
-//! None of this depends on how many lines an item spans, so running rustfmt after sorting leaves nothing for
-//! sorting to change again.
+//! rustfmt may wrap a one-liner or join an item spanning several lines, which changes the blank lines around it, so
+//! sorting again after rustfmt changes blank lines and nothing else; rustfmt keeps them, and sorting once more
+//! changes nothing: `sort`, `rustfmt`, `sort`, `rustfmt` settles.
 #![warn(missing_docs)]
 
 mod cryotheum;

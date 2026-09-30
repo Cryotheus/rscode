@@ -103,6 +103,13 @@ in the style edition it uses for the crate (its edition, unless `rustfmt.toml` s
 macro invocations are never moved, and nothing is moved across them, because macros are scoped textually. Function
 bodies, expressions, fields, and variants are never reordered. See the [`rscode_sort`](crates/rscode_sort) docs.
 
+Imports, module declarations, `extern crate` items, type aliases, constants, and statics (and associated types and
+constants, and the items of `extern` blocks) follow each other directly within their group when they fit on one line;
+an item spanning several lines, or with attributes, doc comments, or comments above it, gets a blank line on both
+sides. Other items are always separated by a blank line. `fmt` lays out `match` arms the same way after formatting:
+one-line arms follow each other directly, and an arm spanning several lines (or with attributes or comments above it)
+is separated from its neighbours by a blank line; code under `#[rustfmt::skip]` is left as it is.
+
 ## MCP server (for AI agents)
 
 `cargo rscode mcp` serves the same operations as tools over stdio: `workspace_info`, `find_items`, `view_items`,

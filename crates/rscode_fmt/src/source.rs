@@ -42,16 +42,7 @@ pub(crate) fn bom_len(text: &str) -> usize {
 
 /// Fails with [`FormatError::StructureMismatch`] if `text` is not a valid Rust file.
 pub(crate) fn ensure_parses(text: &str, produced_by: &str) -> Result<(), FormatError> {
-	match syn::parse_file(text) {
-		Ok(_) => Ok(()),
-		Err(error) => {
-			let location = FormatError::from_syn_in(&error, text);
-
-			Err(FormatError::StructureMismatch(format!(
-				"the output of {produced_by} does not parse: {location}"
-			)))
-		}
-	}
+	parse_output(text, produced_by).map(|_| ())
 }
 
 /// The start of the line containing `offset`, if only indentation (spaces and tabs) precedes `offset` on that line.
@@ -64,6 +55,13 @@ pub(crate) fn indentation_start(text: &str, offset: usize) -> Option<usize> {
 /// The byte offset of the start of the line containing `offset`.
 pub(crate) fn line_start(text: &str, offset: usize) -> usize {
 	text[..offset].rfind('\n').map_or(0, |index| index + 1)
+}
+
+/// Parses text produced by sorting or formatting (`produced_by`); failing to parse is a
+/// [`FormatError::StructureMismatch`].
+pub(crate) fn parse_output(text: &str, produced_by: &str) -> Result<Parsed, FormatError> {
+	Parsed::parse(text)
+		.map_err(|error| FormatError::StructureMismatch(format!("the output of {produced_by} does not parse: {error}")))
 }
 
 /// Converts every `\n` that is not already part of a `\r\n` to `\r\n`.

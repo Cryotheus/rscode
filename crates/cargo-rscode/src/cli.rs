@@ -349,7 +349,8 @@ fn fmt() -> Command {
 		.long_about(
 			"Sort (with the Cryotheum ordering schema) and format items. A module target formats its file(s), including \
 			 child modules unless --skip-children; other items are formatted in place, leaving the rest of their file \
-			 untouched.",
+			 untouched. After formatting, `match` arms spanning several lines are separated from their neighbours by a \
+			 blank line, and one-line arms follow each other directly.",
 		)
 		.arg(targets())
 		.arg(

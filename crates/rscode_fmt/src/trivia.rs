@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::str::FromStr;
 
 /// The length of a (nested) block comment at the start of `text`, including `*/`. `None` if unterminated.
-fn block_comment_len(text: &str) -> Option<usize> {
+pub(crate) fn block_comment_len(text: &str) -> Option<usize> {
 	let bytes = text.as_bytes();
 	let mut depth = 0usize;
 	let mut index = 0;
@@ -76,7 +76,8 @@ fn is_doc_line_comment(text: &str) -> bool {
 	text.starts_with("///") && !text.starts_with("////") || text.starts_with("//!")
 }
 
-fn is_whitespace(character: char) -> bool {
+/// Whether the character is whitespace to the Rust lexer.
+pub(crate) fn is_whitespace(character: char) -> bool {
 	// Rust treats the left-to-right and right-to-left marks as whitespace
 	character.is_whitespace() || character == '\u{200e}' || character == '\u{200f}'
 }
@@ -99,6 +100,17 @@ fn lexed_comments(text: &str) -> Option<bool> {
 	}
 
 	Some(!is_blank(&text[covered.min(text.len())..]))
+}
+
+/// The length of a `//` comment at the start of `text`, excluding the line break (`\n` or `\r\n`) ending it.
+pub(crate) fn line_comment_len(text: &str) -> usize {
+	let length = text.find('\n').unwrap_or(text.len());
+
+	if text[..length].ends_with('\r') && length < text.len() {
+		length - 1
+	} else {
+		length
+	}
 }
 
 /// The length of the text `syn::parse_file` skips before parsing: a byte order mark, and a shebang line (without its
@@ -328,6 +340,14 @@ mod tests {
 			assert_eq!(lexed_comments(text), Some(expected), "{source:?}");
 			assert_eq!(contains_comments(source), expected, "{source:?}");
 		}
+	}
+
+	#[test]
+	fn line_comments() {
+		assert_eq!(line_comment_len("// c\nx"), 4);
+		assert_eq!(line_comment_len("// c\r\nx"), 4);
+		assert_eq!(line_comment_len("// c"), 4);
+		assert_eq!(line_comment_len("// c\r"), 5);
 	}
 
 	#[test]

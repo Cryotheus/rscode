@@ -1,5 +1,7 @@
-//! Sorting and rustfmt agree: rustfmt does not reorder what sorting ordered, and sorting after rustfmt changes nothing,
-//! so `sort` then `rustfmt` settles in one pass.
+//! Sorting and rustfmt agree: rustfmt does not reorder what sorting ordered, and `sort`, `rustfmt`, `sort`, `rustfmt`
+//! settles. rustfmt wraps long one-liners and joins short items spanning several lines, which changes the blank
+//! lines sorting puts around them, so sorting after rustfmt may change blank lines, and nothing else; rustfmt keeps
+//! them, and sorting once more changes nothing.
 //!
 //! Skipped (with a message) when rustfmt is not installed. Set `RSCODE_SORT_FIXPOINT_DIR` to also check every `.rs`
 //! file below a directory (such as copies of crates from `~/.cargo/registry/src`).
@@ -70,7 +72,7 @@ fn declarations_are_ordered_like_rustfmt() {
 
 /// Inputs where rustfmt changes the layout in ways that sorting must not undo.
 const LAYOUTS: &[&str] = &[
-	// rustfmt wraps long items of compact groups
+	// rustfmt wraps long items of compact groups, which then get blank lines around them
 	"use zeta::Zeta;\nuse alpha::{AlphaOne, AlphaTwo, AlphaThree, AlphaFour, AlphaFive, AlphaSix, AlphaSeven, AlphaEight};\nuse beta::Beta;\n",
 	"const Z: u8 = 0;\nconst A: [&str; 8] = [\"alpha\", \"beta\", \"gamma\", \"delta\", \"epsilon\", \"zeta\", \"eta\", \"theta\"];\nconst B: u8 = 0;\n",
 	"static Z: u8 = 0;\ntype A = std::collections::HashMap<std::string::String, std::vec::Vec<std::collections::BTreeMap<u8, u8>>>;\nstatic B: u8 = 0;\n",
@@ -90,7 +92,7 @@ const LAYOUTS: &[&str] = &[
 ];
 
 #[test]
-fn sorting_after_rustfmt_changes_nothing() {
+fn layouts_settle() {
 	let Some(rustfmt) = Rustfmt::find() else {
 		eprintln!("skipped: rustfmt is not installed");
 		return;
@@ -143,19 +145,52 @@ fn real_files_settle() {
 	assert!(checked > 0);
 }
 
-/// Checks that sorting the output of `rustfmt(sort(source))` changes nothing. Returns `Ok(false)` when rustfmt fails.
+/// How many times sorting the formatted text may change it (blank lines only) before rustfmt runs again: rustfmt
+/// keeps the blank lines of that round, so the next sort changes nothing.
+const ROUNDS: usize = 1;
+
+/// Checks that `sort`, `rustfmt`, `sort`, `rustfmt` settles: sorting the formatted text changes nothing, or only
+/// blank lines, and formatting that leaves nothing for sorting to change. Returns `Ok(false)` when rustfmt fails.
 fn check_fixpoint(rustfmt: &Rustfmt, source: &str) -> Result<bool, String> {
 	let sorted = rscode_sort::sort_str(source).map_err(|error| error.to_string())?;
-	let Ok(formatted) = rustfmt.format(&sorted) else {
+	let Ok(mut formatted) = rustfmt.format(&sorted) else {
 		return Ok(false);
 	};
-	let again = rscode_sort::sort_str(&formatted).map_err(|error| error.to_string())?;
+	let mut round = 0;
 
-	if again != formatted {
-		return Err(format!("{}\n--- sorted, then formatted:\n{formatted}", first_difference(&formatted, &again)));
+	loop {
+		let resorted = rscode_sort::sort_str(&formatted).map_err(|error| error.to_string())?;
+
+		if resorted == formatted {
+			return Ok(true);
+		}
+
+		if common::file_tokens(&resorted) != common::file_tokens(&formatted)
+			|| without_blank_lines(&resorted) != without_blank_lines(&formatted)
+		{
+			return Err(format!(
+				"round {round}: sorting again changes more than blank lines\n{}\n--- formatted:\n{formatted}",
+				first_difference(&formatted, &resorted)
+			));
+		}
+
+		if round == ROUNDS {
+			return Err(format!(
+				"not settled after {ROUNDS} round(s)\n{}\n--- formatted:\n{formatted}",
+				first_difference(&formatted, &resorted)
+			));
+		}
+
+		formatted = rustfmt
+			.format(&resorted)
+			.map_err(|error| format!("round {round}: rustfmt fails on the sorted text: {error}\n{resorted}"))?;
+		round += 1;
 	}
+}
 
-	Ok(true)
+/// The text without its empty lines, to compare texts that may only differ in blank lines.
+fn without_blank_lines(text: &str) -> String {
+	text.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 fn first_difference(expected: &str, actual: &str) -> String {

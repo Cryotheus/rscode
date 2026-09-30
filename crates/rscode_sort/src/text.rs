@@ -163,6 +163,12 @@ struct Placed<'a> {
 	/// the container's header, so sorting again must lay it out the same way.
 	decorated_as_first: bool,
 
+	/// Whether the chunk's own text spans several lines: the item with its attributes and doc comments, the comments
+	/// trailing it on its last line, and the sorted text of a nested container, but not the comments above it (a
+	/// section header above the chunk placed first becomes the container's header, so counting it would make sorting
+	/// again lay the chunk out differently).
+	multi_line: bool,
+
 	/// Where the chunk was in the source.
 	span: Range<usize>,
 
@@ -273,7 +279,9 @@ impl<'a> TextSorter<'a> {
 
 	/// Whether a blank line separates two placed chunks (or just a line break).
 	///
-	/// This never depends on how many lines a chunk spans, which rustfmt may change.
+	/// In a compact group, one-line items follow each other directly, and an item spanning several lines gets a blank
+	/// line on both sides, like an item with attributes, doc comments, or comments above it. rustfmt may wrap a
+	/// one-liner or join a multi-line item, so sorting again after rustfmt changes blank lines (and nothing else).
 	fn blank_line_between(&self, previous: &Placed<'_>, next: &Placed<'_>, previous_is_first: bool) -> bool {
 		let decorated = next.decorated
 			|| if previous_is_first {
@@ -297,7 +305,7 @@ impl<'a> TextSorter<'a> {
 		}
 
 		match next.spacing {
-			Spacing::Compact => decorated,
+			Spacing::Compact => decorated || previous.multi_line || next.multi_line,
 			Spacing::Loose | Spacing::Barrier => true,
 		}
 	}
@@ -683,7 +691,11 @@ impl<'a> TextSorter<'a> {
 		))
 	}
 
+	/// A chunk in its new position, with `text` as its new text (which starts at `chunk.start`).
 	fn place(&self, chunk: &Chunk<'a>, text: String, group: usize, spacing: Spacing) -> Placed<'a> {
+		// the comments above the item are never touched by nested replacements, so the item starts at the same offset
+		let multi_line = text[chunk.item.start - chunk.start..].contains('\n');
+
 		Placed {
 			text,
 			indent: chunk.indent,
@@ -692,6 +704,7 @@ impl<'a> TextSorter<'a> {
 			spacing,
 			decorated: chunk.decorated(self.source, chunk.start),
 			decorated_as_first: chunk.decorated(self.source, chunk.start_as_first),
+			multi_line,
 			span: chunk.start..chunk.end,
 			line_comment: chunk.line_comment,
 		}
@@ -1644,6 +1657,109 @@ unsafe extern \"C\" /* abi note */ {
 		);
 	}
 
+	/// The layout a user asked for: a blank line on both sides of a compact item spanning several lines.
+	#[test]
+	fn multi_line_items_get_blank_lines() {
+		let source = "\
+pub(crate) static INCOMING: IncomingDebug = IncomingDebug;
+static INCOMING_STATE: MainThreadCell<IncomingState> = MainThreadCell::new(IncomingState {
+	log: LogMode::Off,
+	blocks: Vec::new(),
+});
+";
+		let expected = "\
+pub(crate) static INCOMING: IncomingDebug = IncomingDebug;
+
+static INCOMING_STATE: MainThreadCell<IncomingState> = MainThreadCell::new(IncomingState {
+	log: LogMode::Off,
+	blocks: Vec::new(),
+});
+";
+
+		assert_sorts_to(source, expected);
+		assert_unchanged(expected);
+
+		// first, in the middle, and last, whether the items move or not
+		assert_sorts_to(
+			"const A: [u8; 2] = [\n\t0,\n\t1,\n];\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
+			"const A: [u8; 2] = [\n\t0,\n\t1,\n];\n\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
+		);
+		assert_sorts_to(
+			"static A: u8 = 0;\nstatic B: X = X {\n\tx: 0,\n};\nstatic C: u8 = 0;\n",
+			"static A: u8 = 0;\n\nstatic B: X = X {\n\tx: 0,\n};\n\nstatic C: u8 = 0;\n",
+		);
+		assert_sorts_to(
+			"type B = u8;\ntype A = u8;\ntype C = Map<\n\tu8,\n\tu8,\n>;\n",
+			"type A = u8;\ntype B = u8;\n\ntype C = Map<\n\tu8,\n\tu8,\n>;\n",
+		);
+		assert_sorts_to(
+			"const B: [u8; 1] = [\n\t0,\n];\nconst A: [u8; 1] = [\n\t0,\n];\n",
+			"const A: [u8; 1] = [\n\t0,\n];\n\nconst B: [u8; 1] = [\n\t0,\n];\n",
+		);
+
+		// in `impl` blocks, traits, and `extern` blocks
+		assert_sorts_to(
+			"impl X {\n\tconst B: u8 = 0;\n\tconst A: [u8; 2] = [\n\t\t0,\n\t\t1,\n\t];\n\tconst C: u8 = 0;\n}\n",
+			"impl X {\n\tconst A: [u8; 2] = [\n\t\t0,\n\t\t1,\n\t];\n\n\tconst B: u8 = 0;\n\tconst C: u8 = 0;\n}\n",
+		);
+		assert_sorts_to(
+			"trait T {\n\ttype C;\n\ttype B: Iterator<Item = u8>\n\t\t+ Clone;\n\ttype A;\n}\n",
+			"trait T {\n\ttype A;\n\n\ttype B: Iterator<Item = u8>\n\t\t+ Clone;\n\n\ttype C;\n}\n",
+		);
+		assert_sorts_to(
+			"extern \"C\" {\n\tfn c();\n\tfn b(\n\t\tx: u8,\n\t);\n\tfn a();\n}\n",
+			"extern \"C\" {\n\tfn a();\n\n\tfn b(\n\t\tx: u8,\n\t);\n\n\tfn c();\n}\n",
+		);
+
+		// a trailing block comment spanning lines makes a one-liner span several lines; a line comment does not
+		assert_sorts_to(
+			"const B: u8 = 0; /* about b\n   continued */\nconst A: u8 = 0;\nconst C: u8 = 0;\n",
+			"const A: u8 = 0;\n\nconst B: u8 = 0; /* about b\n   continued */\n\nconst C: u8 = 0;\n",
+		);
+		assert_sorts_to(
+			"const B: u8 = 0; // b\nconst A: u8 = 0;\n",
+			"const A: u8 = 0;\nconst B: u8 = 0; // b\n",
+		);
+
+		// the comments above an item do not count: a section header becomes the header of the container
+		assert_sorts_to(
+			"const B: u8 = 0;\n\n// section\n\nconst A: [u8; 2] = [\n\t0,\n];\n",
+			"// section\n\nconst A: [u8; 2] = [\n\t0,\n];\n\nconst B: u8 = 0;\n",
+		);
+		assert_sorts_to(
+			"const B: u8 = 0;\n// about a\n// on two lines\nconst A: u8 = 0;\nconst C: u8 = 0;\n",
+			"// about a\n// on two lines\nconst A: u8 = 0;\n\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
+		);
+
+		// decorated and spanning several lines: one blank line, never two
+		assert_sorts_to(
+			"const B: u8 = 0;\n/// Doc\nconst A: [u8; 2] = [\n\t0,\n];\nconst C: u8 = 0;\n",
+			"/// Doc\nconst A: [u8; 2] = [\n\t0,\n];\n\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
+		);
+		assert_sorts_to(
+			"const A: [u8; 1] = [\n\t0,\n];\n#[cfg(x)]\nconst B: u8 = 0;\n",
+			"const A: [u8; 1] = [\n\t0,\n];\n\n#[cfg(x)]\nconst B: u8 = 0;\n",
+		);
+
+		// blank lines between one-liners are still removed
+		assert_sorts_to(
+			"const A: u8 = 0;\n\nconst B: u8 = 0;\n\n\nconst C: u8 = 0;\n",
+			"const A: u8 = 0;\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
+		);
+
+		// CRLF
+		assert_sorts_to(
+			"const B: u8 = 0;\r\nconst A: [u8; 2] = [\r\n\t0,\r\n];\r\nconst C: u8 = 0;\r\n",
+			"const A: [u8; 2] = [\r\n\t0,\r\n];\r\n\r\nconst B: u8 = 0;\r\nconst C: u8 = 0;\r\n",
+		);
+
+		// a merged `extern` block with an item spanning several lines
+		assert_sorts_to(
+			"extern \"C\" {\n\tfn a();\n}\nextern \"C\" {\n\tfn c(\n\t\tx: u8,\n\t);\n\tfn b();\n}\n",
+			"extern \"C\" {\n\tfn a();\n\tfn b();\n\n\tfn c(\n\t\tx: u8,\n\t);\n}\n",
+		);
+	}
+
 	#[test]
 	fn nested_inline_modules() {
 		assert_sorts_to(
@@ -1860,17 +1976,18 @@ extern \"system\" {
 
 	#[test]
 	fn spacing_within_groups() {
-		// one-line items are grouped, however many lines an item spans (which rustfmt may change) ...
+		// one-line items follow each other directly, and an item spanning several lines gets a blank line on both
+		// sides ...
 		assert_sorts_to(
 			"const B: u8 = 0;\nconst A: [u8; 2] = [\n\t0, 1,\n];\nconst C: u8 = 0;\n",
-			"const A: [u8; 2] = [\n\t0, 1,\n];\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
+			"const A: [u8; 2] = [\n\t0, 1,\n];\n\nconst B: u8 = 0;\nconst C: u8 = 0;\n",
 		);
 
-		// ... but blank lines around items with attributes, docs, or comments
+		// ... as do items with attributes, docs, or comments
 		assert_sorts_to("use c;\n/// Doc\nuse b;\nuse a;\n", "use a;\n\n/// Doc\nuse b;\n\nuse c;\n");
 		assert_sorts_to(
 			"use b;\nuse a::{\n    One,\n    Two,\n};\n#[cfg(unix)]\nuse c;\n",
-			"use a::{\n    One,\n    Two,\n};\nuse b;\n\n#[cfg(unix)]\nuse c;\n",
+			"use a::{\n    One,\n    Two,\n};\n\nuse b;\n\n#[cfg(unix)]\nuse c;\n",
 		);
 		assert_sorts_to(
 			"mod c;\n#[cfg(x)]\nmod b;\n#[cfg(x)]\nmod a;\nextern crate e;\n/// Docs\nextern crate d;\nextern crate f;\n",

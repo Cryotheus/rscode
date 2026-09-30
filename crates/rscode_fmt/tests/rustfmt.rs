@@ -87,6 +87,178 @@ fn settles_targeted_containers_when_not_sorting_recursively() {
 	assert!(formatted.contains("impl T<u16> for X {\n    fn a() {}\n\n    fn b() {}\n}"), "{formatted}");
 }
 
+/// rustfmt wrapping a one-liner changes how sorting lays it out (an item spanning several lines gets blank lines
+/// around it): formatting sorts again, so that formatting the result changes nothing.
+#[test]
+fn settles_when_rustfmt_wraps_items() {
+	if !rustfmt_available() {
+		return;
+	}
+
+	let options = rustfmt().sort(Some(rscode_fmt::SortOptions::new()));
+	let source = "\
+use a::b::{Cccccccccccccccccc, Dddddddddddddddddd, Eeeeeeeeeeeeeeeeeeeee, Fffffffffffffffffff, Ggggggggggggg};
+use a::a;
+const B: u8 = 1;
+const A: [u32; 7] = [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777];
+";
+	let expected = "\
+use a::a;
+
+use a::b::{
+    Cccccccccccccccccc, Dddddddddddddddddd, Eeeeeeeeeeeeeeeeeeeee, Fffffffffffffffffff,
+    Ggggggggggggg,
+};
+
+const A: [u32; 7] = [
+    0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777,
+];
+
+const B: u8 = 1;
+";
+	let once = format(options.clone(), source).unwrap();
+
+	assert_eq!(once, expected);
+	assert_eq!(format(options, &once).unwrap(), once);
+}
+
+/// ... also for a targeted container whose items rustfmt wraps.
+#[test]
+fn settles_targeted_containers_when_rustfmt_wraps_items() {
+	if !rustfmt_available() {
+		return;
+	}
+
+	let formatter = Formatter::new(rustfmt().sort(Some(rscode_fmt::SortOptions::new())));
+	let source = "\
+fn  z( ) {}
+impl S {
+    const B: u8 = 1;
+    const A: [u32; 7] = [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777];
+}
+";
+	let expected = "\
+fn  z( ) {}
+impl S {
+    const A: [u32; 7] = [
+        0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777,
+    ];
+
+    const B: u8 = 1;
+}
+";
+	let targets = |text: &str| [FormatTarget::Item(text.find("impl S").unwrap())];
+	let once = formatter.format_items(source, &targets(source)).unwrap();
+
+	assert_eq!(once, expected);
+	assert_eq!(formatter.format_items(&once, &targets(&once)).unwrap(), once);
+
+	// a targeted container nested in another targeted container settles too (sorting is not recursive here)
+	let formatter = Formatter::new(rustfmt().sort(Some(rscode_fmt::SortOptions::new().recursive(false))));
+	let source = "\
+fn  z( ) {}
+mod m {
+    impl S {
+        const B: u8 = 1;
+        const A: [u32; 7] = [0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777];
+    }
+}
+";
+	let expected = "\
+fn  z( ) {}
+mod m {
+    impl S {
+        const A: [u32; 7] = [
+            0x11111111, 0x22222222, 0x33333333, 0x44444444, 0x55555555, 0x66666666, 0x77777777,
+        ];
+
+        const B: u8 = 1;
+    }
+}
+";
+	let targets = |text: &str| {
+		[FormatTarget::Item(text.find("mod m").unwrap()), FormatTarget::Item(text.find("impl S").unwrap())]
+	};
+	let once = formatter.format_items(source, &targets(source)).unwrap();
+
+	assert_eq!(once, expected);
+	assert_eq!(formatter.format_items(&once, &targets(&once)).unwrap(), once);
+}
+
+/// After formatting, `match` arms spanning several lines are separated from their neighbours by a blank line, which
+/// rustfmt keeps: formatting the result again changes nothing.
+#[test]
+fn separates_match_arms_spanning_lines() {
+	if !rustfmt_available() {
+		return;
+	}
+
+	// the example's style: tabs, 120 columns, and calls wide enough for the `format!` to stay on one line
+	let mut options = rustfmt();
+
+	options.rustfmt.config = vec![
+		("hard_tabs".to_owned(), "true".to_owned()),
+		("max_width".to_owned(), "120".to_owned()),
+		("fn_call_width".to_owned(), "100".to_owned()),
+	];
+
+	let source = "\
+fn f() {
+	let summary = match message.decode() {
+		Some(Incoming::Move {
+			backup_commands,
+			new_commands,
+			data,
+		}) => {
+			format!(\"{new_commands} new and {backup_commands} backup commands in {} bits\", data.len())
+		}
+		Some(Incoming::VoiceData { data }) => format!(\"{} bits of voice\", data.len()),
+		Some(decoded) => format!(\"{decoded:?}\"),
+		None => format!(\"undecoded: {:?}\", message.describe().unwrap_or_default()),
+	};
+}
+";
+	let expected = "\
+fn f() {
+	let summary = match message.decode() {
+		Some(Incoming::Move {
+			backup_commands,
+			new_commands,
+			data,
+		}) => {
+			format!(\"{new_commands} new and {backup_commands} backup commands in {} bits\", data.len())
+		}
+
+		Some(Incoming::VoiceData { data }) => format!(\"{} bits of voice\", data.len()),
+		Some(decoded) => format!(\"{decoded:?}\"),
+		None => format!(\"undecoded: {:?}\", message.describe().unwrap_or_default()),
+	};
+}
+";
+	let once = format(options.clone(), source).unwrap();
+
+	assert_eq!(once, expected);
+	assert_eq!(format(options.clone(), &once).unwrap(), once);
+
+	// blank lines between one-line arms go, and the arms of a targeted item are laid out too
+	let source = "fn  g( ) {}\nfn f() {\n\tmatch x {\n\t\tA => 1,\n\n\t\tB => 2,\n\
+		\t\tC => {\n\t\t\tc();\n\t\t\t3\n\t\t}\n\t\tD => 4,\n\t}\n}\n";
+	let expected = "fn  g( ) {}\nfn f() {\n\tmatch x {\n\t\tA => 1,\n\t\tB => 2,\n\n\
+		\t\tC => {\n\t\t\tc();\n\t\t\t3\n\t\t}\n\n\t\tD => 4,\n\t}\n}\n";
+	let formatter = Formatter::new(options);
+
+	assert_eq!(formatter.format_items(source, &[FormatTarget::Item(source.find("fn f").unwrap())]).unwrap(), expected);
+	assert_eq!(formatter.format_str(source).unwrap(), expected.replace("fn  g( ) {}", "fn g() {}"));
+
+	// ... and of formatted tokens
+	let tokens: proc_macro2::TokenStream = "fn f() { match x { A => 1, B => { c(); 2 } C => 3 } }".parse().unwrap();
+
+	assert_eq!(
+		formatter.format_tokens(tokens).unwrap(),
+		"fn f() {\n\tmatch x {\n\t\tA => 1,\n\n\t\tB => {\n\t\t\tc();\n\t\t\t2\n\t\t}\n\n\t\tC => 3,\n\t}\n}\n",
+	);
+}
+
 #[test]
 fn reports_invalid_config_overrides() {
 	if !rustfmt_available() {
