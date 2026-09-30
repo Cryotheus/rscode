@@ -145,7 +145,6 @@
 //!
 //! None of this depends on how many lines an item spans, so running rustfmt after sorting leaves nothing for
 //! sorting to change again.
-
 #![warn(missing_docs)]
 
 mod cryotheum;
