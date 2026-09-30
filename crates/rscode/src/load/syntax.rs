@@ -150,6 +150,7 @@ impl Walker<'_, '_, '_> {
 					path: self.path_ref(&path.path),
 				};
 			}
+
 			Type::Reference(reference) => &reference.elem,
 			Type::Ptr(pointer) => &pointer.elem,
 			Type::Paren(paren) => &paren.elem,
@@ -213,6 +214,7 @@ fn flatten(parsed: &ParsedFile, tokens: TokenStream, pieces: &mut Vec<Piece>) {
 					Delimiter::Parenthesis => ("(", ")"),
 					Delimiter::Brace => ("{", "}"),
 					Delimiter::Bracket => ("[", "]"),
+
 					Delimiter::None => {
 						flatten(parsed, group.stream(), pieces);
 						continue;

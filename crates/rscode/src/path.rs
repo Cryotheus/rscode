@@ -183,6 +183,7 @@ impl std::fmt::Display for CanonicalPath {
 				write!(f, "{arguments} as {trait_text}>")?;
 				separate = true;
 			}
+
 			None => write_segments(f, &self.segments)?,
 		}
 
@@ -305,18 +306,22 @@ impl std::fmt::Display for ItemPath {
 		// whether a `::` is needed before the next segment
 		let mut separate = match self.anchor {
 			Anchor::None => false,
+
 			Anchor::Crate => {
 				f.write_str("crate")?;
 				true
 			}
+
 			Anchor::Global => {
 				f.write_str("::")?;
 				false
 			}
+
 			Anchor::SelfModule => {
 				f.write_str("self")?;
 				true
 			}
+
 			Anchor::Super(count) => {
 				for index in 0..count {
 					f.write_str(if index == 0 { "super" } else { "::super" })?;
@@ -456,18 +461,22 @@ impl<'a> Parser<'a> {
 				path.anchor = Anchor::Global;
 				path.segments.push(self.parse_segment("a crate name after `::`")?);
 			}
+
 			Some(token) if token.is_word("crate") => {
 				self.bump();
 				path.anchor = Anchor::Crate;
 			}
+
 			Some(token) if token.is_word("self") => {
 				self.bump();
 				path.anchor = Anchor::SelfModule;
 			}
+
 			Some(token) if token.is_word("super") => {
 				self.bump();
 				path.anchor = Anchor::Super(1);
 			}
+
 			_ => path.segments.push(self.parse_segment("an identifier")?),
 		}
 
@@ -535,6 +544,7 @@ impl<'a> Parser<'a> {
 			Some(Token::Star) => Err("`*` can only end a `use` path".to_owned()),
 			Some(Token::Ident { text: "_", raw: false }) if last_of_use => Ok("_".into()),
 			Some(Token::Ident { text, raw: true }) => Ok(text.into()),
+
 			Some(Token::Ident { text, raw: false }) => match text {
 				"crate" => Err("`crate` can only start a path".to_owned()),
 				"self" => Err("`self` can only start a path".to_owned()),
@@ -544,6 +554,7 @@ impl<'a> Parser<'a> {
 				_ if is_keyword(text) => Err(format!("`{text}` is a keyword; write `r#{text}` for an item named `{text}`")),
 				_ => Ok(text.into()),
 			},
+
 			Some(token) => Err(format!("expected {expected}, found `{token}`")),
 			None => Err(format!("expected {expected}")),
 		}
@@ -799,6 +810,7 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 
 			'<' => (Token::Lt, 1),
 			'>' => (Token::Gt, 1),
+
 			_ if rest.starts_with("r#") => {
 				let name = &rest[2..2 + word_len(&rest[2..])];
 
@@ -812,6 +824,7 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 
 				(Token::Ident { text: name, raw: true }, 2 + name.len())
 			}
+
 			_ if is_word_char(c) => {
 				let word = &rest[..word_len(rest)];
 
@@ -821,6 +834,7 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 
 				(Token::Ident { text: word, raw: false }, word.len())
 			}
+
 			// glob imports, named at the end of a `use` path
 			'*' if tokens.first().is_some_and(|token| token.is_word("use")) => {
 				if !matches!(tokens.last(), Some(Token::PathSep) | Some(Token::Ident { text: "use", raw: false })) {
@@ -1135,6 +1149,7 @@ mod tests {
 	fn parse_error(text: &str) -> String {
 		match ItemPath::parse(text) {
 			Ok(path) => panic!("`{text}` parsed as {path:?}"),
+
 			Err(error) => {
 				assert_eq!(error.text, text);
 				error.message

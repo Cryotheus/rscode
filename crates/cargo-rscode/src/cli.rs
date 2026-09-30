@@ -45,6 +45,7 @@ pub(crate) const CARGO_SUBCOMMAND: &str = "rscode";
 
 const COMPLETION_HELP: &str = "\
 Run `cargo rscode --help` for how to set up shell completion.";
+
 const COMPLETION_LONG_HELP: &str = "\
 Shell completion completes subcommands, options, item paths, packages, and item kinds dynamically:
   bash  add to ~/.bashrc:
@@ -256,6 +257,7 @@ pub(crate) fn color_choice(args: &[OsString]) -> ColorChoice {
 		match arg {
 			"--" => break,
 			"--color" => value = args.next(),
+
 			_ => {
 				if let Some(inline) = arg.strip_prefix("--color=") {
 					value = Some(inline);

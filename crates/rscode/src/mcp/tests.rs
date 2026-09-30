@@ -935,7 +935,10 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&[&format!("attached `engine` (read and write): {project}"), "packages loaded by default: engine 0.1.0"],
+			&[
+				&format!("attached `engine` (read and write): {project}"),
+				"packages loaded by default: engine 0.1.0",
+			],
 		);
 
 		// asking for what the name has says so, and plans nothing
@@ -1005,7 +1008,10 @@ mod end_to_end {
 		let (failed, text) = client.call("attach_source", attach("refs/log", "log", false)).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &[&format!("source `log` is already attached (read-only): {log}"), "nothing changed"]);
+		assert_contains(
+			&text,
+			&[&format!("source `log` is already attached (read-only): {log}"), "nothing changed"],
+		);
 
 		let (failed, text) = client.call("attach_source", attach("project", "log", false)).await;
 
@@ -1474,7 +1480,13 @@ mod end_to_end {
 		let (failed, text) = client.call("attach_source", attach("refs/log", "engine", false)).await;
 
 		assert!(failed, "{text}");
-		assert_contains(&text, &["there is already a writable source attached as `engine` (read and write)", "nothing was attached"]);
+		assert_contains(
+			&text,
+			&[
+				"there is already a writable source attached as `engine` (read and write)",
+				"nothing was attached",
+			],
+		);
 		client.close().await.unwrap();
 	}
 }

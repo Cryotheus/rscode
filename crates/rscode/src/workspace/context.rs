@@ -123,6 +123,7 @@ pub(super) fn select_packages<'ws>(ws: &'ws Workspace<'_>, options: &LoadOptions
 			.members()
 			.filter(|member| specs.iter().any(|spec| spec.matches(member.package_id())))
 			.collect(),
+
 		_ => packages.get_packages(ws).map_err(cargo_error)?,
 	};
 

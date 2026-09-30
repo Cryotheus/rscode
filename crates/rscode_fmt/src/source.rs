@@ -60,8 +60,7 @@ pub(crate) fn line_start(text: &str, offset: usize) -> usize {
 /// Parses text produced by sorting or formatting (`produced_by`); failing to parse is a
 /// [`FormatError::StructureMismatch`].
 pub(crate) fn parse_output(text: &str, produced_by: &str) -> Result<Parsed, FormatError> {
-	Parsed::parse(text)
-		.map_err(|error| FormatError::StructureMismatch(format!("the output of {produced_by} does not parse: {error}")))
+	Parsed::parse(text).map_err(|error| FormatError::StructureMismatch(format!("the output of {produced_by} does not parse: {error}")))
 }
 
 /// Converts every `\n` that is not already part of a `\r\n` to `\r\n`.
@@ -157,6 +156,7 @@ mod tests {
 				assert_eq!(without, 4);
 				assert_eq!(with, without + 1);
 			}
+
 			other => panic!("unexpected errors: {other:?}"),
 		}
 	}

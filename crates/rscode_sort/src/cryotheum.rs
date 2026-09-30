@@ -100,6 +100,7 @@ impl ImplKey {
 			(None, None) => version_cmp(&self.self_ty, &other.self_ty),
 			(None, Some(_)) => Ordering::Less,
 			(Some(_), None) => Ordering::Greater,
+
 			(Some((a_last, a_path)), Some((b_last, b_path))) => version_cmp(a_last, b_last)
 				.then_with(|| version_cmp(a_path, b_path))
 				.then_with(|| version_cmp(&self.self_ty, &other.self_ty)),
@@ -155,6 +156,7 @@ impl Key {
 			(Self::AttachedImpl(a), Self::AttachedImpl(b)) => a.attached_cmp(b),
 			(Self::LooseImpl(a), Self::LooseImpl(b)) => a.loose_cmp(b),
 			(Self::ExternBlock(a), Self::ExternBlock(b)) => a.cmp(b),
+
 			// different kinds of keys never share a group
 			_ => Ordering::Equal,
 		}
@@ -487,19 +489,23 @@ fn classify_item(item: &syn::Item, style_edition: StyleEdition) -> Option<(Order
 		syn::Item::Macro(item) if item.ident.is_some() && item.mac.path.is_ident("macro_rules") => (Group::MacroScope, Key::Stable),
 		syn::Item::Macro(_) => (Group::MacroInvocation, Key::Stable),
 		syn::Item::Mod(item) if has_macro_use(&item.attrs) => (Group::MacroScope, Key::Stable),
+
 		syn::Item::Mod(item) if item.content.is_none() => {
 			// ordered like rustfmt orders them (by bytes), so rustfmt leaves the order alone
 			(Group::Module(module_cfg(&item.attrs)), Key::Bytes(item.ident.unraw().to_string()))
 		}
+
 		syn::Item::Mod(item) => (Group::ModuleInlined(module_cfg(&item.attrs)), Key::name(&item.ident)),
 		syn::Item::Use(item) if matches!(item.vis, syn::Visibility::Inherited) => (Group::Use, Key::Use(UseKey::new(item, style_edition))),
 		syn::Item::Use(item) => (Group::ReExport, Key::Use(UseKey::new(item, style_edition))),
 		syn::Item::Type(item) => (Group::TypeAlias, Key::name(&item.ident)),
 		syn::Item::Const(item) => (Group::Const, Key::name(&item.ident)),
+
 		syn::Item::Static(item) => match item.mutability {
 			syn::StaticMutability::Mut(_) => (Group::StaticMut, Key::name(&item.ident)),
 			_ => (Group::Static, Key::name(&item.ident)),
 		},
+
 		syn::Item::Struct(item) => (Group::DataType, Key::name(&item.ident)),
 		syn::Item::Enum(item) => (Group::DataType, Key::name(&item.ident)),
 		syn::Item::Union(item) => (Group::DataType, Key::name(&item.ident)),
@@ -703,6 +709,7 @@ pub(crate) fn plan_items(items: &[&syn::Item], ties: &[String], mergeable: &dyn 
 				groups.extend(plan_module_segment(items, std::mem::take(&mut segment), ties, mergeable));
 				groups.push(PlanGroup::barrier(index));
 			}
+
 			class => segment.push((index, class)),
 		}
 	}
@@ -750,6 +757,7 @@ fn plan_module_segment(
 				.entry(owner)
 				.or_default()
 				.push(Sortable::new(index, Key::AttachedImpl(key), ties)),
+
 			None => loose.push(Sortable::new(index, Key::LooseImpl(key), ties)),
 		}
 	}
@@ -896,10 +904,12 @@ mod tests {
 				Some((_, rename)) => format!("extern crate {} as {rename}", item.ident),
 				None => format!("extern crate {}", item.ident),
 			},
+
 			syn::Item::Macro(item) => match &item.ident {
 				Some(ident) => format!("macro_rules {ident}"),
 				None => format!("{}!", item.mac.path.to_token_stream()),
 			},
+
 			syn::Item::Mod(item) => format!("mod {}{}", item.ident, if item.content.is_some() { " {}" } else { ";" }),
 			syn::Item::Use(item) => item.to_token_stream().to_string(),
 			syn::Item::Type(item) => format!("type {}", item.ident),
@@ -910,6 +920,7 @@ mod tests {
 			syn::Item::Union(item) => format!("union {}", item.ident),
 			syn::Item::Trait(item) => format!("trait {}", item.ident),
 			syn::Item::TraitAlias(item) => format!("trait alias {}", item.ident),
+
 			syn::Item::Impl(item) => {
 				let self_ty = compact_tokens(&item.self_ty);
 
@@ -918,6 +929,7 @@ mod tests {
 					None => format!("impl {self_ty}"),
 				}
 			}
+
 			syn::Item::ForeignMod(item) => {
 				let names: Vec<String> = item
 					.items
@@ -932,6 +944,7 @@ mod tests {
 
 				format!("extern [{}]", names.join(" "))
 			}
+
 			syn::Item::Fn(item) => format!("fn {}", item.sig.ident),
 			other => other.to_token_stream().to_string(),
 		}

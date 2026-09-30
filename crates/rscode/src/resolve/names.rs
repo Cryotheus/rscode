@@ -215,6 +215,7 @@ pub(super) fn namespaces(item: &ItemData) -> &'static [Namespace] {
 				shape: DataShape::Tuple | DataShape::Unit,
 				..
 			} => TYPE_AND_VALUE,
+
 			_ => TYPE,
 		},
 

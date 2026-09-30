@@ -150,6 +150,7 @@ impl Resolver<'_> {
 						imports.push(import);
 						imported.push(item);
 					}
+
 					None => own.push(item),
 				}
 			}

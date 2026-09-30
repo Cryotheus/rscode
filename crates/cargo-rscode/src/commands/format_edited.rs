@@ -200,6 +200,7 @@ fn item_path(path: &CanonicalPath, in_impl: bool) -> Option<ItemPath> {
 			arguments: last_segment_arguments(written),
 			..ItemPath::from_segments([trait_name(written)?])
 		})),
+
 		None => None,
 	};
 	let self_ty = ItemPath {

@@ -67,7 +67,9 @@ impl Segment {
 				(Some(a), Some(b)) => names(a, b),
 				_ => a.cmp(b),
 			},
+
 			(Self::Glob, Self::Glob) => Ordering::Equal,
+
 			(Self::Ident(a, a_rename), Self::Ident(b, b_rename)) => {
 				let ordering = match version_sorting {
 					true => rustfmt_version_cmp(unraw(a), unraw(b)),
@@ -81,6 +83,7 @@ impl Segment {
 					(Some(a), Some(b)) => names(a, b),
 				})
 			}
+
 			(Self::List(a), Self::List(b)) => {
 				for (a, b) in a.iter().zip(b) {
 					let ordering = a.rustfmt_cmp(b);
@@ -92,6 +95,7 @@ impl Segment {
 
 				a.len().cmp(&b.len())
 			}
+
 			_ => self.rank().cmp(&other.rank()),
 		}
 	}
@@ -156,10 +160,12 @@ impl UseKey {
 					self.path.clear();
 					return self;
 				}
+
 				Segment::SelfValue(None) if self.path.is_empty() && top_level => {
 					self.path.clear();
 					return self;
 				}
+
 				_ => {}
 			}
 		}
@@ -248,7 +254,9 @@ fn push_tree(path: &mut Vec<Segment>, tree: &syn::UseTree, global: bool, version
 			path.push(Segment::from_ident(&tree.ident, global, None));
 			push_tree(path, &tree.tree, false, version_sorting);
 		}
+
 		syn::UseTree::Name(tree) => path.push(Segment::from_ident(&tree.ident, global, None)),
+
 		syn::UseTree::Rename(tree) => {
 			let rename = if tree.rename == "_" {
 				Some("_".to_owned())
@@ -260,6 +268,7 @@ fn push_tree(path: &mut Vec<Segment>, tree: &syn::UseTree, global: bool, version
 
 			path.push(Segment::from_ident(&tree.ident, global, rename));
 		}
+
 		syn::UseTree::Glob(_) => {
 			// `::*`
 			if global {
@@ -268,6 +277,7 @@ fn push_tree(path: &mut Vec<Segment>, tree: &syn::UseTree, global: bool, version
 
 			path.push(Segment::Glob);
 		}
+
 		syn::UseTree::Group(group) => {
 			// `::{..}`
 			if global {

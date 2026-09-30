@@ -596,6 +596,7 @@ impl<'a, 'ws> FileWalker<'a, 'ws> {
 					match (&field.colon_token, &*field.pat) {
 						// `Struct { name }` binds the field `name` (renaming a constant `name` would rename the field)
 						(None, Pat::Ident(binding)) => self.bind(&binding.ident),
+
 						_ => self.pattern(&field.pat),
 					}
 				}
@@ -1229,6 +1230,7 @@ fn local_item_names(item: &Item) -> Vec<(SmolStr, Namespace)> {
 		Item::Type(item) => named(&item.ident, &[Type]),
 		Item::Mod(item) => named(&item.ident, &[Type]),
 		Item::ExternCrate(item) => named(item.rename.as_ref().map_or(&item.ident, |(_, alias)| alias), &[Type]),
+
 		Item::Macro(item) => match &item.ident {
 			Some(ident) => named(ident, &[Macro]),
 

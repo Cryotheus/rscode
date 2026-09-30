@@ -158,15 +158,12 @@ impl CfgContext {
 	pub fn eval(&self, expr: &CfgExpr) -> Tristate {
 		match expr {
 			CfgExpr::Bool(value) => Tristate::from(*value),
-
 			CfgExpr::Name(name) if self.names.contains(name) => Tristate::True,
 			CfgExpr::Name(name) if self.definite.contains(name) => Tristate::False,
 			CfgExpr::Name(_) => Tristate::Unknown,
-
 			CfgExpr::KeyValue(key, value) if self.values.get(key).is_some_and(|values| values.contains(value)) => Tristate::True,
 			CfgExpr::KeyValue(key, _) if self.definite.contains(key) => Tristate::False,
 			CfgExpr::KeyValue(..) => Tristate::Unknown,
-
 			CfgExpr::All(exprs) => exprs.iter().fold(Tristate::True, |result, expr| result.and(self.eval(expr))),
 			CfgExpr::Any(exprs) => exprs.iter().fold(Tristate::False, |result, expr| result.or(self.eval(expr))),
 			CfgExpr::Not(expr) => self.eval(expr).not(),

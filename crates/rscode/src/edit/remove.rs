@@ -267,6 +267,7 @@ fn dangling(
 
 	let references = match search_references(resolver, &targets, lost, dead) {
 		Ok(references) => references,
+
 		Err(message) => {
 			warnings.push(format!(
 				"dangling references are not reported: searching for references failed ({message})"
@@ -327,6 +328,7 @@ fn element_removal_ranges(text: &str, elements: &[TextRange]) -> Vec<TextRange> 
 			Some(block) if text.get(block.end..element.start).is_some_and(|between| between.trim() == ",") => {
 				block.end = element.end;
 			}
+
 			_ => blocks.push(element),
 		}
 	}
@@ -415,6 +417,7 @@ fn module_files(resolver: &Resolver<'_>, targets: &[ItemId], removed: &HashSet<I
 					ws.display_path(file).display(),
 					resolver.canonical_path(other),
 				)),
+
 				None if !files.contains(&file) => files.push(file),
 				None => {}
 			}
@@ -839,6 +842,7 @@ fn use_elements(text: &str, use_item: TextRange, leaves: &[TextRange]) -> Vec<Te
 	match use_element(tree, use_item.start, leaves, &mut elements) {
 		// the caller removes a `use` whose leaves all go as a whole
 		Pruned::All | Pruned::Nothing => leaves.to_vec(),
+
 		Pruned::Some => elements,
 	}
 }

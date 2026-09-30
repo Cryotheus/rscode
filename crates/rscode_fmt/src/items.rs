@@ -118,6 +118,7 @@ impl<'a> Matcher<'a> {
 
 				self.mismatch(format!("the items of {container} changed"))
 			}
+
 			tree::Misalignment::Missing(node) => self.mismatch(format!("{} is missing", node.describe())),
 		}
 	}
@@ -170,6 +171,7 @@ fn check_unmoved(sorted: &Parsed, targets: &[Target]) -> Result<(), FormatError>
 	for target in targets {
 		match Node::at(&sorted.file, &target.path) {
 			Some(node) if node.kind() == target.kind && node.name() == target.name => {}
+
 			_ => {
 				return Err(FormatError::StructureMismatch(format!(
 					"{} (item path {:?}) moved in the output of sorting",
@@ -262,6 +264,7 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 
 						formatted = reformatted;
 					}
+
 					_ => break,
 				}
 			}
@@ -273,12 +276,7 @@ pub(crate) fn format_items(source: &str, targets: &[FormatTarget], options: &For
 	// every targeted container, nested ones included: sorting again after formatting must reach all of them, while
 	// only the outermost targets are formatted (formatting them formats the nested ones)
 	let containers: Vec<Identity> = match (&options.sort, options.formatter) {
-		(Some(_), RsFormatter::RustFmt) => items
-			.iter()
-			.filter(|item| item.container)
-			.map(|item| identity(&parsed, item))
-			.collect(),
-
+		(Some(_), RsFormatter::RustFmt) => items.iter().filter(|item| item.container).map(|item| identity(&parsed, item)).collect(),
 		_ => Vec::new(),
 	};
 	let items = outermost(items);
@@ -343,6 +341,7 @@ fn format_targets(text: &str, parsed: &Parsed, targets: &[Target], options: &For
 
 	let formatted = match options.formatter {
 		RsFormatter::RustFmt => rustfmt::format_preserving_items(text, &options.rustfmt)?,
+
 		RsFormatter::PrettyPlease => {
 			// comments elsewhere are lost too, but only the targets' text is used
 			if !options.allow_comment_loss && before.iter().any(|range| contains_comments(&text[range.clone()])) {
@@ -351,6 +350,7 @@ fn format_targets(text: &str, parsed: &Parsed, targets: &[Target], options: &For
 
 			prettyplease_fmt::format_str(text, true)?
 		}
+
 		RsFormatter::None => return Ok(text.to_owned()),
 	};
 
@@ -511,6 +511,7 @@ fn splice(text: &str, before: &[Range<usize>], formatted: &str, after: &[Option<
 
 				with_line_breaks(&formatted[replacement], crlf)
 			}
+
 			None => {
 				if let (Some(line_start), Some(line_end)) = (line_start, trailing_line_end(text, range.end)) {
 					range = line_start..line_end;

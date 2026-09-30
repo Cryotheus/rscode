@@ -239,6 +239,7 @@ impl EditSet {
 				Entry::Vacant(entry) => {
 					entry.insert(file);
 				}
+
 				Entry::Occupied(mut entry) => {
 					let target = entry.get_mut();
 
@@ -426,7 +427,9 @@ impl FileEdits {
 
 					merged.end = merged.end.max(range.end);
 				}
+
 				Some(index) => return Err(overlap(path, accepted[index].0, range)),
+
 				None => {
 					last_replaced = Some(accepted.len());
 					accepted.push((range, &edit.replacement));
@@ -499,6 +502,7 @@ impl Step<'_> {
 
 			Step::Moved { from, to, through } => match through {
 				None => move_back(to, from).map_err(|error| stays_moved(from, to, error)),
+
 				Some(temporary) => {
 					move_back(to, temporary).map_err(|error| stays_moved(from, to, error))?;
 					move_back(temporary, from).map_err(|error| stays_moved(from, temporary, error))
@@ -560,6 +564,7 @@ impl<'a> Transaction<'a> {
 
 				// (created by someone else in the meantime)
 				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+
 				Err(source) => return Err(Failure::at(directory, source)),
 			}
 		}
@@ -648,6 +653,7 @@ impl<'a> Transaction<'a> {
 		for change in changes {
 			match stage(&change.path, &change.formatted) {
 				Ok(file) => staged.push(file),
+
 				Err(failure) => {
 					remove_temporaries(&staged);
 					return Err(failure);
@@ -1249,6 +1255,7 @@ mod tests {
 				assert_eq!(location, LineCol { line: 3, column: 13 });
 				assert!(!message.is_empty());
 			}
+
 			other => panic!("expected a syntax error, got {other:?}"),
 		}
 
@@ -1310,6 +1317,7 @@ mod tests {
 					assert_eq!((found_first.start, found_first.end), *first, "case {index}");
 					assert_eq!((found_second.start, found_second.end), *second, "case {index}");
 				}
+
 				other => panic!("case {index}: expected overlapping edits, got {other:?}"),
 			}
 		}

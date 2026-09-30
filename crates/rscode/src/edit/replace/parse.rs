@@ -65,6 +65,7 @@ impl Container {
 
 			// the only macro calls with children
 			ItemKind::MacroCall => Some(Self::ThreadLocal),
+
 			_ => None,
 		}
 	}
@@ -285,6 +286,7 @@ fn has_cfg_attributes(text: &str) -> bool {
 		[TokenTree::Punct(pound), TokenTree::Group(group)] if pound.as_char() == '#' => {
 			group.delimiter() == Delimiter::Bracket && is_cfg_attribute(group.stream())
 		}
+
 		_ => false,
 	})
 }
@@ -415,6 +417,7 @@ fn module_verbatim(rest: &[TokenTree]) -> Option<NewItem> {
 
 			Some(NewItem::with_name(kind, Some(name), TYPE))
 		}
+
 		[keyword, ..] if is(keyword, "impl") => Some(NewItem::unnamed(ItemKind::Impl)),
 		[keyword, ..] if is(keyword, "use") => Some(NewItem::unnamed(ItemKind::Use)),
 		_ => None,
@@ -459,6 +462,7 @@ fn parse_source_here(source: &str, container: Container) -> Result<ParsedSource,
 		Container::Trait => parse_list(text, |item: &TraitItem| trait_item(item)),
 		Container::Extern => parse_list(text, |item: &ForeignItem| foreign_item(item)),
 		Container::Enum => parse_variants(text),
+
 		Container::ThreadLocal => parse_list(text, |declaration: &Declaration| {
 			NewItem::named(ItemKind::Static, &declaration.ident, VALUE)
 		}),
@@ -515,6 +519,7 @@ fn reject_inner_attributes(input: ParseStream<'_>) -> syn::Result<()> {
 			"inner attributes (`#![...]`) and inner doc comments (`//!`) are not allowed here, as they would apply to \
 			 the container",
 		)),
+
 		None => Ok(()),
 	}
 }
@@ -644,6 +649,7 @@ fn verbatim(tokens: &TokenStream, container: Container) -> NewItem {
 			Some(kind) => NewItem::with_name(kind, Some(name), VALUE),
 			None => unknown,
 		},
+
 		(Some(keyword), Some(name)) if is(keyword, "type") => NewItem::with_name(container.type_kind(), Some(name), TYPE),
 
 		// a declarative macro 2.0 (`macro m() {}`)

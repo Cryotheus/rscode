@@ -169,8 +169,10 @@ pub(crate) fn run(name: &str, matches: &ArgMatches, ui: &Ui) -> anyhow::Result<E
 		"remove" => remove::run(matches, ui),
 		"replace" => replace::run(matches, ui),
 		"insert" => insert::run(matches, ui),
+
 		#[cfg(feature = "mcp")]
 		"mcp" => mcp::run(matches),
+
 		_ => anyhow::bail!("unknown subcommand `{name}`"),
 	}
 }
@@ -190,10 +192,12 @@ fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMember>) -> Opti
 
 	match names.as_slice() {
 		[] => None,
+
 		[name] => Some(format!(
 			"the workspace member `{name}` is not selected, so its crates were not searched: pass `-p {name}` or \
 			 `--workspace`"
 		)),
+
 		_ => Some(format!(
 			"{} workspace members are not selected, so their crates were not searched ({}): pass `-p NAME` or \
 			 `--workspace`",

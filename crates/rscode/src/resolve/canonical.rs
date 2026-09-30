@@ -38,7 +38,6 @@ impl Resolver<'_> {
 			}
 
 			(_, ItemKind::Impl) => self.set_impl_owner(parent, &mut path),
-
 			(_, ItemKind::Trait | ItemKind::Enum) => path.segments = self.flat_path(parent),
 
 			(ItemKind::Import, _) => {

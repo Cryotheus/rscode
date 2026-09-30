@@ -580,6 +580,7 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 
 		let source = match parsed.iter().position(|(known, _)| *known == container) {
 			Some(index) => &parsed[index].1,
+
 			None => {
 				parsed.push((container, parse_source(source, container)?));
 				&parsed[parsed.len() - 1].1
@@ -807,6 +808,7 @@ fn target<'ws>(resolver: &Resolver<'ws>, parent: &ItemPath, anchor: Option<&Item
 	match targets.as_slice() {
 		[] => Err(unsupported.unwrap_or_else(|| Error::NotFound(parent.to_string()))),
 		[target] => Ok(*target),
+
 		_ => Err(ambiguous(
 			resolver,
 			parent,
@@ -900,6 +902,7 @@ mod tests {
 					"`c::x` is a fn, but the source is a struct (allow a kind change to replace it anyway)"
 				)
 			}
+
 			other => panic!("{other:?}"),
 		}
 

@@ -197,6 +197,7 @@ impl<'a> Lexed<'a> {
 
 				(floor, self.text[..floor].chars().next_back())
 			}
+
 			None => (self.start, None),
 		};
 
@@ -316,6 +317,7 @@ fn block_comment_len(rest: &str) -> usize {
 				depth += 1;
 				index += 2;
 			}
+
 			(b'*', b'/') => {
 				depth -= 1;
 				index += 2;
@@ -324,6 +326,7 @@ fn block_comment_len(rest: &str) -> usize {
 					return index;
 				}
 			}
+
 			_ => index += 1,
 		}
 	}
@@ -349,6 +352,7 @@ pub(crate) fn body_indent(text: &str, body: TextRange) -> String {
 		match piece.kind {
 			Kind::LineBreak => line_start = Some(piece.end),
 			Kind::Space => {}
+
 			_ => match line_start {
 				Some(start) if piece.start >= body.start => return text[start..piece.start].to_owned(),
 				_ => line_start = None,
@@ -462,7 +466,9 @@ fn indent_unit_in(lexed: &Lexed<'_>) -> String {
 				line_start = true;
 				indentation = "";
 			}
+
 			Kind::Space if line_start => indentation = &lexed.text[piece.start..piece.end],
+
 			Kind::Code | Kind::Comment if line_start => {
 				if indentation.starts_with('\t') {
 					tab_lines += 1;
@@ -475,6 +481,7 @@ fn indent_unit_in(lexed: &Lexed<'_>) -> String {
 
 				line_start = false;
 			}
+
 			_ => line_start = false,
 		}
 	}
@@ -694,6 +701,7 @@ fn lines(pieces: &[Piece], start: usize, end: usize) -> Vec<Line> {
 					has_comment: false,
 				};
 			}
+
 			Kind::Comment => line.has_comment = true,
 			_ => {}
 		}
@@ -745,6 +753,7 @@ fn next_piece(rest: &str) -> (Kind, usize) {
 		[b'b' | b'c' | b'r', ..] => prefixed_literal(rest).unwrap_or((Kind::Code, word_len(rest))),
 		[byte, ..] if byte.is_ascii_alphanumeric() || *byte == b'_' => (Kind::Code, word_len(rest)),
 		[byte, ..] if byte.is_ascii() => (Kind::Code, 1),
+
 		_ => {
 			let c = rest.chars().next().unwrap_or(' ');
 
@@ -805,6 +814,7 @@ fn quote_len(rest: &str) -> usize {
 
 	match chars.next() {
 		None => 1,
+
 		Some('\\') => {
 			// an escaped character: the next quote on the line closes the literal
 			let body = 2 + rest[2..].chars().next().map_or(0, char::len_utf8);
@@ -814,6 +824,7 @@ fn quote_len(rest: &str) -> usize {
 				_ => body,
 			}
 		}
+
 		Some(c) if chars.next() == Some('\'') => 1 + c.len_utf8() + 1,
 		Some(_) => 1 + word_len(&rest[1..]),
 	}
@@ -867,6 +878,7 @@ fn reindent_with(source: &str, indent: &str, line_ending: &str, unit: &str) -> S
 		.map(|line| match line.verbatim {
 			true => (line.text, true),
 			false if line.text.trim().is_empty() => ("", false),
+
 			false => (
 				line.text
 					.strip_prefix(common)
@@ -1684,9 +1696,11 @@ mod tests {
 				match item {
 					syn::Item::Impl(block) => items.extend(block.items.iter().map(|item| range(item))),
 					syn::Item::Trait(block) => items.extend(block.items.iter().map(|item| range(item))),
+
 					syn::Item::Mod(module) => {
 						items.extend(module.content.iter().flat_map(|(_, items)| items).map(|item| range(item)));
 					}
+
 					syn::Item::Enum(enumeration) => variants.extend(enumeration.variants.iter().map(|v| range(v))),
 					_ => {}
 				}

@@ -519,6 +519,7 @@ impl Server {
 			Some(Access::Write) => {
 				format!("set `{preview}` to preview the change, or attach the source again with `write` set to true")
 			}
+
 			_ => format!("set `{preview}` to preview the change (its directory is only exposed for reading)"),
 		};
 
@@ -555,6 +556,7 @@ impl Server {
 						source: name.to_owned(),
 						exposed: self.exposed.clone(),
 					},
+
 					Access::Read => WriteScope::Nowhere { source: name.to_owned() },
 				};
 
@@ -584,6 +586,7 @@ impl Server {
 				"no source is attached as `{name}`: this rscode server exposes no directories to attach sources from \
 				 (it was started without `--expose`)\nhint: leave out `attached` to work on the server's own workspace"
 			),
+
 			false => sources::unknown(name, attached),
 		}
 	}
@@ -696,6 +699,7 @@ fn respond(tool: &str, result: Result<String, String>) -> CallToolResult {
 fn sources_instructions(read_only: bool) -> String {
 	let (write, writing) = match read_only {
 		true => ("", ""),
+
 		false => (
 			", and `write` if you need to edit them",
 			", for writing only where the pattern is marked write",

@@ -332,6 +332,7 @@ impl PathPattern {
 		match &self.qualifier {
 			Some((self_ty, trait_pattern)) => self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref()),
 			None if path.is_impl => false,
+
 			None => {
 				// most candidates fail on their name, which needs no flattening
 				if let (Some(SegmentPattern::Ident(last)), Some(name)) = (self.segments.last(), &path.name)
@@ -378,6 +379,7 @@ impl PathPattern {
 
 		let owner_matches = match &path.unresolved_self_ty {
 			Some(self_ty_text) => self_ty.matches_written(self_ty_text) && self_ty.matches_arguments(Some(self_ty_text)),
+
 			None => {
 				let owner: Vec<&str> = path.segments.iter().map(SmolStr::as_str).collect();
 
@@ -434,12 +436,14 @@ impl PathPattern {
 			.map(|(index, segment)| match segment {
 				// the name of underscore imports (a `*` stays a wildcard: it matches any import)
 				SegmentPattern::Ident(pattern) if self.import && index == last && pattern.is_exact_underscore() => Some(SmolStr::new_static("_")),
+
 				SegmentPattern::Ident(pattern) => pattern.exact_ident(),
 				SegmentPattern::AnyDepth => None,
 			})
 			.collect::<Option<Vec<SmolStr>>>()?;
 		let qualifier = match &self.qualifier {
 			None => None,
+
 			Some((self_ty, trait_pattern)) => Some(Qualifier {
 				self_ty: Box::new(self_ty.to_item_path()?),
 				trait_path: match trait_pattern {
@@ -485,18 +489,22 @@ impl std::fmt::Display for PathPattern {
 		// whether a `::` is needed before the next segment
 		let mut separate = match self.anchor {
 			Anchor::None => false,
+
 			Anchor::Crate => {
 				f.write_str("crate")?;
 				true
 			}
+
 			Anchor::Global => {
 				f.write_str("::")?;
 				false
 			}
+
 			Anchor::SelfModule => {
 				f.write_str("self")?;
 				true
 			}
+
 			Anchor::Super(count) => {
 				for index in 0..count {
 					f.write_str(if index == 0 { "super" } else { "::super" })?;
@@ -564,6 +572,7 @@ fn match_segments(pattern: &[SegmentPattern], segments: &[&str], suffix: bool) -
 
 		match segment_pattern {
 			SegmentPattern::AnyDepth if index + 1 == pattern.len() => next[..count].fill(true),
+
 			SegmentPattern::AnyDepth => {
 				next[count] = row[count];
 
@@ -571,6 +580,7 @@ fn match_segments(pattern: &[SegmentPattern], segments: &[&str], suffix: bool) -
 					next[position] = row[position] || next[position + 1];
 				}
 			}
+
 			SegmentPattern::Ident(ident) => {
 				for position in 0..count {
 					next[position] = row[position + 1] && ident.matches(segments[position]);
@@ -670,6 +680,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 				parse_nested(self_text, options, "a type pattern after `for`")?,
 				Some(parse_nested(trait_text, options, "a trait pattern after `impl`")?),
 			),
+
 			None => (parse_nested(self_text, options, "a type pattern after `impl`")?, None),
 		};
 
@@ -702,6 +713,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 				parse_nested(self_text, options, "a type pattern after `<`")?,
 				Some(parse_nested(trait_text, options, "a trait pattern after `as`")?),
 			),
+
 			None => (parse_nested(inside, options, "a type pattern after `<`")?, None),
 		};
 		let mut segments = Vec::new();
@@ -732,6 +744,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			Some(_) => return Err("generic arguments are only supported on the last segment of a type or trait".to_owned()),
 			None => return Err("expected `>` to close the generic arguments".to_owned()),
 		},
+
 		Some(_) => return Err(ONLY_QUALIFIER_ARGUMENTS.to_owned()),
 		None if text.contains('>') => return Err(format!("unexpected `>` in `{text}`")),
 		None => (text, None),
@@ -754,13 +767,17 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			parse_segment(crate_name, options, &mut segments)?;
 			Anchor::Global
 		}
+
 		"crate" => Anchor::Crate,
+
 		"crate**" => {
 			segments.push(SegmentPattern::AnyDepth);
 			Anchor::Crate
 		}
+
 		"self" | "self**" => return Err("`self` is not supported in patterns".to_owned()),
 		"super" | "super**" => return Err("`super` is not supported in patterns".to_owned()),
+
 		first => {
 			parse_segment(first, options, &mut segments)?;
 			Anchor::None
@@ -796,6 +813,7 @@ fn parse_segment(raw: &str, options: MatchOptions, segments: &mut Vec<SegmentPat
 		match text.len() {
 			1 => segments.push(SegmentPattern::Ident(IdentPattern::any(options))),
 			2 => segments.push(SegmentPattern::AnyDepth),
+
 			_ => {
 				return Err(format!(
 					"`{text}` is not a segment pattern; use `*` for one segment or `**` for any number"
@@ -886,6 +904,7 @@ fn simplify_written_path(text: &str) -> String {
 					break;
 				}
 			}
+
 			'+' if depth == 0 => break,
 			'<' | '(' => depth += 1,
 			'>' | ')' => depth = depth.saturating_sub(1),
@@ -1329,6 +1348,7 @@ mod tests {
 	fn pattern_error(text: &str) -> String {
 		match PathPattern::parse(text, CASE) {
 			Ok(pattern) => panic!("`{text}` parsed as {pattern:?}"),
+
 			Err(error) => {
 				assert_eq!(error.text, text);
 				error.message

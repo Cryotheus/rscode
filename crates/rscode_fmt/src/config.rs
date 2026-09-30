@@ -39,6 +39,7 @@ pub(crate) fn newline_style_is_auto(options: &RustFmtOptions) -> bool {
 	let overridden = options.config.iter().rev().find(|(key, _)| key == "newline_style");
 	let style = match overridden {
 		Some((_, style)) => Some(style.clone()),
+
 		None => config_file(options.config_path.as_deref())
 			.and_then(|path| std::fs::read_to_string(path).ok())
 			.and_then(|text| toml_string(&text, "newline_style").map(str::to_owned)),

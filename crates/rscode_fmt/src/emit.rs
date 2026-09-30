@@ -148,6 +148,7 @@ pub fn mismatches(original: &str, formatted: &str) -> Vec<Mismatch> {
 				original_line += 1;
 				expected_line += 1;
 			}
+
 			Line::Original(text) => {
 				let mismatch = current.get_or_insert_with(|| Mismatch::new(original_line, expected_line));
 
@@ -156,6 +157,7 @@ pub fn mismatches(original: &str, formatted: &str) -> Vec<Mismatch> {
 				mismatch.original.push('\n');
 				original_line += 1;
 			}
+
 			Line::Formatted(text) => {
 				let mismatch = current.get_or_insert_with(|| Mismatch::new(original_line, expected_line));
 

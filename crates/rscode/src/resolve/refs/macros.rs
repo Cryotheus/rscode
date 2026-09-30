@@ -293,6 +293,7 @@ impl FileWalker<'_, '_> {
 
 					// a metavariable
 					Some(TokenTree::Ident(_)) => index += 1,
+
 					_ => {}
 				},
 

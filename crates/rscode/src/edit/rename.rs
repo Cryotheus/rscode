@@ -648,6 +648,7 @@ fn is_renamed(reference: &Reference, options: &ReferenceOptions) -> bool {
 
 		// paths through generic parameters (`T::method`) depend on types, like method calls
 		_ if !reference.certain => options.method_calls,
+
 		_ => true,
 	}
 }
@@ -741,6 +742,7 @@ fn namespaces(data: &ItemData) -> &'static [Namespace] {
 				shape: DataShape::Tuple | DataShape::Unit,
 				..
 			} => TYPE_AND_VALUE,
+
 			_ => TYPE,
 		},
 

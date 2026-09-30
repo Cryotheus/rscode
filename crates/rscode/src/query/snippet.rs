@@ -491,6 +491,7 @@ fn normalize(working: &str, edits: Vec<Edit>) -> Vec<Edit> {
 			Some(last) if range.start <= last.end || working[last.end..range.start].bytes().all(is_space) => {
 				last.end = last.end.max(range.end);
 			}
+
 			_ => merged.push(range),
 		}
 	}
@@ -511,6 +512,7 @@ fn normalize(working: &str, edits: Vec<Edit>) -> Vec<Edit> {
 					last.end = last.end.max(range.end);
 				}
 			}
+
 			Some(last) if edit.range().start < last.range().end => {}
 			_ => disjoint.push(edit),
 		}

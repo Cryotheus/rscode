@@ -610,10 +610,12 @@ impl Walker<'_, '_, '_> {
 						thread_local: false,
 					},
 				),
+
 				None => unknown(self, None),
 			},
 
 			Shape::Type { name } => (container.type_kind(), Some(name), ItemDetail::None),
+
 			Shape::Macro { name, body } if container == Container::Module => {
 				(ItemKind::MacroRules, Some(name), self.macro_detail("macro", body, end))
 			}

@@ -132,9 +132,7 @@ fn handshake_failure(error: ServerInitializeError) -> Result<(), Error> {
 	let kind = match &error {
 		ServerInitializeError::ConnectionClosed(_) => return Ok(()),
 		ServerInitializeError::TransportError { error, .. } => io_error_kind(error.error.as_ref()),
-
 		ServerInitializeError::ExpectedInitializeRequest(_) | ServerInitializeError::UnexpectedInitializeResponse(_) => ErrorKind::InvalidData,
-
 		_ => ErrorKind::Other,
 	};
 
@@ -157,10 +155,12 @@ where
 	E: std::error::Error + Send + Sync + 'static,
 {
 	let edits = server.edit_lock();
+
 	let running = match server.serve(transport).await {
 		Ok(running) => running,
 		Err(error) => return handshake_failure(error),
 	};
+
 	let stopped = running.waiting().await;
 
 	// an edit may still be writing on its worker thread: let it finish before the process may exit

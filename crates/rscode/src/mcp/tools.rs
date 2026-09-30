@@ -126,6 +126,7 @@ fn describe_in(error: &Error, resolver: &Resolver<'_>) -> String {
 	match (member, unloaded_hint(workspace, member)) {
 		// the crate is known: searching the loaded crates would not help
 		(Some(_), Some(hint)) => format!("{error}\nhint: {hint}"),
+
 		(None, Some(hint)) => format!("{}\nhint: {hint}", describe(error)),
 
 		(_, None) => match path.and_then(|path| resolver.import_hint(&path)) {
@@ -404,6 +405,7 @@ pub(crate) fn rename(load: &LoadOptions, params: &RenameParams, permit: &Permit<
 		Error::InvalidIdent(_) => {
 			format!("{error}\nhint: `new_name` is the new identifier alone (e.g. `parse_config`), not a path")
 		}
+
 		error => describe_in(&error, &resolver),
 	})?;
 	let root = workspace.root();
@@ -425,9 +427,11 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 			Error::Ambiguous { .. } if all_variants && in_several_crates(&resolver, &path) => {
 				format!("{error}\nhint: {SELECT_ONE_CRATE}, or set `all_variants` to replace every one of them")
 			}
+
 			Error::Ambiguous { .. } if all_variants => {
 				format!("{error}\nhint: set `all_variants` to replace every one of them")
 			}
+
 			error => describe_in(&error, &resolver),
 		}
 	})?;
@@ -523,10 +527,12 @@ fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMember>) -> Opti
 
 	match names.as_slice() {
 		[] => None,
+
 		[name] => Some(format!(
 			"the workspace member `{name}` is not selected, so its crates were not searched: add it to `packages`, or \
 			 set `workspace` to true"
 		)),
+
 		_ => Some(format!(
 			"{} workspace members are not selected, so their crates were not searched ({}): add them to `packages`, or \
 			 set `workspace` to true",
@@ -559,6 +565,7 @@ fn usable_from(resolver: &Resolver<'_>, text: &str) -> Result<UsableFrom, String
 
 	match (modules.as_slice(), active.as_slice()) {
 		([module], _) | (_, [module]) => Ok(UsableFrom::Viewpoint(Viewpoint::Module(*module))),
+
 		([], _) => Err(format!(
 			"`from`: `{text}` does not name a module (give `crate`, `::`, or the path of a module)"
 		)),
@@ -598,6 +605,7 @@ pub(crate) fn view(load: &LoadOptions, params: &ViewParams) -> Output {
 						.filter(|view| seen.insert((shown_item(&workspace, view.item), view.path.clone()))),
 				);
 			}
+
 			Err(error) => errors.push(describe_in(&error, &resolver)),
 		}
 	}

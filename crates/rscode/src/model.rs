@@ -755,6 +755,7 @@ impl std::str::FromStr for ItemKind {
 			"method" | "assoc-function" => Self::AssocFn,
 			"extern" => Self::ExternBlock,
 			"variant" | "enum-variant" => Self::Variant,
+
 			other => {
 				return Self::ALL
 					.iter()

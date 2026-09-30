@@ -62,6 +62,7 @@ impl Resolver<'_> {
 	fn add_dead(&self, dead: &mut Vec<DeadName>, import: ItemId, module: ItemId, name: Option<SmolStr>) {
 		let name = match name {
 			Some(name) => name,
+
 			None => {
 				let info = self.ws.item(import).import_info();
 
@@ -274,6 +275,7 @@ impl Resolver<'_> {
 					0 if edition_2015 => vec![ItemId::crate_root(import.krate())],
 					0 if info.path.leading_colon => return false,
 					0 => vec![module],
+
 					_ => (prefixes[index - 1].iter())
 						.filter_map(|res| match res {
 							Res::Item(item) if self.ws.item(*item).kind == ItemKind::Module => Some(*item),

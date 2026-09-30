@@ -78,6 +78,7 @@ impl<'a> Node<'a> {
 				Some((_, items)) => items.iter().map(Node::Item).collect(),
 				None => Vec::new(),
 			},
+
 			Self::Item(syn::Item::Impl(block)) => block.items.iter().map(Node::ImplItem).collect(),
 			Self::Item(syn::Item::Trait(definition)) => definition.items.iter().map(Node::TraitItem).collect(),
 			Self::Item(syn::Item::ForeignMod(block)) => block.items.iter().map(Node::ForeignItem).collect(),
@@ -161,6 +162,7 @@ impl<'a> Node<'a> {
 
 				Some(format!("{} {} use {}", attributes(&item.attrs), visibility(&item.vis), leaves.join(", ")))
 			}
+
 			Self::Item(syn::Item::ExternCrate(item)) => {
 				let rename = match &item.rename {
 					Some((_, rename)) if *rename != item.ident => format!(" as {rename}"),
@@ -174,6 +176,7 @@ impl<'a> Node<'a> {
 					item.ident
 				))
 			}
+
 			_ => None,
 		}
 	}
@@ -203,6 +206,7 @@ impl<'a> Node<'a> {
 	pub(crate) fn kind(self) -> &'static str {
 		match self {
 			Self::Item(item) => item_kind(item),
+
 			Self::ImplItem(item) => match item {
 				syn::ImplItem::Const(_) => "associated const",
 				syn::ImplItem::Fn(_) => "associated fn",
@@ -211,6 +215,7 @@ impl<'a> Node<'a> {
 				syn::ImplItem::Verbatim(_) => "unmodeled item",
 				_ => "unknown item",
 			},
+
 			Self::TraitItem(item) => match item {
 				syn::TraitItem::Const(_) => "associated const",
 				syn::TraitItem::Fn(_) => "associated fn",
@@ -219,6 +224,7 @@ impl<'a> Node<'a> {
 				syn::TraitItem::Verbatim(_) => "unmodeled item",
 				_ => "unknown item",
 			},
+
 			Self::ForeignItem(item) => match item {
 				syn::ForeignItem::Fn(_) => "foreign fn",
 				syn::ForeignItem::Static(_) => "foreign static",
@@ -235,6 +241,7 @@ impl<'a> Node<'a> {
 	pub(crate) fn name(self) -> Option<String> {
 		match self {
 			Self::Item(item) => item_name(item),
+
 			Self::ImplItem(item) => match item {
 				syn::ImplItem::Const(item) => Some(item.ident.to_string()),
 				syn::ImplItem::Fn(item) => Some(item.sig.ident.to_string()),
@@ -242,6 +249,7 @@ impl<'a> Node<'a> {
 				syn::ImplItem::Macro(item) => macro_name(&item.mac),
 				_ => None,
 			},
+
 			Self::TraitItem(item) => match item {
 				syn::TraitItem::Const(item) => Some(item.ident.to_string()),
 				syn::TraitItem::Fn(item) => Some(item.sig.ident.to_string()),
@@ -249,6 +257,7 @@ impl<'a> Node<'a> {
 				syn::TraitItem::Macro(item) => macro_name(&item.mac),
 				_ => None,
 			},
+
 			Self::ForeignItem(item) => match item {
 				syn::ForeignItem::Fn(item) => Some(item.sig.ident.to_string()),
 				syn::ForeignItem::Static(item) => Some(item.ident.to_string()),
@@ -351,10 +360,13 @@ fn flatten_use_tree(prefix: String, tree: &syn::UseTree, leaves: &mut Vec<String
 	match tree {
 		syn::UseTree::Path(path) => flatten_use_tree(format!("{prefix}{}::", path.ident), &path.tree, leaves),
 		syn::UseTree::Name(name) => leaves.push(format!("{prefix}{}", name.ident)),
+
 		// rustfmt removes renames to the same name
 		syn::UseTree::Rename(rename) if rename.rename == rename.ident => leaves.push(format!("{prefix}{}", rename.ident)),
+
 		syn::UseTree::Rename(rename) => leaves.push(format!("{prefix}{} as {}", rename.ident, rename.rename)),
 		syn::UseTree::Glob(_) => leaves.push(format!("{prefix}*")),
+
 		syn::UseTree::Group(group) => {
 			for tree in &group.items {
 				flatten_use_tree(prefix.clone(), tree, leaves);
@@ -441,10 +453,12 @@ fn item_name(item: &syn::Item) -> Option<String> {
 		syn::Item::ExternCrate(item) => Some(item.ident.to_string()),
 		syn::Item::Fn(item) => Some(item.sig.ident.to_string()),
 		syn::Item::Impl(item) => Some(impl_name(item)),
+
 		syn::Item::Macro(item) => match &item.ident {
 			Some(ident) => Some(ident.to_string()),
 			None => macro_name(&item.mac),
 		},
+
 		syn::Item::Mod(item) => Some(item.ident.to_string()),
 		syn::Item::Static(item) => Some(item.ident.to_string()),
 		syn::Item::Struct(item) => Some(item.ident.to_string()),
@@ -471,6 +485,7 @@ pub(crate) fn same_subtree(a: Node<'_>, b: Node<'_>) -> bool {
 			Some(index) => node.is_reorderable() || same_subtree(node, b[*index]),
 			None => true,
 		}),
+
 		Err(_) => false,
 	}
 }
@@ -501,6 +516,7 @@ fn visibility(visibility: &syn::Visibility) -> String {
 			drop_redundant_in(&mut restricted);
 			tokens(&syn::Visibility::Restricted(restricted))
 		}
+
 		_ => tokens(visibility),
 	}
 }

@@ -319,6 +319,7 @@ pub(crate) fn check(mut before: syn::File, mut after: syn::File) -> Result<(), S
 
 	match difference {
 		None if before_tokens.len() == after_tokens.len() => Ok(()),
+
 		difference => {
 			let at = difference.unwrap_or_else(|| before_tokens.len().min(after_tokens.len()));
 
@@ -332,6 +333,7 @@ pub(crate) fn check(mut before: syn::File, mut after: syn::File) -> Result<(), S
 fn ends_statement(expr: &syn::Expr) -> bool {
 	match expr {
 		syn::Expr::Assign(_) | syn::Expr::Break(_) | syn::Expr::Continue(_) | syn::Expr::Return(_) | syn::Expr::Yield(_) => true,
+
 		syn::Expr::Binary(binary) => matches!(
 			binary.op,
 			syn::BinOp::AddAssign(_)
@@ -345,6 +347,7 @@ fn ends_statement(expr: &syn::Expr) -> bool {
 				| syn::BinOp::ShlAssign(_)
 				| syn::BinOp::ShrAssign(_)
 		),
+
 		syn::Expr::Group(group) => ends_statement(&group.expr),
 		_ => false,
 	}
@@ -409,7 +412,9 @@ fn flatten(stream: TokenStream, tokens: &mut Vec<Token>) {
 
 				tokens.push(Token::Close(delimiter));
 			}
+
 			TokenTree::Ident(ident) => tokens.push(Token::Ident(ident.to_string())),
+
 			TokenTree::Punct(punct) => {
 				let character = punct.as_char();
 				let joined = punct.spacing() == Spacing::Joint
@@ -417,6 +422,7 @@ fn flatten(stream: TokenStream, tokens: &mut Vec<Token>) {
 
 				tokens.push(Token::Punct(character, joined));
 			}
+
 			TokenTree::Literal(literal) => tokens.push(Token::Literal(literal.to_string())),
 		}
 	}
@@ -451,10 +457,12 @@ fn is_thread_local(mac: &syn::Macro) -> bool {
 fn is_unit_block(expr: &syn::Expr) -> bool {
 	match expr {
 		syn::Expr::ForLoop(_) | syn::Expr::While(_) => true,
+
 		syn::Expr::If(expr_if) => match &expr_if.else_branch {
 			Some((_, else_branch)) => is_unit_block(else_branch),
 			None => true,
 		},
+
 		syn::Expr::Group(group) => is_unit_block(&group.expr),
 		_ => false,
 	}
@@ -508,8 +516,10 @@ fn normalize_semicolon(statement: &mut syn::Stmt, last: bool) {
 	match statement {
 		syn::Stmt::Expr(expr, semicolon @ None) if ends_statement(expr) => *semicolon = Some(Default::default()),
 		syn::Stmt::Expr(expr, semicolon @ Some(_)) if is_unit_block(expr) => *semicolon = None,
+
 		// `thread_local!` declares items, so it has no value even at the end of a block
 		syn::Stmt::Macro(statement) if !last || is_thread_local(&statement.mac) => statement.semi_token = Some(Default::default()),
+
 		_ => {}
 	}
 }
@@ -545,10 +555,12 @@ fn unwrap_block(expr: &mut syn::Expr) {
 		let inner = match statement {
 			syn::Stmt::Expr(inner, None) => std::mem::replace(inner, syn::Expr::PLACEHOLDER),
 			syn::Stmt::Expr(inner, Some(_)) if ends_statement(inner) => std::mem::replace(inner, syn::Expr::PLACEHOLDER),
+
 			syn::Stmt::Macro(statement) if statement.semi_token.is_none() => syn::Expr::Macro(syn::ExprMacro {
 				attrs: std::mem::take(&mut statement.attrs),
 				mac: statement.mac.clone(),
 			}),
+
 			_ => return,
 		};
 

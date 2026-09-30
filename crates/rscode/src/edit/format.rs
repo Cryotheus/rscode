@@ -109,7 +109,6 @@ impl<'ws> Files<'ws> {
 			match (info.inline, info.file, &info.load_error) {
 				(true, _, _) if is_target => self.add(ws.file_of(module), krate.edition(), FormatTarget::Item(data.range.start)),
 				(true, _, _) => {}
-
 				(false, Some(file), None) => self.add(krate.file(file), krate.edition(), FormatTarget::File),
 
 				(false, _, error) => {
@@ -343,6 +342,7 @@ fn matching(resolver: &Resolver<'_>, pattern: &PathPattern) -> Vec<ItemId> {
 
 				// `use` patterns match imports, other patterns never do
 				false if pattern.is_import() => data.kind == ItemKind::Import,
+
 				false => data.kind.is_nameable() && data.kind != ItemKind::Import && data.name.is_some(),
 			};
 
@@ -393,6 +393,7 @@ mod tests {
 				assert_eq!(location, LineCol { line: 3, column: 7 });
 				assert_eq!(message, "expected `;`");
 			}
+
 			other => panic!("{other:?}"),
 		}
 

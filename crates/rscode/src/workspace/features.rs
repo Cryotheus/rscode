@@ -368,6 +368,7 @@ impl<'a> LocalResolver<'a> {
 		match value {
 			FeatureValue::Feature(feature) => self.activate_feature(package, build, *feature),
 			FeatureValue::Dep { dep_name } => self.activate_dependency(package, build, *dep_name),
+
 			FeatureValue::DepFeature { dep_name, dep_feature, weak } => {
 				self.activate_dependency_feature(package, build, *dep_name, *dep_feature, *weak)
 			}
@@ -460,6 +461,7 @@ impl<'a> LocalResolver<'a> {
 			match closest(&feature, summary.features().keys(), |feature| feature.as_str()) {
 				Some(similar) => format!("help: there is a feature `{similar}` with a similar name\n"),
 				None if summary.features().is_empty() => String::new(),
+
 				None => {
 					let mut features: Vec<&str> = summary.features().keys().map(|feature| feature.as_str()).collect();
 

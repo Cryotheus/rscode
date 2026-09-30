@@ -360,6 +360,7 @@ impl Resolved {
 		let workspace = resolver.workspace();
 		let impl_block = match workspace.item(item).kind {
 			ItemKind::Impl => item,
+
 			_ => match workspace.parent(item) {
 				Some(parent) if workspace.item(parent).kind == ItemKind::Impl => parent,
 				_ => return false,
@@ -376,12 +377,14 @@ impl Resolved {
 fn candidate_name(data: &ItemData) -> Option<&str> {
 	match data.kind {
 		ItemKind::Impl => Some(""),
+
 		// like `ImportInfo::path_name`
 		ItemKind::Import => match &data.name {
 			Some(name) => Some(name),
 			None if data.import_info().is_some_and(|info| info.glob) => Some("*"),
 			None => Some("_"),
 		},
+
 		kind if kind.is_nameable() => data.name.as_deref(),
 		_ => None,
 	}
@@ -421,10 +424,12 @@ fn may_match(pattern: &PathPattern, kind: ItemKind, name: &str) -> bool {
 	match pattern.segments.last() {
 		// `<Type as Trait>` and `impl Trait for Type` match `impl` blocks, and only those
 		None if pattern.is_qualified() => is_impl,
+
 		_ if is_impl => false,
 
 		// `use` patterns match imports, and only those
 		_ if pattern.is_import() && kind != ItemKind::Import => false,
+
 		Some(SegmentPattern::Ident(last)) => last.matches(name),
 		_ => true,
 	}

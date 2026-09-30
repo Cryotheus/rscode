@@ -316,9 +316,11 @@ pub(crate) fn check_name(name: &str) -> Result<(), String> {
 
 	match name {
 		"" => Err("`name` is empty: choose a name to refer to the source by".to_owned()),
+
 		_ if !valid || name.len() > MAX_NAME_LEN => Err(format!(
 			"invalid name `{name}`: use up to {MAX_NAME_LEN} ASCII letters, digits, `_`, `-`, and `.`"
 		)),
+
 		_ => Ok(()),
 	}
 }
@@ -332,10 +334,12 @@ fn compile(text: &str) -> Result<(Pattern, Option<Pattern>), String> {
 	let path = Path::new(text);
 	let absolute = match path.is_absolute() {
 		true => path.to_path_buf(),
+
 		false => std::env::current_dir()
 			.map_err(|error| format!("the working directory is unknown: {error}"))?
 			.join(path),
 	};
+
 	let mut literal = PathBuf::new();
 	let mut wild: Vec<&str> = Vec::new();
 
@@ -357,6 +361,7 @@ fn compile(text: &str) -> Result<(Pattern, Option<Pattern>), String> {
 
 	let literal = resolve(&literal);
 	let literal = Pattern::escape(literal.to_str().ok_or("the pattern is not valid UTF-8")?);
+
 	let join = |wild: &[&str]| {
 		let mut pattern = literal.clone();
 
@@ -370,6 +375,7 @@ fn compile(text: &str) -> Result<(Pattern, Option<Pattern>), String> {
 
 		Pattern::new(&pattern).map_err(|error| format!("{} (at `{pattern}`)", error.msg))
 	};
+
 	let base = match wild.split_last() {
 		Some((&"**", rest)) => Some(join(rest)?),
 		_ => None,
@@ -449,10 +455,12 @@ pub(crate) fn manifest(text: &str) -> Result<PathBuf, String> {
 	}
 
 	let path = Path::new(text);
+
 	let path = match path.is_dir() {
 		true => path.join("Cargo.toml"),
 		false => path.to_path_buf(),
 	};
+
 	let manifest = std::fs::canonicalize(&path)
 		.map(without_verbatim_prefix)
 		.map_err(|error| format!("{}: {error}", path.display()))?;
@@ -513,6 +521,7 @@ pub(crate) fn unknown(name: &str, sources: &Sources) -> String {
 
 	match sources.is_empty() {
 		true => message.push_str("\nhint: attach one with `attach_source`"),
+
 		false => {
 			let names: Vec<String> = sources.keys().map(|name| format!("`{name}`")).collect();
 
@@ -533,7 +542,9 @@ pub(crate) fn verdict(name: &str, existing: Option<&Source>, requested: &Source)
 	let Some(existing) = existing else {
 		return Verdict::Attach;
 	};
+
 	let current = format!("({}): {}", existing.access.describe(), existing.manifest.display());
+
 	let already = match (existing.access, requested.access) {
 		(Access::Write, Access::Read) => format!("there is already a writable source attached as `{name}` {current}"),
 		_ => format!("source `{name}` is already attached {current}"),
@@ -632,6 +643,7 @@ mod tests {
 			source: "project".to_owned(),
 			exposed: exposed.into(),
 		};
+
 		let error = scope.check(&tree.path("project"), &edits).unwrap_err();
 
 		assert!(error.contains("link.rs, which is not in a directory exposed for writing"), "{error}");
@@ -689,8 +701,14 @@ mod tests {
 	/// Attaching decides and attaches in one step: only what the name allows is attached.
 	#[test]
 	fn registering_attaches_only_what_the_name_allows() {
-		let a = |access| Source { manifest: PathBuf::from("/a/Cargo.toml"), access };
-		let b = |access| Source { manifest: PathBuf::from("/b/Cargo.toml"), access };
+		let a = |access| Source {
+			manifest: PathBuf::from("/a/Cargo.toml"),
+			access,
+		};
+		let b = |access| Source {
+			manifest: PathBuf::from("/b/Cargo.toml"),
+			access,
+		};
 		let mut sources = Sources::new();
 
 		assert_eq!(register(&mut sources, "n", &a(Access::Read)), Verdict::Attach);
@@ -760,8 +778,14 @@ mod tests {
 	/// What attaching under a taken name comes to, for every combination of access and `Cargo.toml`.
 	#[test]
 	fn taken_names_keep_their_sources() {
-		let a = |access| Source { manifest: PathBuf::from("/a/Cargo.toml"), access };
-		let b = |access| Source { manifest: PathBuf::from("/b/Cargo.toml"), access };
+		let a = |access| Source {
+			manifest: PathBuf::from("/a/Cargo.toml"),
+			access,
+		};
+		let b = |access| Source {
+			manifest: PathBuf::from("/b/Cargo.toml"),
+			access,
+		};
 		let (read, write) = (Access::Read, Access::Write);
 
 		assert_eq!(verdict("n", None, &a(read)), Verdict::Attach);
@@ -774,11 +798,17 @@ mod tests {
 		};
 		let text = keep(read, read);
 
-		assert!(text.starts_with("source `n` is already attached (read-only): /a/Cargo.toml\nnothing changed"), "{text}");
+		assert!(
+			text.starts_with("source `n` is already attached (read-only): /a/Cargo.toml\nnothing changed"),
+			"{text}"
+		);
 
 		let text = keep(write, write);
 
-		assert!(text.starts_with("source `n` is already attached (read and write): /a/Cargo.toml\nnothing changed"), "{text}");
+		assert!(
+			text.starts_with("source `n` is already attached (read and write): /a/Cargo.toml\nnothing changed"),
+			"{text}"
+		);
 
 		let text = keep(write, read);
 
@@ -799,9 +829,15 @@ mod tests {
 				_ => "source `n` is already attached",
 			};
 
-			assert!(text.starts_with(&format!("{already} ({}): /a/Cargo.toml\n", has.describe())), "{has} {asked}: {text}");
+			assert!(
+				text.starts_with(&format!("{already} ({}): /a/Cargo.toml\n", has.describe())),
+				"{has} {asked}: {text}"
+			);
 			assert!(text.contains("nothing was attached"), "{text}");
-			assert!(text.contains("hint: attach /b/Cargo.toml under another name, or detach `n` first with `detach_source`"), "{text}");
+			assert!(
+				text.contains("hint: attach /b/Cargo.toml under another name, or detach `n` first with `detach_source`"),
+				"{text}"
+			);
 		}
 	}
 

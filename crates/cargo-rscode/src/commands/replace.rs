@@ -26,6 +26,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		let hint = match (hint, all_variants) {
 			// (`cfg` variants of an import: removing and inserting is not the better way)
 			(Some(_), true) if path.import => Some("pass `--all-variants` to replace every one of them".to_owned()),
+
 			(Some(hint), true) => Some(format!("{hint}, or `--all-variants` to replace all")),
 			(None, true) => Some("pass `--all-variants` to replace every one of them".to_owned()),
 			(hint, false) => hint,

@@ -84,6 +84,7 @@ fn delimit(stream: TokenStream) -> TokenStream {
 				match group.delimiter() {
 					Delimiter::None if inner.clone().into_iter().nth(1).is_none() => inner,
 					Delimiter::None => TokenTree::Group(Group::new(Delimiter::Parenthesis, inner)).into(),
+
 					delimiter => {
 						let mut delimited = Group::new(delimiter, inner);
 
@@ -92,6 +93,7 @@ fn delimit(stream: TokenStream) -> TokenStream {
 					}
 				}
 			}
+
 			tree => TokenStream::from(tree),
 		})
 		.collect()

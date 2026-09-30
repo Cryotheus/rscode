@@ -289,6 +289,7 @@ impl<'a> Walker<'a> {
 
 			// `u8::MAX`, `str::from_utf8`
 			Res::Builtin(ty) if self.kind == PathKind::Code => extend_external(ty, name, want, out),
+
 			Res::Builtin(_) => {}
 		}
 	}
@@ -420,6 +421,7 @@ impl<'a> Walker<'a> {
 
 			// only named imports of the module can add to bindings that shadow glob imports
 			Some(imports) if slot.is_some_and(Slot::shadows_globs) => imports.pending(module, name, namespace, own).collect(),
+
 			Some(imports) => imports.unsettling(module, name, namespace, own),
 		};
 

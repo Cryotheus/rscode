@@ -216,6 +216,7 @@ impl FmtArgs {
 				cargo: matches._values_of("config"),
 				rustfmt: Vec::new(),
 			},
+
 			false => ConfigValues::split(matches._values_of("config"))?,
 		};
 
@@ -313,9 +314,11 @@ impl InsertArgs {
 		let position = match (matches._value_of("position").unwrap_or("end"), anchor) {
 			("before", Some(anchor)) => InsertPosition::Before(anchor),
 			("after", Some(anchor)) => InsertPosition::After(anchor),
+
 			("before" | "after", None) => {
 				anyhow::bail!("`--position before` and `--position after` need an `--anchor`")
 			}
+
 			(_, Some(_)) => anyhow::bail!("`--anchor` needs `--position before` or `--position after`"),
 			("start", None) => InsertPosition::Start,
 			(_, None) => InsertPosition::End,

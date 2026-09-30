@@ -39,6 +39,7 @@ fn communicate(mut command: Command, input: &str) -> io::Result<Output> {
 		let writer = scope.spawn(move || match stdin {
 			// dropping stdin closes it, signaling the end of the input
 			Some(mut stdin) => stdin.write_all(input.as_bytes()),
+
 			None => Ok(()),
 		});
 
@@ -342,6 +343,7 @@ mod tests {
 				assert_eq!(stderr, stderr.trim());
 				assert!(!stderr.contains('\u{1b}'), "no color codes: {stderr:?}");
 			}
+
 			other => panic!("unexpected result: {other:?}"),
 		}
 	}
@@ -358,6 +360,7 @@ mod tests {
 				assert_eq!(program, "/nonexistent/rustfmt");
 				assert_eq!(source.kind(), io::ErrorKind::NotFound);
 			}
+
 			other => panic!("unexpected result: {other:?}"),
 		}
 	}

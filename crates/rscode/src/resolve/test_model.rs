@@ -190,6 +190,7 @@ impl Builder<'_> {
 			syn::Item::Use(item) => return self.use_item(parent, parsed, item, dirs),
 			syn::Item::Impl(item) => return self.impl_item(parent, parsed, item, dirs),
 			syn::Item::Verbatim(tokens) => return self.verbatim(parent, parsed, tokens, range, dirs),
+
 			syn::Item::Struct(item) => (
 				ItemKind::Struct,
 				Some(&item.ident),
@@ -237,6 +238,7 @@ impl Builder<'_> {
 			}
 
 			syn::Item::Type(item) => (ItemKind::TypeAlias, Some(&item.ident), &item.attrs, private(&item.vis), ItemDetail::None),
+
 			syn::Item::Fn(item) => (
 				ItemKind::Fn,
 				Some(&item.sig.ident),
@@ -779,6 +781,7 @@ fn path_attr(attr: &syn::Attribute) -> Option<String> {
 			syn::Expr::Lit(syn::ExprLit {
 				lit: syn::Lit::Str(value), ..
 			}) => Some(value.value()),
+
 			_ => None,
 		},
 

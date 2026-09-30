@@ -504,6 +504,7 @@ impl<'a> TextSorter<'a> {
 
 				(&self.source[body.start..header_end.max(body.start)], &self.source[last.end..body.end])
 			}
+
 			_ => ("", body_text),
 		};
 		let single_line = !body_text.contains('\n');
@@ -722,6 +723,7 @@ impl<'a> TextSorter<'a> {
 
 				cryotheum::plan_items(&items.iter().collect::<Vec<_>>(), &ties, &mergeable, self.options.style_edition)
 			}
+
 			Children::Impl(items) => cryotheum::plan_impl_items(&items.iter().collect::<Vec<_>>(), &token_texts(items)),
 			Children::Trait(items) => cryotheum::plan_trait_items(&items.iter().collect::<Vec<_>>(), &token_texts(items)),
 			Children::Foreign(items) => cryotheum::plan_foreign_items(&items.iter().collect::<Vec<_>>(), &token_texts(items)),
@@ -802,6 +804,7 @@ impl<'a> TextSorter<'a> {
 
 						self.merge_extern_blocks(items, &chunks, entry, indent, sort_items)?
 					}
+
 					_ => {
 						let replacement = replacements[entry.index].as_ref().map(|(range, text)| (range.clone(), text.as_str()));
 
@@ -900,6 +903,7 @@ fn block_comment_len(text: &str) -> Option<usize> {
 				depth += 1;
 				index += 2;
 			}
+
 			(b'*', b'/') => {
 				depth = depth.saturating_sub(1);
 				index += 2;
@@ -908,6 +912,7 @@ fn block_comment_len(text: &str) -> Option<usize> {
 					return Some(index);
 				}
 			}
+
 			_ => index += 1,
 		}
 	}
@@ -1007,6 +1012,7 @@ fn token_spans(tokens: TokenStream, spans: &mut Vec<proc_macro2::Span>) {
 				token_spans(group.stream(), spans);
 				spans.push(group.span_close());
 			}
+
 			other => spans.push(other.span()),
 		}
 	}
@@ -1716,10 +1722,7 @@ static INCOMING_STATE: MainThreadCell<IncomingState> = MainThreadCell::new(Incom
 			"const B: u8 = 0; /* about b\n   continued */\nconst A: u8 = 0;\nconst C: u8 = 0;\n",
 			"const A: u8 = 0;\n\nconst B: u8 = 0; /* about b\n   continued */\n\nconst C: u8 = 0;\n",
 		);
-		assert_sorts_to(
-			"const B: u8 = 0; // b\nconst A: u8 = 0;\n",
-			"const A: u8 = 0;\nconst B: u8 = 0; // b\n",
-		);
+		assert_sorts_to("const B: u8 = 0; // b\nconst A: u8 = 0;\n", "const A: u8 = 0;\nconst B: u8 = 0; // b\n");
 
 		// the comments above an item do not count: a section header becomes the header of the container
 		assert_sorts_to(

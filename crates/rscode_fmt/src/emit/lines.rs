@@ -67,6 +67,7 @@ fn align_myers<'a>(old: &[&'a str], new: &[&'a str], lines: &mut Vec<Line<'a>>) 
 	for operation in similar::capture_diff_slices(Algorithm::Myers, old, new) {
 		match operation {
 			DiffOp::Equal { .. } => lines.extend(old[operation.old_range()].iter().map(|&line| Line::Both(line))),
+
 			DiffOp::Delete { .. } | DiffOp::Insert { .. } | DiffOp::Replace { .. } => {
 				lines.extend(old[operation.old_range()].iter().map(|&line| Line::Original(line)));
 				lines.extend(new[operation.new_range()].iter().map(|&line| Line::Formatted(line)));

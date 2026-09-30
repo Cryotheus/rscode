@@ -173,6 +173,7 @@ mod tests {
 				assert_eq!(range, TextRange::new(text.find(open).unwrap(), text.len() - 1));
 				Some(replacement)
 			}
+
 			_ => None,
 		};
 

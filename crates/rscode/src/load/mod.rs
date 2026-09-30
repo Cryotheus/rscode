@@ -551,6 +551,7 @@ fn parent(path: &mut PathBuf) {
 
 		// `/..` is `/`
 		Some(Component::RootDir | Component::Prefix(_)) => {}
+
 		_ => path.push(".."),
 	}
 }

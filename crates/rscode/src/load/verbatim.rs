@@ -401,6 +401,7 @@ mod tests {
 			Shape::Trait(item) => format!("trait {} ({} items)", item.ident, item.items.len()),
 			Shape::TraitAlias(item) => format!("trait alias {}", item.ident),
 			Shape::Impl(item) => format!("impl {} ({} items)", item.self_ty.to_token_stream(), item.items.len()),
+
 			Shape::Use(elements) => {
 				let rooted = elements.iter().filter(|element| element.leading_colon.is_some()).count();
 
@@ -456,18 +457,22 @@ mod tests {
 
 		match (&file.items[0], container) {
 			(Item::Verbatim(tokens), Container::Module) => tokens.clone(),
+
 			(Item::Impl(item), _) => match &item.items[0] {
 				ImplItem::Verbatim(tokens) => tokens.clone(),
 				other => panic!("not verbatim: {}", other.to_token_stream()),
 			},
+
 			(Item::Trait(item), _) => match &item.items[0] {
 				TraitItem::Verbatim(tokens) => tokens.clone(),
 				other => panic!("not verbatim: {}", other.to_token_stream()),
 			},
+
 			(Item::ForeignMod(item), _) => match &item.items[0] {
 				ForeignItem::Verbatim(tokens) => tokens.clone(),
 				other => panic!("not verbatim: {}", other.to_token_stream()),
 			},
+
 			(other, _) => panic!("not verbatim: {}", other.to_token_stream()),
 		}
 	}

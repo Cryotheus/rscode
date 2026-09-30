@@ -16,8 +16,10 @@ fn canonicalize(item: &mut syn::Item) {
 				sort_by_text(items);
 			}
 		}
+
 		syn::Item::Impl(block) => sort_by_text(&mut block.items),
 		syn::Item::Trait(block) => sort_by_text(&mut block.items),
+
 		syn::Item::ForeignMod(block) => {
 			if block.abi.name.is_none() {
 				block.abi.name = Some(syn::LitStr::new("C", block.abi.extern_token.span));
@@ -25,6 +27,7 @@ fn canonicalize(item: &mut syn::Item) {
 
 			sort_by_text(&mut block.items);
 		}
+
 		_ => {}
 	}
 }
@@ -117,15 +120,19 @@ fn sort_nested(item: &mut syn::Item, options: &SortOptions) {
 				sort_items(items, options, options.inline_modules);
 			}
 		}
+
 		syn::Item::Impl(block) if options.impl_items => {
 			reorder(&mut block.items, cryotheum::plan_impl_items);
 		}
+
 		syn::Item::Trait(block) if options.trait_items => {
 			reorder(&mut block.items, cryotheum::plan_trait_items);
 		}
+
 		syn::Item::ForeignMod(block) if options.foreign_items => {
 			reorder(&mut block.items, cryotheum::plan_foreign_items);
 		}
+
 		_ => {}
 	}
 }

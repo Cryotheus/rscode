@@ -58,16 +58,19 @@ impl RequiredFeatures<'_> {
 						warnings.push(format!("{invalid}: `{value}` is not present in [features] section"));
 					}
 				}
+
 				FeatureValue::Dep { .. } => {
 					return Err(Error::Cargo(format!(
 						"{invalid}: `dep:` prefixed feature values are not allowed in required-features"
 					)));
 				}
+
 				FeatureValue::DepFeature { weak: true, .. } => {
 					return Err(Error::Cargo(format!(
 						"{invalid}: optional dependency with `?` is not allowed in required-features"
 					)));
 				}
+
 				FeatureValue::DepFeature {
 					dep_name,
 					dep_feature,
@@ -131,6 +134,7 @@ impl RequiredFeatures<'_> {
 
 		required.iter().all(|feature| match FeatureValue::new(feature.as_str().into()) {
 			FeatureValue::Feature(feature) => features.is_some_and(|features| features.contains(&feature)),
+
 			FeatureValue::DepFeature {
 				dep_name,
 				dep_feature,

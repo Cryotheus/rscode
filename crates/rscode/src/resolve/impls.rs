@@ -159,6 +159,7 @@ fn generic_param_names(text: &str) -> Vec<&str> {
 		match bytes[index] {
 			// `Fn() -> T` bounds
 			b'-' if bytes.get(index + 1) == Some(&b'>') => index += 1,
+
 			b'<' | b'(' | b'[' | b'{' => depth += 1,
 
 			b'>' | b')' | b']' | b'}' if depth == 0 => {

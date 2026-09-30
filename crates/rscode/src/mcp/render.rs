@@ -135,6 +135,7 @@ fn features(package: &Package) -> Option<String> {
 
 					format!("{name}{mark} = [{}]", enables.join(", "))
 				}
+
 				None => format!("{name}{mark}"),
 			}
 		})
@@ -237,9 +238,11 @@ pub(crate) fn format_check(root: &Path, changes: &[FileChange], warnings: &[Stri
 	let changed: Vec<&FileChange> = changes.iter().filter(|change| change.is_changed()).collect();
 	let mut out = match (changes.len(), changed.len()) {
 		(0, _) => "no files matched the targets\n".to_owned(),
+
 		(processed, 0) => {
 			format!("{} already formatted; nothing would change\n", count(processed, "file is", "files are"))
 		}
+
 		(processed, _) => format!("{} of {} would change:\n", changed.len(), count(processed, "file", "files")),
 	};
 
@@ -320,6 +323,7 @@ pub(crate) fn load_errors_note(workspace: &Workspace) -> String {
 
 	match errors.len() {
 		0 => String::new(),
+
 		errors => format!(
 			"note: {} while loading; items of files that could not be loaded are missing (see `workspace_info`)\n",
 			count(errors, "error", "errors")
@@ -566,10 +570,12 @@ pub(crate) fn truncation_hint(tool: &str) -> &'static str {
 		"find_items" => "narrow the request: a more specific `pattern`, `kinds`, or a smaller `limit` (or an `offset`)",
 		"view_items" => "narrow the request: fewer or more specific `paths`, or `mode` `outline`",
 		"remove_items" => "narrow the request: fewer `paths`; without `dry_run`, the edit is written and only summarized",
+
 		"format_items" => {
 			"narrow the request: fewer or more specific `targets`, or `skip_children`; without `check`, the changes are \
 			 written and only the files are listed"
 		}
+
 		_ => "without `dry_run`, the edit is written and only summarized",
 	}
 }

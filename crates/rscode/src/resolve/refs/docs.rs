@@ -266,11 +266,13 @@ fn code_lines(lines: &[(usize, &str)]) -> Vec<bool> {
 
 			match (fence, marker) {
 				(None, Some(open)) => fence = Some(open),
+
 				(Some((char, length)), Some((closing, closing_length)))
 					if closing == char && closing_length >= length && trimmed[closing_length..].trim().is_empty() =>
 				{
 					fence = None;
 				}
+
 				(None, None) => return false,
 				(Some(_), _) => {}
 			}

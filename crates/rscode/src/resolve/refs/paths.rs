@@ -518,10 +518,12 @@ impl FileWalker<'_, '_> {
 
 			let scopes: Vec<ItemId> = match index {
 				0 if is_path_keyword(&segment.name) => continue,
+
 				0 => match self.first_scope(path, &segment.name, kind) {
 					Some(scope) => vec![scope],
 					None => continue,
 				},
+
 				_ => (segments[index - 1].iter())
 					.filter_map(|res| match res {
 						Res::Item(item) if self.ws.item(*item).kind == ItemKind::Module => Some(*item),
@@ -650,6 +652,7 @@ impl FileWalker<'_, '_> {
 		let first: Vec<Res> = match self.self_types.last() {
 			// `Self` alone names types; `Self::item` may also name an item of the implemented (or defined) trait
 			Some(self_types) if path.segments.len() == 1 => self_types.types.iter().map(|&item| Res::Item(item)).collect(),
+
 			Some(self_types) => self_types.types.iter().chain(&self_types.traits).map(|&item| Res::Item(item)).collect(),
 			None => Vec::new(),
 		};
@@ -768,6 +771,7 @@ pub(super) fn item_namespaces(data: &ItemData) -> &'static [Namespace] {
 				shape: DataShape::Tuple | DataShape::Unit,
 				..
 			} => TYPE_AND_VALUE,
+
 			_ => TYPE,
 		},
 

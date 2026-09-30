@@ -18,6 +18,7 @@ pub(crate) fn block_comment_len(text: &str) -> Option<usize> {
 				depth += 1;
 				index += 2;
 			}
+
 			b"*/" => {
 				depth = depth.saturating_sub(1);
 				index += 2;
@@ -26,6 +27,7 @@ pub(crate) fn block_comment_len(text: &str) -> Option<usize> {
 					return Some(index);
 				}
 			}
+
 			_ => index += 1,
 		}
 	}
@@ -45,6 +47,7 @@ fn char_or_lifetime_len(text: &str) -> usize {
 
 			closing_quote.map_or(1, |(index, _)| index + 2)
 		}
+
 		(Some('\\'), None) => text.len(),
 		(Some(character), Some('\'')) => 1 + character.len_utf8() + 1,
 		_ => 1,
@@ -172,6 +175,7 @@ fn scanned_comments(text: &str) -> bool {
 
 				rest.find('\n').unwrap_or(rest.len())
 			}
+
 			'/' if rest.starts_with("/*") => {
 				if !is_doc_block_comment(rest) {
 					return true;
@@ -179,6 +183,7 @@ fn scanned_comments(text: &str) -> bool {
 
 				block_comment_len(rest).unwrap_or(rest.len())
 			}
+
 			'"' => quoted_len(rest),
 			'\'' => char_or_lifetime_len(rest),
 			character if character == '_' || character.is_alphabetic() => word_or_literal_len(rest),
@@ -224,7 +229,9 @@ fn token_ranges(tokens: TokenStream) -> Vec<Range<usize>> {
 				ranges.push(group.span_close().byte_range());
 				stack.push(group.stream().into_iter());
 			}
+
 			Some(token) => ranges.push(token.span().byte_range()),
+
 			None => {
 				stack.pop();
 			}

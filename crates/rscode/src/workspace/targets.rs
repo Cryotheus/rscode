@@ -136,6 +136,7 @@ impl<'a> Chooser<'_, 'a> {
 
 		let in_packages = match &self.selection.packages {
 			Packages::Default | Packages::OptOut(_) | Packages::All(_) => " in default-run packages".to_owned(),
+
 			Packages::Packages(specs) => match specs.as_slice() {
 				[] => String::new(),
 				[spec] => format!(" in `{spec}` package"),
@@ -172,6 +173,7 @@ impl<'a> Chooser<'_, 'a> {
 			for (name, packages) in available {
 				match packages.as_slice() {
 					[_] => message.push_str(&format!("\n    {name}")),
+
 					_ => packages
 						.iter()
 						.for_each(|package| message.push_str(&format!("\n    {name} in package {package}"))),

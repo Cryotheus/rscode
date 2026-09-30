@@ -223,6 +223,7 @@ pub(crate) fn find_human(rows: &[MatchRow], show: &[ShowField]) -> String {
 				ShowField::Vis => columns.push(row.visibility.clone()),
 				ShowField::Crate => columns.push(format!("crate: {}", row.krate)),
 				ShowField::Cfg => columns.extend(row.cfg.as_ref().map(|cfg| format!("cfg: {cfg}"))),
+
 				ShowField::Usable => match row.usable_paths.is_empty() {
 					true => columns.push("usable: none".to_owned()),
 					false => columns.push(format!("usable: {}", row.usable_paths.join(", "))),
@@ -266,6 +267,7 @@ pub(crate) fn find_json(matches: &[FindMatch], paths: &PathDisplay) -> serde_jso
 pub(crate) fn formatted_contents(changes: &[FileChange]) -> String {
 	match changes {
 		[single] => single.formatted.clone(),
+
 		_ => changes
 			.iter()
 			.map(|change| format!("{}:\n\n{}", change.path.display(), change.formatted))

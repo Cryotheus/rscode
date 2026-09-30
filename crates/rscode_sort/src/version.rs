@@ -79,6 +79,7 @@ pub(crate) fn rustfmt_version_cmp(a: &str, b: &str) -> Ordering {
 			(Some(VersionChunk::Underscore), Some(VersionChunk::Underscore)) => Ordering::Equal,
 			(Some(VersionChunk::Underscore), _) => Ordering::Less,
 			(_, Some(VersionChunk::Underscore)) => Ordering::Greater,
+
 			(Some(VersionChunk::Number(x)), Some(VersionChunk::Number(y))) => {
 				let ordering = numeric_cmp(x, y);
 
@@ -88,6 +89,7 @@ pub(crate) fn rustfmt_version_cmp(a: &str, b: &str) -> Ordering {
 
 				ordering
 			}
+
 			(Some(VersionChunk::Str(x) | VersionChunk::Number(x)), Some(VersionChunk::Str(y) | VersionChunk::Number(y))) => x.cmp(y),
 		};
 

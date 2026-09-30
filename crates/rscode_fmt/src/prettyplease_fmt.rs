@@ -139,6 +139,7 @@ impl<'ast> Visit<'ast> for Unsupported {
 		match expr {
 			// empty statements (`;`) are empty tokens, which prettyplease leaves out
 			syn::Expr::Verbatim(tokens) if !tokens.is_empty() => self.found(tokens),
+
 			_ => visit::visit_expr(self, expr),
 		}
 	}
@@ -160,11 +161,13 @@ impl<'ast> Visit<'ast> for Unsupported {
 	fn visit_item(&mut self, item: &'ast syn::Item) {
 		match item {
 			syn::Item::Verbatim(tokens) => self.found(tokens),
+
 			syn::Item::Macro(definition)
 				if definition.ident.is_some() && definition.mac.path.is_ident("macro_rules") && !is_printable_macro_rules(&definition.mac.tokens) =>
 			{
 				self.found(&quote::ToTokens::to_token_stream(definition));
 			}
+
 			_ => visit::visit_item(self, item),
 		}
 	}
@@ -283,6 +286,7 @@ fn unparse(mut file: syn::File) -> Result<String, FormatError> {
 	let formatted = std::panic::catch_unwind(AssertUnwindSafe(|| prettyplease::unparse(&file))).map_err(|payload| {
 		let message = match payload.downcast_ref::<&str>() {
 			Some(message) => (*message).to_owned(),
+
 			None => match payload.downcast_ref::<String>() {
 				Some(message) => message.clone(),
 				None => "prettyplease panicked".to_owned(),

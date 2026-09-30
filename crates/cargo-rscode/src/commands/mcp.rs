@@ -25,6 +25,7 @@ pub(super) fn run(matches: &ArgMatches) -> anyhow::Result<ExitCode> {
 	match runtime.block_on(rscode::mcp::serve_stdio(options)) {
 		// the client left while being answered: the session is over, and nobody is left to tell
 		Err(error) if is_broken_pipe(&error) => Ok(ExitCode::SUCCESS),
+
 		result => result.map(|()| ExitCode::SUCCESS).map_err(Into::into),
 	}
 }
