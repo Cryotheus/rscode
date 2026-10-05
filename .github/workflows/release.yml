@@ -2,6 +2,10 @@
 # release. Push a tag `cargo-rscode-v<version>` (matching the `version` cargo-rscode inherits from `[workspace.package]`
 # in Cargo.toml) to release.
 #
+# A run builds with the workflow of the tagged commit, so running it again cannot pick up a fix. Run this workflow by
+# hand instead (Actions, release, Run workflow) with the tag: it builds the tag with the workflow of the branch it runs
+# on, and its archives replace those of the release.
+#
 # The archive names and layout must match `[package.metadata.binstall]` in crates/cargo-rscode/Cargo.toml.
 
 name: release
@@ -9,13 +13,25 @@ name: release
 on:
   push:
     tags: ["cargo-rscode-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to build, `cargo-rscode-v<version>`"
+        required: true
+
+# runs for one tag upload the same archives, so they take turns
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
 
 env:
-  # the nightly rscode is developed with; bump deliberately
-  TOOLCHAIN: nightly-2026-09-28
+  # the tag pushed, or the one given to a run by hand
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  # the nightly rscode is developed with; bump deliberately. Not named `TOOLCHAIN`: Windows does not tell environment
+  # variables apart by case, which hides the `toolchain` variable of dtolnay/rust-toolchain from its own scripts
+  RUST_TOOLCHAIN: nightly-2026-09-28
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_RELEASE_STRIP: symbols
 
@@ -24,26 +40,28 @@ jobs:
     name: create the release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.TOOLCHAIN }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
 
       # cargo-rscode inherits its version from the workspace, so ask cargo rather than reading its manifest
       - name: check that the tag matches the crate version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cargo-rscode") | .version')
 
-          if [ "${GITHUB_REF_NAME}" != "cargo-rscode-v${version}" ]; then
-            echo "::error::tag ${GITHUB_REF_NAME} does not match cargo-rscode ${version}"
+          if [ "${RELEASE_TAG}" != "cargo-rscode-v${version}" ]; then
+            echo "::error::tag ${RELEASE_TAG} does not match cargo-rscode ${version}"
             exit 1
           fi
 
       - name: create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1 || gh release create "${GITHUB_REF_NAME}" --verify-tag --title "${GITHUB_REF_NAME}" --generate-notes
+        run: gh release view "${RELEASE_TAG}" > /dev/null 2>&1 || gh release create "${RELEASE_TAG}" --verify-tag --title "${RELEASE_TAG}" --generate-notes
 
   build:
     name: build ${{ matrix.target }}
@@ -59,11 +77,13 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ env.TOOLCHAIN }}
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       # OpenSSL is linked statically so the binaries do not depend on the system's (it is not used on Windows)
@@ -74,7 +94,7 @@ jobs:
         id: package
         shell: bash
         run: |
-          name="cargo-rscode-${GITHUB_REF_NAME#cargo-rscode-}-${{ matrix.target }}"
+          name="cargo-rscode-${RELEASE_TAG#cargo-rscode-}-${{ matrix.target }}"
           mkdir "${name}"
           cp README.md LICENSE-APACHE LICENSE-MIT "${name}/"
 
@@ -92,4 +112,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" "${{ steps.package.outputs.archive }}" --clobber
+        run: gh release upload "${RELEASE_TAG}" "${{ steps.package.outputs.archive }}" --clobber
