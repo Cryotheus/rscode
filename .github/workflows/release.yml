@@ -1,5 +1,6 @@
 # Builds `cargo-rscode` for every target `cargo binstall` can install it on, and attaches the archives to a GitHub
-# release. Push a tag `cargo-rscode-v<version>` (matching `version` in crates/cargo-rscode/Cargo.toml) to release.
+# release. Push a tag `cargo-rscode-v<version>` (matching the `version` cargo-rscode inherits from `[workspace.package]`
+# in Cargo.toml) to release.
 #
 # The archive names and layout must match `[package.metadata.binstall]` in crates/cargo-rscode/Cargo.toml.
 
@@ -25,9 +26,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+
+      # cargo-rscode inherits its version from the workspace, so ask cargo rather than reading its manifest
       - name: check that the tag matches the crate version
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/cargo-rscode/Cargo.toml | head -n 1)
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "cargo-rscode") | .version')
 
           if [ "${GITHUB_REF_NAME}" != "cargo-rscode-v${version}" ]; then
             echo "::error::tag ${GITHUB_REF_NAME} does not match cargo-rscode ${version}"

@@ -10,14 +10,14 @@ Prebuilt binaries for Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Wind
 find them:
 
 ```sh
-cargo binstall cargo-rscode                                          # once published on crates.io
+cargo binstall cargo-rscode                                          # the latest release
 cargo binstall --git https://github.com/Cryotheus/rscode cargo-rscode  # from the repository
 ```
 
-Or build from source with a nightly toolchain:
+Or build from source with Rust 1.97 or newer:
 
 ```sh
-cargo +nightly install --path crates/cargo-rscode
+cargo install cargo-rscode
 ```
 
 Building the `cargo` library it depends on takes a few minutes, and needs a C compiler, `pkg-config`, and OpenSSL
@@ -25,9 +25,11 @@ headers (or the `vendored-openssl` feature, which builds OpenSSL from source and
 
 ## Releasing
 
-Push a tag `cargo-rscode-v<version>` matching the `version` in `Cargo.toml`. The `release` workflow
-(`.github/workflows/release.yml`) creates the GitHub release and attaches the archives `cargo binstall` expects, as
-described by `[package.metadata.binstall]` in `Cargo.toml`.
+Push a tag `cargo-rscode-v<version>`, where `<version>` is the workspace `version` (`[workspace.package]` in the
+repository's root `Cargo.toml`, which cargo-rscode inherits). The `release` workflow (`.github/workflows/release.yml`)
+creates the GitHub release and attaches the archives `cargo binstall` expects, as described by
+`[package.metadata.binstall]` in this crate's `Cargo.toml`. `cargo binstall` reads that metadata from the version
+published on crates.io, so publish the crates for the same version.
 
 ## Commands
 

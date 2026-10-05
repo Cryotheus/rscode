@@ -23,13 +23,13 @@ Prebuilt binaries are attached to the `cargo-rscode-v*` GitHub releases, for
 [`cargo-binstall`](https://github.com/cargo-bins/cargo-binstall):
 
 ```sh
-cargo binstall --git https://github.com/Cryotheus/rscode cargo-rscode
+cargo binstall cargo-rscode
 ```
 
-Building from source requires a nightly toolchain (the workspace is developed on `1.101.0-nightly`):
+Building from source requires Rust 1.97 or newer (the workspace is developed on `1.101.0-nightly`):
 
 ```sh
-cargo +nightly install --path crates/cargo-rscode
+cargo install --path crates/cargo-rscode
 ```
 
 Building the `cargo` library takes a few minutes and needs a C compiler, `pkg-config`, and OpenSSL headers.
