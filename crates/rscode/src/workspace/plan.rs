@@ -22,11 +22,11 @@ use crate::Error;
 use crate::model;
 use crate::model::CrateSpec;
 use crate::model::TargetKind;
-use cargo::core::Package;
-use cargo::core::Workspace;
-use cargo::core::compiler::RustcTargetData;
-use cargo::core::resolver::CliFeatures;
+use cargo::compiler::RustcTargetData;
+use cargo::resolver::CliFeatures;
 use cargo::util::interning::InternedString;
+use cargo::workspace::Package;
+use cargo::workspace::Workspace;
 use smol_str::SmolStr;
 use std::io::Write;
 

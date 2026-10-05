@@ -1,6 +1,6 @@
 //! The features and optional dependencies enabled per package, resolved over the local packages.
 //!
-//! By default, cargo's feature resolution algorithm (`cargo::core::resolver::features::FeatureResolver`) runs over the
+//! By default, cargo's feature resolution algorithm (`cargo::resolver::features::FeatureResolver`) runs over the
 //! local packages only (the workspace members and their path dependencies), which needs no dependency resolution at
 //! all, after checking the features requested of local packages like cargo's dependency resolver does. With
 //! [`LoadOptions::exact_features`], cargo's own resolvers run instead (see [`super::exact`]).
@@ -10,20 +10,20 @@
 use super::context::LocalPackages;
 use super::platform::Platforms;
 use crate::Error;
-use cargo::core::Dependency;
-use cargo::core::FeatureValue;
-use cargo::core::Package;
-use cargo::core::PackageId;
-use cargo::core::Summary;
-use cargo::core::Target;
-use cargo::core::Workspace;
-use cargo::core::dependency::DepKind;
-use cargo::core::resolver::CliFeatures;
-use cargo::core::resolver::ResolveBehavior;
-use cargo::core::resolver::features::FeaturesFor;
+use cargo::resolver::CliFeatures;
+use cargo::resolver::ResolveBehavior;
+use cargo::resolver::features::FeaturesFor;
 use cargo::util::closest;
 use cargo::util::closest_msg;
 use cargo::util::interning::InternedString;
+use cargo::workspace::Dependency;
+use cargo::workspace::FeatureValue;
+use cargo::workspace::Package;
+use cargo::workspace::PackageId;
+use cargo::workspace::Summary;
+use cargo::workspace::Target;
+use cargo::workspace::Workspace;
+use cargo::workspace::dependency::DepKind;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;

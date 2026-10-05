@@ -4,10 +4,10 @@
 
 use crate::cli::parse_key_value;
 use cargo::GlobalContext;
-use cargo::core::Target;
+use cargo::context::TOP_LEVEL_CONFIG_KEYS;
 use cargo::util::command_prelude::ArgMatchesExt as _;
-use cargo::util::context::TOP_LEVEL_CONFIG_KEYS;
 use cargo::util::print_available_packages;
+use cargo::workspace::Target;
 use clap::ArgMatches;
 use rscode::Edition;
 use rscode::ItemKind;

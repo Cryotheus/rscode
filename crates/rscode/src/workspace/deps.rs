@@ -8,10 +8,10 @@ use super::platform::Platform;
 use super::targets::Candidate;
 use crate::model::Dependency;
 use crate::model::TargetKind;
-use cargo::core::Dependency as CargoDependency;
-use cargo::core::Package;
-use cargo::core::Target;
-use cargo::core::dependency::DepKind;
+use cargo::workspace::Dependency as CargoDependency;
+use cargo::workspace::Package;
+use cargo::workspace::Target;
+use cargo::workspace::dependency::DepKind;
 use smol_str::SmolStr;
 
 /// What decides which dependencies crates can name.

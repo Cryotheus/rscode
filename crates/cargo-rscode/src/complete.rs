@@ -549,7 +549,7 @@ fn unraw(ident: &str) -> &str {
 fn workspace_members(manifest_path: Option<&Path>) -> anyhow::Result<Vec<CompletionCandidate>> {
 	let gctx = new_gctx_for_completions()?;
 	let manifest = root_manifest(manifest_path, &gctx)?;
-	let workspace = cargo::core::Workspace::new(&manifest, &gctx)?;
+	let workspace = cargo::workspace::Workspace::new(&manifest, &gctx)?;
 
 	Ok(workspace
 		.members()

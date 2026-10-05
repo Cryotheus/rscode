@@ -2004,7 +2004,7 @@ fn robustness_on_large_registry_crates() {
 		.collect();
 
 	let crates = [
-		("cargo-0.99.0", "src/cargo/lib.rs"),
+		("cargo-0.100.0", "src/lib.rs"),
 		("gix-0.85.0", "src/lib.rs"),
 		("rustix-1.1.5", "src/lib.rs"),
 		("clap_builder-4.6.7", "src/lib.rs"),

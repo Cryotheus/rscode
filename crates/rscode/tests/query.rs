@@ -1175,11 +1175,11 @@ fn robustness_on_large_registry_crates() {
 
 	let crates = [
 		("syn-3.0.6", "src/lib.rs"),
-		("cargo-0.99.0", "src/cargo/lib.rs"),
+		("cargo-0.100.0", "src/lib.rs"),
 		("regex-1.13.1", "src/lib.rs"),
 		("libc-0.2.189", "src/lib.rs"),
 		("serde_json-1.0.151", "src/lib.rs"),
-		("tokio-1.53.1", "src/lib.rs"),
+		("tokio-1.53.2", "src/lib.rs"),
 	];
 
 	for (name, lib) in crates {

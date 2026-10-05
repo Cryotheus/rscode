@@ -6,11 +6,11 @@ use crate::CfgContext;
 use crate::Error;
 use crate::model::TargetKind;
 use cargo::GlobalContext;
-use cargo::core::Dependency;
-use cargo::core::compiler::CompileKind;
-use cargo::core::compiler::RustcTargetData;
-use cargo::core::compiler::TargetInfo;
+use cargo::compiler::CompileKind;
+use cargo::compiler::RustcTargetData;
+use cargo::compiler::TargetInfo;
 use cargo::util::Rustc;
+use cargo::workspace::Dependency;
 use cargo_platform::Cfg;
 
 /// A platform crates are compiled for.

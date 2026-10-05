@@ -7,13 +7,13 @@ use super::features::Build;
 use super::platform::Platforms;
 use super::targets::Candidate;
 use crate::Error;
-use cargo::core::Dependency;
-use cargo::core::FeatureValue;
-use cargo::core::Package;
-use cargo::core::PackageId;
-use cargo::core::Summary;
-use cargo::core::dependency::DepKind;
 use cargo::util::interning::InternedString;
+use cargo::workspace::Dependency;
+use cargo::workspace::FeatureValue;
+use cargo::workspace::Package;
+use cargo::workspace::PackageId;
+use cargo::workspace::Summary;
+use cargo::workspace::dependency::DepKind;
 
 /// The package a dependency refers to.
 struct Known<'a> {
