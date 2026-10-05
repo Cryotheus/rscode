@@ -1,10 +1,12 @@
-//! The emit formats, compared with rustfmt's own output.
+//! The emit formats, compared with rustfmt's own output. rustfmt's `json` and `checkstyle` emit modes are unstable, so
+//! the comparisons need a nightly rustfmt, and are skipped (with a message) without one.
 
 mod common;
 
 use common::fixture;
 use common::rustfmt;
 use common::rustfmt_available;
+use common::rustfmt_unstable_emit;
 use rscode_fmt::Formatter;
 use rscode_fmt::emit;
 use rscode_fmt::emit::FileChange;
@@ -59,7 +61,7 @@ fn assert_like_rustfmt(samples: &[(&str, &str)]) {
 
 #[test]
 fn several_blocks() {
-	if !rustfmt_available() {
+	if !rustfmt_unstable_emit() {
 		return;
 	}
 
@@ -71,7 +73,7 @@ fn several_blocks() {
 
 #[test]
 fn removed_lines() {
-	if !rustfmt_available() {
+	if !rustfmt_unstable_emit() {
 		return;
 	}
 
@@ -83,7 +85,7 @@ fn removed_lines() {
 
 #[test]
 fn final_line_breaks() {
-	if !rustfmt_available() {
+	if !rustfmt_unstable_emit() {
 		return;
 	}
 
@@ -92,7 +94,7 @@ fn final_line_breaks() {
 
 #[test]
 fn escaping() {
-	if !rustfmt_available() {
+	if !rustfmt_unstable_emit() {
 		return;
 	}
 
@@ -101,7 +103,7 @@ fn escaping() {
 
 #[test]
 fn unchanged_files() {
-	if !rustfmt_available() {
+	if !rustfmt_unstable_emit() {
 		return;
 	}
 
@@ -112,7 +114,7 @@ fn unchanged_files() {
 
 #[test]
 fn many_blocks() {
-	if !rustfmt_available() {
+	if !rustfmt_unstable_emit() {
 		return;
 	}
 

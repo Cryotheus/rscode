@@ -38,6 +38,34 @@ pub fn rustfmt_available() -> bool {
 	available
 }
 
+/// Whether `rustfmt` takes the unstable `--emit` modes (`json`, `checkstyle`), which only a nightly rustfmt does. Tests
+/// that compare with their output return early (with a message) when it does not.
+pub fn rustfmt_unstable_emit() -> bool {
+	static AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+	if !rustfmt_available() {
+		return false;
+	}
+
+	let available = *AVAILABLE.get_or_init(|| {
+		let empty = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("rustfmt_unstable_emit.rs");
+
+		std::fs::write(&empty, "").is_ok()
+			&& Command::new(rustfmt_program())
+				.args(["--emit", "json", "--config-path"])
+				.arg(fixture("rustfmt/default/rustfmt.toml"))
+				.arg(&empty)
+				.output()
+				.is_ok_and(|output| output.status.success())
+	});
+
+	if !available {
+		eprintln!("rustfmt does not take `--emit json` (only a nightly rustfmt does): skipping");
+	}
+
+	available
+}
+
 /// rustfmt options with rustfmt's default configuration (so that no configuration file around the repository is
 /// picked up) and the 2024 edition.
 pub fn rustfmt_options() -> RustFmtOptions {

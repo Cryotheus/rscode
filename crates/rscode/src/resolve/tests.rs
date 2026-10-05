@@ -9,6 +9,8 @@ use crate::model::TargetKind;
 use crate::path::Anchor;
 use crate::path::Qualifier;
 use crate::source::TextRange;
+use crate::test_registry::locked_version;
+use crate::test_registry::registry_crate;
 use rscode_fmt::Edition;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1894,7 +1896,8 @@ fn readers_see_every_cfg_variant_of_named_imports() {
 	}
 }
 
-/// The crates of this repository, and syn's source from the cargo registry (when present, unselected).
+/// The crates of this repository, and syn's source from the cargo registry at the version `Cargo.lock` locks (when
+/// present, unselected).
 fn real_crates() -> Vec<TestCrate> {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let crates_dir = manifest_dir.parent().expect("crates directory");
@@ -1914,20 +1917,9 @@ fn real_crates() -> Vec<TestCrate> {
 		}
 	}
 
-	let home = std::env::home_dir().map(|home| home.join(".cargo"));
-	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home);
-
-	let syn = (registry
-		.and_then(|home| std::fs::read_dir(home.join("registry/src")).ok())
-		.into_iter()
-		.flatten()
-		.flatten())
-	.map(|index| index.path().join("syn-3.0.6/src/lib.rs"))
-	.find(|path| path.exists());
-
-	if let Some(syn) = syn {
+	if let Some(syn) = registry_crate("syn") {
 		crates.push(
-			TestCrate::on_disk("syn", syn)
+			TestCrate::on_disk("syn", syn.join("src/lib.rs"))
 				.dep("proc_macro2", "proc_macro2")
 				.dep("quote", "quote")
 				.unselected(),
@@ -1990,37 +1982,31 @@ fn resolver_is_send_and_sync() {
 #[test]
 #[ignore = "slow; needs large crates in the cargo registry"]
 fn robustness_on_large_registry_crates() {
-	let home = std::env::home_dir().map(|home| home.join(".cargo"));
-	let registry = std::env::var_os("CARGO_HOME")
-		.map(PathBuf::from)
-		.or(home)
-		.map(|home| home.join("registry/src"));
-	let indices: Vec<PathBuf> = registry
-		.and_then(|registry| std::fs::read_dir(registry).ok())
-		.into_iter()
-		.flatten()
-		.flatten()
-		.map(|index| index.path())
-		.collect();
-
+	// dependencies of this workspace, at the versions `Cargo.lock` locks
 	let crates = [
-		("cargo-0.100.0", "src/lib.rs"),
-		("gix-0.85.0", "src/lib.rs"),
-		("rustix-1.1.5", "src/lib.rs"),
-		("clap_builder-4.6.7", "src/lib.rs"),
-		("regex-1.13.1", "src/lib.rs"),
-		("libc-0.2.189", "src/lib.rs"),
-		("rmcp-3.5.0", "src/lib.rs"),
+		("cargo", "src/lib.rs"),
+		("gix", "src/lib.rs"),
+		("rustix", "src/lib.rs"),
+		("clap_builder", "src/lib.rs"),
+		("regex", "src/lib.rs"),
+		("libc", "src/lib.rs"),
+		("rmcp", "src/lib.rs"),
 	];
 
 	for (name, lib) in crates {
-		let Some(root) = indices.iter().map(|index| index.join(name).join(lib)).find(|root| root.exists()) else {
+		let version = locked_version(name);
+
+		let Some(dir) = registry_crate(name) else {
+			println!("{name} {version}: not in cargo's registry, skipped");
 			continue;
 		};
 
-		let crate_name = name.rsplit_once('-').map_or(name, |(crate_name, _)| crate_name);
+		let root = dir.join(lib);
+
+		assert!(root.exists(), "{name} {version} has no {lib}: update its library path");
+
 		let started = Instant::now();
-		let ws = workspace([TestCrate::on_disk(crate_name, root)]);
+		let ws = workspace([TestCrate::on_disk(name, root)]);
 		let loaded = started.elapsed();
 		let started = Instant::now();
 		let resolver = Resolver::new(&ws);
@@ -2033,7 +2019,7 @@ fn robustness_on_large_registry_crates() {
 		let failures = canonical_path_round_trip_failures(&ws, &resolver);
 
 		println!(
-			"{name}: {} items, model {loaded:?}, resolver {resolved:?}, usable paths {:?} ({foreign}), {} unresolved imports, {} round trip failures",
+			"{name} {version}: {} items, model {loaded:?}, resolver {resolved:?}, usable paths {:?} ({foreign}), {} unresolved imports, {} round trip failures",
 			ws.crates()[0].items().count(),
 			started.elapsed(),
 			resolver.unresolved_imports().len(),

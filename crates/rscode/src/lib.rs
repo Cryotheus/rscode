@@ -51,6 +51,9 @@ pub mod mcp;
 #[cfg(feature = "cargo")]
 pub mod workspace;
 
+#[cfg(test)]
+mod test_registry;
+
 pub use cfg::CfgContext;
 pub use cfg::CfgExpr;
 pub use cfg::Tristate;

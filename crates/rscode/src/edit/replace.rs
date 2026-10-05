@@ -857,6 +857,8 @@ fn use_items(resolver: &Resolver<'_>, items: Vec<ItemId>) -> Result<UseItems, Er
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::test_registry::locked_version;
+	use crate::test_registry::registry_crate;
 
 	/// Parsing the text of every `step`th item of a crate as a replacement tells the kind and name the loader gave it.
 	fn check_classification(name: &str, root: PathBuf, step: usize) {
@@ -921,9 +923,9 @@ mod tests {
 	fn classifies_items_like_the_loader() {
 		check_classification("rscode", PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"), 1);
 
-		match registry_crate("syn-3.0.6") {
+		match registry_crate("syn") {
 			Some(syn) => check_classification("syn", syn.join("src/lib.rs"), 7),
-			None => eprintln!("syn-3.0.6 is not in cargo's registry; skipping"),
+			None => eprintln!("syn {} is not in cargo's registry; skipping", locked_version("syn")),
 		}
 	}
 
@@ -935,17 +937,6 @@ mod tests {
 		assert_eq!(article(ItemKind::Impl), "an impl");
 		assert_eq!(article(ItemKind::Use), "a use");
 		assert_eq!(article(ItemKind::Union), "a union");
-	}
-
-	/// The source of a crate in cargo's registry, if it is there.
-	fn registry_crate(name_version: &str) -> Option<PathBuf> {
-		let cargo_home = std::env::var_os("CARGO_HOME")
-			.map(PathBuf::from)
-			.or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))?;
-
-		(std::fs::read_dir(cargo_home.join("registry/src")).ok()?.filter_map(Result::ok))
-			.map(|index| index.path().join(name_version))
-			.find(|path| path.is_dir())
 	}
 
 	#[test]

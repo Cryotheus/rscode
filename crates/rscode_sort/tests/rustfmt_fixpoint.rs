@@ -150,12 +150,19 @@ fn real_files_settle() {
 const ROUNDS: usize = 1;
 
 /// Checks that `sort`, `rustfmt`, `sort`, `rustfmt` settles: sorting the formatted text changes nothing, or only
-/// blank lines, and formatting that leaves nothing for sorting to change. Returns `Ok(false)` when rustfmt fails.
+/// blank lines, and formatting that leaves nothing for sorting to change. Returns `Ok(false)` when rustfmt fails, or
+/// formats the sorted text into what no longer parses: a rustfmt older than the syntax it is given may rewrite it (the
+/// rustfmt of Rust 1.97 turns `const impl Trait for T` into `impl const Trait for T`).
 fn check_fixpoint(rustfmt: &Rustfmt, source: &str) -> Result<bool, String> {
 	let sorted = rscode_sort::sort_str(source).map_err(|error| error.to_string())?;
 	let Ok(mut formatted) = rustfmt.format(&sorted) else {
 		return Ok(false);
 	};
+
+	if syn::parse_file(&formatted).is_err() {
+		return Ok(false);
+	}
+
 	let mut round = 0;
 
 	loop {

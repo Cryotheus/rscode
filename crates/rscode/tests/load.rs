@@ -1,5 +1,9 @@
 //! Loading crates: module file resolution, item extraction, locations, `cfg`s, and diagnostics.
 
+mod common;
+
+use common::locked_version;
+use common::registry_crate;
 use rscode::CfgContext;
 use rscode::CrateId;
 use rscode::CrateSpec;
@@ -1283,41 +1287,12 @@ fn loads_this_repository() {
 	load_real_crate("cargo_rscode", &crates.join("cargo-rscode/src/main.rs"), 5);
 }
 
-/// The source of a crate in cargo's registry, if it is there.
-fn registry_crate(name_version: &str) -> Option<PathBuf> {
-	let cargo_home = std::env::var_os("CARGO_HOME")
-		.map(PathBuf::from)
-		.or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))?;
-
-	std::fs::read_dir(cargo_home.join("registry/src"))
-		.ok()?
-		.filter_map(Result::ok)
-		.map(|index| index.path().join(name_version))
-		.find(|path| path.is_dir())
-}
-
-/// The version of syn 3 that this workspace uses, from its `Cargo.lock`.
-fn locked_syn_version() -> String {
-	let lock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
-	let lock = std::fs::read_to_string(&lock).unwrap_or_else(|error| panic!("cannot read {}: {error}", lock.display()));
-
-	lock.split("[[package]]")
-		.filter(|package| package.lines().any(|line| line.trim() == "name = \"syn\""))
-		.find_map(|package| {
-			let version = package.lines().find_map(|line| line.trim().strip_prefix("version = \""))?;
-
-			version.strip_suffix('"').filter(|version| version.starts_with("3."))
-		})
-		.expect("syn 3 in Cargo.lock")
-		.to_owned()
-}
-
 /// Loads the source of syn (a dependency of rscode, so it is normally in cargo's registry) as a crate.
 #[test]
 fn loads_syn() {
-	let version = locked_syn_version();
+	let version = locked_version("syn");
 
-	let Some(syn) = registry_crate(&format!("syn-{version}")) else {
+	let Some(syn) = registry_crate("syn") else {
 		eprintln!("SKIPPED loads_syn: the source of syn {version} (from Cargo.lock) is not in cargo's registry");
 		return;
 	};

@@ -1,5 +1,9 @@
 //! Finding and viewing items of fixture crates.
 
+mod common;
+
+use common::locked_version;
+use common::registry_crate;
 use rscode::CfgContext;
 use rscode::CrateSpec;
 use rscode::Error;
@@ -1166,31 +1170,29 @@ fn line_numbers(text: &str) -> Vec<Option<usize>> {
 #[test]
 #[ignore = "slow; needs large crates in the cargo registry"]
 fn robustness_on_large_registry_crates() {
-	let home = std::env::home_dir().map(|home| home.join(".cargo"));
-	let registry = std::env::var_os("CARGO_HOME").map(PathBuf::from).or(home).map(|home| home.join("registry/src"));
-	let indices: Vec<PathBuf> = (registry.and_then(|registry| std::fs::read_dir(registry).ok()).into_iter().flatten())
-		.flatten()
-		.map(|index| index.path())
-		.collect();
-
+	// dependencies of this workspace, at the versions `Cargo.lock` locks
 	let crates = [
-		("syn-3.0.6", "src/lib.rs"),
-		("cargo-0.100.0", "src/lib.rs"),
-		("regex-1.13.1", "src/lib.rs"),
-		("libc-0.2.189", "src/lib.rs"),
-		("serde_json-1.0.151", "src/lib.rs"),
-		("tokio-1.53.2", "src/lib.rs"),
+		("syn", "src/lib.rs"),
+		("cargo", "src/lib.rs"),
+		("regex", "src/lib.rs"),
+		("libc", "src/lib.rs"),
+		("serde_json", "src/lib.rs"),
+		("tokio", "src/lib.rs"),
 	];
 
 	for (name, lib) in crates {
-		let Some(dir) = indices.iter().map(|index| index.join(name)).find(|dir| dir.join(lib).exists()) else {
+		let version = locked_version(name);
+
+		let Some(dir) = registry_crate(name) else {
+			println!("{name} {version}: not in cargo's registry, skipped");
 			continue;
 		};
 
-		let crate_name = name.rsplit_once('-').map_or(name, |(crate_name, _)| crate_name);
+		assert!(dir.join(lib).exists(), "{name} {version} has no {lib}: update its library path");
+
 		let mut workspace = Workspace::new(&dir);
 
-		workspace.load_crate(CrateSpec::new(crate_name, dir.join(lib)));
+		workspace.load_crate(CrateSpec::new(name, dir.join(lib)));
 
 		let resolver = Resolver::new(&workspace);
 		let started = std::time::Instant::now();
@@ -1260,6 +1262,6 @@ fn robustness_on_large_registry_crates() {
 			}
 		}
 
-		println!("{name}: {} items, found in {found:?}, viewed 5 times in {:?}", items.len(), started.elapsed());
+		println!("{name} {version}: {} items, found in {found:?}, viewed 5 times in {:?}", items.len(), started.elapsed());
 	}
 }

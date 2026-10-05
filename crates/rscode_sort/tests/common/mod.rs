@@ -65,7 +65,7 @@ pub struct Rustfmt {
 }
 
 impl Rustfmt {
-	/// rustfmt from the nightly toolchain if rustup provides it, otherwise the default one.
+	/// rustfmt from the nightly toolchain if rustup has it installed, otherwise the default one.
 	pub fn find() -> Option<Self> {
 		// an empty config, so no `rustfmt.toml` of the environment applies
 		let directory = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("rscode_sort_rustfmt");
@@ -93,6 +93,8 @@ impl Rustfmt {
 	pub fn format_for(&self, source: &str, edition: &str) -> Result<String, String> {
 		let mut child = Command::new("rustfmt")
 			.args(self.toolchain)
+			// rustup fails instead of downloading a toolchain that `+nightly` names and is not installed
+			.env("RUSTUP_AUTO_INSTALL", "0")
 			.args(["--edition", edition, "--emit", "stdout", "--config-path"])
 			.arg(&self.config)
 			.stdin(Stdio::piped())
