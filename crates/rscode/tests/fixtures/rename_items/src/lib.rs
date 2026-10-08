@@ -27,3 +27,6 @@ pub fn platform() -> &'static str {
 pub fn platform() -> &'static str {
 	"other"
 }
+
+// (last, so that the lines above stay where the tests expect them)
+pub mod unnamed;

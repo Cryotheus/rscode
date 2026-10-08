@@ -40,6 +40,10 @@ const MAX_LISTED_TARGETS: usize = 5;
 /// Tool output longer than this many characters is truncated.
 pub(crate) const MAX_OUTPUT_CHARS: usize = 100_000;
 
+/// What the search for references does not find.
+const UNSEARCHED: &str = "uses in attributes (derives, attribute macro arguments, and paths in strings like \
+	`#[serde(default = \"name\")]`) are not searched";
+
 /// Which of a search's matches are shown.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct Page {
@@ -487,7 +491,8 @@ pub(crate) fn references(root: &Path, path: &str, report: &ReferenceReport, page
 			);
 		}
 
-		out.push('\n');
+		// (nothing found is no proof that nothing uses it)
+		writeln!(out, "\nnote: {UNSEARCHED}").unwrap();
 	} else {
 		let shown: Vec<&FoundReference> = report.references.iter().skip(page.offset).take(page.limit).collect();
 		let mut counted = count(page.total, "reference", "references");
@@ -1305,10 +1310,16 @@ mod tests {
 
 		assert_eq!(
 			references(root(), "T1", &none, page(0, 100, 0), false),
-			"no references to `T1` found (method calls, names inside of macros, and doc links are only searched with \
-			 `method_calls`, `macro_tokens`, and `doc_links`)\n"
+			format!(
+				"no references to `T1` found (method calls, names inside of macros, and doc links are only searched \
+				 with `method_calls`, `macro_tokens`, and `doc_links`)\nnote: {UNSEARCHED}\n"
+			)
 		);
-		assert_eq!(references(root(), "T1", &none, page(0, 100, 0), true), "no references to `T1` found\n");
+		assert_eq!(
+			references(root(), "T1", &none, page(0, 100, 0), true),
+			"no references to `T1` found\nnote: uses in attributes (derives, attribute macro arguments, and paths in \
+			 strings like `#[serde(default = \"name\")]`) are not searched\n"
+		);
 	}
 
 	#[test]

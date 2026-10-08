@@ -691,6 +691,22 @@ fn found_references_name_their_items_and_lines() {
 		]
 	);
 
+	// unnamed items are in no item of their own
+	assert_eq!(found(&ws, &["crate::unnamed::Marker"], &default)[0], "src/unnamed.rs:6:10: let _ = Marker;");
+
+	// uses through the alias of an import (`pub use shapes::Circle as Round;`) are uses of the item
+	let through_alias: Vec<String> = (found(&ws, &["crate::Round"], &default).into_iter())
+		.filter(|row| row.contains("Round"))
+		.collect();
+
+	assert_eq!(
+		through_alias,
+		[
+			"src/lib.rs:13:17: pub use shapes::Circle as Round;",
+			"src/main.rs:11:31 in main: println!(\"{}\", rename_items::Round::new(4.0).radius);",
+		]
+	);
+
 	let definitions: Vec<String> = (found(&ws, &["crate::traits::Area::area"], &options).into_iter())
 		.filter(|row| row.ends_with("fn area(&self) -> f64 {") || row.ends_with("fn area(&self) -> f64;"))
 		.collect();
@@ -753,6 +769,11 @@ fn found_references_cover_related_items_and_refuse_unnamed_ones() {
 			"crate::shapes::Circle.radius",
 			"`rename_items::shapes::Circle.radius` is a field, whose uses (field accesses, struct literals, and \
 			 patterns) are not tracked",
+		),
+		(
+			"crate::unnamed::marked!",
+			"`rename_items::unnamed::marked!` is a macro invocation, whose references cannot be searched: search for \
+			 the uses of the macro `marked!` with the path of the macro itself, without `!`",
 		),
 	];
 

@@ -25,6 +25,10 @@ use rscode::query::ReferenceReport;
 use rscode::query::find_references;
 use std::process::ExitCode;
 
+/// What the search for references does not find.
+const UNSEARCHED: &str = "uses in attributes (derives, attribute macro arguments, and paths in strings like \
+	`#[serde(default = \"name\")]`) are not searched";
+
 /// Adds the references of `more`, found in another load of the workspace, to `report`.
 fn merge(report: &mut ReferenceReport, more: ReferenceReport) {
 	let at = |found: &FoundReference| (found.reference.path.clone(), found.reference.range);
@@ -98,8 +102,10 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		ui.note(note);
 	}
 
+	// (nothing found is no proof that nothing uses it)
 	if report.references.is_empty() {
 		ui.note("no references found");
+		ui.note(UNSEARCHED);
 	}
 
 	Ok(ExitCode::SUCCESS)

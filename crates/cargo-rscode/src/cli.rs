@@ -758,8 +758,7 @@ fn refs() -> Command {
 			"Find the references to items (every `cfg` variant, and for trait items also those of the items \
 			 implementing them) in every crate of the workspace, and print them by file: `line:column`, the item they \
 			 are in, and their line of code. Method calls, names inside of macro bodies that are not code, and doc \
-			 links are only searched with the flags below; references in attributes and through aliases \
-			 (`use a::Old as New;`) are not found.",
+			 links are only searched with the flags below; references in attributes are not found.",
 		)
 		.arg(item_paths("paths", "PATH", "The items whose references to find"))
 		.arg(flag(

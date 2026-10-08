@@ -788,6 +788,9 @@ fn finds_references() {
 
 	assert_eq!(none.stdout, "");
 	assert!(none.stderr.contains("note: no references found"), "{}", none.stderr);
+
+	// nothing found is no proof that nothing uses it
+	assert!(none.stderr.contains("note: uses in attributes (derives,"), "{}", none.stderr);
 }
 
 #[test]

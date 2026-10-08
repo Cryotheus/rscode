@@ -4,6 +4,7 @@ use crate::Error;
 use crate::edit::add_related;
 use crate::edit::narrow_private_imports;
 use crate::model::CrateId;
+use crate::model::ItemData;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::Workspace;
@@ -150,9 +151,16 @@ fn check_searchable(resolver: &Resolver<'_>, item: ItemId) -> Result<(), Error> 
 		_ => return Ok(()),
 	};
 
-	let hint = match data.kind {
-		ItemKind::Import => ": search for the references of what it imports instead (its path without `use`)",
-		_ => "",
+	let hint = match data.macro_name() {
+		_ if data.kind == ItemKind::Import => {
+			": search for the references of what it imports instead (its path without `use`)".to_owned()
+		}
+
+		Some(name) => {
+			format!(": search for the uses of the macro `{name}!` with the path of the macro itself, without `!`")
+		}
+
+		None => String::new(),
 	};
 
 	Err(Error::Unsupported(format!(
@@ -177,9 +185,10 @@ fn child_at(ws: &Workspace, parent: ItemId, offset: usize) -> Option<ItemId> {
 /// A path names every `cfg` variant of an item, and through private imports what they import (see
 /// [`edit::rename`](crate::edit::rename), whose search this is). The items of traits are searched with the items of
 /// the trait's `impl`s, and the other way around, since they share their name; so are the copies of items that other
-/// crates load from the same file. Certain references are always found (paths, including those in imports);
-/// uncertain ones and doc links only as `options` ask (see [`ReferenceOptions`]). Attributes are not searched, nor
-/// are uses through aliases (`use a::Old as New;`).
+/// crates load from the same file. Certain references are always found (paths, including those in imports, and paths
+/// through the aliases of imports, like `New` after `use a::Old as New;`); uncertain ones and doc links only as
+/// `options` ask (see [`ReferenceOptions`]). Attributes are not searched (derives, attribute macro arguments, paths in
+/// strings like serde's `default = "path"`).
 ///
 /// Fails with [`Error::NotFound`] when a path names nothing, and with [`Error::Unsupported`] when it names an item
 /// that code does not refer to by a name of its own (an `impl` block, an import, a crate root, ...).
@@ -211,7 +220,13 @@ pub fn find_references(
 	targets.dedup();
 	add_related(resolver, &mut targets);
 
-	let found = resolver.find_references(&targets, &options.references);
+	// uses through the aliases of the targets' imports (`use a::Old as New;` and uses of `New`) name them too
+	let aliases = renaming_imports(resolver, &targets);
+	let lost = match aliases.is_empty() {
+		true => Vec::new(),
+		false => resolver.lost_bindings(&Resolver::without_imports(resolver.workspace(), &aliases)),
+	};
+	let found = resolver.find_references_through(&targets, &lost, &[], &options.references);
 	let mut modules = ModuleFiles::new(resolver.workspace());
 	let references = (found.references.into_iter())
 		.filter(|reference| options.definitions || reference.kind != ReferenceKind::Definition)
@@ -245,18 +260,20 @@ fn innermost(ws: &Workspace, module: ItemId, offset: usize) -> ItemId {
 	item
 }
 
-/// Whether a reference in an item of the kind is better described by what the item is in: the line shows imports,
-/// and macro invocations and `extern` blocks have no paths of their own.
-fn is_transparent(kind: ItemKind) -> bool {
-	matches!(
-		kind,
+/// Whether a reference in an item is better described by what the item is in: the line shows imports, and macro
+/// invocations, `extern` blocks, and unnamed items (`const _: () = { ... };`) have no paths of their own.
+fn is_transparent(data: &ItemData) -> bool {
+	match data.kind {
 		ItemKind::Use
-			| ItemKind::Import
-			| ItemKind::MacroCall
-			| ItemKind::AssocMacro
-			| ItemKind::ForeignMacro
-			| ItemKind::ExternBlock
-	)
+		| ItemKind::Import
+		| ItemKind::MacroCall
+		| ItemKind::AssocMacro
+		| ItemKind::ForeignMacro
+		| ItemKind::ExternBlock => true,
+
+		ItemKind::Impl => false,
+		_ => data.name.is_none(),
+	}
 }
 
 /// The line of code of `range`, trimmed, and cut around the range when it is longer than [`MAX_LINE_CHARS`].
@@ -301,7 +318,7 @@ fn locate(resolver: &Resolver<'_>, modules: &mut ModuleFiles<'_>, reference: Ref
 			(root, root)
 		});
 
-	while item != module && is_transparent(ws.item(item).kind) {
+	while item != module && is_transparent(ws.item(item)) {
 		item = ws.parent(item).unwrap_or(module);
 	}
 
@@ -338,6 +355,28 @@ fn relative(path: &CanonicalPath, module: &CanonicalPath) -> String {
 
 	relative.segments.drain(..prefix.len());
 	relative.to_string()
+}
+
+/// The imports of `targets` that bind them under another name (`use a::Old as New;`), in every loaded crate.
+fn renaming_imports(resolver: &Resolver<'_>, targets: &[ItemId]) -> Vec<ItemId> {
+	let ws = resolver.workspace();
+	let mut imports: Vec<ItemId> = Vec::new();
+
+	for &target in targets {
+		let name = ws.item(target).name.as_ref();
+
+		for import in resolver.imports_of(target) {
+			let binding = ws.item(import).import_info().and_then(|info| info.binding_name());
+
+			if binding.is_some_and(|binding| Some(binding) != name) {
+				imports.push(import);
+			}
+		}
+	}
+
+	imports.sort();
+	imports.dedup();
+	imports
 }
 
 #[cfg(test)]
