@@ -1961,6 +1961,13 @@ mod end_to_end {
 
 		assert!(failed, "{text}");
 		assert_contains(&text, &["its crate `right` is not a dependency of `demo`"]);
+
+		// `bin` can leave out every crate of a selected member
+		let view = json!({ "paths": ["left::left_only"], "packages": ["twin", "left"], "bin": ["twin"] });
+		let (failed, text) = client.call("view_items", view).await;
+
+		assert!(failed, "{text}");
+		assert_contains(&text, &["`left` is selected, but `lib` and `bin` leave out all of its crates"]);
 		client.close().await.unwrap();
 	}
 
