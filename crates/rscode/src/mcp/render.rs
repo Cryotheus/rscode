@@ -1391,6 +1391,7 @@ mod tests {
 			inserted: vec![(ItemKind::AssocFn, Some("new".to_owned())), (ItemKind::MacroCall, None)],
 			imports: Vec::new(),
 			parent: "impl demo::Foo".to_owned(),
+			container: ItemId::crate_root(CrateId(0)),
 			file: PathBuf::from("/ws/src/lib.rs"),
 			warnings: Vec::new(),
 		};

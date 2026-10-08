@@ -726,6 +726,9 @@ fn done(dry_run: bool, verb: &str, past: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use rscode::CrateSpec;
+	use rscode::ItemId;
+	use rscode::Workspace;
 	use rscode::edit::EditSet;
 	use rscode::edit::RemovedItem;
 	use std::path::PathBuf;
@@ -776,6 +779,7 @@ mod tests {
 			inserted: vec![(ItemKind::Fn, Some("helper".to_owned())), (ItemKind::Impl, None)],
 			imports: Vec::new(),
 			parent: "demo::util".to_owned(),
+			container: ItemId::crate_root(Workspace::new("/ws").load_crate(CrateSpec::new("demo", "/ws/src/lib.rs"))),
 			file: PathBuf::from("/ws/src/util.rs"),
 			warnings: Vec::new(),
 		};

@@ -97,14 +97,6 @@ fn child_path(container: &CanonicalPath, name: &str) -> (CanonicalPath, bool) {
 	(child, false)
 }
 
-/// The file that holds a container's items: an out-of-line module's own file, else the container's file.
-fn children_file(workspace: &Workspace, container: ItemId) -> &Path {
-	match workspace.item(container).module_info().and_then(|info| info.file) {
-		Some(file) => workspace.krate(container.krate()).file(file).path(),
-		None => workspace.file_of(container).path(),
-	}
-}
-
 /// Formats the targets once the edit is written (see [`try_format`]). Returns the formatted files (for display) and
 /// the warnings, among them a failure to format: the edit is done, and failing to format it is no failure to edit.
 pub(super) fn format(options: &LoadOptions, targets: Targets, paths: &PathDisplay) -> (Vec<String>, Vec<String>) {
@@ -124,36 +116,28 @@ fn in_files<'ws>(workspace: &'ws Workspace, items: Vec<ItemId>, files: &[PathBuf
 	if chosen.is_empty() { items } else { chosen }
 }
 
-/// The named items among `inserted`, in the container `parent` resolves to (the one in `file`).
+/// The named items among `inserted`, in `container` (named by their canonical paths before the edit changes it).
 pub(super) fn inserted(
 	resolver: &Resolver<'_>,
-	parent: &ItemPath,
-	file: &Path,
+	container: ItemId,
 	inserted: &[(ItemKind, Option<String>)],
 	imports: &[(usize, String)],
 ) -> Targets {
-	let workspace = resolver.workspace();
-	let containers = in_files(workspace, resolver.resolve_item_path(parent), &[file.to_path_buf()], |container| {
-		children_file(workspace, container)
-	});
-	let names: Vec<&str> = inserted.iter().filter_map(|(_, name)| name.as_deref()).collect();
+	let container = resolver.canonical_path(container);
+	let names = inserted.iter().filter_map(|(_, name)| name.as_deref());
 	let mut targets = Targets::default();
 
-	for container in containers {
-		let container = resolver.canonical_path(container);
+	for name in names {
+		let (path, in_impl) = child_path(&container, name);
 
-		for name in &names {
-			let (path, in_impl) = child_path(&container, name);
+		targets.add(path, in_impl);
+	}
 
-			targets.add(path, in_impl);
-		}
+	// `use` items, by their imports
+	for (_, name) in imports.iter().filter(|_| !container.is_impl) {
+		let (path, _) = child_path(&container, name);
 
-		// `use` items, by their imports
-		for (_, name) in imports.iter().filter(|_| !container.is_impl) {
-			let (path, _) = child_path(&container, name);
-
-			targets.add(CanonicalPath { is_import: true, ..path }, false);
-		}
+		targets.add(CanonicalPath { is_import: true, ..path }, false);
 	}
 
 	let unnamed = (inserted.iter().enumerate())

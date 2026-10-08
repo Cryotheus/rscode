@@ -103,6 +103,11 @@ pub struct Insertion {
 	/// The canonical path of the container the items go into (the parent, given or found from the anchor).
 	pub parent: String,
 
+	/// The container the items go into. Its canonical path ([`Insertion::parent`]) is not always a path that names it,
+	/// such as that of an `impl` of a type that is not loaded (`a::<impl Tr for Vec<u8>>`).
+	#[serde(skip)]
+	pub container: ItemId,
+
 	/// The edited file.
 	pub file: PathBuf,
 
@@ -511,6 +516,7 @@ pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, 
 			.flat_map(|(index, item)| item.bindings.iter().map(move |binding| (index, binding.name.to_string())))
 			.collect(),
 		parent: canonical,
+		container: target.item,
 		file: target.file.path().to_path_buf(),
 		warnings,
 	})

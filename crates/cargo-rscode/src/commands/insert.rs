@@ -38,14 +38,10 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 				report.warnings.push("the diff shows the items before `--fmt` formats them".to_owned());
 			}
 		} else {
-			// the container is resolved before the edit changes it
-			let parent = match &parent {
-				Some(parent) => parent.clone(),
-				None => ItemPath::parse(&plan.parent).map_err(anyhow::Error::from)?,
-			};
+			// (named from the container, before the edit changes it)
 			let targets = args
 				.format
-				.then(|| format_edited::inserted(resolver, &parent, &plan.file, &plan.inserted, &plan.imports));
+				.then(|| format_edited::inserted(resolver, plan.container, &plan.inserted, &plan.imports));
 
 			report.warnings.extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings);
 

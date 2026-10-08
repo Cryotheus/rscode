@@ -39,6 +39,7 @@ use crate::edit::EditSet;
 use crate::edit::FileChange;
 use crate::edit::FmtOptions;
 use crate::edit::ImportOptions;
+use crate::edit::Insertion;
 use crate::model::UnloadedMember;
 use crate::query;
 use crate::query::ItemView;
@@ -479,38 +480,12 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 			text.push_str(UNFORMATTED_DIFF);
 		}
 
+		// (named before the edit is written, which must not fail once it is)
+		let targets = (params.format && !params.dry_run).then(|| inserted_targets(&plan, parent.as_ref()));
+
 		finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 
-		if params.format && !params.dry_run {
-			// (the canonical path of the container found from the anchor is a path to it)
-			let parent = match &parent {
-				Some(parent) => parent.clone(),
-				None => parse_path(&plan.parent)?,
-			};
-			let child = |name: &str, import: bool| {
-				let mut path = ItemPath { import, ..parent.clone() };
-
-				path.segments.push(name.into());
-
-				let label = if import { format!("use {name}") } else { name.to_owned() };
-
-				(label, path)
-			};
-
-			let named = plan
-				.inserted
-				.iter()
-				.filter_map(|(_, name)| name.as_deref())
-				.map(|name| child(name, false));
-
-			// `use` items, by their imports (not in `impl` blocks: `use` items are not items of those)
-			let imports = plan
-				.imports
-				.iter()
-				.filter(|_| parent.qualifier.is_none())
-				.map(|(_, name)| child(name, true));
-			let targets: Vec<(String, ItemPath)> = named.chain(imports).collect();
-
+		if let Some(targets) = targets {
 			let unnamed = (plan.inserted.iter().enumerate())
 				.filter(|(index, (_, name))| name.is_none() && !plan.imports.iter().any(|(import_of, _)| import_of == index))
 				.count();
@@ -521,11 +496,51 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 				);
 			}
 
-			text.push_str(&format_written(load, permit, &targets));
+			match targets {
+				Ok(targets) => text.push_str(&format_written(load, permit, &targets)),
+				Err(note) => writeln!(text, "note: {note}").unwrap(),
+			}
 		}
 
 		Ok(text)
 	})
+}
+
+/// The items that `insert_items` formats, with their labels: the named items it inserted, and the imports of the `use`
+/// items it inserted, by their paths in the container (`parent`, or else the container's canonical path). Fails with
+/// a note when the container has no path, like an `impl` of a type that is not loaded (`a::<impl Tr for Vec<u8>>`).
+fn inserted_targets(plan: &Insertion, parent: Option<&ItemPath>) -> Result<Vec<(String, ItemPath)>, String> {
+	let parent = match parent {
+		Some(parent) => parent.clone(),
+
+		None => ItemPath::parse(&plan.parent).map_err(|_| {
+			format!("the inserted items were not formatted: `{}` has no path to name them by", plan.parent)
+		})?,
+	};
+	let child = |name: &str, import: bool| {
+		let mut path = ItemPath { import, ..parent.clone() };
+
+		path.segments.push(name.into());
+
+		let label = if import { format!("use {name}") } else { name.to_owned() };
+
+		(label, path)
+	};
+
+	let named = plan
+		.inserted
+		.iter()
+		.filter_map(|(_, name)| name.as_deref())
+		.map(|name| child(name, false));
+
+	// `use` items, by their imports (not in `impl` blocks: `use` items are not items of those)
+	let imports = plan
+		.imports
+		.iter()
+		.filter(|_| parent.qualifier.is_none())
+		.map(|(_, name)| child(name, true));
+
+	Ok(named.chain(imports).collect())
 }
 
 /// Loads the workspace, with a hint when there is no `Cargo.toml` to load it from.

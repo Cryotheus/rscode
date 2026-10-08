@@ -1180,6 +1180,31 @@ fn inserts_items() {
 	assert!(taken.stderr.contains("collides"), "{}", taken.stderr);
 }
 
+/// Items go next to an item of an `impl` of a type that is not loaded, whose container has no path: `--fmt` says
+/// that it cannot format them, rather than failing once the edit is written (and the edit does not fail without
+/// `--fmt`).
+#[test]
+fn inserts_into_impls_of_unloaded_types() {
+	let copy = TempCopy::new("insert-unloaded");
+	let added = "\npub trait Tr {\n\tfn f(&self);\n\n\tfn g(&self) {}\n\n\tfn h(&self) {}\n}\n\n\
+	             impl Tr for Vec<u8> {\n\tfn f(&self) {}\n}\n";
+
+	std::fs::write(copy.path().join("src/lib.rs"), copy.read("src/lib.rs") + added).unwrap();
+
+	let inserted = run_with_stdin(copy.path(), &["insert", "--after", "<Vec<u8> as Tr>::f", "--lib"], "fn g(&self) {}").success();
+
+	assert_eq!(inserted.stdout, native("inserted assoc-fn g into demo::<impl Tr for Vec<u8>> (src/lib.rs)\n"));
+	assert!(copy.read("src/lib.rs").ends_with("\tfn f(&self) {}\n\n\tfn g(&self) {}\n}\n"));
+
+	let args = ["insert", "--after", "<Vec<u8> as Tr>::g", "--lib", "--fmt"];
+	let formatted = run_with_stdin(copy.path(), &args, "fn h(&self)  {}").success();
+	let warning = "warning: `demo::<impl Tr for Vec<u8>>::h` has no path to be formatted by, so `--fmt` leaves it";
+
+	assert!(formatted.stderr.contains(warning), "{}", formatted.stderr);
+	assert!(copy.read("src/lib.rs").ends_with("\tfn g(&self) {}\n\n\tfn h(&self)  {}\n}\n"));
+	cargo_check(copy.path());
+}
+
 #[test]
 fn creates_modules() {
 	let copy = TempCopy::new("create-module");
