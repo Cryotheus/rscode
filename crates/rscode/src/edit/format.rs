@@ -365,7 +365,7 @@ fn matching(resolver: &Resolver<'_>, pattern: &PathPattern) -> Vec<ItemId> {
 				continue;
 			}
 
-			if pattern.matches(&resolver.canonical_path(item), true) {
+			if resolver.matches_pattern(pattern, item, &resolver.canonical_path(item), true) {
 				items.push(item);
 			}
 		}

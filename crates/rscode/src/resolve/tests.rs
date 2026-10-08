@@ -2312,6 +2312,24 @@ fn selectors_tell_impl_blocks_with_the_same_header_apart() {
 	assert!(resolve(&resolver, "<Single>[2]").is_empty());
 	assert_eq!(canonical_path_round_trip_failures(&ws, &resolver), Vec::<String>::new());
 
+	// any selector that picks a block selects it and its items, like in paths (for patterns)
+	let selects = |selector: &str, path: &str| {
+		let selector = Selector::parse(selector).unwrap();
+
+		(resolver.resolve_item_path(&item_path(path)).into_iter())
+			.map(|item| resolver.selects(&selector, item))
+			.collect::<Vec<_>>()
+	};
+
+	assert_eq!(selects("3", "<Tools>[kick]"), [true]);
+	assert_eq!(selects("shared", "<Tools>"), [true, false, true]);
+	assert_eq!(selects("#tool_router", "Tools::shared"), [true, false]);
+	assert_eq!(selects("kick", "Tools::kick"), [true]);
+	assert_eq!(selects("1", "<Tools as Tr>::f"), [true, false]);
+	assert_eq!(selects("1", "<Single>::new"), [true]);
+	assert_eq!(selects("2", "<Single>"), [false]);
+	assert_eq!(selects("1", "Single"), [false]);
+
 	// a selector that picks nothing gets a hint listing the blocks
 	assert_eq!(
 		resolver.selector_hint(&item_path("<Tools as Tr>[3]")).as_deref(),

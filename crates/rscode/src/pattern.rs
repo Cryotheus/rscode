@@ -27,8 +27,10 @@
 //! Qualified patterns `<TypePattern as TraitPattern>::name` match associated items of `impl` blocks, and
 //! `<TypePattern>::name` those of inherent `impl`s. Without trailing segments (`<Foo as Display>`), or written as
 //! `impl TraitPattern for TypePattern` / `impl TypePattern`, they match the `impl` blocks themselves. A selector after
-//! the qualifier (`impl Foo[new]`, `<Foo>[2]::*`, see [`Selector`]) is matched exactly, against the selectors that
-//! canonical paths show.
+//! the qualifier (`impl Foo[new]`, `<Foo>[2]::*`, `<Foo as Tr>[#attr]::*`, see [`Selector`]) keeps the blocks (and
+//! their items) that it picks among those with the same header, like in paths, when the caller tests it on the items
+//! (see [`PathPattern::matches_any_selector`]); [`PathPattern::matches`] compares it with the selector that canonical
+//! paths show.
 //! Unqualified patterns match `impl` items through their owner (`Foo::fmt` matches `<Foo as Display>::fmt`), but
 //! never `impl` blocks.
 //!
@@ -289,8 +291,9 @@ pub struct PathPattern {
 	/// Whether the pattern is a `use` pattern, which only matches imports (see [`CanonicalPath::is_import`]).
 	pub import: bool,
 
-	/// The selector after the qualifier (or the `!` of a macro invocation pattern), which must be the
-	/// [`CanonicalPath::selector`] of what matches.
+	/// The selector after the qualifier (or the `!` of a macro invocation pattern), which picks among the `impl` blocks
+	/// with the same header (or the invocations of the same macro in a module): see [`PathPattern::matches`] and
+	/// [`PathPattern::matches_any_selector`].
 	pub selector: Option<Selector>,
 
 	/// The pattern of a field's name (or index) after a `.`: the pattern only matches fields, whose struct, union, or
@@ -368,43 +371,20 @@ impl PathPattern {
 		self.qualifier.is_some()
 	}
 
-	/// Matches a canonical path, honoring the anchor and `impl` qualifiers.
+	/// Matches a canonical path, honoring the anchor and `impl` qualifiers. A selector must be the path's
+	/// [`CanonicalPath::selector`] (see [`PathPattern::matches_any_selector`]).
 	///
 	/// `is_selected` tells whether the crate the path belongs to is part of the user's selection (only selected
 	/// crates match `crate::` anchors). See [`PathPattern::is_qualified`] for a limitation of qualified patterns.
 	pub fn matches(&self, path: &CanonicalPath, is_selected: bool) -> bool {
-		if self.import && !path.is_import {
-			return false;
-		}
+		self.matches_selecting(path, is_selected, true)
+	}
 
-		if self.macro_call && (!path.is_macro_call || (self.selector.is_some() && self.selector != path.selector)) {
-			return false;
-		}
-
-		match &self.qualifier {
-			Some((self_ty, trait_pattern)) => self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref()),
-			None if path.is_impl => false,
-
-			None if let Some(field) = &self.field => {
-				let owner: Vec<&str> = path.segments.iter().map(SmolStr::as_str).collect();
-
-				path.is_field && path.name.as_ref().is_some_and(|name| field.matches(name)) && self.matches_from_crate(&owner, is_selected)
-			}
-
-			None => {
-				// most candidates fail on their name, which needs no flattening
-				if let (Some(SegmentPattern::Ident(last)), Some(name)) = (self.segments.last(), &path.name)
-					&& !last.matches(name)
-				{
-					return false;
-				}
-
-				let flat = path.flat_segments();
-				let flat: Vec<&str> = flat.iter().map(AsRef::as_ref).collect();
-
-				self.matches_from_crate(&flat, is_selected)
-			}
-		}
+	/// Like [`PathPattern::matches`], whatever the selector: for callers that test what the pattern's selector picks on
+	/// the item itself (see [`Resolver::selects`](crate::Resolver::selects)). The selector of a canonical path is only one
+	/// of those that pick its `impl` block (or invocation), and the paths of items of inherent `impl`s show none.
+	pub fn matches_any_selector(&self, path: &CanonicalPath, is_selected: bool) -> bool {
+		self.matches_selecting(path, is_selected, false)
 	}
 
 	/// Whether the generic arguments of a type or trait as written (or just its generic arguments) are the pattern's,
@@ -431,7 +411,7 @@ impl PathPattern {
 			_ => false,
 		};
 
-		if !trait_matches || (self.selector.is_some() && self.selector != path.selector) {
+		if !trait_matches {
 			return false;
 		}
 
@@ -453,6 +433,47 @@ impl PathPattern {
 			(true, _) => path.is_impl,
 			(false, Some(name)) => !path.is_impl && match_segments(&self.segments, &[name.as_str()], false),
 			(false, None) => false,
+		}
+	}
+
+	/// See [`PathPattern::matches`]. `compare_selector`: whether a selector must be the path's.
+	fn matches_selecting(&self, path: &CanonicalPath, is_selected: bool, compare_selector: bool) -> bool {
+		if self.import && !path.is_import {
+			return false;
+		}
+
+		let selector_matches = !compare_selector || self.selector.is_none() || self.selector == path.selector;
+
+		if self.macro_call && (!path.is_macro_call || !selector_matches) {
+			return false;
+		}
+
+		match &self.qualifier {
+			Some((self_ty, trait_pattern)) => {
+				selector_matches && self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref())
+			}
+
+			None if path.is_impl => false,
+
+			None if let Some(field) = &self.field => {
+				let owner: Vec<&str> = path.segments.iter().map(SmolStr::as_str).collect();
+
+				path.is_field && path.name.as_ref().is_some_and(|name| field.matches(name)) && self.matches_from_crate(&owner, is_selected)
+			}
+
+			None => {
+				// most candidates fail on their name, which needs no flattening
+				if let (Some(SegmentPattern::Ident(last)), Some(name)) = (self.segments.last(), &path.name)
+					&& !last.matches(name)
+				{
+					return false;
+				}
+
+				let flat = path.flat_segments();
+				let flat: Vec<&str> = flat.iter().map(AsRef::as_ref).collect();
+
+				self.matches_from_crate(&flat, is_selected)
+			}
 		}
 	}
 
@@ -1660,6 +1681,16 @@ mod tests {
 		assert!(!pattern("impl Foo[new]").matches(&impl_block(&["c", "a", "Foo"], None), true));
 		assert!(pattern("<Foo as Display>[2]::*").matches(&second_fmt, true));
 		assert!(!pattern("<Foo as Display>[1]::fmt").matches(&second_fmt, true));
+		assert!(!pattern("commands![1]").matches(&call, true));
+
+		// unless the caller tests them on the items
+		assert!(pattern("impl Foo[2]").matches_any_selector(&block, true));
+		assert!(pattern("<Foo as Display>[1]::fmt").matches_any_selector(&second_fmt, true));
+		assert!(pattern("<Foo as *>[#a]::f*").matches_any_selector(&display_fmt, true));
+		assert!(pattern("commands![1]").matches_any_selector(&call, true));
+		assert!(!pattern("impl Bar[2]").matches_any_selector(&block, true));
+		assert!(!pattern("<Foo as Debug>[1]::fmt").matches_any_selector(&second_fmt, true));
+		assert!(!pattern("commands![1]").matches_any_selector(&item(&["c", "m"], "commands"), true));
 	}
 
 	#[test]

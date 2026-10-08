@@ -1313,6 +1313,28 @@ fn formats_edited_items_by_their_canonical_paths() {
 	assert_eq!(copy.read("src/other.rs"), other);
 }
 
+/// Items inserted into one of several `impl` blocks with the same header are formatted in that block, which its
+/// selector picks (though the canonical paths of the items show none).
+#[test]
+fn formats_items_inserted_into_impl_blocks_with_selectors() {
+	let copy = TempCopy::new("fmt-selectors");
+	let tools = "pub struct Tools;\n\nimpl Tools {\n\tpub fn a() {}\n}\n\nimpl Tools {\n\tpub fn b() {}\n}\n";
+
+	std::fs::write(copy.path().join("src/tools.rs"), tools).unwrap();
+	std::fs::write(copy.path().join("src/lib.rs"), copy.read("src/lib.rs") + "\npub mod tools;\n").unwrap();
+
+	let args = ["insert", "--after", "crate::tools::Tools::b", "--fmt", "--lib"];
+	let inserted = run_with_stdin(copy.path(), &args, "pub fn   n( )->u8{1}").success();
+
+	assert_eq!(
+		inserted.stdout,
+		native("inserted assoc-fn n into impl demo::tools::Tools[b] (src/tools.rs)\nformatted src/tools.rs\n")
+	);
+	assert_eq!(inserted.stderr, "");
+	assert_eq!(copy.read("src/tools.rs"), tools.replace("b() {}\n", "b() {}\n\n\tpub fn n() -> u8 {\n\t\t1\n\t}\n"));
+	cargo_check(copy.path());
+}
+
 #[test]
 fn completes_item_paths() {
 	let dir = fixture();

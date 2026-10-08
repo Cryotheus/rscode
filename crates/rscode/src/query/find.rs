@@ -95,7 +95,7 @@ impl Find {
 				.filter(|(pattern, _)| pattern.is_macro_call() || !macro_patterns_only)
 				.filter(|(pattern, _)| may_match(pattern, data.kind, name))
 				.any(|(pattern, resolved)| {
-					matches(workspace, pattern, item, &path, selected) || resolved.matches_owner(resolver, item, &path, selected)
+					matches(resolver, pattern, item, &path, selected) || resolved.matches_owner(resolver, item, &path, selected)
 				});
 
 		if !matched {
@@ -384,7 +384,7 @@ impl Resolved {
 			},
 		};
 
-		resolver.impl_self_types(impl_block).iter().any(|ty| owners.contains(ty)) && any_type.matches(path, selected)
+		resolver.impl_self_types(impl_block).iter().any(|ty| owners.contains(ty)) && resolver.matches_pattern(any_type, item, path, selected)
 	}
 }
 
@@ -429,11 +429,12 @@ fn import_targets(resolver: &Resolver<'_>, import: ItemId) -> Vec<String> {
 
 /// Whether an item with a canonical path matches a pattern. Qualified patterns only match `impl` blocks and their
 /// items.
-fn matches(workspace: &Workspace, pattern: &PathPattern, item: ItemId, path: &CanonicalPath, selected: bool) -> bool {
+fn matches(resolver: &Resolver<'_>, pattern: &PathPattern, item: ItemId, path: &CanonicalPath, selected: bool) -> bool {
+	let workspace = resolver.workspace();
 	let in_impl =
 		|| workspace.item(item).kind == ItemKind::Impl || workspace.parent(item).is_some_and(|parent| workspace.item(parent).kind == ItemKind::Impl);
 
-	(!pattern.is_qualified() || in_impl()) && pattern.matches(path, selected)
+	(!pattern.is_qualified() || in_impl()) && resolver.matches_pattern(pattern, item, path, selected)
 }
 
 /// Whether an item could match a pattern, judging by its kind and name only (before computing its canonical path).

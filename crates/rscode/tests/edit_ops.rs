@@ -453,7 +453,7 @@ impl Tools {
 
 		assert_eq!(edited(&dir, &removal.edits, "src/lib.rs"), lib.replace(removed, ""));
 
-		// found by paths with any selector, and by patterns (with wildcards) with the selectors that canonical paths show
+		// found by paths and by patterns (with wildcards) with any selector that picks them, like their items
 		let found = |text: &str| -> Vec<u32> {
 			let found = rscode::Find::new().pattern(text).unwrap().run_with(&resolver).unwrap();
 
@@ -464,7 +464,12 @@ impl Tools {
 		assert_eq!(found("impl crate::Tools[2]"), [8]);
 		assert_eq!(found("impl crate::Tools[#cfg]"), [12, 17]);
 		assert_eq!(found("impl *Tools[3]"), [12]);
-		assert_eq!(found("impl *Tools[#cfg]"), Vec::<u32>::new());
+		assert_eq!(found("impl *Tools[#cfg]"), [12, 17]);
+		assert_eq!(found("<crate::Tools>[2]::*"), [9]);
+		assert_eq!(found("<Tools>[kick]::k*"), [9]);
+		assert_eq!(found("<*Tools>[#cfg]::*"), [14, 19]);
+		assert_eq!(found("<Tools>[#allow]::*"), [5]);
+		assert_eq!(found("<Tools>[5]::*"), Vec::<u32>::new());
 
 		// `cfg` variants (of items of such blocks too) still go together
 		assert!(rscode::edit::replaces_all_variants(&resolver, &path("crate::Tools::os")));
@@ -2579,6 +2584,26 @@ mod format {
 		let formatting = format(&ws, &["crate::util::alpha"], &options).unwrap();
 
 		assert!(edited(&dir, &formatting.edits, "src/util.rs").ends_with("pub(crate) fn alpha() -> u8 {\n    2\n}\n"));
+	}
+
+	/// Targets with a selector format what it picks, as paths with it name: by any selector of a block (not only the one
+	/// its canonical path shows), and the items of the block, whose canonical paths show none.
+	#[test]
+	fn formats_what_selectors_pick() {
+		let lib = "pub struct Tools;\n\nimpl Tools {\n\tpub fn   a( ) {}\n}\n\n#[allow(dead_code)]\nimpl Tools {\n\tpub fn   b( ) {   }\n}\n";
+		let dir = TempDir::with_files("format-selectors", &[("rustfmt.toml", "hard_tabs = true\n"), ("src/lib.rs", lib)]);
+		let ws = load(&dir);
+
+		for target in ["<Tools>[b]::b", "<crate::Tools>[2]::*", "<Tools>[#allow]::b*", "impl Tools[#allow]", "impl crate::Tools[2]"] {
+			let formatting = format(&ws, &[target], &rustfmt()).unwrap();
+
+			assert_eq!(
+				edited(&dir, &formatting.edits, "src/lib.rs"),
+				lib.replace("pub fn   b( ) {   }", "pub fn b() {}"),
+				"{target}"
+			);
+			assert!(formatting.warnings.is_empty(), "{target}: {:?}", formatting.warnings);
+		}
 	}
 
 	#[test]

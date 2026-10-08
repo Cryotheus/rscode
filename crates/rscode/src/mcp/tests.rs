@@ -1161,6 +1161,13 @@ mod end_to_end {
 		assert_contains(&text, &[&native("inserted 1 item into `impl demo::Tools[kick]` (src/lib.rs)")]);
 		assert_eq!(fixture.read("src/lib.rs"), lib.replace("kick() {}\n", "kick() {}\n\n\tpub fn ban() {}\n"));
 
+		// formatted in that block, which its selector picks (the inserted item's canonical path shows none)
+		let inserted = json!({ "source": "pub fn   unban( ) {   }", "position": "after", "anchor": "Tools::ban", "format": true });
+		let (failed, text) = client.call("insert_items", inserted).await;
+
+		assert!(!failed && !text.contains("matches no item"), "{text}");
+		assert!(fixture.read("src/lib.rs").contains("pub fn unban() {}\n}\n"), "{}", fixture.read("src/lib.rs"));
+
 		// a selector that picks nothing
 		let (failed, text) = client.call("view_items", json!({ "paths": ["impl Tools[3]"] })).await;
 

@@ -5,10 +5,12 @@ use super::Resolver;
 use super::impls::named_assoc_items;
 use super::text::attribute_paths;
 use crate::model::ItemId;
+use crate::model::ItemKind;
 use crate::model::Workspace;
 use crate::path::CanonicalPath;
 use crate::path::ItemPath;
 use crate::path::Selector;
+use crate::pattern::PathPattern;
 use crate::source::TextRange;
 use std::path::Path;
 
@@ -25,21 +27,7 @@ impl Resolver<'_> {
 			return None;
 		}
 
-		let info = self.ws.item(impl_block).impl_info()?;
-		let text = match &base.unresolved_self_ty {
-			None => base.to_string(),
-			Some(self_ty) => match &info.trait_text {
-				Some(trait_text) => format!("impl {trait_text} for {self_ty}"),
-				None => format!("impl {self_ty}"),
-			},
-		};
-		let path = ItemPath::parse(&text).ok()?;
-		let named = self.compute_item_path(&path);
-
-		if !named.contains(&impl_block) {
-			return None;
-		}
-
+		let named = self.header_blocks(impl_block, base)?;
 		let places = places(self.ws, &named);
 		let own = place(self.ws, impl_block);
 
@@ -69,20 +57,54 @@ impl Resolver<'_> {
 		Some(Selector::Index(u32::try_from(index + 1).ok()?))
 	}
 
+	/// The `impl` blocks that the header of `impl_block` names (`base` is the block's canonical path without a
+	/// selector), the block among them. `None` when the header cannot be written as a user path, or does not name the
+	/// block.
+	fn header_blocks(&self, impl_block: ItemId, base: &CanonicalPath) -> Option<Vec<ItemId>> {
+		let info = self.ws.item(impl_block).impl_info()?;
+		let text = match &base.unresolved_self_ty {
+			None => base.to_string(),
+			Some(self_ty) => match &info.trait_text {
+				Some(trait_text) => format!("impl {trait_text} for {self_ty}"),
+				None => format!("impl {self_ty}"),
+			},
+		};
+		let named = self.compute_item_path(&ItemPath::parse(&text).ok()?);
+
+		named.contains(&impl_block).then_some(named)
+	}
+
 	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
 	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
 	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
-		let path = ItemPath::parse(&base.to_string()).ok()?;
-		let named = self.compute_item_path(&path);
+		let named = self.macro_calls(call, base)?;
 		let places = places(self.ws, &named);
 
-		if places.len() < 2 || !named.contains(&call) {
+		if places.len() < 2 {
 			return None;
 		}
 
 		let index = places.iter().position(|&known| known == place(self.ws, call))?;
 
 		Some(Selector::Index(u32::try_from(index + 1).ok()?))
+	}
+
+	/// The invocations that the path of a macro invocation names (`base` is its canonical path without a selector): those
+	/// of the same macro in its module (and the module's `cfg` variants), the invocation among them. `None` when the path
+	/// does not name it.
+	fn macro_calls(&self, call: ItemId, base: &CanonicalPath) -> Option<Vec<ItemId>> {
+		let named = self.compute_item_path(&ItemPath::parse(&base.to_string()).ok()?);
+
+		named.contains(&call).then_some(named)
+	}
+
+	/// Whether an item with this canonical path matches a pattern, with the pattern's selector tested by what it picks
+	/// ([`Resolver::selects`]) rather than compared with the path's (see [`PathPattern::matches_any_selector`]).
+	pub(crate) fn matches_pattern(&self, pattern: &PathPattern, item: ItemId, path: &CanonicalPath, is_selected: bool) -> bool {
+		match &pattern.selector {
+			Some(selector) => pattern.matches_any_selector(path, is_selected) && self.selects(selector, item),
+			None => pattern.matches(path, is_selected),
+		}
 	}
 
 	/// Whether another `impl` block may have the same header as `impl_block`: one for a type of the same name, and
@@ -121,6 +143,33 @@ impl Resolver<'_> {
 		}
 
 		items
+	}
+
+	/// Whether `selector` picks the `impl` block of an item (the item itself, or the block of an associated item) among
+	/// the blocks with the same header, or a macro invocation among those of the same macro in its module, as a path with
+	/// that selector does (`impl Foo[2]`, `<Foo>[#attr]::name`, `m::name![2]`). Every selector that picks a block counts,
+	/// not only the one its canonical path shows (items of inherent `impl`s show none). `false` for other items.
+	pub fn selects(&self, selector: &Selector, item: ItemId) -> bool {
+		let ws = self.ws;
+		let target = match ws.item(item).kind {
+			ItemKind::Impl | ItemKind::MacroCall => item,
+
+			_ => match ws.parent(item) {
+				Some(parent) if ws.item(parent).kind == ItemKind::Impl => parent,
+				_ => return false,
+			},
+		};
+		let base = CanonicalPath {
+			selector: None,
+			..self.compute_canonical_path(target)
+		};
+		let named = match ws.item(target).kind {
+			ItemKind::Impl if self.may_share_header(target) => self.header_blocks(target, &base),
+			ItemKind::Impl => None,
+			_ => self.macro_calls(target, &base),
+		};
+
+		self.select(named.unwrap_or_else(|| vec![target]), selector).contains(&target)
 	}
 }
 
