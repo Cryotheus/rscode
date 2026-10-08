@@ -7,8 +7,9 @@
 //! breaks, and nothing else is re-indented.
 //!
 //! The text of an out-of-line module (or of a crate root) is its file, as views show it, so its items and inner doc
-//! comments can be edited; its visibility and outer attributes are those of its `mod` declaration. Attributes, doc
-//! comments, and visibilities are found by parsing the item's text on a thread of its own, as plain ranges.
+//! comments can be edited; its visibility and outer attributes are those of its `mod` declaration. The inner
+//! attributes and doc comments of an inline module follow its `{`. Attributes, doc comments, and visibilities are found
+//! by parsing the item's text on a thread of its own, as plain ranges.
 //!
 //! The edited item must still be one item of its kind (unless kind changes are allowed), which is checked by parsing
 //! it as an item of its container; what that parser cannot take (such as the contents of macro invocations) is left to
@@ -55,7 +56,7 @@ struct Attr {
 	/// Where it is, from its `#` (or the start of its doc comment) to its `]` (or the end of its doc comment).
 	range: TextRange,
 
-	/// Whether it is an inner attribute (`#![...]`, `//!`) of a module's file.
+	/// Whether it is an inner attribute (`#![...]`, `//!`) of a module's file, or of an inline module after its `{`.
 	inner: bool,
 
 	/// Whether it is a doc comment (or `#[doc = "..."]`).
@@ -184,15 +185,16 @@ pub struct ItemEdit {
 	pub remove_attributes: Vec<String>,
 
 	/// Attributes to add (`#[derive(Debug)]`, or without brackets, `derive(Debug)`), after the existing ones (just
-	/// before the visibility or the keyword). Inner attributes (`#![...]`) go into the file of a module (or crate root)
-	/// after its inner attributes; a crate root only has inner attributes, so every attribute added to it is one. The
-	/// traits of a `derive` that the item does not derive yet join its last `derive` attribute, if it has one (with a
-	/// note naming those it derives already).
+	/// before the visibility or the keyword). Inner attributes (`#![...]`) go into the file of a module (or crate
+	/// root), or after the `{` of an inline module, after its inner attributes; a crate root only has inner attributes,
+	/// so every attribute added to it is one. The traits of a `derive` that the item does not derive yet join its last
+	/// `derive` attribute, if it has one (with a note naming those it derives already).
 	pub add_attributes: Vec<String>,
 
 	/// The text of the new doc comment, without `///`, replacing the existing doc comments (`///`, `/** */`, and
 	/// `#[doc = "..."]`); an empty text removes them. The docs of a module with a file of its own are its inner docs
-	/// (`//!`), unless its declaration has docs.
+	/// (`//!`), unless its declaration has docs; those of an inline module are its inner docs if it has some (and no
+	/// outer docs).
 	pub doc: Option<String>,
 
 	/// The new visibility: `pub`, `pub(crate)`, `pub(super)`, `pub(self)`, `pub(in path)`, `crate` (for `pub(crate)`),
@@ -326,6 +328,9 @@ struct Prefix {
 
 	/// The visibility as written in items (`pub(crate)`), `None` when there is none.
 	visibility_text: Option<String>,
+
+	/// For an inline module, where its body starts: just after its `{`.
+	body: Option<usize>,
 }
 
 /// Text of a file that an edit changes, as edited so far.
@@ -354,6 +359,9 @@ struct Region<'ws> {
 
 	/// Whether the text is the file of a module (or crate root), whose attributes are inner attributes.
 	module_file: bool,
+
+	/// Whether the text is an inline module, whose inner attributes follow its `{`.
+	inline_module: bool,
 }
 
 impl<'ws> Region<'ws> {
@@ -377,6 +385,7 @@ impl<'ws> Region<'ws> {
 			indent,
 			line_ending: trivia::line_ending(text),
 			module_file: false,
+			inline_module: false,
 		}
 	}
 
@@ -394,6 +403,7 @@ impl<'ws> Region<'ws> {
 			indent: String::new(),
 			line_ending: trivia::line_ending(text),
 			module_file: true,
+			inline_module: false,
 		}
 	}
 
@@ -406,11 +416,13 @@ impl<'ws> Region<'ws> {
 		}
 	}
 
-	/// The attributes and visibility of the item (inner attributes of a module's file), as the text has them now.
+	/// The attributes and visibility of the item (inner attributes of a module's file, and also those of an inline
+	/// module), as the text has them now.
 	fn attributes(&self, path: &str) -> Result<Prefix, Error> {
-		let (text, start, module_file) = (self.text.as_str(), self.item, self.module_file);
+		let (text, start) = (self.text.as_str(), self.item);
+		let (module_file, inline_module) = (self.module_file, self.inline_module);
 
-		isolated(|| parse_prefix(&text[start..], start, module_file))
+		isolated(|| parse_prefix(&text[start..], start, module_file, inline_module))
 			.map_err(|error| Error::Unsupported(format!("cannot read the attributes of `{path}`: {error}")))
 	}
 
@@ -469,10 +481,11 @@ struct Regions<'ws> {
 }
 
 impl<'ws> Regions<'ws> {
-	/// The region with the inner attributes of the item (the file of a module or crate root) or else with its outer
-	/// attributes, if it has one.
+	/// The region with the inner attributes of the item (the file of a module or crate root, or an inline module) or
+	/// else with its outer attributes, if it has one.
 	fn attributes(&mut self, inner: bool) -> Option<&mut Region<'ws>> {
 		match inner {
+			true if self.file.is_none() => self.outer.as_mut().filter(|outer| outer.inline_module),
 			true => self.file.as_mut(),
 			false => self.outer.as_mut(),
 		}
@@ -530,7 +543,7 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 
 	let Some(region) = regions.attributes(inner) else {
 		return Err(Error::Unsupported(format!(
-			"`{}` is an inner attribute, which only modules with a file of their own (and crate roots) take",
+			"`{}` is an inner attribute, which only modules (and crate roots) take",
 			attribute.text
 		)));
 	};
@@ -572,26 +585,42 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 	let line_ending = region.line_ending;
 
 	let edit = match inner {
-		// after the last inner attribute (or inner doc comment), on a line of its own
-		true => match prefix.attributes.last() {
+		// after the last inner attribute (or inner doc comment): on a line of its own, unless code follows it
+		true => match prefix.attributes.iter().rfind(|attribute| attribute.inner) {
 			Some(last) => match line_end(&region.text, last.range.end) {
+				end if !region.text[last.range.end..end].trim().is_empty() => {
+					(TextRange::new(last.range.end, last.range.end), format!(" {text}"))
+				}
+
 				end if end == region.text.len() => (TextRange::new(end, end), format!("{line_ending}{text}")),
-				end => (TextRange::new(end + 1, end + 1), format!("{text}{line_ending}")),
+
+				end => {
+					let indent = trivia::line_indent(&region.text, last.range.start);
+
+					(TextRange::new(end + 1, end + 1), format!("{indent}{text}{line_ending}"))
+				}
 			},
 
-			None => {
-				let start = shebang_len(&region.text);
-				let blank_after = region.text[start..].trim_start_matches([' ', '\t', '\r']).starts_with('\n');
-				let separator = if blank_after || region.text[start..].trim().is_empty() { "" } else { line_ending };
+			None => match inner_start(region, &prefix) {
+				Some((start, indent, separator)) => {
+					(TextRange::new(start, start), format!("{indent}{text}{line_ending}{separator}"))
+				}
 
-				(TextRange::new(start, start), format!("{text}{line_ending}{separator}"))
-			}
+
+				// (an inline module with code on the line of its `{`)
+				None => {
+					let body = prefix.body.unwrap_or_default();
+
+					(TextRange::new(body, body), format!(" {text}"))
+				}
+			},
 		},
 
 		// before the visibility (or keyword), on the line of the attributes when they share it with the item
 		false => {
 			let at = prefix.visibility.start;
-			let shares_line = (prefix.attributes.last()).is_some_and(|last| !region.text[last.range.end..at].contains('\n'));
+			let last = prefix.attributes.iter().rfind(|attribute| !attribute.inner);
+			let shares_line = last.is_some_and(|last| !region.text[last.range.end..at].contains('\n'));
 
 			match shares_line {
 				true => (TextRange::new(at, at), format!("{text} ")),
@@ -620,6 +649,15 @@ fn attribute_pattern(text: &str) -> Result<AttributePattern, Error> {
 		meta: attribute.meta,
 		inner: text.starts_with('#').then_some(attribute.inner),
 	})
+}
+
+/// The indentation of the lines of the body of an inline module, whose first line starts at `start` of a region's
+/// text: that of its first line that is not blank, or else one level more than the module's.
+fn body_indent(region: &Region<'_>, start: usize) -> String {
+	match region.text[start..].split('\n').find(|line| !line.trim().is_empty()) {
+		Some(line) if !line.trim_start().starts_with('}') => line[..spaces(line)].to_owned(),
+		_ => format!("{}{}", region.indent, trivia::indent_unit(region.file.text())),
+	}
 }
 
 /// The length of a byte order mark at the start of a text.
@@ -961,6 +999,23 @@ pub(super) fn gutter_len(line: &str) -> Option<usize> {
 	Some(after + usize::from(line[after..].starts_with(' ')))
 }
 
+/// Where the first inner attribute (or inner doc comment) of a region without any goes, on a line of its own: at the
+/// start of a module's file (after a shebang), or on the line after the `{` of an inline module (`None` when code
+/// follows the `{` on its line). With the indentation of that line, and the line break to put after the new lines when
+/// they are followed by code rather than by a blank line.
+fn inner_start(region: &Region<'_>, prefix: &Prefix) -> Option<(usize, String, &'static str)> {
+	let text = region.text.as_str();
+
+	let (start, indent) = match prefix.body.map(|body| (body, line_end(text, body))) {
+		None => (shebang_len(text), String::new()),
+		Some((body, end)) if end == text.len() || !text[body..end].trim().is_empty() => return None,
+		Some((_, end)) => (end + 1, body_indent(region, end + 1)),
+	};
+	let next = text[start..line_end(text, start)].trim();
+
+	Some((start, indent, if next.is_empty() || next.starts_with('}') { "" } else { region.line_ending }))
+}
+
 /// Whether `offset` is strictly inside of one of the (sorted, disjoint) `ranges`.
 fn is_inside(ranges: &[TextRange], offset: usize) -> bool {
 	let index = ranges.partition_point(|range| range.start < offset);
@@ -1043,8 +1098,9 @@ fn old_name(index: usize, count: usize, old: &str) -> String {
 }
 
 /// Parses the attributes and the visibility at the start of `text`, an item (or with `module_file`, the inner
-/// attributes of a file), which starts at `offset` of its region's text; must run on a parsing thread.
-fn parse_prefix(text: &str, offset: usize, module_file: bool) -> Result<Prefix, String> {
+/// attributes of a file; with `inline_module`, also the inner attributes after the `{` of the inline module that it
+/// is), which starts at `offset` of its region's text; must run on a parsing thread.
+fn parse_prefix(text: &str, offset: usize, module_file: bool, inline_module: bool) -> Result<Prefix, String> {
 	let skipped = if module_file { shebang_len(text) } else { 0 };
 
 	let parser = |input: ParseStream<'_>| {
@@ -1057,20 +1113,36 @@ fn parse_prefix(text: &str, offset: usize, module_file: bool) -> Result<Prefix, 
 			true => syn::Visibility::Inherited,
 			false => input.parse()?,
 		};
+		let mut attributes: Vec<(Attribute, bool)> =
+			(attributes.into_iter()).map(|attribute| (attribute, module_file)).collect();
+		let mut body = None;
+
+		// (the inner attributes of an inline module)
+		if inline_module {
+			input.parse::<Token![mod]>()?;
+			input.parse::<syn::Ident>()?;
+
+			let content;
+			let brace = syn::braced!(content in input);
+
+			body = Some(brace.span.open().byte_range().end);
+			attributes.extend(content.call(Attribute::parse_inner)?.into_iter().map(|attribute| (attribute, true)));
+			content.parse::<TokenStream>()?;
+		}
 
 		input.parse::<TokenStream>()?;
-		Ok((attributes, next, visibility))
+		Ok((attributes, next, visibility, body))
 	};
 
 	let parsed = &text[skipped..];
-	let (attributes, next, visibility) = parser.parse_str(parsed).map_err(|error| error.to_string())?;
+	let (attributes, next, visibility, body) = parser.parse_str(parsed).map_err(|error| error.to_string())?;
 	let shift = |range: std::ops::Range<usize>| TextRange::new(range.start + offset + skipped, range.end + offset + skipped);
 
 	Ok(Prefix {
 		attributes: (attributes.iter())
-			.map(|attribute| Attr {
+			.map(|(attribute, inner)| Attr {
 				range: shift(attribute.span().byte_range()),
-				inner: module_file,
+				inner: *inner,
 				doc: attribute.path().is_ident("doc") && matches!(attribute.meta, Meta::NameValue(_)),
 				path: attribute.path().to_token_stream().to_string(),
 				meta: attribute.meta.to_token_stream().to_string(),
@@ -1085,6 +1157,7 @@ fn parse_prefix(text: &str, offset: usize, module_file: bool) -> Result<Prefix, 
 			ref visibility => shift(visibility.span().byte_range()),
 		},
 		visibility_text: visibility_text(&visibility),
+		body: body.map(|body| shift(body..body).start),
 	})
 }
 
@@ -1123,7 +1196,10 @@ fn plan_item<'ws>(
 
 	let mut plan = ItemPlan {
 		regions: Regions {
-			outer: (!item.is_crate_root()).then(|| Region::item(ws.file_of(item), data.range)),
+			outer: (!item.is_crate_root()).then(|| Region {
+				inline_module: data.module_info().is_some_and(|info| info.inline),
+				..Region::item(ws.file_of(item), data.range)
+			}),
 			file: (data.module_info().filter(|info| !info.inline).and_then(|info| info.file))
 				.map(|file| Region::module_file(ws.krate(item.krate()).file(file))),
 		},
@@ -1282,16 +1358,18 @@ fn remove_attribute(regions: &mut Regions<'_>, text: &str, pattern: &AttributePa
 		}
 	}
 
-	for inner in [false, true] {
+	// (the inner attributes of an inline module follow its outer ones in the same text)
+	for inner in [true, false] {
 		let ranges: Vec<TextRange> = (found.iter())
 			.filter(|(found, _)| *found == inner)
 			.map(|(_, attribute)| attribute.range)
 			.collect();
 
 		if let Some(region) = regions.attributes(inner).filter(|_| !ranges.is_empty()) {
+			let body = region.attributes(path)?.body;
 			let edits = (deletions(region, &ranges).into_iter())
 				.map(|(range, shape)| match shape {
-					Shape::Lines => (with_blank_line(region, range), String::new()),
+					Shape::Lines => (with_blank_line(region, range, body), String::new()),
 					_ => (range, String::new()),
 				})
 				.collect();
@@ -1338,12 +1416,18 @@ fn replace_text(region: &mut Region<'_>, replacement: &TextReplacement, name: &s
 
 /// Sets the doc comment of an item (see [`ItemEdit::doc`]); returns a note when nothing changes.
 fn set_doc(regions: &mut Regions<'_>, lines: &[String], path: &str) -> Result<Option<String>, Error> {
-	// a module's inner docs, unless its declaration has docs (only those are removed)
-	let outer_docs = match &regions.outer {
-		Some(outer) => outer.attributes(path)?.attributes.into_iter().any(|attribute| attribute.doc),
-		None => false,
+	let has_docs = |regions: &mut Regions<'_>, inner: bool| -> Result<bool, Error> {
+		let Some(region) = regions.attributes(inner) else {
+			return Ok(false);
+		};
+
+		Ok(region.attributes(path)?.attributes.iter().any(|attribute| attribute.doc && attribute.inner == inner))
 	};
-	let inner = regions.file.is_some() && !outer_docs;
+
+	// a module's inner docs, unless its declaration has docs (only those are removed), and an inline module's if it
+	// has some
+	let outer_docs = has_docs(regions, false)?;
+	let inner = !outer_docs && (regions.file.is_some() || has_docs(regions, true)?);
 	let mut changed = false;
 
 	// removing the docs removes those of both places
@@ -1358,7 +1442,7 @@ fn set_doc(regions: &mut Regions<'_>, lines: &[String], path: &str) -> Result<Op
 		};
 		let before = region.text.clone();
 
-		set_docs_of(region, lines, path)?;
+		set_docs_of(region, lines, inner, path)?;
 		changed |= region.text != before;
 	}
 
@@ -1368,12 +1452,23 @@ fn set_doc(regions: &mut Regions<'_>, lines: &[String], path: &str) -> Result<Op
 	}))
 }
 
-/// Replaces the doc comments of a region (outer ones, or the inner ones of a module's file) with `lines`.
-fn set_docs_of(region: &mut Region<'_>, lines: &[String], path: &str) -> Result<(), Error> {
+/// Replaces the outer doc comments of a region, or its inner ones (of a module's file, or of an inline module), with
+/// `lines`.
+fn set_docs_of(region: &mut Region<'_>, lines: &[String], inner: bool, path: &str) -> Result<(), Error> {
 	let prefix = region.attributes(path)?;
-	let marker = if region.module_file { "//!" } else { "///" };
-	let docs: Vec<TextRange> = (prefix.attributes.iter()).filter(|attribute| attribute.doc).map(|attribute| attribute.range).collect();
-	let (line_ending, indent) = (region.line_ending, region.indent.clone());
+	let marker = if inner { "//!" } else { "///" };
+	let docs: Vec<TextRange> = (prefix.attributes.iter())
+		.filter(|attribute| attribute.doc && attribute.inner == inner)
+		.map(|attribute| attribute.range)
+		.collect();
+	let start = if inner { inner_start(region, &prefix) } else { None };
+	let line_ending = region.line_ending;
+
+	let indent = match (inner, docs.first(), &start) {
+		(true, Some(first), _) => trivia::line_indent(&region.text, first.start).to_owned(),
+		(true, None, Some((_, indent, _))) => indent.clone(),
+		_ => region.indent.clone(),
+	};
 	let comment = |line: &String| match line.is_empty() {
 		true => marker.to_owned(),
 		false => format!("{marker} {line}"),
@@ -1391,15 +1486,12 @@ fn set_docs_of(region: &mut Region<'_>, lines: &[String], path: &str) -> Result<
 	let mut edits: Vec<(TextRange, String)> = Vec::new();
 
 	match docs.is_empty() {
-		// before the attributes (in a module's file, at its start)
+		// before the attributes (inner ones at the start of a module's file, or of an inline module's body)
 		true if lines.is_empty() => {}
 
-		true if region.module_file => {
-			let start = shebang_len(&region.text);
-			let rest = &region.text[start..];
-			let separator = match rest.trim_start_matches([' ', '\t', '\r']).starts_with('\n') || rest.trim().is_empty() {
-				true => "",
-				false => line_ending,
+		true if inner => {
+			let Some((start, _, separator)) = start else {
+				return Err(Error::Unsupported(format!("`{path}` has code on the line of its `{{`, where no `//!` can go")));
 			};
 
 			edits.push((TextRange::new(start, start), format!("{}{separator}", block(Shape::Lines))));
@@ -1416,7 +1508,7 @@ fn set_docs_of(region: &mut Region<'_>, lines: &[String], path: &str) -> Result<
 				};
 
 				if replacement.is_empty() && shape == Shape::Lines {
-					range = with_blank_line(region, range);
+					range = with_blank_line(region, range, prefix.body);
 				}
 
 				edits.push((range, replacement));
@@ -1697,15 +1789,18 @@ fn visibility_text(visibility: &syn::Visibility) -> Option<String> {
 }
 
 /// A deletion of whole lines of a region's text, extended over the blank line after them when the line before them is
-/// blank too (or they start a module's file), so that removing them leaves no run of blank lines.
-fn with_blank_line(region: &Region<'_>, range: TextRange) -> TextRange {
+/// blank too (or they start a module's file, or the body of an inline module, which starts at `body`), so that
+/// removing them leaves no run of blank lines.
+fn with_blank_line(region: &Region<'_>, range: TextRange, body: Option<usize>) -> TextRange {
 	let text = region.text.as_str();
+	let starts_body = body.is_some_and(|body| body <= range.start && text[body..range.start].trim().is_empty());
 
 	// (the line before the text of an item is not known)
-	let blank_before = match text[..range.start].strip_suffix('\n') {
-		None => region.module_file && range.start == 0,
-		Some(before) => before[before.rfind('\n').map_or(0, |index| index + 1)..].trim().is_empty(),
-	};
+	let blank_before = starts_body
+		|| match text[..range.start].strip_suffix('\n') {
+			None => region.module_file && range.start == 0,
+			Some(before) => before[before.rfind('\n').map_or(0, |index| index + 1)..].trim().is_empty(),
+		};
 	let rest = &text[range.end..];
 
 	match rest.find('\n') {
@@ -1924,7 +2019,7 @@ mod tests {
 	#[test]
 	fn reads_derived_traits() {
 		let text = "#[derive()]\n#[derive(Debug, serde::Serialize,)]\n#[allow(unused)]\nstruct S;";
-		let prefix = isolated(|| parse_prefix(text, 0, false)).unwrap();
+		let prefix = isolated(|| parse_prefix(text, 0, false, false)).unwrap();
 		let derive = |index: usize| prefix.attributes[index].derive.clone();
 
 		assert_eq!(

@@ -1546,6 +1546,55 @@ mod inner;
 	}
 
 	#[test]
+	fn edits_the_inner_attributes_of_inline_modules() {
+		let lib = "pub mod a {\n\t//! Inner docs.\n\t#![allow(unused)]\n\n\tpub fn f() {}\n}\n\npub mod b {\n\tpub fn g() \
+		 {}\n}\n\npub mod c { pub fn h() {} }\n";
+		let dir = crate_dir("edit-inline-modules", lib);
+		let ws = load(&dir);
+		let edited = |target: &str, change: ItemEdit| {
+			let plan = edit(&ws, target, change).unwrap();
+
+			super::edited(&dir, &plan.edits, "src/lib.rs")
+		};
+		let doc = |doc: &str| ItemEdit {
+			doc: Some(doc.to_owned()),
+			..ItemEdit::default()
+		};
+		let attributes = |add: &str, remove: &str| ItemEdit {
+			add_attributes: [add].into_iter().filter(|text| !text.is_empty()).map(str::to_owned).collect(),
+			remove_attributes: [remove].into_iter().filter(|text| !text.is_empty()).map(str::to_owned).collect(),
+			..ItemEdit::default()
+		};
+
+		// the inner docs of a module that has some (else outer ones)
+		assert_eq!(edited("crate::a", doc("New.")), lib.replace("Inner docs.", "New."));
+		assert_eq!(edited("crate::a", doc("")), lib.replace("\t//! Inner docs.\n", ""));
+		assert_eq!(edited("crate::b", doc("B.")), lib.replace("pub mod b", "/// B.\npub mod b"));
+
+		// inner attributes after the others, or first in the body
+		assert_eq!(edited("crate::a", attributes("", "allow")), lib.replace("\t#![allow(unused)]\n", ""));
+		assert_eq!(
+			edited("crate::a", attributes("#![allow(dead_code)]", "")),
+			lib.replace("(unused)]\n", "(unused)]\n\t#![allow(dead_code)]\n")
+		);
+
+		let with_attribute = lib.replace("pub mod b {\n", "pub mod b {\n\t#![allow(dead_code)]\n\n");
+
+		assert_eq!(edited("crate::b", attributes("#![allow(dead_code)]", "")), with_attribute);
+		assert_eq!(
+			edited("crate::c", attributes("#![allow(dead_code)]", "")),
+			lib.replace("c { ", "c { #![allow(dead_code)] ")
+		);
+
+		// removing the first lines of a body removes the blank line after them
+		let dir = crate_dir("edit-inline-modules-removal", &with_attribute);
+		let ws = load(&dir);
+		let plan = edit(&ws, "crate::b", attributes("", "#![allow(dead_code)]")).unwrap();
+
+		assert_eq!(super::edited(&dir, &plan.edits, "src/lib.rs"), lib);
+	}
+
+	#[test]
 	fn edits_the_files_of_modules_and_crates_and_imports() {
 		let dir = crate_dir("edit-files", LIB);
 		let ws = load(&dir);
