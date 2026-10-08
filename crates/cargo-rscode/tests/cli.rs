@@ -1130,6 +1130,11 @@ fn edits_items() {
 	assert!(missing.stderr.contains("the closest line is 10: `right + left`"), "{}", missing.stderr);
 	assert!(missing.stderr.contains("hint: copy `--old` exactly from the output of `cargo rscode view`"), "{}", missing.stderr);
 
+	let split = run(copy.path(), &["edit", "crate::add", "--old", "}", "--new", "}\n\npub fn sub() {}"]);
+
+	assert_eq!(split.code, Some(1));
+	assert!(split.stderr.contains("is 2 items\nhint: pass `--allow-kind-change`"), "{}", split.stderr);
+
 	let nothing = run(copy.path(), &["edit", "crate::add"]);
 
 	assert_eq!(nothing.code, Some(1));

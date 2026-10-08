@@ -994,6 +994,17 @@ mod end_to_end {
 		assert_contains(&text, &["`old` occurs 4 times", "hint: include more of the surrounding text in `old`"]);
 		assert_eq!(fixture.read("src/lib.rs"), lib);
 
+		// an edit that leaves several items tells which tools add or change items
+		let arguments = json!({ "path": "crate::add", "old": "a + b\n}", "new": "a + b\n}\n\npub fn sub() {}" });
+		let (failed, text) = client.call("edit_item", arguments).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&["is 2 items\nhint: edit_item keeps the item one item of its kind: add items next to it with `insert_items`"],
+		);
+		assert_eq!(fixture.read("src/lib.rs"), lib);
+
 		let (failed, text) = client.call("edit_item", json!({ "path": "crate::add" })).await;
 
 		assert!(failed && text.starts_with("nothing to change"), "{text}");

@@ -1656,20 +1656,21 @@ mod inner;
 		let dir = crate_dir("edit-refusals", LIB);
 		let ws = load(&dir);
 		let method = "pub fn triangle() -> Self {\n\tlet sides = 3;\n\n\tSelf { sides }\n}";
+		let kind_change = |new: &str| match edit(&ws, "crate::Shape::triangle", text(method, new)) {
+			Err(Error::KindChange(message)) => message,
+			other => panic!("{other:?}"),
+		};
 
 		assert_eq!(
-			message(edit(&ws, "crate::Shape::triangle", text(method, "pub const TRIANGLE: u8 = 3;"))),
+			kind_change("pub const TRIANGLE: u8 = 3;"),
 			native(
 				"after the edit, `fixture::Shape::triangle` (at line 13 of src/lib.rs) is an assoc-const rather than an \
-				 assoc-fn (allow a kind change to change it)"
+				 assoc-fn"
 			)
 		);
 		assert_eq!(
-			message(edit(&ws, "crate::Shape::triangle", text(method, "fn a() {}\n\nfn b() {}"))),
-			native(
-				"after the edit, `fixture::Shape::triangle` (at line 13 of src/lib.rs) is 2 items (allow a kind change to \
-				 split it)"
-			)
+			kind_change("fn a() {}\n\nfn b() {}"),
+			native("after the edit, `fixture::Shape::triangle` (at line 13 of src/lib.rs) is 2 items")
 		);
 		assert!(
 			message(edit(&ws, "crate::Shape::triangle", text("{ sides }", "{ sides"))).starts_with(&native(

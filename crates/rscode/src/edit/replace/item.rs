@@ -558,8 +558,8 @@ fn bom_len(text: &str) -> usize {
 	if text.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 }
 }
 
-/// Checks that the item still is one item of its kind in its container (unless `allow_kind_change`), and tells what
-/// the edit leaves as it is (see [`replacement_warnings`]).
+/// Checks that the item still is one item of its kind in its container (unless `allow_kind_change`; else the error is
+/// [`Error::KindChange`]), and tells what the edit leaves as it is (see [`replacement_warnings`]).
 ///
 /// Items that the container's parser does not take as they were (such as the contents of macro invocations) are left
 /// to the check that the whole file still parses.
@@ -576,32 +576,29 @@ fn check_item(ws: &Workspace, item: ItemId, path: &str, region: &Region<'_>, all
 	}
 
 	let after = |problem: String| {
-		Error::InvalidSource(format!(
+		format!(
 			"after the edit, `{path}` (at line {} of {}) {problem}",
 			region.line_of(region.item),
 			ws.display_path(region.file.path()).display()
-		))
+		)
 	};
+	let kind_change = |problem: String| Error::KindChange(after(problem));
 
 	let parsed = parse_source(&region.text[region.item..], container).map_err(|error| match error {
-		Error::InvalidSource(message) => after(message.strip_prefix("the source ").unwrap_or(&message).to_owned()),
+		Error::InvalidSource(message) => {
+			Error::InvalidSource(after(message.strip_prefix("the source ").unwrap_or(&message).to_owned()))
+		}
+
 		error => error,
 	})?;
 
 	match parsed.items.as_slice() {
 		_ if is_the_item(&parsed.items) => {}
-		[] => return Err(after("is no item: remove items to remove them".to_owned())),
+		[] => return Err(Error::InvalidSource(after("is no item: remove items to remove them".to_owned()))),
 		_ if allow_kind_change => {}
 
-		[new] => {
-			return Err(after(format!(
-				"is {} rather than {} (allow a kind change to change it)",
-				article(new.kind),
-				article(data.kind)
-			)));
-		}
-
-		items => return Err(after(format!("is {} items (allow a kind change to split it)", items.len()))),
+		[new] => return Err(kind_change(format!("is {} rather than {}", article(new.kind), article(data.kind)))),
+		items => return Err(kind_change(format!("is {} items", items.len()))),
 	}
 
 	// (structural edits of an out-of-line module change its declaration, which keeps its name)
@@ -756,7 +753,8 @@ fn doc_lines(doc: &str) -> Vec<String> {
 ///
 /// Text replacements fail with [`Error::TextMismatch`] when their text does not occur in the item exactly once (the
 /// message tells where it occurs, or what comes closest). The item must still be one item of its kind afterwards
-/// ([`EditItemOptions::allow_kind_change`]), and its file must still parse when the edit is previewed or applied.
+/// ([`Error::KindChange`], unless [`EditItemOptions::allow_kind_change`]), and its file must still parse when the edit
+/// is previewed or applied.
 /// [`Replacement::spans`] tells where the edited items are after the edit, and [`Replacement::notes`] which parts
 /// changed nothing.
 pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, options: &EditItemOptions) -> Result<Replacement, Error> {

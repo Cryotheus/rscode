@@ -230,6 +230,12 @@ pub(crate) fn edit_item(load: &LoadOptions, params: &EditItemParams, permit: &Pe
 					"give `old` text that only one of them has, or set `all_variants` to edit every one of them".to_owned()
 				}
 
+				Error::KindChange(_) => {
+					"edit_item keeps the item one item of its kind: add items next to it with `insert_items`, or turn it \
+					 into another kind of item with `replace_item` (and `allow_kind_change`)"
+						.to_owned()
+				}
+
 				Error::TextMismatch { ref lines, .. } if lines.is_empty() => {
 					"copy `old` exactly from the output of `view_items` (with or without its line numbers)".to_owned()
 				}

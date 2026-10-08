@@ -17,6 +17,9 @@ use rscode::edit::ItemEdit;
 use rscode::edit::TextReplacement;
 use std::process::ExitCode;
 
+/// How to go on when the edited item would become another kind of item, or several items.
+const KIND_CHANGE: &str = "pass `--allow-kind-change` to let the item become another kind of item, or several items";
+
 /// How to go on when `--old` does not occur in the item.
 const NOT_FOUND: &str = "copy `--old` exactly from the output of `cargo rscode view` (with or without its `-n` line numbers)";
 
@@ -63,6 +66,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 				matches!(error, rscode::Error::Ambiguous { .. }) && rscode::edit::replaces_all_variants(resolver, &path);
 
 			let hint = match (&error, hint, all_variants) {
+				(rscode::Error::KindChange(_), ..) => Some(KIND_CHANGE.to_owned()),
 				(rscode::Error::TextMismatch { lines, .. }, ..) if lines.is_empty() => Some(NOT_FOUND.to_owned()),
 				(rscode::Error::TextMismatch { .. }, ..) => Some(SEVERAL.to_owned()),
 				(_, Some(hint), true) => Some(format!("{hint}, or `--all-variants` to edit all")),

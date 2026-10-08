@@ -110,6 +110,11 @@ pub enum Error {
 	#[error("{0}")]
 	InvalidSource(String),
 
+	/// An edited item would become another kind of item, or several items (see
+	/// [`EditItemOptions::allow_kind_change`](crate::edit::EditItemOptions::allow_kind_change)).
+	#[error("{0}")]
+	KindChange(String),
+
 	/// Text to replace inside of an item (see [`edit_item`](crate::edit::edit_item)) does not occur in it exactly once.
 	#[error("{message}")]
 	TextMismatch {
