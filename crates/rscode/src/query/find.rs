@@ -384,7 +384,9 @@ impl Resolved {
 			},
 		};
 
-		resolver.impl_self_types(impl_block).iter().any(|ty| owners.contains(ty)) && resolver.matches_pattern(any_type, item, path, selected)
+		let is_owned = resolver.impl_self_types(impl_block).iter().any(|ty| owners.contains(ty));
+
+		is_owned && resolver.matches_pattern(any_type, item, path, selected)
 	}
 }
 

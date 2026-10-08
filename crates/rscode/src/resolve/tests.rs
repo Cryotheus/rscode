@@ -2259,6 +2259,28 @@ fn segments(text: &str) -> Vec<SmolStr> {
 		.collect()
 }
 
+/// The selectors of many `impl` blocks with one header are computed together: computing each on its own took time
+/// quadratic in the number of blocks (seconds for a thousand of them).
+#[test]
+fn selectors_of_many_impl_blocks_with_one_header() {
+	let blocks: String = (0..3000)
+		.map(|index| format!("#[cfg(feature = \"f{index}\")] #[attr_{index}] impl Tools {{ fn common() {{}} }}\n"))
+		.collect();
+	let ws = single(&format!("pub struct Tools;\npub trait Tr {{ fn f(); }}\n{blocks}"));
+	let resolver = Resolver::new(&ws);
+	let started = Instant::now();
+	let paths = resolve(&resolver, "<Tools>");
+	let items = resolve(&resolver, "Tools::common");
+	let elapsed = started.elapsed();
+
+	println!("the canonical paths of 3000 impl blocks with one header computed in {elapsed:?}");
+
+	assert_eq!(paths.len(), 3000);
+	assert_eq!((paths[0].as_str(), paths[2999].as_str()), ("impl t::Tools[#attr_0]", "impl t::Tools[#attr_2999]"));
+	assert_eq!(items.len(), 3000);
+	assert!(elapsed.as_secs() < 5, "{elapsed:?}");
+}
+
 #[test]
 fn selectors_tell_impl_blocks_with_the_same_header_apart() {
 	let ws = single(
@@ -2337,28 +2359,6 @@ fn selectors_tell_impl_blocks_with_the_same_header_apart() {
 	);
 	assert_eq!(resolver.selector_hint(&item_path("<Tools as Tr>")), None);
 	assert_eq!(resolver.selector_hint(&item_path("<Missing>[1]")), None);
-}
-
-/// The selectors of many `impl` blocks with one header are computed together: computing each on its own took time
-/// quadratic in the number of blocks (seconds for a thousand of them).
-#[test]
-fn selectors_of_many_impl_blocks_with_one_header() {
-	let blocks: String = (0..3000)
-		.map(|index| format!("#[cfg(feature = \"f{index}\")] #[attr_{index}] impl Tools {{ fn common() {{}} }}\n"))
-		.collect();
-	let ws = single(&format!("pub struct Tools;\npub trait Tr {{ fn f(); }}\n{blocks}"));
-	let resolver = Resolver::new(&ws);
-	let started = Instant::now();
-	let paths = resolve(&resolver, "<Tools>");
-	let items = resolve(&resolver, "Tools::common");
-	let elapsed = started.elapsed();
-
-	println!("the canonical paths of 3000 impl blocks with one header computed in {elapsed:?}");
-
-	assert_eq!(paths.len(), 3000);
-	assert_eq!((paths[0].as_str(), paths[2999].as_str()), ("impl t::Tools[#attr_0]", "impl t::Tools[#attr_2999]"));
-	assert_eq!(items.len(), 3000);
-	assert!(elapsed.as_secs() < 5, "{elapsed:?}");
 }
 
 #[test]

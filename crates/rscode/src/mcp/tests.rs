@@ -1187,38 +1187,6 @@ mod end_to_end {
 		client.close().await.unwrap();
 	}
 
-	/// An insertion next to an item of an `impl` of a type that is not loaded, whose container has no path: with
-	/// `format`, the edit is written and the items are left unformatted, with a note (once the edit is written,
-	/// formatting it cannot fail the call).
-	#[tokio::test]
-	async fn inserts_into_impls_of_unloaded_types() {
-		let lib = "pub trait Tr {\n\tfn f(&self);\n\n\tfn g(&self) {}\n}\n\nimpl Tr for Vec<u8> {\n\tfn f(&self) {}\n}\n";
-		let fixture = Fixture::with_files(
-			"insert-unloaded",
-			&[
-				(
-					"Cargo.toml",
-					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
-				),
-				("src/lib.rs", lib),
-			],
-		);
-		let mut client = Client::connect(fixture.options()).await;
-		let inserted = json!({ "source": "fn g(&self) {}", "position": "after", "anchor": "<Vec<u8> as Tr>::f", "format": true });
-		let (failed, text) = client.call("insert_items", inserted).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(
-			&text,
-			&[
-				"inserted 1 item into `demo::<impl Tr for Vec<u8>>`",
-				"note: the inserted items were not formatted: `demo::<impl Tr for Vec<u8>>` has no path to name them by",
-			],
-		);
-		assert_eq!(fixture.read("src/lib.rs"), lib.replace("f(&self) {}\n}", "f(&self) {}\n\n\tfn g(&self) {}\n}"));
-		client.close().await.unwrap();
-	}
-
 	/// Imports are named by `use` paths; a plain path through a private import is ambiguous for edits.
 	#[tokio::test]
 	async fn imports() {
@@ -1287,6 +1255,38 @@ mod end_to_end {
 		let (_, text) = client.call("find_items", json!({ "pattern": "use Circl" })).await;
 
 		assert_contains(&text, &["try `use *Circl*`"]);
+		client.close().await.unwrap();
+	}
+
+	/// An insertion next to an item of an `impl` of a type that is not loaded, whose container has no path: with
+	/// `format`, the edit is written and the items are left unformatted, with a note (once the edit is written,
+	/// formatting it cannot fail the call).
+	#[tokio::test]
+	async fn inserts_into_impls_of_unloaded_types() {
+		let lib = "pub trait Tr {\n\tfn f(&self);\n\n\tfn g(&self) {}\n}\n\nimpl Tr for Vec<u8> {\n\tfn f(&self) {}\n}\n";
+		let fixture = Fixture::with_files(
+			"insert-unloaded",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", lib),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let inserted = json!({ "source": "fn g(&self) {}", "position": "after", "anchor": "<Vec<u8> as Tr>::f", "format": true });
+		let (failed, text) = client.call("insert_items", inserted).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"inserted 1 item into `demo::<impl Tr for Vec<u8>>`",
+				"note: the inserted items were not formatted: `demo::<impl Tr for Vec<u8>>` has no path to name them by",
+			],
+		);
+		assert_eq!(fixture.read("src/lib.rs"), lib.replace("f(&self) {}\n}", "f(&self) {}\n\n\tfn g(&self) {}\n}"));
 		client.close().await.unwrap();
 	}
 

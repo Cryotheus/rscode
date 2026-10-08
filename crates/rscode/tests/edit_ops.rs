@@ -485,8 +485,8 @@ impl Tools {
 	}
 
 	/// An `impl` block without a `cfg` is compiled with every other block of its crate, so it is no `cfg` variant of a
-	/// `#[cfg(test)]` block with the same header: a path naming both is ambiguous, rather than removing the test helpers
-	/// with the other block, or replacing both by the same text (which defines its items twice).
+	/// `#[cfg(test)]` block with the same header: a path naming both is ambiguous, rather than removing the test
+	/// helpers with the other block, or replacing both by the same text (which defines its items twice).
 	#[test]
 	fn does_not_take_an_unconditional_impl_block_for_a_cfg_variant() {
 		let lib = "\
@@ -2586,11 +2586,12 @@ mod format {
 		assert!(edited(&dir, &formatting.edits, "src/util.rs").ends_with("pub(crate) fn alpha() -> u8 {\n    2\n}\n"));
 	}
 
-	/// Targets with a selector format what it picks, as paths with it name: by any selector of a block (not only the one
-	/// its canonical path shows), and the items of the block, whose canonical paths show none.
+	/// Targets with a selector format what it picks, as paths with it name: by any selector of a block (not only the
+	/// one its canonical path shows), and the items of the block, whose canonical paths show none.
 	#[test]
 	fn formats_what_selectors_pick() {
-		let lib = "pub struct Tools;\n\nimpl Tools {\n\tpub fn   a( ) {}\n}\n\n#[allow(dead_code)]\nimpl Tools {\n\tpub fn   b( ) {   }\n}\n";
+		let lib = "pub struct Tools;\n\nimpl Tools {\n\tpub fn   a( ) {}\n}\n\n\
+		           #[allow(dead_code)]\nimpl Tools {\n\tpub fn   b( ) {   }\n}\n";
 		let dir = TempDir::with_files("format-selectors", &[("rustfmt.toml", "hard_tabs = true\n"), ("src/lib.rs", lib)]);
 		let ws = load(&dir);
 
@@ -4443,9 +4444,11 @@ impl Point {
 
 		// only a field replaces a field, of the same form
 		let resolver = Resolver::new(&ws);
-		let replace = |path: &str, source: &str| match rscode::edit::replace(&resolver, &super::path(path), source, &ReplaceOptions::default()) {
-			Err(Error::InvalidSource(message)) => message,
-			other => panic!("{other:?}"),
+		let replace = |path: &str, source: &str| {
+			match rscode::edit::replace(&resolver, &super::path(path), source, &ReplaceOptions::default()) {
+				Err(Error::InvalidSource(message)) => message,
+				other => panic!("{other:?}"),
+			}
 		};
 
 		replace("crate::Point.x", "fn x() {}");

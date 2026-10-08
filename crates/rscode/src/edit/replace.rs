@@ -341,28 +341,6 @@ fn binds_name(ws: &Workspace, item: ItemId, name: &str) -> bool {
 	}
 }
 
-/// Fails unless the new items can replace an item of `kind`: one item of the same kind, or with `allow_kind_change`,
-/// any items.
-fn check_kinds(kind: ItemKind, path: &str, items: &[NewItem], container: Container, allow_kind_change: bool) -> Result<(), Error> {
-	match items {
-		[] => Err(Error::InvalidSource(format!("the source contains no {}", container.items()))),
-		_ if allow_kind_change => Ok(()),
-		[item] if item.kind == kind => Ok(()),
-
-		[item] => Err(Error::InvalidSource(format!(
-			"`{path}` is {}, but the source is {} (allow a kind change to replace it anyway)",
-			article(kind),
-			article(item.kind),
-		))),
-
-		items => Err(Error::InvalidSource(format!(
-			"the source has {} items, but `{path}` can only be replaced by one {kind} (allow a kind change to replace \
-			 it by several items)",
-			items.len(),
-		))),
-	}
-}
-
 /// Refuses an anchor that names statics declared by entries of a macro invocation (other than `thread_local!`, see
 /// [`Workspace::entry_macro`]): the new items would go into the container after the invocation, not into it. A single
 /// name names the entries of the container's invocations too, like in [`siblings`].
@@ -399,6 +377,28 @@ fn check_field_form(data: &ItemData, path: &str, items: &[NewItem]) -> Result<()
 
 		true => Err(Error::InvalidSource(format!(
 			"`{path}` is a field of a tuple struct or variant: write it as a type alone (`pub u8`), without a name"
+		))),
+	}
+}
+
+/// Fails unless the new items can replace an item of `kind`: one item of the same kind, or with `allow_kind_change`,
+/// any items.
+fn check_kinds(kind: ItemKind, path: &str, items: &[NewItem], container: Container, allow_kind_change: bool) -> Result<(), Error> {
+	match items {
+		[] => Err(Error::InvalidSource(format!("the source contains no {}", container.items()))),
+		_ if allow_kind_change => Ok(()),
+		[item] if item.kind == kind => Ok(()),
+
+		[item] => Err(Error::InvalidSource(format!(
+			"`{path}` is {}, but the source is {} (allow a kind change to replace it anyway)",
+			article(kind),
+			article(item.kind),
+		))),
+
+		items => Err(Error::InvalidSource(format!(
+			"the source has {} items, but `{path}` can only be replaced by one {kind} (allow a kind change to replace \
+			 it by several items)",
+			items.len(),
 		))),
 	}
 }

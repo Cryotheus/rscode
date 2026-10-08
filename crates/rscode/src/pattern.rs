@@ -381,8 +381,8 @@ impl PathPattern {
 	}
 
 	/// Like [`PathPattern::matches`], whatever the selector: for callers that test what the pattern's selector picks on
-	/// the item itself (see [`Resolver::selects`](crate::Resolver::selects)). The selector of a canonical path is only one
-	/// of those that pick its `impl` block (or invocation), and the paths of items of inherent `impl`s show none.
+	/// the item itself (see [`Resolver::selects`](crate::Resolver::selects)). The selector of a canonical path is only
+	/// one of those that pick its `impl` block (or invocation), and the paths of items of inherent `impl`s show none.
 	pub fn matches_any_selector(&self, path: &CanonicalPath, is_selected: bool) -> bool {
 		self.matches_selecting(path, is_selected, false)
 	}
@@ -436,6 +436,15 @@ impl PathPattern {
 		}
 	}
 
+	/// Matches a sequence of segments.
+	///
+	/// With [`Anchor::None`] the pattern may match any suffix of `segments`. Other anchors are matched from the
+	/// start of `segments`, which the caller must have already stripped of the anchor's prefix
+	/// (e.g. the crate name for [`Anchor::Crate`]). The qualifier is ignored.
+	pub fn matches_segments(&self, segments: &[&str]) -> bool {
+		match_segments(&self.segments, segments, self.anchor == Anchor::None)
+	}
+
 	/// See [`PathPattern::matches`]. `compare_selector`: whether a selector must be the path's.
 	fn matches_selecting(&self, path: &CanonicalPath, is_selected: bool, compare_selector: bool) -> bool {
 		if self.import && !path.is_import {
@@ -475,15 +484,6 @@ impl PathPattern {
 				self.matches_from_crate(&flat, is_selected)
 			}
 		}
-	}
-
-	/// Matches a sequence of segments.
-	///
-	/// With [`Anchor::None`] the pattern may match any suffix of `segments`. Other anchors are matched from the
-	/// start of `segments`, which the caller must have already stripped of the anchor's prefix
-	/// (e.g. the crate name for [`Anchor::Crate`]). The qualifier is ignored.
-	pub fn matches_segments(&self, segments: &[&str]) -> bool {
-		match_segments(&self.segments, segments, self.anchor == Anchor::None)
 	}
 
 	/// Matches a path as written in source (an `impl`'s trait or unresolved self type), ignoring generic arguments,

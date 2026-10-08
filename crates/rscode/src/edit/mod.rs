@@ -865,6 +865,22 @@ fn check_unmodified(change: &FileChange) -> Result<(), Error> {
 	Ok(())
 }
 
+/// Whether two of `items` at distinct places are in the same crate and are compiled together whenever one of them is:
+/// they have the same effective `cfg`, or one of them has none. Such items are not `cfg` variants of each other (like
+/// two `impl Tools` blocks with the same header, an `impl Config` block and a `#[cfg(test)] impl Config` block, or two
+/// `use a::Trait as _;` of one module), so they neither get the same text nor go away together.
+pub(crate) fn coexisting_items(ws: &Workspace, items: &[ItemId]) -> bool {
+	let place = |item: ItemId| (ws.file_of(item).path(), ws.item(item).range);
+	let coexist = |a: ItemId, b: ItemId| match (ws.effective_cfg(a), ws.effective_cfg(b)) {
+		(Some(a), Some(b)) => a == b,
+		_ => true,
+	};
+
+	items.iter().enumerate().any(|(index, &a)| {
+		(items[index + 1..].iter()).any(|&b| a.krate() == b.krate() && place(a) != place(b) && coexist(a, b))
+	})
+}
+
 fn delete_path(path: &Path) -> io::Result<()> {
 	match fs::symlink_metadata(path)?.is_dir() {
 		true => fs::remove_dir_all(path),
@@ -1007,22 +1023,6 @@ fn restore(path: &Path, original: &str, written: &str) -> io::Result<()> {
 	let file = stage(path, original).map_err(|failure| failure.source)?;
 
 	fs::rename(&file.temporary, &file.target).inspect_err(|_| remove_temporaries(std::slice::from_ref(&file)))
-}
-
-/// Whether two of `items` at distinct places are in the same crate and are compiled together whenever one of them is:
-/// they have the same effective `cfg`, or one of them has none. Such items are not `cfg` variants of each other (like
-/// two `impl Tools` blocks with the same header, an `impl Config` block and a `#[cfg(test)] impl Config` block, or two
-/// `use a::Trait as _;` of one module), so they neither get the same text nor go away together.
-pub(crate) fn coexisting_items(ws: &Workspace, items: &[ItemId]) -> bool {
-	let place = |item: ItemId| (ws.file_of(item).path(), ws.item(item).range);
-	let coexist = |a: ItemId, b: ItemId| match (ws.effective_cfg(a), ws.effective_cfg(b)) {
-		(Some(a), Some(b)) => a == b,
-		_ => true,
-	};
-
-	items.iter().enumerate().any(|(index, &a)| {
-		(items[index + 1..].iter()).any(|&b| a.krate() == b.krate() && place(a) != place(b) && coexist(a, b))
-	})
 }
 
 /// Writes contents to a new temporary file in the directory of the file of `path` (which may be a symbolic link to it),

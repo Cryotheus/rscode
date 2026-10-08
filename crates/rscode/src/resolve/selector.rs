@@ -20,12 +20,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
+/// Where an item is: its file and range. Items of a file that several crates load are at the same place.
+type Place<'ws> = (&'ws Path, TextRange);
+
 /// The selectors that the canonical paths of `impl` blocks and macro invocations show, by block or invocation (see
 /// [`Resolver::impl_selector`]).
 pub(super) type SelectorCache = Mutex<FxHashMap<ItemId, Option<Selector>>>;
-
-/// Where an item is: its file and range. Items of a file that several crates load are at the same place.
-type Place<'ws> = (&'ws Path, TextRange);
 
 impl Resolver<'_> {
 	/// The selector of an `impl` block or macro invocation that the cache has, else the one among those that `compute`
@@ -43,19 +43,29 @@ impl Resolver<'_> {
 		cache.entry(item).or_default().clone()
 	}
 
-	/// The selector that the canonical path of an `impl` block shows (`base` is that path without it), when the path
-	/// names other blocks too: the first associated item name that no other block has, else the first attribute path
-	/// that no other block has, else its index (see [`Selector`]). `None` when the path names the block alone (or does
-	/// not name it, or cannot be written as a user path).
-	///
-	/// (The selectors of the blocks with the same header are computed together, once: computing each on its own would
-	/// take time quadratic in the number of blocks.)
-	pub(super) fn impl_selector(&self, impl_block: ItemId, base: &CanonicalPath) -> Option<Selector> {
-		self.cached_selector(impl_block, || self.header_selectors(impl_block, base))
+	/// The indexes that the canonical paths of the invocations with the path of `call` show (`base` is its canonical
+	/// path without a selector), `call` among them (see [`Resolver::macro_selector`]).
+	fn call_selectors(&self, call: ItemId, base: &CanonicalPath) -> Vec<(ItemId, Option<Selector>)> {
+		let ws = self.ws;
+		let Some(named) = self.macro_calls(call, base) else {
+			return vec![(call, None)];
+		};
+		let places = places(ws, &named);
+		let at: FxHashMap<Place<'_>, usize> = places.iter().enumerate().map(|(index, &place)| (place, index)).collect();
+
+		// (those in modules with the same path have the same path)
+		(named.into_iter())
+			.filter(|&other| other == call || self.module_segments(home_module(ws, other)) == base.segments)
+			.map(|other| {
+				let index = (places.len() > 1).then(|| u32::try_from(at[&place(ws, other)] + 1).ok()).flatten();
+
+				(other, index.map(Selector::Index))
+			})
+			.collect()
 	}
 
-	/// The `impl` blocks that `header` (the header of `impl_block` as a user path, see [`header_text`]) names, the block
-	/// among them. `None` when the header does not parse, or does not name the block.
+	/// The `impl` blocks that `header` (the header of `impl_block` as a user path, see [`header_text`]) names, the
+	/// block among them. `None` when the header does not parse, or does not name the block.
 	fn header_blocks(&self, impl_block: ItemId, header: &str) -> Option<Vec<ItemId>> {
 		let named = self.compute_item_path(&ItemPath::parse(header).ok()?);
 
@@ -73,7 +83,7 @@ impl Resolver<'_> {
 			return vec![(impl_block, None)];
 		};
 
-		// the blocks with the same header text name the same blocks, so their selectors are told apart from the same ones
+		// (blocks with the same header text name the same blocks, so their selectors are computed from those too)
 		let same: Vec<ItemId> = (named.iter().copied())
 			.filter(|&block| block == impl_block || header_text(ws, block, &self.impl_base(block)).as_ref() == Some(&header))
 			.collect();
@@ -102,7 +112,9 @@ impl Resolver<'_> {
 			}
 		}
 
-		let only_at = |places: Option<&FxHashSet<usize>>, index: usize| places.is_some_and(|places| places.len() == 1 && places.contains(&index));
+		let only_at = |places: Option<&FxHashSet<usize>>, index: usize| {
+			places.is_some_and(|places| places.len() == 1 && places.contains(&index))
+		};
 
 		(same.into_iter())
 			.map(|block| {
@@ -121,42 +133,32 @@ impl Resolver<'_> {
 			.collect()
 	}
 
-	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
-	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
+	/// The selector that the canonical path of an `impl` block shows (`base` is that path without it), when the path
+	/// names other blocks too: the first associated item name that no other block has, else the first attribute path
+	/// that no other block has, else its index (see [`Selector`]). `None` when the path names the block alone (or does
+	/// not name it, or cannot be written as a user path).
 	///
-	/// (Like [`Resolver::impl_selector`], the indexes of the invocations with the same path are computed together, once.)
-	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
-		self.cached_selector(call, || self.call_selectors(call, base))
+	/// (The selectors of the blocks with the same header are computed together, once: computing each on its own would
+	/// take time quadratic in the number of blocks.)
+	pub(super) fn impl_selector(&self, impl_block: ItemId, base: &CanonicalPath) -> Option<Selector> {
+		self.cached_selector(impl_block, || self.header_selectors(impl_block, base))
 	}
 
-	/// The indexes that the canonical paths of the invocations with the path of `call` show (`base` is its canonical path
-	/// without a selector), `call` among them (see [`Resolver::macro_selector`]).
-	fn call_selectors(&self, call: ItemId, base: &CanonicalPath) -> Vec<(ItemId, Option<Selector>)> {
-		let ws = self.ws;
-		let Some(named) = self.macro_calls(call, base) else {
-			return vec![(call, None)];
-		};
-		let places = places(ws, &named);
-		let at: FxHashMap<Place<'_>, usize> = places.iter().enumerate().map(|(index, &place)| (place, index)).collect();
-
-		// (those in modules with the same path have the same path)
-		(named.into_iter())
-			.filter(|&other| other == call || self.module_segments(home_module(ws, other)) == base.segments)
-			.map(|other| {
-				let index = (places.len() > 1).then(|| u32::try_from(at[&place(ws, other)] + 1).ok()).flatten();
-
-				(other, index.map(Selector::Index))
-			})
-			.collect()
-	}
-
-	/// The invocations that the path of a macro invocation names (`base` is its canonical path without a selector): those
-	/// of the same macro in its module (and the module's `cfg` variants), the invocation among them. `None` when the path
-	/// does not name it.
+	/// The invocations that the path of a macro invocation names (`base` is its canonical path without a selector):
+	/// those of the same macro in its module (and the module's `cfg` variants), the invocation among them. `None` when
+	/// the path does not name it.
 	fn macro_calls(&self, call: ItemId, base: &CanonicalPath) -> Option<Vec<ItemId>> {
 		let named = self.compute_item_path(&ItemPath::parse(&base.to_string()).ok()?);
 
 		named.contains(&call).then_some(named)
+	}
+
+	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
+	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
+	///
+	/// (Like [`Resolver::impl_selector`], the indexes of invocations with the same path are computed together, once.)
+	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
+		self.cached_selector(call, || self.call_selectors(call, base))
 	}
 
 	/// Whether an item with this canonical path matches a pattern, with the pattern's selector tested by what it picks
@@ -207,9 +209,9 @@ impl Resolver<'_> {
 	}
 
 	/// Whether `selector` picks the `impl` block of an item (the item itself, or the block of an associated item) among
-	/// the blocks with the same header, or a macro invocation among those of the same macro in its module, as a path with
-	/// that selector does (`impl Foo[2]`, `<Foo>[#attr]::name`, `m::name![2]`). Every selector that picks a block counts,
-	/// not only the one its canonical path shows (items of inherent `impl`s show none). `false` for other items.
+	/// the blocks with the same header, or a macro invocation among those of the same macro in its module, as a path
+	/// with that selector does (`impl Foo[2]`, `<Foo>[#attr]::name`, `m::name![2]`): any selector that picks a block,
+	/// not only the one its canonical path shows (items of inherent `impl`s show none). Picks no other items.
 	pub fn selects(&self, selector: &Selector, item: ItemId) -> bool {
 		let ws = self.ws;
 		let target = match ws.item(item).kind {
