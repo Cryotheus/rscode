@@ -3324,9 +3324,7 @@ mod a;
 
 		// (names of other crates need their paths)
 		match import(&ws, "crate", &["Nope"]) {
-			Err(Error::Unsupported(message)) => {
-				assert!(message.starts_with("no item of the workspace is named `Nope`: name an item"), "{message}");
-			}
+			Err(Error::NotFound(name)) => assert_eq!(name, "Nope"),
 			other => panic!("{other:?}"),
 		}
 

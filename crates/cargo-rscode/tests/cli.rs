@@ -1017,6 +1017,100 @@ fn errors_name_the_options_that_get_past_them() {
 	);
 }
 
+/// Searching the members that are not selected leaves the other paths of a command naming what they named.
+#[test]
+fn searches_members_for_one_path_only() {
+	let package = |name: &str, dependencies: &str| {
+		format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}")
+	};
+	let workspace = TempCopy::with_files(
+		"members",
+		&[
+			(
+				"Cargo.toml",
+				"[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"liba\", \"libb\", \"twin\"]\n\
+				 default-members = [\"app\"]\n",
+			),
+			("app/Cargo.toml", &package("app", "\n[dependencies]\nliba = { path = \"../liba\" }\n")),
+			("app/src/main.rs", "mod cmd;\n\nfn main() {\n\tcmd::run();\n}\n"),
+			("app/src/cmd.rs", "pub fn run() {}\n"),
+			("liba/Cargo.toml", &package("liba", "")),
+			("liba/src/lib.rs", "pub struct Widget;\n\nimpl Widget {\n\tpub fn draw(&self) {}\n}\n\npub fn only_in_a() {}\n"),
+			("libb/Cargo.toml", &package("libb", "")),
+			(
+				"libb/src/lib.rs",
+				"pub fn only_in_b() {}\n\npub mod cmd {\n\tpub fn go() {}\n}\n\npub fn use_cmd() {\n\tcmd::go();\n}\n",
+			),
+			("twin/Cargo.toml", &package("twin", "")),
+			("twin/src/lib.rs", "pub mod util;\n\npub fn lib_fn() {\n\tutil::shared();\n}\n"),
+			("twin/src/main.rs", "mod util;\n\nfn main() {\n\tutil::shared();\n}\n"),
+			("twin/src/util.rs", "pub fn shared() {}\n"),
+		],
+	);
+	let dir = workspace.path();
+
+	// `crate::cmd` still names the module of `app`
+	let found = run(dir, &["find", "--from", "crate::cmd", "Widget"]).success();
+
+	assert!(found.stdout.contains("liba::Widget  struct"), "{}", found.stdout);
+
+	let view = run(dir, &["view", "crate::cmd", "crate::only_in_b"]).success();
+
+	assert!(view.stdout.contains("// app::cmd (mod)"), "{}", view.stdout);
+	assert!(view.stdout.contains("// libb::only_in_b (fn)"), "{}", view.stdout);
+	assert!(!view.stdout.contains("libb::cmd"), "{}", view.stdout);
+
+	let refs = run(dir, &["refs", "crate::cmd", "crate::only_in_b"]).success();
+
+	assert!(refs.stdout.contains("cmd::run();") && !refs.stdout.contains("cmd::go();"), "{}", refs.stdout);
+
+	let import = run(dir, &["import", "crate::cmd", "only_in_a", "--dry-run"]).success();
+
+	assert!(import.stdout.contains("+use liba::only_in_a;"), "{}", import.stdout);
+
+	// ... unless the member it was found in has it too
+	let import = run(dir, &["import", "crate::cmd", "only_in_b", "--dry-run"]);
+
+	assert_eq!(import.code, Some(1));
+	assert!(
+		import.stderr.contains("crates of several packages (`app`, `libb`): start it with the name of one of these crates"),
+		"{}",
+		import.stderr
+	);
+
+	let import = run(dir, &["import", "app::cmd", "only_in_b", "--dry-run"]);
+
+	assert_eq!(import.code, Some(1));
+	assert!(import.stderr.contains("its crate `libb` is not a dependency of `app`"), "{}", import.stderr);
+
+	// the binary and the library of a member load one file: its items are not ambiguous
+	let rename = run(dir, &["rename", "crate::util::shared", "common", "--dry-run"]).success();
+
+	assert!(rename.stderr.contains("note: found in workspace member `twin`"), "{}", rename.stderr);
+	assert!(rename.stdout.contains("+++ b/twin/src/main.rs"), "{}", rename.stdout);
+	assert!(rename.stdout.contains("+pub fn common() {}"), "{}", rename.stdout);
+
+	// what a path ends like is found in the member too
+	let suffix = run(dir, &["view", "draw"]).success();
+
+	assert!(suffix.stderr.contains("note: found in workspace member `liba`"), "{}", suffix.stderr);
+
+	// targets that leave out the crates of the other members: nothing is searched
+	let missing = run(dir, &["view", "--bin", "app", "only_in_b"]);
+
+	assert_eq!(missing.code, Some(1));
+	assert!(!missing.stderr.contains("searched workspace"), "{}", missing.stderr);
+
+	let missing = run(dir, &["view", "-p", "app", "-p", "liba", "--bin", "app", "liba::only_in_a"]);
+
+	assert_eq!(missing.code, Some(1));
+	assert!(
+		missing.stderr.contains("`liba` is selected, but the target options (like `--lib` and `--bin`) leave out"),
+		"{}",
+		missing.stderr
+	);
+}
+
 #[test]
 fn renames_across_crates() {
 	let copy = TempCopy::new("rename");
@@ -1285,7 +1379,8 @@ fn imports() {
 	let unknown = run(copy.path(), &["import", "crate", "HashSet", "--lib"]);
 
 	assert_eq!(unknown.code, Some(1));
-	assert!(unknown.stderr.starts_with("error: no item of the workspace is named `HashSet`"), "{}", unknown.stderr);
+	assert!(unknown.stderr.starts_with("error: no item found for `HashSet`"), "{}", unknown.stderr);
+	assert!(unknown.stderr.contains("hint: name an item of another crate by its path"), "{}", unknown.stderr);
 
 	let taken = run(copy.path(), &["import", "crate", "other::add", "--lib"]);
 

@@ -3,7 +3,8 @@
 //! Every `cfg` variant of an item is searched, and for items of traits also the items implementing them (and the
 //! other way around), since a call through either names both. Certain references are always printed; method calls,
 //! names inside of macro bodies, and doc links on request. Paths that name nothing in the selected packages are
-//! searched in the other workspace members (see [`super::retry`]).
+//! searched in the other workspace members (see [`super::retry`]), and a plain path that names nothing stands for the
+//! only item whose path ends like it.
 
 use super::retry;
 use super::retry::Failure;
@@ -18,7 +19,29 @@ use crate::ui;
 use crate::ui::Ui;
 use clap::ArgMatches;
 use rscode::ItemPath;
+use rscode::Resolver;
+use rscode::query::FoundReference;
+use rscode::query::ReferenceReport;
+use rscode::query::find_references;
 use std::process::ExitCode;
+
+/// Adds the references of `more`, found in another load of the workspace, to `report`.
+fn merge(report: &mut ReferenceReport, more: ReferenceReport) {
+	let at = |found: &FoundReference| (found.reference.path.clone(), found.reference.range);
+
+	report.targets.extend(more.targets);
+	report.targets.sort();
+	report.targets.dedup();
+	report.references.extend(more.references);
+	report.references.sort_by_key(at);
+	report.references.dedup_by(|later, kept| at(later) == at(kept));
+
+	for note in more.notes {
+		if !report.notes.contains(&note) {
+			report.notes.push(note);
+		}
+	}
+}
 
 pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let args = RefsArgs::from_matches(matches);
@@ -29,36 +52,41 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	options.load_all_members = true;
 
 	let targets = args.paths.iter().map(|path| ItemPath::parse(path)).collect::<Result<Vec<_>, _>>()?;
-	let (text, report, notes) = retry::run(ui, &options, output.absolute_paths, Search::Everything, |_, _, paths, resolver| {
-		let mut found = Vec::new();
-		let mut notes = Vec::new();
+	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
+	let resolver = Resolver::new(&workspace);
+	let mut notes = Vec::new();
+	let (found, missing) = retry::split(&resolver, &targets, &mut notes);
+	let mut report = match found.is_empty() {
+		true => ReferenceReport::default(),
+		false => find_references(&resolver, &found, &args.options).map_err(|error| super::hinted(error, &resolver))?,
+	};
 
-		for path in &targets {
-			// a plain path that names nothing stands for the only item whose path ends like it
-			match resolver.resolve_item_path(path).is_empty() {
-				false => found.push(path.clone()),
-
-				true => match retry::by_suffix(resolver, path) {
-					Some((path, note)) => {
-						notes.push(note);
-						found.push(path);
-					}
-
-					None => return Err(Failure::NotFound(rscode::Error::NotFound(path.to_string()))),
-				},
-			}
-		}
-
-		let report =
-			rscode::query::find_references(resolver, &found, &args.options).map_err(|error| retry::fail(error, resolver))?;
-		let rows: Vec<ReferenceRow> = report.references.iter().map(|found| ReferenceRow::new(found, paths)).collect();
-		let text = match output.format {
-			MessageFormat::Json => render::json_line(&rows).map_err(anyhow::Error::from)?,
-			MessageFormat::Human | MessageFormat::FileLines => render::references_human(&rows),
+	// (only the paths that name nothing: with more crates selected, the others could name more items)
+	if let Some(first) = missing.first() {
+		let load = retry::Load {
+			ui,
+			options: &options,
+			absolute_paths: output.absolute_paths,
 		};
+		let error = rscode::Error::NotFound(first.to_string());
+		let more = retry::again(load, Search::Everything, &resolver, error, &missing, |_, _, _, resolver| {
+			let (found, missing) = retry::split(resolver, &missing, &mut notes);
 
-		Ok((text, report, notes))
-	})?;
+			if let Some(first) = missing.first() {
+				return Err(Failure::NotFound(rscode::Error::NotFound(first.to_string())));
+			}
+
+			find_references(resolver, &found, &args.options).map_err(|error| retry::fail(error, resolver))
+		})?;
+
+		merge(&mut report, more);
+	}
+
+	let rows: Vec<ReferenceRow> = report.references.iter().map(|found| ReferenceRow::new(found, &paths)).collect();
+	let text = match output.format {
+		MessageFormat::Json => render::json_line(&rows)?,
+		MessageFormat::Human | MessageFormat::FileLines => render::references_human(&rows),
+	};
 
 	for note in notes {
 		ui.note(note);

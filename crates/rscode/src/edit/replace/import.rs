@@ -491,10 +491,10 @@ struct UseItem {
 ///
 /// Fails with [`Error::InvalidSource`] for an import that is not a `use` tree (or has attributes), with
 /// [`Error::Collision`] when a new import binds a name the module binds otherwise (unless [`ImportOptions::force`];
-/// glob imports never collide), with [`Error::NotFound`] for a path into the loaded crates that names nothing, with
-/// [`Error::Ambiguous`] for a bare name that names several items, and with [`Error::Unsupported`] when `module` is not
-/// a module, for a bare name that names no item of the workspace, and for what the module cannot import (an item that
-/// is not visible from it, or an associated item).
+/// glob imports never collide), with [`Error::NotFound`] for a path into the loaded crates that names nothing and for
+/// a bare name that names no loaded item, with [`Error::Ambiguous`] for a bare name that names several items, and with
+/// [`Error::Unsupported`] when `module` is not a module, and for what the module cannot import (an item that is not
+/// visible from it, or an associated item).
 pub fn add_imports(
 	resolver: &Resolver<'_>,
 	module: &ItemPath,
@@ -1246,12 +1246,8 @@ fn path_of_bare_name(
 	found.dedup_by(|a, b| a.0 == b.0);
 
 	let item = match found.as_slice() {
-		[] => {
-			return Err(Error::Unsupported(format!(
-				"no item of the workspace is named `{name}`: name an item of another crate by its path (like \
-				 `std::collections::HashSet`)"
-			)));
-		}
+		// (workspace members that are not loaded may have it; else it is an item of another crate, which needs its path)
+		[] => return Err(Error::NotFound(name.clone())),
 
 		[(_, item)] => *item,
 

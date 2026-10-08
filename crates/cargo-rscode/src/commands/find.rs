@@ -31,10 +31,16 @@ use rscode::query::FindMatch;
 use std::process::ExitCode;
 
 /// The matches of the search in `resolver`'s workspace (up to the `--limit`, which the second value tells when there
-/// were more), with the usable paths that `--from` asks for.
-fn matches_of(resolver: &Resolver<'_>, find: &Find, args: &FindArgs) -> anyhow::Result<(Vec<FindMatch>, Option<usize>)> {
+/// were more), with the usable paths that `--from` asks for (from a module of the `selected` packages, when it names
+/// modules of several; see [`viewpoint`]).
+fn matches_of(
+	resolver: &Resolver<'_>,
+	find: &Find,
+	args: &FindArgs,
+	selected: &[&str],
+) -> anyhow::Result<(Vec<FindMatch>, Option<usize>)> {
 	let mut find = find.clone();
-	let from = args.from.as_ref().map(|from| viewpoint(resolver, from)).transpose()?;
+	let from = args.from.as_ref().map(|from| viewpoint(resolver, from, selected)).transpose()?;
 
 	if let Some(Some(viewpoint)) = from {
 		find = find.from(viewpoint);
@@ -130,10 +136,10 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let find = search(&args)?;
 	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
 	let resolver = Resolver::new(&workspace);
-	let found = matches_of(&resolver, &find, &args)?;
+	let found = matches_of(&resolver, &find, &args, &[])?;
 
 	// nothing found: search the workspace members that the command line did not select
-	let named_packages = options.workspace || !options.packages.is_empty();
+	let named_packages = retry::named_packages(&options);
 	let member = (args.patterns.iter())
 		.find_map(|pattern| pattern_crate(pattern))
 		.and_then(|krate| ItemPath::parse(krate).ok());
@@ -142,17 +148,25 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		&& !named_packages
 		&& let Some(widening) = options.widened(&workspace, member.as_ref())
 	{
-		let (wider, paths) = super::load(ui, &widening.options, output.absolute_paths)?;
+		let (wider, wider_paths) = super::load(ui, &widening.options, output.absolute_paths)?;
+		let searched = widening.searched(&wider);
+
+		// (the target options left out the crates of every member to search)
+		if searched.is_empty() {
+			return print(ui, &args, &output, &workspace, &paths, found, named_packages);
+		}
+
 		let resolver = Resolver::new(&wider);
-		let found = matches_of(&resolver, &find, &args)?;
-		let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &widening.members);
+		let selected: Vec<&str> = widening.selected.iter().map(|package| package.as_str()).collect();
+		let found = matches_of(&resolver, &find, &args, &selected)?;
+		let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &searched);
 
 		match members.is_empty() {
-			true => ui.note(retry::note(&widening.members, false)),
+			true => ui.note(retry::note(&searched, false)),
 			false => ui.note(retry::note(&members, true)),
 		}
 
-		return print(ui, &args, &output, &wider, &paths, found, named_packages);
+		return print(ui, &args, &output, &wider, &wider_paths, found, named_packages);
 	}
 
 	print(ui, &args, &output, &workspace, &paths, found, named_packages)
@@ -190,8 +204,10 @@ fn search(args: &FindArgs) -> Result<Find, rscode::Error> {
 	Ok(find)
 }
 
-/// The viewpoint of `--from`; `None` for `crate`, which is each found item's own crate root.
-fn viewpoint(resolver: &Resolver<'_>, from: &FromArg) -> anyhow::Result<Option<Viewpoint>> {
+/// The viewpoint of `--from`; `None` for `crate`, which is each found item's own crate root. When the path names
+/// modules of several crates and only one of them is of the `selected` packages (those of the command line's own
+/// selection, after a search of more workspace members), it names that one.
+fn viewpoint(resolver: &Resolver<'_>, from: &FromArg, selected: &[&str]) -> anyhow::Result<Option<Viewpoint>> {
 	let text = match from {
 		FromArg::CrateRoot => return Ok(None),
 		FromArg::Foreign => return Ok(Some(Viewpoint::Foreign)),
@@ -204,10 +220,17 @@ fn viewpoint(resolver: &Resolver<'_>, from: &FromArg) -> anyhow::Result<Option<V
 		.into_iter()
 		.filter(|&item| workspace.item(item).kind == ItemKind::Module)
 		.collect();
+	let of_selected: Vec<ItemId> = (modules.iter().copied())
+		.filter(|module| {
+			let package = workspace.krate(module.krate()).package();
 
-	match modules.as_slice() {
-		[module] => Ok(Some(Viewpoint::Module(*module))),
-		[] => anyhow::bail!("`--from {text}` does not name a module"),
+			package.is_some_and(|package| selected.contains(&workspace.package(package).name.as_str()))
+		})
+		.collect();
+
+	match (modules.as_slice(), of_selected.as_slice()) {
+		([module], _) | (_, [module]) => Ok(Some(Viewpoint::Module(*module))),
+		([], _) => anyhow::bail!("`--from {text}` does not name a module"),
 
 		_ => {
 			let candidates: Vec<String> = modules.iter().map(|&module| resolver.canonical_path(module).to_string()).collect();

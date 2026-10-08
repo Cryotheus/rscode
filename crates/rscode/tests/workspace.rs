@@ -603,7 +603,21 @@ fn widens_the_selection_to_find_more() {
 	let widening = options.widened(&workspace, Some(&path("crate::x"))).unwrap();
 
 	assert_eq!(widening.members, ["real-core", "extra", "macros"]);
+	assert_eq!(widening.selected, ["app", "tool"]);
 	assert!(widening.options.workspace && widening.options.packages.is_empty());
+	assert_eq!(widening.searched(&plan(&widening.options).load()), widening.members);
+
+	// ... and then only those that have what was searched for, besides the selected ones
+	let narrowed = options.with_members(&workspace, &["macros"]);
+
+	assert_eq!(narrowed.packages, strings(&["app", "tool", "macros"]));
+	assert!(!narrowed.workspace);
+
+	// target options can leave out the crates of every member to search
+	let tool = with(virtual_ws(), |options| options.targets.bins = strings(&["tool"]));
+	let widening = tool.widened(&plan(&tool).load(), None).unwrap();
+
+	assert!(widening.searched(&plan(&widening.options).load()).is_empty(), "{widening:?}");
 
 	let everything = with(virtual_ws(), |options| options.load_all_members = true);
 	let widening = everything.widened(&plan(&everything).load(), None).unwrap();

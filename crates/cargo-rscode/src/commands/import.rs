@@ -16,6 +16,9 @@ use rscode::Resolver;
 use rscode::edit::ImportOptions;
 use std::process::ExitCode;
 
+/// How to import a bare name that names no item of the workspace.
+const OTHER_CRATE_HINT: &str = "name an item of another crate by its path (like `std::collections::HashSet`)";
+
 /// An error of [`rscode::edit::add_imports`], with a hint naming the argument that gets past it.
 fn hinted(error: Error, resolver: &Resolver<'_>) -> anyhow::Error {
 	let hint = match &error {
@@ -34,8 +37,14 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let output = OutputArgs::from_matches(matches);
 	let options = args::load_options(matches)?;
 	let module = ItemPath::parse(&args.module)?;
-	let report = retry::run(ui, &options, output.absolute_paths, Search::OneCrate, |_, _, paths, resolver| {
+	let report = retry::run(ui, &options, output.absolute_paths, Search::OneCrate, |options, workspace, paths, resolver| {
+		// (no workspace member is left to search for a bare name)
+		let searched = options.workspace || !options.packages.is_empty() || options.widened(workspace, None).is_none();
 		let plan = rscode::edit::add_imports(resolver, &module, &args.paths, &ImportOptions::default()).map_err(|error| match error {
+			Error::NotFound(ref name) if searched && !name.contains("::") && *name != module.to_string() => {
+				Failure::Other(super::with_hint(error, Some(OTHER_CRATE_HINT.to_owned())))
+			}
+
 			Error::NotFound(_) => Failure::NotFound(error),
 			error => Failure::Other(hinted(error, resolver)),
 		})?;

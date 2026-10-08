@@ -3,9 +3,10 @@
 //!
 //! A call that names no packages works on the server's selection (cargo's default members, usually). When one of its
 //! paths names nothing there, the tool searches the other members (the one whose crate the path starts with, or else
-//! all of them), runs again with them selected, and starts its text with a note saying where the path was found. Read
-//! tools also take the only item whose path ends like a plain path that names nothing (`Type::method`). What still
-//! names nothing gets the items named like it as suggestions.
+//! all of them), runs again with the members it was found in selected too (so that the call's other paths, like
+//! `crate::m`, name what they named before, unless those members have them too), and starts its text with a note
+//! saying where the path was found. Read tools also take the only item whose path ends like a plain path that names
+//! nothing (`Type::method`). What still names nothing gets the items named like it as suggestions.
 
 use super::params::Selection;
 use super::tools;
@@ -16,10 +17,12 @@ use crate::ItemPath;
 use crate::Resolver;
 use crate::Workspace;
 use crate::edit;
+use crate::model::CrateId;
 use crate::query;
 use crate::workspace::LoadOptions;
 use smol_str::SmolStr;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::fmt::Write as _;
 
 /// Why an attempt of an operation failed.
@@ -68,6 +71,32 @@ pub(crate) fn fail(error: Error, resolver: &Resolver<'_>) -> Failure {
 		Error::NotFound(_) => Failure::NotFound(error),
 		error => Failure::Message(tools::describe_in(&error, resolver)),
 	}
+}
+
+/// The items that `path` names in `resolver`'s workspace, or for reading (see [`Search::Everything`]), when it names
+/// nothing, the only item whose path ends like it (see [`by_suffix`]).
+fn found_items(resolver: &Resolver<'_>, path: &ItemPath, search: Search) -> Vec<ItemId> {
+	let found = resolver.resolve_item_path(path);
+
+	match (found.is_empty(), search) {
+		(true, Search::Everything) => (by_suffix(resolver, path))
+			.map(|(path, _)| resolver.resolve_item_path(&path))
+			.unwrap_or_default(),
+
+		_ => found,
+	}
+}
+
+/// Whether `items` are in several crates, counting the copies of an item once that several crates load from one file
+/// (a library and a binary of a package, usually), since edits change them together.
+fn in_several_crates(workspace: &Workspace, items: &[ItemId]) -> bool {
+	let mut copies = HashSet::new();
+	let crates: BTreeSet<CrateId> = (items.iter())
+		.filter(|&&item| copies.insert((workspace.file_of(item).path(), workspace.item(item).range)))
+		.map(|item| item.krate())
+		.collect();
+
+	crates.len() > 1
 }
 
 /// The workspace members among `members` that `items` are in.
@@ -140,10 +169,21 @@ pub(crate) fn note(members: &[SmolStr], found: bool) -> String {
 	format!("{what} unselected workspace {members}")
 }
 
+/// The result of a run of an operation after a search of more workspace members: its text after the `note` on the
+/// search, or its error (after the note too, unless a path still names nothing).
+fn noted(note: &str, result: Result<String, Failure>, resolver: &Resolver<'_>) -> Output {
+	match result {
+		Ok(text) => Ok(format!("{note}{text}")),
+		Err(Failure::Message(message)) => Err(format!("{note}{message}")),
+		Err(Failure::NotFound(error)) => Err(not_found(&error, resolver)),
+	}
+}
+
 /// Runs `op` on the workspace loaded with `load`. When it fails because a path names nothing, and the call named no
 /// packages (`selection`), searches the workspace members it did not select (see [`LoadOptions::widened`]), as
-/// `search` allows, and runs `op` again with them selected, starting its text with a note line on where the path was
-/// found. A path that still names nothing gets suggestions (see [`not_found`]).
+/// `search` allows, and runs `op` again with the members the path was found in selected too (all those searched when
+/// it was not found), starting its text with a note line on where the path was found. A path that still names nothing
+/// gets suggestions (see [`not_found`]).
 pub(crate) fn run(
 	load: &LoadOptions,
 	selection: &Selection,
@@ -172,31 +212,42 @@ pub(crate) fn run(
 	};
 
 	let wider = tools::load(&widening.options)?;
-	let resolver = Resolver::new(&wider);
-	let found = path.as_ref().map(|path| resolver.resolve_item_path(path)).unwrap_or_default();
+	let searched = widening.searched(&wider);
 
-	if found.is_empty() && search == Search::OneCrate {
+	// (`lib` or `bin` left out the crates of every member to search)
+	if searched.is_empty() {
 		return Err(not_found(&error, &resolver));
 	}
 
-	let crates: BTreeSet<_> = found.iter().map(|item| item.krate()).collect();
+	let wide = Resolver::new(&wider);
+	let found = path.as_ref().map(|path| found_items(&wide, path, search)).unwrap_or_default();
 
-	if search == Search::OneCrate && crates.len() > 1 {
-		return Err(several_crates(&resolver, path.as_ref(), &found));
+	if search == Search::OneCrate && found.is_empty() {
+		return Err(not_found(&error, &wide));
 	}
 
-	let members = members_of(&wider, found, &widening.members);
+	if search == Search::OneCrate && in_several_crates(&wider, &found) {
+		return Err(several_crates(&wide, path.as_ref(), &found));
+	}
+
+	let members = members_of(&wider, found, &searched);
 	let note = match members.is_empty() {
-		true => format!("note: {}\n", self::note(&widening.members, false)),
+		true => format!("note: {}\n", self::note(&searched, false)),
 		false if asked => String::new(),
 		false => format!("note: {}\n", self::note(&members, true)),
 	};
 
-	match op(&widening.options, &wider, &resolver) {
-		Ok(text) => Ok(note + &text),
-		Err(Failure::Message(message)) => Err(note + &message),
-		Err(Failure::NotFound(error)) => Err(not_found(&error, &resolver)),
+	// with only the members the path was found in added to the selection, the call's other paths (`crate::...`) name
+	// what they named in it, unless those members have them too
+	if members.is_empty() || members.len() == searched.len() {
+		return noted(&note, op(&widening.options, &wider, &wide), &wide);
 	}
+
+	let options = load.with_members(&workspace, &members);
+	let narrower = tools::load(&options)?;
+	let resolver = Resolver::new(&narrower);
+
+	noted(&note, op(&options, &narrower, &resolver), &resolver)
 }
 
 /// The error for an edit whose path names nothing in the selected crates, but items of several crates of the
@@ -204,8 +255,10 @@ pub(crate) fn run(
 fn several_crates(resolver: &Resolver<'_>, path: Option<&ItemPath>, items: &[ItemId]) -> String {
 	let path = path.map(ToString::to_string).unwrap_or_default();
 	let mut candidates: Vec<String> = items.iter().map(|&item| edit::describe(resolver, item)).collect();
+	let mut seen = HashSet::new();
 
-	candidates.dedup();
+	// (copies of an item that several crates load from one file)
+	candidates.retain(|candidate| seen.insert(candidate.clone()));
 
 	let error = Error::Ambiguous {
 		path: path.clone(),

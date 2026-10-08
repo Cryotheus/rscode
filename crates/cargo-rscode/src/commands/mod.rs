@@ -55,7 +55,7 @@ fn hint(error: &rscode::Error, resolver: &Resolver<'_>) -> Option<String> {
 
 	match error {
 		rscode::Error::Collision { .. } => Some("pass `--force` to proceed anyway".to_owned()),
-		rscode::Error::Ambiguous { path, .. } if in_several_crates(resolver, path) => Some(SELECT_ONE_CRATE.to_owned()),
+		rscode::Error::Ambiguous { path, .. } if let Some(hint) = select_one_crate(resolver, path) => Some(hint),
 
 		// several imports of a module (`use` paths are never ambiguous through imports)
 		rscode::Error::Ambiguous { path, .. } if path.starts_with("use ") => Some(SEVERAL_IMPORTS.to_owned()),
@@ -97,17 +97,6 @@ fn hinted(error: rscode::Error, resolver: &Resolver<'_>) -> anyhow::Error {
 	let hint = hint(&error, resolver);
 
 	with_hint(error, hint)
-}
-
-/// Whether the items a path names are in several crates.
-fn in_several_crates(resolver: &Resolver<'_>, path: &str) -> bool {
-	let Ok(path) = ItemPath::parse(path) else {
-		return false;
-	};
-
-	let crates: BTreeSet<_> = resolver.resolve_item_path(&path).iter().map(|item| item.krate()).collect();
-
-	crates.len() > 1
 }
 
 /// Loads the workspace, reporting load problems (errors, and with `-v` warnings) as warnings.
@@ -202,20 +191,62 @@ pub(crate) fn run(name: &str, matches: &ArgMatches, ui: &Ui) -> anyhow::Result<E
 	}
 }
 
+/// How to pick one of the several crates that the items a path names are in, if they are: by target (see
+/// [`SELECT_ONE_CRATE`]) when they are crates of one package, or else by crate name or package.
+fn select_one_crate(resolver: &Resolver<'_>, path: &str) -> Option<String> {
+	let workspace = resolver.workspace();
+	let path = ItemPath::parse(path).ok()?;
+	let crates: BTreeSet<_> = resolver.resolve_item_path(&path).iter().map(|item| item.krate()).collect();
+	let packages: BTreeSet<_> = crates.iter().map(|&krate| workspace.krate(krate).package()).collect();
+
+	match (crates.len(), packages.len()) {
+		(0 | 1, _) => None,
+		(_, 1) => Some(SELECT_ONE_CRATE.to_owned()),
+
+		_ => {
+			let mut names: Vec<&str> = crates.iter().map(|&krate| workspace.krate(krate).name().as_str()).collect();
+			let mut seen = BTreeSet::new();
+
+			names.retain(|name| seen.insert(*name));
+
+			Some(format!(
+				"the path names items of crates of several packages (`{}`): start it with the name of one of these \
+				 crates rather than `crate`, or select one package with `-p NAME`",
+				names.join("`, `")
+			))
+		}
+	}
+}
+
 /// How to include the workspace members that are not loaded: `member` (whose crate was asked for) if given, or else
-/// all of them.
+/// all of them. Members that are selected, but none of whose crates the target options (`--lib`, `--bin`, ...) select,
+/// are not loaded either.
 fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMember>) -> Option<String> {
+	let is_selected = |member: &UnloadedMember| workspace.packages().iter().any(|package| package.name == member.name);
+
 	if let Some(member) = member {
-		return Some(format!(
-			"`{0}` is a workspace member that is not selected, so its crates are not loaded: pass `-p {0}` or \
-			 `--workspace`",
-			member.name
-		));
+		let hint = match is_selected(member) {
+			true => format!(
+				"`{}` is selected, but the target options (like `--lib` and `--bin`) leave out all of its crates",
+				member.name
+			),
+
+			false => format!(
+				"`{0}` is a workspace member that is not selected, so its crates are not loaded: pass `-p {0}` or \
+				 `--workspace`",
+				member.name
+			),
+		};
+
+		return Some(hint);
 	}
 
-	let names: Vec<&str> = workspace.unloaded_members().iter().map(|member| member.name.as_str()).collect();
+	let (selected, names): (Vec<&UnloadedMember>, Vec<&UnloadedMember>) =
+		workspace.unloaded_members().iter().partition(|member| is_selected(member));
+	let names: Vec<&str> = names.iter().map(|member| member.name.as_str()).collect();
+	let selected: Vec<String> = selected.iter().map(|member| format!("`{}`", member.name)).collect();
 
-	match names.as_slice() {
+	let unselected = match names.as_slice() {
 		[] => None,
 
 		[name] => Some(format!(
@@ -229,6 +260,18 @@ fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMember>) -> Opti
 			names.len(),
 			names.join(", ")
 		)),
+	};
+	let filtered = (!selected.is_empty()).then(|| {
+		format!(
+			"the target options (like `--lib` and `--bin`) leave out all crates of the selected workspace {} {}",
+			if selected.len() == 1 { "member" } else { "members" },
+			selected.join(", ")
+		)
+	});
+
+	match (unselected, filtered) {
+		(Some(unselected), Some(filtered)) => Some(format!("{unselected}\nhint: {filtered}")),
+		(unselected, filtered) => unselected.or(filtered),
 	}
 }
 

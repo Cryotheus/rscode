@@ -796,7 +796,8 @@ mod end_to_end {
 		// a bare name of another crate needs its path
 		let (failed, text) = client.call("add_import", json!({ "module": "crate", "paths": "HashSet" })).await;
 
-		assert!(failed && text.starts_with("no item of the workspace is named `HashSet`: name an item"), "{text}");
+		assert!(failed, "{text}");
+		assert_eq!(text, format!("no item found for `HashSet`\nhint: {}", tools::OTHER_CRATE_HINT));
 		assert!(!text.contains("find_items"), "{text}");
 
 		// refusals name the parameter to change
@@ -1865,16 +1866,21 @@ mod end_to_end {
 		let package = |name: &str, workspace: &str| {
 			format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{workspace}")
 		};
-		let workspace = "\n[workspace]\nmembers = [\"left\", \"right\"]\n";
+		let workspace =
+			"\n[dependencies]\nleft = { path = \"left\" }\n\n[workspace]\nmembers = [\"left\", \"right\", \"twin\"]\n";
 		let fixture = Fixture::with_files(
 			"unselected",
 			&[
 				("Cargo.toml", &package("demo", workspace)),
-				("src/lib.rs", "pub fn own() {}\n"),
+				("src/lib.rs", "pub fn own() {}\n\npub mod cmd {\n\tpub fn run() {}\n}\n"),
 				("left/Cargo.toml", &package("left", "")),
 				("left/src/lib.rs", "pub fn shared() {}\n\npub fn left_only() {}\n"),
 				("right/Cargo.toml", &package("right", "")),
-				("right/src/lib.rs", "pub fn shared() {}\n"),
+				("right/src/lib.rs", "pub fn shared() {}\n\npub fn right_only() {}\n\npub mod cmd {}\n"),
+				("twin/Cargo.toml", &package("twin", "")),
+				("twin/src/lib.rs", "pub mod util;\n"),
+				("twin/src/main.rs", "mod util;\n\nfn main() {\n\tutil::twinned();\n}\n"),
+				("twin/src/util.rs", "pub fn twinned() {}\n"),
 			],
 		);
 		let mut client = Client::connect(fixture.options()).await;
@@ -1919,6 +1925,42 @@ mod end_to_end {
 
 		assert!(failed, "{text}");
 		assert_contains(&text, &["no item found for `crate::left_only`", "did you mean `left::left_only`?"]);
+
+		// the binary and the library of a member load one file: its items are not ambiguous
+		let rename = json!({ "path": "crate::util::twinned", "new_name": "paired", "dry_run": true });
+		let (failed, text) = client.call("rename_item", rename).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["note: found in unselected workspace member `twin`", "+\tutil::paired();", "+pub fn paired() {}"]);
+
+		// only the member the path is found in is selected besides the selection: `crate::cmd` still names one module,
+		// and `from` is the module of the selection
+		let import = json!({ "module": "crate::cmd", "paths": ["left_only"], "dry_run": true });
+		let (failed, text) = client.call("add_import", import).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["note: found in unselected workspace member `left`", "+\tuse left::left_only;"]);
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "left_only", "from": "crate::cmd" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["note: found in unselected workspace member `left`", "left::left_only"]);
+
+		// a bare name of a member that the module's crate does not depend on cannot be imported
+		let import = json!({ "module": "crate::cmd", "paths": ["right_only"], "dry_run": true });
+		let (failed, text) = client.call("add_import", import).await;
+
+		assert!(failed, "{text}");
+		assert_contains(
+			&text,
+			&["`crate::cmd` is ambiguous", "packages (`right`, `demo`): start it with the name of one of these crates"],
+		);
+
+		let import = json!({ "module": "demo::cmd", "paths": ["right_only"], "dry_run": true });
+		let (failed, text) = client.call("add_import", import).await;
+
+		assert!(failed, "{text}");
+		assert_contains(&text, &["its crate `right` is not a dependency of `demo`"]);
 		client.close().await.unwrap();
 	}
 

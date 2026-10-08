@@ -40,6 +40,7 @@ use crate::edit::FileChange;
 use crate::edit::FmtOptions;
 use crate::edit::ImportOptions;
 use crate::edit::Insertion;
+use crate::model::CrateId;
 use crate::model::UnloadedMember;
 use crate::query;
 use crate::query::ItemView;
@@ -49,6 +50,8 @@ use crate::rscode_fmt::FormatOptions;
 use crate::rscode_fmt::RsFormatter;
 use crate::workspace::LoadOptions;
 use crate::workspace::load_workspace;
+use smol_str::SmolStr;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -63,6 +66,9 @@ type ViewKey = (bool, ItemId, String);
 /// How to search for the path of an item.
 pub(super) const SEARCH_HINT: &str = "search with `find_items` (e.g. the pattern `*name*` with `ignore_case`, and \
 	`include_imports` for imports) for the exact path";
+
+/// How to import a bare name that names no item of the workspace.
+pub(super) const OTHER_CRATE_HINT: &str = "name an item of another crate by its path (like `std::collections::HashSet`)";
 
 /// How to pick one of several crates that a path names items of.
 const SELECT_ONE_CRATE: &str = "the path names items of several crates (such as the library and a binary of a \
@@ -112,14 +118,20 @@ pub(crate) fn add_import(load: &LoadOptions, params: &AddImportParams, permit: &
 
 	let module = parse_path(&params.module)?;
 
-	retry::run(load, &params.selection, Search::OneCrate, |_, workspace, resolver| {
+	retry::run(load, &params.selection, Search::OneCrate, |load, workspace, resolver| {
+		// (no workspace member is left to search for a bare name)
+		let searched = params.selection.names_packages() || load.widened(workspace, None).is_none();
 		let plan = edit::add_imports(resolver, &module, &imports, &ImportOptions::default()).map_err(|error| {
 			let hint = match &error {
-				Error::Ambiguous { .. } if in_several_crates(resolver, &module) => SELECT_ONE_CRATE,
-				Error::Collision { .. } => {
-					"import it under another name (`x::Y as Z`), or remove what has the name (it names something else)"
+				Error::NotFound(name) if searched && !name.contains("::") && *name != module.to_string() => {
+					OTHER_CRATE_HINT.to_owned()
 				}
-				Error::InvalidSource(_) => "each of `paths` is a `use` tree: `std::fs`, `crate::a::{B, C}`, or `x::Y as Z`",
+
+				Error::Ambiguous { .. } if let Some(hint) = select_one_crate(resolver, &module) => hint,
+				Error::Collision { .. } => {
+					"import it under another name (`x::Y as Z`), or remove what has the name (it names something else)".into()
+				}
+				Error::InvalidSource(_) => "each of `paths` is a `use` tree: `std::fs`, `crate::a::{B, C}`, or `x::Y as Z`".into(),
 				_ => return retry::fail(error, resolver),
 			};
 
@@ -146,7 +158,7 @@ pub(crate) fn create_module(load: &LoadOptions, params: &CreateModuleParams, per
 	retry::run(load, &params.selection, Search::OneCrate, |_, workspace, resolver| {
 		let plan = edit::create_module(resolver, &parent, name, &params.source, &params.options()).map_err(|error| {
 			let hint = match &error {
-				Error::Ambiguous { .. } if in_several_crates(resolver, &parent) => SELECT_ONE_CRATE.to_owned(),
+				Error::Ambiguous { .. } if let Some(hint) = select_one_crate(resolver, &parent) => hint,
 				Error::InvalidIdent(_) => "`name` is the new module's identifier alone (e.g. `render`), not a path".to_owned(),
 				Error::Collision { .. } => "choose another `name`".to_owned(),
 
@@ -225,8 +237,8 @@ pub(crate) fn edit_item(load: &LoadOptions, params: &EditItemParams, permit: &Pe
 		let plan = edit::edit_item(resolver, &path, &edit, &params.options()).map_err(|error| {
 			let all_variants = matches!(error, Error::Ambiguous { .. }) && edit::replaces_all_variants(resolver, &path);
 			let hint = match error {
-				Error::Ambiguous { .. } if all_variants && in_several_crates(resolver, &path) => {
-					format!("{SELECT_ONE_CRATE}, or set `all_variants` to edit every one of them")
+				Error::Ambiguous { .. } if all_variants && let Some(hint) = select_one_crate(resolver, &path) => {
+					format!("{hint}, or set `all_variants` to edit every one of them")
 				}
 
 				Error::Ambiguous { .. } if all_variants => {
@@ -309,7 +321,7 @@ pub(crate) fn find(load: &LoadOptions, params: &FindParams) -> Output {
 
 	let workspace = self::load(load)?;
 	let resolver = Resolver::new(&workspace);
-	let found = search(&resolver, &find, params)?;
+	let found = search(&resolver, &find, params, &[])?;
 	let path = pattern_crate(&params.pattern).and_then(|krate| ItemPath::parse(krate).ok());
 	let widening = (found.0.is_empty() && !params.selection.names_packages())
 		.then(|| load.widened(&workspace, path.as_ref()))
@@ -320,13 +332,20 @@ pub(crate) fn find(load: &LoadOptions, params: &FindParams) -> Output {
 	};
 
 	let wider = self::load(&widening.options)?;
+	let searched = widening.searched(&wider);
+
+	// (`lib` or `bin` left out the crates of every member to search)
+	if searched.is_empty() {
+		return Ok(found_text(&workspace, &resolver, params, found));
+	}
+
 	let resolver = Resolver::new(&wider);
-	let found = search(&resolver, &find, params)?;
-	let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &widening.members);
+	let found = search(&resolver, &find, params, &widening.selected)?;
+	let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &searched);
 	// (a pattern that starts with the crate of a member asks for that member: finding it there is no news)
 	let asked = path.as_ref().is_some_and(|path| workspace.unloaded_member_of(path).is_some());
 	let note = match members.is_empty() {
-		true => format!("note: {}\n", retry::note(&widening.members, false)),
+		true => format!("note: {}\n", retry::note(&searched, false)),
 		false if asked => String::new(),
 		false => format!("note: {}\n", retry::note(&members, true)),
 	};
@@ -452,13 +471,6 @@ fn found_text(
 	text
 }
 
-/// Whether the items `path` names are in several crates.
-fn in_several_crates(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
-	let crates: HashSet<_> = resolver.resolve_item_path(path).iter().map(|item| item.krate()).collect();
-
-	crates.len() > 1
-}
-
 /// `insert_items`
 pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<'_>) -> Output {
 	let options = params.options()?;
@@ -466,8 +478,8 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 
 	retry::run(load, &params.selection, Search::OneCrate, |load, workspace, resolver| {
 		let plan = edit::insert(resolver, parent.as_ref(), &params.source, &options).map_err(|error| match (&error, &parent) {
-			(Error::Ambiguous { .. }, Some(parent)) if in_several_crates(resolver, parent) => {
-				Failure::Message(format!("{error}\nhint: {SELECT_ONE_CRATE}"))
+			(Error::Ambiguous { .. }, Some(parent)) if let Some(hint) = select_one_crate(resolver, parent) => {
+				Failure::Message(format!("{error}\nhint: {hint}"))
 			}
 
 			// several containers have the anchor
@@ -665,9 +677,9 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 			let all_variants = matches!(error, Error::Ambiguous { .. }) && edit::replaces_all_variants(resolver, &path);
 
 			match error {
-				Error::Ambiguous { .. } if all_variants && in_several_crates(resolver, &path) => Failure::Message(format!(
-					"{error}\nhint: {SELECT_ONE_CRATE}, or set `all_variants` to replace every one of them"
-				)),
+				Error::Ambiguous { .. } if all_variants && let Some(hint) = select_one_crate(resolver, &path) => {
+					Failure::Message(format!("{error}\nhint: {hint}, or set `all_variants` to replace every one of them"))
+				}
 
 				Error::Ambiguous { .. } if all_variants => {
 					Failure::Message(format!("{error}\nhint: set `all_variants` to replace every one of them"))
@@ -698,22 +710,50 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 	})
 }
 
-/// The matches of `find_items`' search, and the viewpoint of its `from`, in `resolver`'s workspace.
+/// The matches of `find_items`' search, and the viewpoint of its `from`, in `resolver`'s workspace (of the `selected`
+/// packages when it names modules of several, see [`usable_from`]).
 fn search(
 	resolver: &Resolver<'_>,
 	find: &Find,
 	params: &FindParams,
+	selected: &[SmolStr],
 ) -> Result<(Vec<FindMatch>, Option<UsableFrom>), String> {
 	let from = params
 		.from
 		.as_deref()
 		.map(str::trim)
 		.filter(|from| !from.is_empty())
-		.map(|from| usable_from(resolver, from))
+		.map(|from| usable_from(resolver, from, selected))
 		.transpose()?;
 	let found = find.run_with(resolver).map_err(|error| describe(&error))?;
 
 	Ok((found, from))
+}
+
+/// How to pick one of the several crates that the items `path` names are in, if they are: by target (see
+/// [`SELECT_ONE_CRATE`]) when they are crates of one package, or else by crate name or package.
+fn select_one_crate(resolver: &Resolver<'_>, path: &ItemPath) -> Option<String> {
+	let workspace = resolver.workspace();
+	let crates: BTreeSet<CrateId> = resolver.resolve_item_path(path).iter().map(|item| item.krate()).collect();
+	let packages: BTreeSet<_> = crates.iter().map(|&krate| workspace.krate(krate).package()).collect();
+
+	match (crates.len(), packages.len()) {
+		(0 | 1, _) => None,
+		(_, 1) => Some(SELECT_ONE_CRATE.to_owned()),
+
+		_ => {
+			let mut names: Vec<&str> = crates.iter().map(|&krate| workspace.krate(krate).name().as_str()).collect();
+			let mut seen = HashSet::new();
+
+			names.retain(|name| seen.insert(*name));
+
+			Some(format!(
+				"the path names items of crates of several packages (`{}`): start it with the name of one of these \
+				 crates rather than `crate`, or select one package with `packages`",
+				names.join("`, `")
+			))
+		}
+	}
 }
 
 fn try_format_written(load: &LoadOptions, permit: &Permit<'_>, targets: &[(String, ItemPath)]) -> Result<String, String> {
@@ -778,19 +818,30 @@ fn try_format_written(load: &LoadOptions, permit: &Permit<'_>, targets: &[(Strin
 }
 
 /// How to include the workspace members that are not loaded: `member` (whose crate was asked for) if given, or else
-/// all of them.
+/// all of them. Members that are selected, but none of whose crates `lib` and `bin` select, are not loaded either.
 pub(super) fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMember>) -> Option<String> {
+	let is_selected = |member: &UnloadedMember| workspace.packages().iter().any(|package| package.name == member.name);
+
 	if let Some(member) = member {
-		return Some(format!(
-			"`{}` is a workspace member that is not selected, so its crates are not loaded: add it to `packages`, or set \
-			 `workspace` to true",
-			member.name
-		));
+		let hint = match is_selected(member) {
+			true => format!("`{}` is selected, but `lib` and `bin` leave out all of its crates", member.name),
+
+			false => format!(
+				"`{}` is a workspace member that is not selected, so its crates are not loaded: add it to `packages`, or \
+				 set `workspace` to true",
+				member.name
+			),
+		};
+
+		return Some(hint);
 	}
 
-	let names: Vec<&str> = workspace.unloaded_members().iter().map(|member| member.name.as_str()).collect();
+	let (selected, names): (Vec<&UnloadedMember>, Vec<&UnloadedMember>) =
+		workspace.unloaded_members().iter().partition(|member| is_selected(member));
+	let names: Vec<&str> = names.iter().map(|member| member.name.as_str()).collect();
+	let selected: Vec<String> = selected.iter().map(|member| format!("`{}`", member.name)).collect();
 
-	match names.as_slice() {
+	let unselected = match names.as_slice() {
 		[] => None,
 
 		[name] => Some(format!(
@@ -804,11 +855,25 @@ pub(super) fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMembe
 			names.len(),
 			names.join(", ")
 		)),
+	};
+	let filtered = (!selected.is_empty()).then(|| {
+		format!(
+			"`lib` and `bin` leave out all crates of the selected workspace {} {}",
+			if selected.len() == 1 { "member" } else { "members" },
+			selected.join(", ")
+		)
+	});
+
+	match (unselected, filtered) {
+		(Some(unselected), Some(filtered)) => Some(format!("{unselected}\nhint: {filtered}")),
+		(unselected, filtered) => unselected.or(filtered),
 	}
 }
 
-/// Parses `find_items`' `from`: `crate`, `::`, or the path of a module.
-fn usable_from(resolver: &Resolver<'_>, text: &str) -> Result<UsableFrom, String> {
+/// Parses `find_items`' `from`: `crate`, `::`, or the path of a module. When the path names modules of several crates
+/// and only one of them is of the `selected` packages (those of a call's own selection, after a search of more
+/// workspace members), it names that one.
+fn usable_from(resolver: &Resolver<'_>, text: &str, selected: &[SmolStr]) -> Result<UsableFrom, String> {
 	match text {
 		"crate" => return Ok(UsableFrom::CrateRoot),
 		"::" => return Ok(UsableFrom::Viewpoint(Viewpoint::Foreign)),
@@ -827,11 +892,18 @@ fn usable_from(resolver: &Resolver<'_>, text: &str) -> Result<UsableFrom, String
 		.copied()
 		.filter(|&module| workspace.is_active(module) != Tristate::False)
 		.collect();
+	let of_selected: Vec<ItemId> = (modules.iter().copied())
+		.filter(|module| {
+			let package = workspace.krate(module.krate()).package();
 
-	match (modules.as_slice(), active.as_slice()) {
-		([module], _) | (_, [module]) => Ok(UsableFrom::Viewpoint(Viewpoint::Module(*module))),
+			package.is_some_and(|package| selected.contains(&workspace.package(package).name))
+		})
+		.collect();
 
-		([], _) => Err(format!(
+	match (modules.as_slice(), active.as_slice(), of_selected.as_slice()) {
+		([module], ..) | (_, [module], _) | (.., [module]) => Ok(UsableFrom::Viewpoint(Viewpoint::Module(*module))),
+
+		([], ..) => Err(format!(
 			"`from`: `{text}` does not name a module (give `crate`, `::`, or the path of a module)"
 		)),
 
