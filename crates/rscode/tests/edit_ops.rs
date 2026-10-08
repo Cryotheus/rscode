@@ -1486,6 +1486,12 @@ mod inner;
 		assert_eq!(edited(doc("crate::Kind", "/// Kinds."), "src/lib.rs"), LIB.replace("pub enum Kind", "/// Kinds.\npub enum Kind"));
 		assert_eq!(edited(doc("crate::Kind::A", "The first."), "src/lib.rs"), LIB.replace("\tA,", "\t/// The first.\n\tA,"));
 
+		// the lines of an item that new docs start
+		let span = |plan: Replacement| (plan.spans[0].start, plan.spans[0].end);
+
+		assert_eq!(span(doc("crate::Kind", "Kinds,\nof shapes.")), (43, 48));
+		assert_eq!(span(doc("crate::Kind::A", "The first.")), (44, 45));
+
 		// the docs of a module with a file are its inner docs
 		assert_eq!(edited(doc("crate::inner", "Inner, changed."), "src/inner.rs"), INNER.replace("Inner docs.", "Inner, changed."));
 		assert_eq!(edited(doc("crate::inner", ""), "src/inner.rs"), "pub fn f() {}\n");

@@ -38,7 +38,6 @@ use proc_macro2::TokenStream;
 use quote::ToTokens;
 use serde::Deserialize;
 use serde::Serialize;
-use std::path::Path;
 use syn::Attribute;
 use syn::Meta;
 use syn::Token;
@@ -888,15 +887,15 @@ pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, opti
 		notes,
 	};
 
-	// the file edits, to tell how many lines the edits before an item add
-	let changes: Vec<(&Path, TextRange, isize)> = (plans.iter())
+	// the file edits of the regions, to tell how many lines the edits before an item add
+	let changes: Vec<(&Region<'_>, TextRange, isize)> = (plans.iter())
 		.flat_map(|plan| plan.regions.changed())
 		.filter_map(|region| {
 			let (range, text) = region.edit()?;
 			let added = text.matches('\n').count() as isize - region.file.text()[range.as_range()].matches('\n').count() as isize;
 
 			edits.replace(region.file, range, text);
-			Some((region.file.path(), range, added))
+			Some((region, range, added))
 		})
 		.collect();
 
@@ -909,8 +908,11 @@ pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, opti
 			continue;
 		};
 
+		// (the region's own edit may be an insertion at its start, which is not before it)
 		let shift: isize = (changes.iter())
-			.filter(|(file, range, _)| *file == region.file.path() && range.end <= region.range.start)
+			.filter(|(changed, range, _)| {
+				!std::ptr::eq(*changed, region) && changed.file.path() == region.file.path() && range.end <= region.range.start
+			})
 			.map(|(_, _, added)| added)
 			.sum();
 		let start = region.line_of(region.item).saturating_add_signed(shift);
