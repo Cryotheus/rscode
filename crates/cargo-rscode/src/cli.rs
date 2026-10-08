@@ -535,7 +535,8 @@ fn insert() -> Command {
 			 indented like the container's items, and separated from their neighbors by blank lines, except that \
 			 one-line `use` items, `mod x;` declarations, and the like join one-line siblings of their kind.\n\n\
 			 With --after or --before, PARENT may be left out: the sibling's container is the parent, and a single \
-			 positional argument is the SOURCE (`insert items.rs --after 'Tools::add_bots'`).",
+			 positional argument is the SOURCE (`insert items.rs --after 'Tools::add_bots'`), unless it is an item \
+			 path that names no file: then it is the PARENT, and the source is read from stdin.",
 		)
 		.arg(
 			item_path(

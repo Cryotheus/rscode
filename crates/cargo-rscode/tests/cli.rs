@@ -1174,6 +1174,12 @@ fn inserts_items() {
 	assert!(copy.read("src/util.rs").ends_with("pub(crate) fn last() -> u8 {\n\t3\n}\n"));
 	cargo_check(copy.path());
 
+	// a single item path that names no file is the parent, and the source comes from stdin
+	let zero = run_with_stdin(copy.path(), &["insert", "crate::util", "--before", "first"], "pub(crate) fn zero() {}\n").success();
+
+	assert_eq!(zero.stdout, native("inserted fn zero into crate::util (src/util.rs)\n"));
+	assert!(copy.read("src/util.rs").starts_with("pub(crate) fn zero() {}\n"), "{}", copy.read("src/util.rs"));
+
 	let taken = run_with_stdin(copy.path(), &["insert", "crate::util"], "pub(crate) fn first() {}\n");
 
 	assert_eq!(taken.code, Some(1));

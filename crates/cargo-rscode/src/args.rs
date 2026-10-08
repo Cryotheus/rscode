@@ -12,6 +12,7 @@ use clap::ArgMatches;
 use clap::parser::ValueSource;
 use rscode::Edition;
 use rscode::ItemKind;
+use rscode::ItemPath;
 use rscode::LoadOptions;
 use rscode::edit::CreateModuleOptions;
 use rscode::edit::EditItemOptions;
@@ -422,7 +423,8 @@ impl ImportArgs {
 /// `insert`
 #[derive(Debug, Clone)]
 pub(crate) struct InsertArgs {
-	/// `None` with `--after` or `--before` and a single positional argument (the source): the anchor's container.
+	/// `None` with `--after` or `--before` and a single positional argument that is the source (see [`names_parent`]):
+	/// the anchor's container.
 	pub(crate) parent: Option<String>,
 	pub(crate) source: SourceArg,
 	pub(crate) options: InsertOptions,
@@ -441,9 +443,13 @@ impl InsertArgs {
 		};
 
 		// with `--after` or `--before`, a single positional argument is the source (the parent is the anchor's
-		// container)
+		// container), unless it is an item path that names no file: then it is the parent, and the source is stdin
 		let (parent, source) = match shorthand.is_some() && matches.value_source("source") != Some(ValueSource::CommandLine) {
-			true => (None, SourceArg::from_value(matches._value_of("parent"))),
+			true => match matches._value_of("parent") {
+				Some(value) if names_parent(value) => (Some(value.to_owned()), SourceArg::Stdin),
+				value => (None, SourceArg::from_value(value)),
+			},
+
 			false => (matches._value_of("parent").map(str::to_owned), SourceArg::from_matches(matches)),
 		};
 
@@ -840,6 +846,12 @@ fn load_options_with_config(matches: &ArgMatches, config: Vec<String>) -> anyhow
 		config,
 		silent: matches.flag("quiet"),
 	})
+}
+
+/// Whether the single positional argument of `insert --after/--before` is the PARENT rather than the SOURCE: an item
+/// path (`crate`, `impl Tools[b]`) that names no file and does not end with `.rs` (like a source file that is missing).
+fn names_parent(value: &str) -> bool {
+	value != "-" && !value.ends_with(".rs") && !Path::new(value).exists() && ItemPath::parse(value).is_ok()
 }
 
 /// `mcp`
@@ -1254,6 +1266,19 @@ mod tests {
 
 		assert_eq!((args.parent, args.source), (None, SourceArg::File("items.rs".into())));
 		assert_eq!(args.options.position, InsertPosition::After("Tools::a".to_owned()));
+
+		// unless it is an item path that names no file: the parent, with the source on stdin
+		for parent in ["crate", "impl Tools[b]", "crate::m"] {
+			let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", parent, "--after", "b"])).unwrap();
+
+			assert_eq!((args.parent.as_deref(), args.source), (Some(parent), SourceArg::Stdin));
+		}
+
+		for source in ["missing.rs", "Cargo.toml", "-"] {
+			let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", source, "--after", "b"])).unwrap();
+
+			assert_eq!((args.parent, args.source), (None, SourceArg::from_path(source)), "{source}");
+		}
 
 		let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", "--before", "Tools::a", "-n"])).unwrap();
 
