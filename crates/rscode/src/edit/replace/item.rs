@@ -1943,40 +1943,6 @@ mod tests {
 	}
 
 	#[test]
-	fn tells_text_as_printed_from_text_as_written() {
-		let text = "impl W {\n\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t}\n\t}\n}\n";
-		let file = SourceFile::new(PathBuf::from("lib.rs"), text);
-		let range = TextRange::new(10, text.len() - 3);
-		let replace = |old: &str, new: &str| {
-			let mut region = Region::item(&file, range);
-			let replacement = TextReplacement {
-				old: old.to_owned(),
-				new: new.to_owned(),
-			};
-
-			replace_text(&mut region, &replacement, "`old`", "`h`").map(|()| region.text)
-		};
-
-		// the closing braces of the `if` and the `for` as views print them are those of the `for` and `h` as written
-		assert_eq!(
-			replace("\t\t}\n\t}", "\t\t}\n\t\tb();\n\t}").unwrap_err().to_string(),
-			"`old` occurs 2 times in `h`, at lines 6, 7: as views print it at line 6, and as written in the file at line 7"
-		);
-
-		// the line numbers of a numbered view tell which one is meant
-		assert_eq!(
-			replace("   6 │ \t\t}\n   7 │ \t}", "   6 │ \t\t}\n\t\tb();\n   7 │ \t}").unwrap(),
-			"\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t\tb();\n\t\t}\n\t}"
-		);
-
-		// (or the one as written, whose `new` is as written too)
-		assert_eq!(
-			replace("   7 │ \t\t}\n   8 │ \t}", "   7 │ \t\t}\n\t\tb();\n   8 │ \t}").unwrap(),
-			"\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t}\n\t\tb();\n\t}"
-		);
-	}
-
-	#[test]
 	fn checks_the_parts_of_edits() {
 		let checked = ItemEdit {
 			remove_attributes: vec!["derive".to_owned(), "allow(dead_code)".to_owned(), "#![allow(x)]".to_owned()],
@@ -2147,5 +2113,39 @@ mod tests {
 		assert_eq!(occurrences("aaa", "aa"), [0, 1]);
 		assert_eq!(occurrences("éaé", "é"), [0, 3]);
 		assert!(occurrences("a", "").is_empty());
+	}
+
+	#[test]
+	fn tells_text_as_printed_from_text_as_written() {
+		let text = "impl W {\n\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t}\n\t}\n}\n";
+		let file = SourceFile::new(PathBuf::from("lib.rs"), text);
+		let range = TextRange::new(10, text.len() - 3);
+		let replace = |old: &str, new: &str| {
+			let mut region = Region::item(&file, range);
+			let replacement = TextReplacement {
+				old: old.to_owned(),
+				new: new.to_owned(),
+			};
+
+			replace_text(&mut region, &replacement, "`old`", "`h`").map(|()| region.text)
+		};
+
+		// the closing braces of the `if` and the `for` as views print them are those of the `for` and `h` as written
+		assert_eq!(
+			replace("\t\t}\n\t}", "\t\t}\n\t\tb();\n\t}").unwrap_err().to_string(),
+			"`old` occurs 2 times in `h`, at lines 6, 7: as views print it at line 6, and as written in the file at line 7"
+		);
+
+		// the line numbers of a numbered view tell which one is meant
+		assert_eq!(
+			replace("   6 │ \t\t}\n   7 │ \t}", "   6 │ \t\t}\n\t\tb();\n   7 │ \t}").unwrap(),
+			"\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t\tb();\n\t\t}\n\t}"
+		);
+
+		// (or the one as written, whose `new` is as written too)
+		assert_eq!(
+			replace("   7 │ \t\t}\n   8 │ \t}", "   7 │ \t\t}\n\t\tb();\n   8 │ \t}").unwrap(),
+			"\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t}\n\t\tb();\n\t}"
+		);
 	}
 }
