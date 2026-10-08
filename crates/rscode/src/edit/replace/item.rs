@@ -41,8 +41,10 @@ use serde::Serialize;
 use std::path::Path;
 use syn::Attribute;
 use syn::Meta;
+use syn::Token;
 use syn::parse::ParseStream;
 use syn::parse::Parser;
+use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 
 /// How [`closest`] tells what comes closest to a text that was not found, from the closest.
@@ -65,6 +67,9 @@ struct Attr {
 
 	/// What is inside of its brackets, as token streams print it.
 	meta: String,
+
+	/// The traits it derives, when it is a `#[derive(...)]`.
+	derive: Option<Derive>,
 }
 
 /// An attribute to remove, from [`ItemEdit::remove_attributes`].
@@ -115,6 +120,44 @@ impl Checked {
 	}
 }
 
+/// The traits that a `#[derive(...)]` attribute derives.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct Derive {
+	/// Their paths: as token streams print them (to compare them), and as written.
+	paths: Vec<(String, String)>,
+
+	/// Where more traits go in the text that the attribute was parsed from: after the last one, or before the closing
+	/// parenthesis when there is none.
+	end: usize,
+}
+
+impl Derive {
+	/// The traits that an attribute derives (spans index `text`, which it was parsed from), if it is a `derive` with a
+	/// list of paths; must run on a parsing thread.
+	fn of(attribute: &Attribute, text: &str) -> Option<Self> {
+		let Meta::List(list) = &attribute.meta else {
+			return None;
+		};
+
+		if !attribute.path().is_ident("derive") {
+			return None;
+		}
+
+		let paths = list.parse_args_with(Punctuated::<syn::Path, Token![,]>::parse_terminated).ok()?;
+		let written = |path: &syn::Path| text.get(path.span().byte_range()).map(str::to_owned);
+
+		Some(Self {
+			paths: (paths.iter())
+				.map(|path| Some((path.to_token_stream().to_string(), written(path)?)))
+				.collect::<Option<_>>()?,
+			end: match paths.last() {
+				Some(last) => last.span().byte_range().end,
+				None => list.delimiter.span().close().byte_range().start,
+			},
+		})
+	}
+}
+
 /// Options for [`edit_item`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -143,7 +186,9 @@ pub struct ItemEdit {
 
 	/// Attributes to add (`#[derive(Debug)]`, or without brackets, `derive(Debug)`), after the existing ones (just
 	/// before the visibility or the keyword). Inner attributes (`#![...]`) go into the file of a module (or crate root)
-	/// after its inner attributes; a crate root only has inner attributes, so every attribute added to it is one.
+	/// after its inner attributes; a crate root only has inner attributes, so every attribute added to it is one. The
+	/// traits of a `derive` that the item does not derive yet join its last `derive` attribute, if it has one (with a
+	/// note naming those it derives already).
 	pub add_attributes: Vec<String>,
 
 	/// The text of the new doc comment, without `///`, replacing the existing doc comments (`///`, `/** */`, and
@@ -227,6 +272,9 @@ struct NewAttribute {
 
 	/// What is inside of its brackets, as token streams print it.
 	meta: String,
+
+	/// The traits it derives, when it is a `#[derive(...)]`.
+	derive: Option<Derive>,
 }
 
 /// Where a text to replace occurs in the text of a region (see [`try_replace`]).
@@ -475,8 +523,9 @@ pub struct TextReplacement {
 	pub new: String,
 }
 
-/// Adds an attribute to an item (see [`ItemEdit::add_attributes`]).
-fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str) -> Result<(), Error> {
+/// Adds an attribute to an item (see [`ItemEdit::add_attributes`]): a `derive` adds the traits that the item does not
+/// derive yet to its last `derive` attribute, if it has one. Returns a note naming the traits it derives already.
+fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str) -> Result<Option<String>, Error> {
 	// (a crate root only has inner attributes: whatever is added to it is one)
 	let inner = attribute.inner || regions.outer.is_none();
 
@@ -488,6 +537,27 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 	};
 
 	let prefix = region.attributes(path)?;
+	let derives: Vec<&Derive> = (prefix.attributes.iter())
+		.filter(|existing| !existing.inner)
+		.filter_map(|existing| existing.derive.as_ref())
+		.collect();
+
+	// (a second `derive` of a trait would not compile)
+	if let (Some(derive), Some(last), false) = (&attribute.derive, derives.last(), inner) {
+		let derived = |path: &str| derives.iter().any(|existing| existing.paths.iter().any(|(other, _)| other == path));
+		let (already, new): (Vec<_>, Vec<_>) = derive.paths.iter().partition(|(path, _)| derived(path));
+		let new: Vec<&str> = new.iter().map(|(_, written)| written.as_str()).collect();
+
+		if !new.is_empty() {
+			let separator = if last.paths.is_empty() { "" } else { ", " };
+
+			region.apply(vec![(TextRange::new(last.end, last.end), format!("{separator}{}", new.join(", ")))]);
+		}
+
+		let already: Vec<String> = already.iter().map(|(_, written)| format!("`{written}`")).collect();
+
+		return Ok((!already.is_empty()).then(|| format!("`{path}` already derives {}", already.join(", "))));
+	}
 
 	if let Some(existing) = (prefix.attributes.iter()).find(|existing| existing.inner == inner && existing.meta == attribute.meta) {
 		return Err(Error::InvalidSource(format!(
@@ -532,7 +602,7 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 	};
 
 	region.apply(vec![edit]);
-	Ok(())
+	Ok(None)
 }
 
 /// Parses an attribute to remove (see [`ItemEdit::remove_attributes`]); must run on a parsing thread.
@@ -927,6 +997,7 @@ fn new_attribute(text: &str) -> Result<NewAttribute, Error> {
 	}
 
 	Ok(NewAttribute {
+		derive: Derive::of(&attribute, &bracketed),
 		text: bracketed,
 		inner,
 		meta: attribute.meta.to_token_stream().to_string(),
@@ -989,7 +1060,8 @@ fn parse_prefix(text: &str, offset: usize, module_file: bool) -> Result<Prefix, 
 		Ok((attributes, next, visibility))
 	};
 
-	let (attributes, next, visibility) = parser.parse_str(&text[skipped..]).map_err(|error| error.to_string())?;
+	let parsed = &text[skipped..];
+	let (attributes, next, visibility) = parser.parse_str(parsed).map_err(|error| error.to_string())?;
 	let shift = |range: std::ops::Range<usize>| TextRange::new(range.start + offset + skipped, range.end + offset + skipped);
 
 	Ok(Prefix {
@@ -1000,6 +1072,10 @@ fn parse_prefix(text: &str, offset: usize, module_file: bool) -> Result<Prefix, 
 				doc: attribute.path().is_ident("doc") && matches!(attribute.meta, Meta::NameValue(_)),
 				path: attribute.path().to_token_stream().to_string(),
 				meta: attribute.meta.to_token_stream().to_string(),
+				derive: Derive::of(attribute, parsed).map(|derive| Derive {
+					end: shift(derive.end..derive.end).start,
+					..derive
+				}),
 			})
 			.collect(),
 		visibility: match visibility {
@@ -1089,7 +1165,7 @@ fn plan_item<'ws>(
 	}
 
 	for attribute in &checked.add {
-		add_attribute(&mut plan.regions, attribute, path)?;
+		plan.notes.extend(add_attribute(&mut plan.regions, attribute, path)?);
 	}
 
 	if let Some(lines) = &checked.doc {
@@ -1841,6 +1917,34 @@ mod tests {
 		assert_eq!(deleted(&["#[a]"]), [("\t#[a]\n", Shape::Lines)]);
 		assert_eq!(deleted(&["#[b]", "#[c]"]), [("#[b] #[c]  ", Shape::BeforeCode)]);
 		assert_eq!(deleted(&["/// e"]), [(" /// e", Shape::AfterCode)]);
+	}
+
+	#[test]
+	fn reads_derived_traits() {
+		let text = "#[derive()]\n#[derive(Debug, serde::Serialize,)]\n#[allow(unused)]\nstruct S;";
+		let prefix = isolated(|| parse_prefix(text, 0, false)).unwrap();
+		let derive = |index: usize| prefix.attributes[index].derive.clone();
+
+		assert_eq!(
+			derive(0),
+			Some(Derive {
+				paths: Vec::new(),
+				end: text.find(')').unwrap(),
+			})
+		);
+
+		let derive = derive(1).unwrap();
+
+		assert_eq!(
+			derive.paths,
+			[
+				("Debug".to_owned(), "Debug".to_owned()),
+				("serde :: Serialize".to_owned(), "serde::Serialize".to_owned())
+			]
+		);
+		assert!(text[..derive.end].ends_with("serde::Serialize"));
+		assert_eq!(prefix.attributes[2].derive, None);
+		assert_eq!(isolated(|| new_attribute("derive(Eq)")).unwrap().derive.unwrap().paths, [("Eq".to_owned(), "Eq".to_owned())]);
 	}
 
 	#[test]

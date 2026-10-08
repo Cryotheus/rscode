@@ -1422,6 +1422,17 @@ mod inner;
 			"`fixture::Shape::name` already has the attribute `#[allow(unused)]`"
 		);
 
+		// the traits of a `derive` join the item's `derive`, but those that it derives already
+		let plan = attributes("crate::Shape", &["derive(Clone, PartialEq)"], &[]).unwrap();
+
+		assert_eq!(super::edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("(Debug, Clone)", "(Debug, Clone, PartialEq)"));
+		assert_eq!(plan.notes, ["`fixture::Shape` already derives `Clone`"]);
+
+		let plan = attributes("crate::Shape", &["#[derive(Debug)]"], &[]).unwrap();
+
+		assert!(plan.spans.is_empty() && changes(&dir, &plan.edits).is_empty());
+		assert_eq!(plan.notes, ["`fixture::Shape` already derives `Debug`"]);
+
 		// inner attributes of crate roots and module files
 		assert_eq!(
 			edited(attributes("crate", &["allow(dead_code)"], &[]), "src/lib.rs"),
