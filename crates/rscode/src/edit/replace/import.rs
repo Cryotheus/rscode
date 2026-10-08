@@ -14,6 +14,7 @@ use crate::edit::TextEdit;
 use crate::edit::describe;
 use crate::edit::trivia;
 use crate::edit::trivia::Placement;
+use crate::edit::trivia::Spacing;
 use crate::model::ImportInfo;
 use crate::model::ItemId;
 use crate::model::ItemKind;
@@ -55,10 +56,10 @@ pub struct AddedImport {
 /// What the edits of [`add_imports`] are planned with.
 #[derive(Clone, Copy)]
 struct Context<'a, 'ws> {
-	ws: &'ws Workspace,
 	target: &'a super::Target<'ws>,
 	leaves: &'a [Leaf],
 	uses: &'a [UseItem],
+	siblings: &'a Siblings,
 	style_edition: StyleEdition,
 }
 
@@ -264,6 +265,28 @@ impl Merging<'_> {
 		Some((end..end, inserted))
 	}
 
+	/// Whether `element` of `group`, with the text at `range` of the item replaced by `replacement`, still sorts among
+	/// the other elements (where it did).
+	fn sorts_in(&self, group: &syn::UseGroup, element: &UseTree, range: &Range<usize>, replacement: &str) -> bool {
+		let span = element.span().byte_range();
+		let text = format!("{}{replacement}{}", &self.item[span.start..range.start], &self.item[range.end..span.end]);
+		let Ok(new) = syn::parse_str::<UseTree>(&text) else {
+			return false;
+		};
+
+		let elements: Vec<&UseTree> = group.items.iter().collect();
+		let Some(index) = elements.iter().position(|&other| std::ptr::eq(other, element)) else {
+			return false;
+		};
+
+		let after = |a: &UseTree, b: &UseTree| rscode_sort::use_tree_cmp(a, b, self.style_edition) == Ordering::Greater;
+		let previous = index.checked_sub(1).map(|previous| elements[previous]);
+		let next = elements.get(index + 1).copied();
+
+		previous.is_none_or(|previous| !after(previous, &new) || after(previous, element))
+			&& next.is_none_or(|next| !after(&new, next) || after(element, next))
+	}
+
 	/// The edit merging `leaf` (from its segment `depth`) into `tree`.
 	fn walk(&self, tree: &UseTree, leaf: &Leaf, depth: usize) -> Option<(Range<usize>, String)> {
 		let segment = leaf.segments.get(depth).map(|segment| unraw(segment));
@@ -281,16 +304,22 @@ impl Merging<'_> {
 				self.walk(&path.tree, &module, depth + 1)
 			}
 
+			// into the element that shares the most segments with the leaf, unless that changes how it sorts among the
+			// others: the leaf is then an element of its own
 			UseTree::Group(group) => {
-				let next = group.items.iter().find(|element| match element {
-					UseTree::Path(path) => same(&path.ident, segment),
-					UseTree::Name(name) => same(&name.ident, segment),
-					_ => false,
-				});
+				let next = (group.items.iter())
+					.filter(|element| shared_segments(element, leaf, depth) > 0)
+					.min_by_key(|element| std::cmp::Reverse(shared_segments(element, leaf, depth)));
 
-				match next {
-					Some(element) => self.walk(element, leaf, depth),
-					None => self.insert(group, &leaf.tree(depth)),
+				let Some(element) = next else {
+					return self.insert(group, &leaf.tree(depth));
+				};
+
+				let (range, replacement) = self.walk(element, leaf, depth)?;
+
+				match self.sorts_in(group, element, &range, &replacement) {
+					true => Some((range, replacement)),
+					false => self.insert(group, &leaf.tree(depth)),
 				}
 			}
 
@@ -320,8 +349,8 @@ impl Merging<'_> {
 	}
 }
 
-/// Where the module of an import is from, for modules that group their imports by it.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Where the module of an import is from, for modules that group their imports by it (in the order of the groups).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum Origin {
 	/// The standard library (`std`, `core`, `alloc`, ...).
 	Std,
@@ -364,12 +393,16 @@ struct UseItem {
 /// `std::fs`, `crate::a::{B, C}`, `x::Y as Z`, `m::*`, `pub use a::B`. Every leaf of the trees is one import.
 ///
 /// What the module imports already (by the same path and name, with the same visibility) is left as it is
-/// ([`ImportOutcome::Present`]). The other imports follow the module's import granularity:
+/// ([`ImportOutcome::Present`]). The other imports follow the module's import granularity, as its `use` items of the
+/// import's visibility show it:
 /// - with one import per `use` item (or no `use` items), each gets a `use` item of its own, where `cargo rscode sort`
 ///   puts it: among the `use` items (or re-exports) in order, on consecutive lines like theirs (see [`super::insert`]),
 ///   or, when blank lines group them by where their paths are from (the standard library, other crates, the crate
-///   itself, like rustfmt's `group_imports = "StdExternalCrate"`), in order in its group;
-/// - with one `use` item per module, an import from a module that a `use` item has imports from is merged into it;
+///   itself, like rustfmt's `group_imports = "StdExternalCrate"`), in order in its group (or in a group of its own
+///   where its origin goes);
+/// - with one `use` item per module, an import from a module that a `use` item has several imports from is merged
+///   into it (and into one with a single import only when no module has several `use` items, and the modules of
+///   those with one import and those with several do not contain each other);
 /// - with `use` items of several modules, an import is merged into the `use` item that shares the longest path
 ///   prefix with it.
 ///
@@ -378,8 +411,8 @@ struct UseItem {
 ///
 /// `use` items with attributes (or `cfg`s) and of other visibilities take no imports. Merged imports go into the
 /// `{}` groups in the order rustfmt sorts them, and an import that diverges from a path of the item turns it into a
-/// group (`use std::fs;` with `std::io` becomes `use std::{fs, io};`). Imports that cannot be merged get `use` items
-/// of their own.
+/// group (`use std::fs;` with `std::io` becomes `use std::{fs, io};`). Imports that cannot be merged, or whose `use`
+/// item would then sort elsewhere, get `use` items of their own.
 ///
 /// Fails with [`Error::InvalidSource`] for an import that is not a `use` tree (or has attributes), with
 /// [`Error::Collision`] when a new import binds a name the module binds otherwise (unless [`ImportOptions::force`];
@@ -449,13 +482,13 @@ pub fn add_imports(
 	check_collisions(resolver, &target, &new_leaves, options)?;
 
 	let style_edition = order::style_edition(ws, &target);
+	let siblings = Siblings::of(ws, &target, style_edition);
 	let line_ending = trivia::line_ending(file.text());
-	let granularity = granularity(&uses);
 	let mut merged: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
 	let mut lines: Vec<usize> = Vec::new();
 
 	for &index in &new {
-		match merge_target(&uses, &leaves[index], granularity) {
+		match merge_target(&uses, &leaves[index]) {
 			Some(use_index) => merged.entry(use_index).or_default().push(index),
 			None => lines.push(index),
 		}
@@ -474,7 +507,11 @@ pub fn add_imports(
 		let mut done = Vec::new();
 
 		for &index in indices {
-			match merge(&text, &leaves[index], style_edition, line_ending) {
+			// (where the merged item would sort elsewhere, sorting would move it)
+			let merged = merge(&text, &leaves[index], style_edition, line_ending)
+				.filter(|merged| siblings.keeps_order(use_item.range, &order::item_order(merged, style_edition)));
+
+			match merged {
 				Some(merged) => {
 					text = merged;
 					done.push(index);
@@ -496,10 +533,10 @@ pub fn add_imports(
 
 	if !lines.is_empty() {
 		let cx = Context {
-			ws,
 			target: &target,
 			leaves: &leaves,
 			uses: &uses,
+			siblings: &siblings,
 			style_edition,
 		};
 
@@ -592,7 +629,7 @@ fn display(leaf: &Leaf) -> String {
 }
 
 /// The granularity the `use` items show (see [`Granularity`]).
-fn granularity(uses: &[UseItem]) -> Granularity {
+fn granularity(uses: &[&UseItem]) -> Granularity {
 	if uses.iter().all(|use_item| use_item.paths.len() <= 1) {
 		return Granularity::Item;
 	}
@@ -605,10 +642,16 @@ fn granularity(uses: &[UseItem]) -> Granularity {
 
 /// Where a `use` item for `leaf` (of the order `order`) goes in a module that groups its `use` items by origin into
 /// runs that blank lines separate (the standard library, other crates, then the crate itself, as with rustfmt's
-/// `group_imports = "StdExternalCrate"`): in order in the run of its origin. `None` when the module does not group
-/// them so, or has no run of that origin (sorting then decides).
-fn grouped_placement(siblings: &Siblings, uses: &[UseItem], leaf: &Leaf, order: &ItemOrder) -> Option<Placement> {
-	let runs = siblings.runs(order);
+/// `group_imports = "StdExternalCrate"`), and how it is spaced there: in order in the run of its origin, which it
+/// joins without blank lines; or, when no run has its origin and the runs are in the order of their origins, as a run
+/// of its own where its origin goes. `None` when the module does not group them so (sorting then decides).
+fn grouped_placement(
+	siblings: &Siblings,
+	uses: &[UseItem],
+	leaf: &Leaf,
+	order: &ItemOrder,
+) -> Option<(Placement, Spacing)> {
+	let mut runs = siblings.runs(order);
 
 	if runs.len() < 2 {
 		return None;
@@ -634,13 +677,44 @@ fn grouped_placement(siblings: &Siblings, uses: &[UseItem], leaf: &Leaf, order: 
 	}
 
 	let leaf_origin = origin(leaf.segments.first().map(String::as_str).or_else(|| leaf.names().first().copied()));
-	let run = origins.iter().position(|&origin| origin == leaf_origin)?;
 
-	siblings.placement_in(&runs[run], order)
+	if let Some(run) = origins.iter().position(|&origin| origin == leaf_origin) {
+		let run = runs.swap_remove(run);
+		let placement = siblings.placement_in(&run, order)?;
+
+		return Some((placement, siblings.spacing_in(placement, &run)));
+	}
+
+	if !origins.windows(2).all(|pair| pair[0] < pair[1]) {
+		return None;
+	}
+
+	let placement = match origins.iter().position(|&origin| origin > leaf_origin) {
+		Some(later) => Placement::Before(siblings.range(*runs[later].first()?)),
+		None => Placement::After(siblings.range(*runs.last()?.last()?)),
+	};
+
+	Some((placement, Spacing::default()))
+}
+
+/// Whether the `use` items of a module of [`Granularity::Module`] clearly keep one item per module, so that an import
+/// may turn an item of one import into a group: no module has several items, and the modules of the items of one
+/// import and of those of several do not contain each other (`use std::fs;` next to `use std::io::{self, Write};` is
+/// as likely to be one import per item, with a group where it reads better).
+fn groups_by_module(uses: &[&UseItem]) -> bool {
+	let module = |use_item: &&UseItem| use_item.modules.first().cloned().unwrap_or_default();
+	let (groups, singles): (Vec<&UseItem>, Vec<&UseItem>) = uses.iter().partition(|use_item| use_item.paths.len() > 1);
+	let nested = |a: &[String], b: &[String]| a.starts_with(b) || b.starts_with(a);
+	let mut modules: Vec<Vec<String>> = uses.iter().map(module).collect();
+
+	modules.sort();
+
+	modules.windows(2).all(|pair| pair[0] != pair[1])
+		&& (singles.iter()).all(|single| groups.iter().all(|group| !nested(&module(single), &module(group))))
 }
 
 /// Inserts `use` items for the leaves of `lines`, where sorting puts them (several at one place as one block, in
-/// order).
+/// order, with a blank line between items of different groups, such as `use` and `pub use` items).
 fn insert_lines(
 	cx: &Context<'_, '_>,
 	lines: &[usize],
@@ -648,10 +722,10 @@ fn insert_lines(
 	placed: &mut Vec<(usize, ImportOutcome, Place)>,
 ) -> Result<(), Error> {
 	let Context {
-		ws,
 		target,
 		leaves,
 		uses,
+		siblings,
 		style_edition,
 	} = *cx;
 	let text = target.file.text();
@@ -662,14 +736,13 @@ fn insert_lines(
 
 	ordered.sort_by(|(_, a), (_, b)| a.compare(b).unwrap_or(Ordering::Equal));
 
-	let siblings = Siblings::of(ws, target, style_edition);
 	let indent = trivia::body_indent(text, target.body);
 
 	// the leaves for each place, in order
 	let mut places: Vec<(Placement, Vec<(usize, ItemOrder)>)> = Vec::new();
 
 	for (index, order) in ordered {
-		let placement = (grouped_placement(&siblings, uses, &leaves[index], &order))
+		let placement = (grouped_placement(siblings, uses, &leaves[index], &order).map(|(placement, _)| placement))
 			.or_else(|| siblings.sorted_placement(&order))
 			.unwrap_or(Placement::End(target.body));
 
@@ -680,16 +753,35 @@ fn insert_lines(
 	}
 
 	for (placement, group) in places {
-		let source: Vec<String> = group.iter().map(|&(index, _)| leaves[index].item()).collect();
-		let orders: Vec<ItemOrder> = group.iter().map(|(_, order)| order.clone()).collect();
-		let spacing = siblings.spacing(placement, Some(&orders));
-		let edit = trivia::insertion(text, placement, &source.join("\n"), &indent, spacing);
+		let mut source = String::new();
+
+		for (position, (index, order)) in group.iter().enumerate() {
+			if let Some((_, previous)) = position.checked_sub(1).map(|previous| &group[previous]) {
+				source.push_str(if order.same_group(previous) { "\n" } else { "\n\n" });
+			}
+
+			source.push_str(&leaves[*index].item());
+		}
+
+		// spaced like the run of their origin, or the first items like their group above, the last ones like theirs
+		// below
+		let ((first, first_order), (_, last_order)) = (&group[0], &group[group.len() - 1]);
+		let spacing = match grouped_placement(siblings, uses, &leaves[*first], first_order) {
+			Some((_, spacing)) => spacing,
+
+			None => Spacing {
+				compact_above: siblings.spacing(placement, Some(std::slice::from_ref(first_order))).compact_above,
+				compact_below: siblings.spacing(placement, Some(std::slice::from_ref(last_order))).compact_below,
+			},
+		};
+		let edit = trivia::insertion(text, placement, &source, &indent, spacing);
 		let mut from = 0;
 
-		for (&(index, _), item) in group.iter().zip(&source) {
+		for (index, _) in &group {
+			let item = leaves[*index].item();
 			let within = edit.replacement[from..].find(item.as_str()).map_or(from, |offset| from + offset);
 
-			placed.push((index, ImportOutcome::Added, Place::Inserted(edits.len(), within)));
+			placed.push((*index, ImportOutcome::Added, Place::Inserted(edits.len(), within)));
 			from = within + item.len();
 		}
 
@@ -745,21 +837,29 @@ fn merge(item: &str, leaf: &Leaf, style_edition: StyleEdition, line_ending: &str
 	})
 }
 
-/// The `use` item that `leaf` merges into, by its index in `uses`, if any.
-fn merge_target(uses: &[UseItem], leaf: &Leaf, granularity: Granularity) -> Option<usize> {
+/// The `use` item that `leaf` merges into, by its index in `uses`, if any: as the granularity of the items that may
+/// take it (those of its visibility without attributes) has it.
+fn merge_target(uses: &[UseItem], leaf: &Leaf) -> Option<usize> {
 	let module: Vec<String> = leaf.module().iter().map(|segment| unraw(segment).to_owned()).collect();
 	let names = leaf.names();
+	let mergeable: Vec<&UseItem> = (uses.iter())
+		.filter(|use_item| use_item.mergeable && compact(&use_item.vis) == compact(&leaf.vis))
+		.collect();
 	let candidates = (uses.iter().enumerate())
 		.filter(|(_, use_item)| use_item.mergeable && use_item.leading_colon == leaf.leading_colon)
 		.filter(|(_, use_item)| compact(&use_item.vis) == compact(&leaf.vis));
 
-	match granularity {
+	match granularity(&mergeable) {
 		Granularity::Item => None,
 
 		Granularity::Module if module.is_empty() => None,
-		Granularity::Module => (candidates.filter(|(_, use_item)| use_item.modules.contains(&module)))
-			.map(|(index, _)| index)
-			.next(),
+		Granularity::Module => {
+			let groups_singles = groups_by_module(&mergeable);
+
+			(candidates.filter(|(_, use_item)| use_item.modules.contains(&module)))
+				.find(|(_, use_item)| use_item.paths.len() > 1 || groups_singles)
+				.map(|(index, _)| index)
+		}
 
 		// the item with the longest shared prefix, and of those, the one with the most imports sharing it
 		Granularity::Crate => {
@@ -937,6 +1037,21 @@ fn path_of_bare_name(resolver: &Resolver<'_>, module: ItemId, leaf: &Leaf) -> Re
 		segments,
 		last: Last::Name(last, alias.clone()),
 	}))
+}
+
+/// How many segments of `leaf` from its segment `depth` on a path of `tree` starts with.
+fn shared_segments(tree: &UseTree, leaf: &Leaf, depth: usize) -> usize {
+	let same = |ident: &syn::Ident| leaf.segments.get(depth).is_some_and(|segment| ident.unraw() == unraw(segment));
+
+	match tree {
+		UseTree::Path(path) if same(&path.ident) => 1 + shared_segments(&path.tree, leaf, depth + 1),
+		UseTree::Name(name) if same(&name.ident) => 1,
+		UseTree::Group(group) => (group.items.iter())
+			.map(|element| shared_segments(element, leaf, depth))
+			.max()
+			.unwrap_or(0),
+		_ => 0,
+	}
 }
 
 /// A name without `r#`.

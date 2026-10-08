@@ -88,6 +88,42 @@ impl Siblings {
 			.is_some_and(|item| item.plain && new.is_compact() && item.order.same_group(new))
 	}
 
+	/// Whether the sibling at `range`, with the order `new` instead of its own, still sorts among its neighbors
+	/// (where it did): `cargo rscode sort` would not move it.
+	pub(super) fn keeps_order(&self, range: TextRange, new: &ItemOrder) -> bool {
+		let Some(index) = self.index_of(range) else {
+			return true;
+		};
+
+		let old = &self.items[index].order;
+		let after = |a: &ItemOrder, b: &ItemOrder| a.compare(b) == Some(std::cmp::Ordering::Greater);
+		let previous = index.checked_sub(1).map(|previous| &self.items[previous].order);
+		let next = self.items.get(index + 1).map(|next| &next.order);
+
+		previous.is_none_or(|previous| !after(previous, new) || after(previous, old))
+			&& next.is_none_or(|next| !after(new, next) || after(old, next))
+	}
+
+	/// The siblings above and below new items placed at `placement` (by index); `None` when it is not next to a
+	/// sibling.
+	fn neighbors(&self, placement: Placement) -> Option<(Option<usize>, Option<usize>)> {
+		match placement {
+			Placement::After(range) => {
+				let index = self.index_of(range)?;
+
+				Some((Some(index), Some(index + 1).filter(|&next| next < self.items.len())))
+			}
+
+			Placement::Before(range) => {
+				let index = self.index_of(range)?;
+
+				Some((index.checked_sub(1), Some(index)))
+			}
+
+			Placement::End(_) => None,
+		}
+	}
+
 	/// Where a new item of the order `new` goes among the siblings of `run` (indices, in order): before the first
 	/// that sorts after it, else after the last.
 	pub(super) fn placement_in(&self, run: &[usize], new: &ItemOrder) -> Option<Placement> {
@@ -142,18 +178,8 @@ impl Siblings {
 			return Spacing::default();
 		}
 
-		let (above, below) = match placement {
-			Placement::After(range) => match self.index_of(range) {
-				Some(index) => (Some(index), Some(index + 1).filter(|&next| next < self.items.len())),
-				None => return Spacing::default(),
-			},
-
-			Placement::Before(range) => match self.index_of(range) {
-				Some(index) => (index.checked_sub(1), Some(index)),
-				None => return Spacing::default(),
-			},
-
-			Placement::End(_) => return Spacing::default(),
+		let Some((above, below)) = self.neighbors(placement) else {
+			return Spacing::default();
 		};
 
 		let runs = self.runs(first);
@@ -175,6 +201,19 @@ impl Siblings {
 			compact_below: !spaced && joins_anchor(below),
 		}
 	}
+
+	/// The spacing of new one-line items placed at `placement` in `run` (see [`Siblings::runs`]): no blank line next to
+	/// the members of the run, blank lines next to other siblings.
+	pub(super) fn spacing_in(&self, placement: Placement, run: &[usize]) -> Spacing {
+		let Some((above, below)) = self.neighbors(placement) else {
+			return Spacing::default();
+		};
+
+		Spacing {
+			compact_above: above.is_some_and(|above| run.contains(&above)),
+			compact_below: below.is_some_and(|below| run.contains(&below)),
+		}
+	}
 }
 
 /// Whether an item has outer attributes (or doc comments), by its first token.
@@ -182,6 +221,11 @@ fn has_attributes(item: &impl quote::ToTokens) -> bool {
 	let tokens = item.to_token_stream();
 
 	matches!(tokens.into_iter().next(), Some(proc_macro2::TokenTree::Punct(punct)) if punct.as_char() == '#')
+}
+
+/// The order of a module item, from its source (see [`order_of`]).
+pub(super) fn item_order(source: &str, style_edition: StyleEdition) -> ItemOrder {
+	crate::source::isolated(|| order_of(source, Container::Module, style_edition))
 }
 
 /// The orders of the items of `source` (for `container`), when each is on a line of its own without attributes and

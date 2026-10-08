@@ -3234,6 +3234,18 @@ mod inline {
 		let addition = import(&ws, "crate::a", &["std::fmt"]).unwrap();
 
 		assert_eq!(edited(&dir, &addition.edits, "src/a.rs"), format!("use std::fmt;\n\n{}", ITEMS[1].1));
+
+		// imports of several groups at one place: a blank line between the groups
+		let imports = ["pub use std::fmt", "std::fs", "pub(crate) use std::io", "std::env"];
+		let addition = import(&ws, "crate::a", &imports).unwrap();
+		let text = sorted(edited(&dir, &addition.edits, "src/a.rs"));
+		let added = "use std::env;\nuse std::fs;\n\npub use std::fmt;\npub(crate) use std::io;\n\n";
+
+		assert_eq!(text, format!("{added}{}", ITEMS[1].1));
+		assert_eq!(
+			outcomes(&addition),
+			["+ pub use std::fmt 4", "+ std::fs 2", "+ pub(crate) use std::io 5", "+ std::env 1"]
+		);
 	}
 
 	/// In modules that group their `use` items by where the paths are from, imports go into their group.
@@ -3262,6 +3274,31 @@ mod a;
 
 			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace(old, new), "{import}");
 		}
+
+		// a group of one item takes more without blank lines; an origin without a group gets one where it goes
+		let lib = "use std::fmt;\n\nuse crate::a::B;\n\nmod a;\n";
+		let files = [("src/lib.rs", lib), ("src/a.rs", "pub struct B;\npub struct C;\n")];
+		let dir = TempDir::with_files("import-origins-one", &files);
+		let ws = load(&dir);
+
+		for (import, old, new) in [
+			("std::io", "use std::fmt;\n", "use std::fmt;\nuse std::io;\n"),
+			("crate::a::C", "use crate::a::B;\n", "use crate::a::B;\nuse crate::a::C;\n"),
+			("serde::Serialize", "use std::fmt;\n\n", "use std::fmt;\n\nuse serde::Serialize;\n\n"),
+		] {
+			let addition = self::import(&ws, "crate", &[import]).unwrap();
+
+			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace(old, new), "{import}");
+		}
+
+		let lib = "use std::fmt;\n\nuse serde::Serialize;\n\nmod a;\n";
+		let dir = TempDir::with_files("import-origins-last", &[("src/lib.rs", lib), ("src/a.rs", "pub struct B;\n")]);
+		let addition = self::import(&load(&dir), "crate", &["crate::a::B"]).unwrap();
+
+		assert_eq!(
+			edited(&dir, &addition.edits, "src/lib.rs"),
+			lib.replace("Serialize;\n", "Serialize;\n\nuse crate::a::B;\n")
+		);
 
 		// without such groups, sorting decides
 		let lib = "use std::fmt;\n\nuse crate::a::B;\nuse serde::Serialize;\n\nmod a;\n";
@@ -3409,6 +3446,78 @@ mod c;
 			let addition = import(&ws, "crate", imports).unwrap();
 
 			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace("use std::fs;", new), "{imports:?}");
+		}
+	}
+
+	/// Only modules that clearly keep one `use` item per module turn a `use` item of one import into a group: one
+	/// import per item next to a group (or to a re-export of several) takes new `use` items.
+	#[test]
+	fn keeps_one_import_per_item_next_to_groups() {
+		let cases: &[(&str, &[&str], &str)] = &[
+			(
+				"use std::collections::HashMap;\nuse std::fs;\nuse std::io::{self, Write};\nuse std::path::Path;\n",
+				&["std::fmt", "std::collections::BTreeMap", "std::env"],
+				"use std::collections::BTreeMap;\nuse std::collections::HashMap;\nuse std::env;\nuse std::fmt;\n\
+				 use std::fs;\nuse std::io::{self, Write};\nuse std::path::Path;\n",
+			),
+			(
+				"mod a;\n\nuse std::fs;\nuse std::io;\n\npub use a::{B, C};\n",
+				&["std::fmt", "std::path::Path"],
+				"mod a;\n\nuse std::fmt;\nuse std::fs;\nuse std::io;\nuse std::path::Path;\n\npub use a::{B, C};\n",
+			),
+			(
+				"mod a;\n\nuse crate::a::{B, C};\nuse std::fs;\n",
+				&["std::io"],
+				"mod a;\n\nuse crate::a::{B, C};\nuse std::{fs, io};\n",
+			),
+		];
+
+		for &(lib, imports, expected) in cases {
+			let files = [("src/lib.rs", lib), ("src/a.rs", "pub struct B;\npub struct C;\n")];
+			let dir = TempDir::with_files("import-granularity", &files);
+			let addition = import(&load(&dir), "crate", imports).unwrap();
+
+			assert_eq!(sorted(edited(&dir, &addition.edits, "src/lib.rs")), expected, "{imports:?}");
+		}
+	}
+
+	/// Merged `use` items, and the elements of their groups, stay where sorting puts them: otherwise the import gets
+	/// an item or element of its own.
+	#[test]
+	fn merges_where_the_order_stays() {
+		let a = "\
+pub fn k() {}
+
+pub mod m {
+	pub struct X;
+	pub struct Y;
+	pub struct Z;
+}
+
+pub mod n {
+	pub struct Z;
+}
+";
+		let cases: &[(&str, &str, &str, &str)] = &[
+			// `use std::{fmt, io::{Read, Write}};` would sort after `use std::path::Path;`
+			(
+				"use crate::{a::m::X, a::n::Z};\nuse std::fs;\nuse std::io::{Read, Write};\nuse std::path::Path;\n",
+				"std::fmt",
+				"use std::fs;",
+				"use std::fmt;\nuse std::fs;",
+			),
+			// into the element that shares the most with it
+			("use crate::{a::k, a::m::X};\n", "crate::a::m::Y", "a::m::X}", "a::m::{X, Y}}"),
+			// `a::m::{X, Y}` would sort after `a::m::Z`
+			("use crate::{a::m::X, a::m::Z};\n", "crate::a::m::Y", "a::m::X, ", "a::m::X, a::m::Y, "),
+		];
+
+		for &(lib, import, old, new) in cases {
+			let lib = format!("mod a;\n\n{lib}");
+			let dir = TempDir::with_files("import-order", &[("src/lib.rs", &lib), ("src/a.rs", a)]);
+			let addition = self::import(&load(&dir), "crate", &[import]).unwrap();
+
+			assert_eq!(sorted(edited(&dir, &addition.edits, "src/lib.rs")), lib.replace(old, new), "{import}");
 		}
 	}
 
