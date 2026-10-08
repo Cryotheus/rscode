@@ -1614,6 +1614,24 @@ mod inner;
 			)
 		);
 
+		// the replacement that fits none of them, or the one that the replacements got furthest in
+		assert_eq!(
+			message(edit(&ws, "crate::variant", texts(&[("-> u8", "-> u16"), ("zzz", "y")]))),
+			"`old` number 2 (`zzz`) not found in any of the 2 items that `crate::variant` names"
+		);
+		assert_eq!(
+			message(edit(&ws, "crate::variant", texts(&[("2", "20"), ("zzz", "y")]))),
+			native("`old` number 2 (`zzz`) not found in `fixture::variant` (src/lib.rs:38-41)")
+		);
+
+		let several_dir = crate_dir("edit-variants-several", &LIB.replace("\t2\n", "\t2 * 2\n"));
+		let several = load(&several_dir);
+
+		assert_eq!(
+			message(edit(&several, "crate::variant", text("2", "3"))),
+			native("`old` occurs 2 times in `fixture::variant` (src/lib.rs:38-41), at line 40")
+		);
+
 		let all = EditItemOptions {
 			all_variants: true,
 			..EditItemOptions::default()

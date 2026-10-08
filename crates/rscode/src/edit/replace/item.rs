@@ -240,6 +240,35 @@ struct Occurrence {
 	printed: Option<(usize, usize)>,
 }
 
+/// Why [`plan_item`] failed for an item: the error, and the index of the text replacement that failed, if one did.
+#[derive(Debug)]
+struct PlanFailure {
+	error: Error,
+	replacement: Option<usize>,
+}
+
+impl PlanFailure {
+	/// How far the edit of the item got (of `replacements` text replacements): the text replacements that fit it, and
+	/// then whether more than text that the item does not have failed (text that occurs several times in it, or what
+	/// follows the text replacements).
+	fn progress(&self, replacements: usize) -> (usize, bool) {
+		match (self.replacement, &self.error) {
+			(Some(index), Error::TextMismatch { lines, .. }) => (index, !lines.is_empty()),
+			(Some(index), _) => (index, true),
+			(None, _) => (replacements, true),
+		}
+	}
+}
+
+impl From<Error> for PlanFailure {
+	fn from(error: Error) -> Self {
+		Self {
+			error,
+			replacement: None,
+		}
+	}
+}
+
 /// The attributes and the visibility of an item, as ranges of the text of its [`Region`].
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct Prefix {
@@ -721,7 +750,9 @@ fn doc_lines(doc: &str) -> Vec<String> {
 /// The item is named like for [`replace`](super::replace): imports stand for their `use` items (the text of a `use`
 /// item with other imports can be edited, but not its attributes or visibility), and when the path names several
 /// items (`cfg` variants), the one that every text replacement fits is edited, or with
-/// [`EditItemOptions::all_variants`] every one of them, or else the path is [`Error::Ambiguous`].
+/// [`EditItemOptions::all_variants`] every one of them. Without text replacements, or when they fit several, the path
+/// is [`Error::Ambiguous`]; when they fit none, the error is that of the item they got furthest in (or that the text of
+/// a replacement is in none of the items that they got as far in).
 ///
 /// Text replacements fail with [`Error::TextMismatch`] when their text does not occur in the item exactly once (the
 /// message tells where it occurs, or what comes closest). The item must still be one item of its kind afterwards
@@ -742,9 +773,9 @@ pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, opti
 
 	let plans: Vec<ItemPlan<'_>> = match items.as_slice() {
 		[] => return Err(Error::NotFound(path.to_string())),
-		[item] => vec![plan(*item)?],
+		[item] => vec![plan(*item).map_err(|failure| failure.error)?],
 		_ if options.all_variants && super::replaces_all_variants(resolver, path) => {
-			items.iter().map(|&item| plan(item)).collect::<Result<_, _>>()?
+			items.iter().map(|&item| plan(item).map_err(|failure| failure.error)).collect::<Result<_, _>>()?
 		}
 
 		_ if checked.replacements.is_empty() => return Err(super::ambiguous(resolver, path, &items, &imports)),
@@ -752,41 +783,26 @@ pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, opti
 		// the text to replace may tell them apart
 		_ => {
 			let (fitting, failed): (Vec<_>, Vec<_>) = items.iter().map(|&item| (item, plan(item))).partition(|(_, plan)| plan.is_ok());
-			let not_found = (failed.iter()).all(|(_, plan)| {
-				matches!(plan, Err(Error::TextMismatch { lines, .. }) if lines.is_empty())
-			});
+			let mut fitting: Vec<_> = fitting.into_iter().filter_map(|(item, plan)| Some((item, plan.ok()?))).collect();
 
 			match fitting.len() {
 				1 => {
-					let [(item, plan)] = <[_; 1]>::try_from(fitting).unwrap_or_else(|_| unreachable!());
+					let (item, plan) = fitting.remove(0);
 
 					notes.push(format!(
 						"of the {} items that `{path}` names, only {} has the text to replace",
 						items.len(),
 						crate::edit::describe(resolver, item)
 					));
-					vec![plan?]
+					vec![plan]
 				}
 
-				0 if not_found => {
-					// what comes closest in any of them (as the messages of their failures tell)
-					let messages = (failed.iter()).filter_map(|(_, plan)| match plan {
-						Err(Error::TextMismatch { message, .. }) => message.split_once(" not found in ").map(|(_, rest)| rest),
-						_ => None,
-					});
-					let closest = (messages.filter_map(|rest| Some((CLOSEST.iter().position(|kind| rest.contains(kind))?, rest))))
-						.min_by_key(|(rank, _)| *rank)
-						.map(|(_, rest)| format!("; the closest is in {rest}"))
-						.unwrap_or_default();
+				0 => {
+					let failures = failed.into_iter().filter_map(|(_, plan)| plan.err()).collect();
 
-					return Err(Error::TextMismatch {
-						message: format!(
-							"{} not found in any of the {} items that `{path}` names{closest}",
-							old_name(0, checked.replacements.len(), ""),
-							items.len()
-						),
-						lines: Vec::new(),
-					});
+					return Err(unfit(failures, &checked.replacements, path).unwrap_or_else(|| {
+						super::ambiguous(resolver, path, &items, &imports)
+					}));
 				}
 
 				_ => return Err(super::ambiguous(resolver, path, &items, &imports)),
@@ -1023,7 +1039,7 @@ fn plan_item<'ws>(
 	imports: &[(ItemId, ItemId)],
 	checked: &Checked,
 	options: &EditItemOptions,
-) -> Result<ItemPlan<'ws>, Error> {
+) -> Result<ItemPlan<'ws>, PlanFailure> {
 	let ws = resolver.workspace();
 	let data = ws.item(item);
 	let named = super::import_of(item, imports);
@@ -1053,7 +1069,10 @@ fn plan_item<'ws>(
 	for (index, replacement) in checked.replacements.iter().enumerate() {
 		let name = old_name(index, checked.replacements.len(), &replacement.old);
 
-		replace_text(plan.regions.text(), replacement, &name, &place)?;
+		replace_text(plan.regions.text(), replacement, &name, &place).map_err(|error| PlanFailure {
+			error,
+			replacement: Some(index),
+		})?;
 	}
 
 	if checked.is_structural() && named != item && ws.children(item).count() > 1 {
@@ -1063,7 +1082,8 @@ fn plan_item<'ws>(
 			ws.children(item).count(),
 			ws.display_path(ws.file_of(item).path()).display(),
 			ws.file_of(item).line_col(data.range.start),
-		)));
+		))
+		.into());
 	}
 
 	for (text, pattern) in &checked.remove {
@@ -1080,7 +1100,7 @@ fn plan_item<'ws>(
 
 	if let Some(visibility) = &checked.visibility {
 		if let Some(why) = without_visibility(ws, item) {
-			return Err(Error::Unsupported(format!("cannot change the visibility of `{path}`: it is {why}")));
+			return Err(Error::Unsupported(format!("cannot change the visibility of `{path}`: it is {why}")).into());
 		}
 
 		plan.notes.extend(set_visibility(&mut plan.regions, visibility.as_deref(), path)?);
@@ -1519,6 +1539,48 @@ fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize
 
 	region.text.replace_range(range.as_range(), &new);
 	Ok(())
+}
+
+/// The error for an edit with text replacements that fits none of the items a path names (one per failure), unless
+/// it is ambiguous: the failure of the item that the edit got furthest in, or that the text a replacement needs is in
+/// none of the items that it got that far in (with what comes closest in any of them).
+fn unfit(mut failures: Vec<PlanFailure>, replacements: &[TextReplacement], path: &ItemPath) -> Option<Error> {
+	let count = failures.len();
+	let furthest = failures.iter().map(|failure| failure.progress(replacements.len())).max()?;
+
+	failures.retain(|failure| failure.progress(replacements.len()) == furthest);
+
+	match (failures.len(), furthest) {
+		(1, _) => failures.pop().map(|failure| failure.error),
+
+		// (the same text replacement does not fit any of them)
+		(_, (index, false)) => {
+			// what comes closest in any of them (as the messages of their failures tell)
+			let messages = (failures.iter()).filter_map(|failure| match &failure.error {
+				Error::TextMismatch { message, .. } => message.split_once(" not found in ").map(|(_, rest)| rest),
+				_ => None,
+			});
+			let closest = (messages.filter_map(|rest| Some((CLOSEST.iter().position(|kind| rest.contains(kind))?, rest))))
+				.min_by_key(|(rank, _)| *rank)
+				.map(|(_, rest)| format!("; the closest is in {rest}"))
+				.unwrap_or_default();
+			let name = old_name(index, replacements.len(), replacements.get(index).map_or("", |replacement| &replacement.old));
+
+			Some(Error::TextMismatch {
+				message: match failures.len() == count {
+					true => format!("{name} not found in any of the {count} items that `{path}` names{closest}"),
+					false => format!(
+						"{name} not found in any of the {} items (of {count}) that `{path}` names with the text before \
+						 it{closest}",
+						failures.len()
+					),
+				},
+				lines: Vec::new(),
+			})
+		}
+
+		_ => None,
+	}
 }
 
 /// Imports stand for their `use` items: the items to edit, and the imports named for `use` items.
