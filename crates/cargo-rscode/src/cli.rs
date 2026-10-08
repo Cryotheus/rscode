@@ -154,15 +154,16 @@ One server for several workspaces: the project's own, one more to edit, and refe
 
 #[cfg(feature = "mcp")]
 const MCP_LONG_ABOUT: &str = "\
-Serve rscode's operations (workspace info, find, view, rename, remove, replace, insert, format) as tools over the \
-Model Context Protocol, on stdin and stdout.
+Serve rscode's operations (workspace info, find, view, references, rename, remove, replace, edit, insert, create \
+module, add import, format) as tools over the Model Context Protocol, on stdin and stdout.
 
 The workspace options given here are the server's defaults (tools can narrow the package selection per call). The \
 workspace is loaded anew for every tool call, so changes made by other tools are always seen, and every edit is \
 validated to still parse before anything is written.
 
 With --expose, clients can also attach other workspaces and packages at runtime, by the path of their Cargo.toml and \
-a name of their choice, and then work on them by that name. Names are only known to the client that attached them.";
+a name of their choice, and then work on them by that name (or by default, after use_source). Names are only known to \
+the client that attached them.";
 
 /// `insert --position` values.
 pub(crate) const POSITIONS: &[&str] = &["start", "end", "before", "after"];

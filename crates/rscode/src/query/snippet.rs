@@ -319,6 +319,11 @@ impl Snippet {
 		}
 	}
 
+	/// Whether the lines that come from the file are its consecutive lines from line `first` on.
+	pub(super) fn is_consecutive_from(&self, first: usize) -> bool {
+		(self.lines.iter().filter_map(|line| line.number)).zip(first..).all(|(number, expected)| number == expected)
+	}
+
 	/// The lines joined with `\n` (no line break at the end), each prefixed with its line number (right-aligned, then
 	/// ` │ `) if `line_numbers` is set.
 	pub(super) fn render(&self, line_numbers: bool) -> String {

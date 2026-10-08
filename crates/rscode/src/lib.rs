@@ -76,6 +76,7 @@ pub use pattern::MatchOptions;
 pub use pattern::PathPattern;
 pub use query::Find;
 pub use query::FindMatch;
+pub use query::LineNumbers;
 pub use query::View;
 pub use query::ViewMode;
 pub use resolve::Resolver;

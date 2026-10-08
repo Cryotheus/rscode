@@ -719,7 +719,8 @@ impl ViewArgs {
 			options: ViewOptions {
 				mode,
 				docs: !matches.flag("no-docs"),
-				line_numbers: matches.flag("line-numbers"),
+				line_numbers: matches.flag("line-numbers").into(),
+				imports: true,
 				impls: matches.flag("impls"),
 				active_only: matches.flag("active-only"),
 			},
@@ -893,6 +894,7 @@ pub(crate) fn target_selection(matches: &ArgMatches) -> TargetSelection {
 mod tests {
 	use super::*;
 	use crate::cli::cli;
+	use rscode::LineNumbers;
 
 	#[test]
 	fn a_bare_bin_lists_the_binaries() {
@@ -1629,7 +1631,8 @@ mod tests {
 
 		assert_eq!(args.paths, ["a", "b::c"]);
 		assert_eq!(args.options.mode, ViewMode::Auto);
-		assert!(args.options.docs && !args.options.line_numbers && !args.options.impls && !args.options.active_only);
+		assert!(args.options.docs && args.options.imports && !args.options.impls && !args.options.active_only);
+		assert_eq!(args.options.line_numbers, LineNumbers::Never);
 
 		let args = ViewArgs::from_matches(&parse(&[
 			"cargo-rscode",
@@ -1643,7 +1646,8 @@ mod tests {
 		]));
 
 		assert_eq!(args.options.mode, ViewMode::Outline);
-		assert!(!args.options.docs && args.options.line_numbers && args.options.impls && args.options.active_only);
+		assert!(!args.options.docs && args.options.impls && args.options.active_only);
+		assert_eq!(args.options.line_numbers, LineNumbers::Always);
 		assert_eq!(
 			ViewArgs::from_matches(&parse(&["cargo-rscode", "view", "a", "--full"])).options.mode,
 			ViewMode::Full

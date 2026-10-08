@@ -7,7 +7,7 @@
 //! |---|---|
 //! | `workspace_info` | packages (with features), crates, and load problems |
 //! | `find_items` | items whose paths match a glob pattern (`*`, `**`), one line each, with locations and `cfg`s |
-//! | `view_items` | the source (or an outline) of items by path, with line numbers |
+//! | `view_items` | the source (or an outline) of items by path, numbered where its lines are not consecutive |
 //! | `find_references` | the references to an item, by file, with the item and line of code of each |
 //! | `rename_item` | renames an item and updates the references to it across the workspace |
 //! | `remove_items` | removes items with their attached comments (and out-of-line module files) |
@@ -26,6 +26,11 @@
 //! `all_targets`, `lib`, and `bin`, which adjust the server's [`LoadOptions`] for that call (and `attached`, see
 //! [Sources](#sources)). Editing tools accept `dry_run` (`check` for `format_items`), which
 //! returns a unified diff instead of writing. With [`ServerOptions::read_only`], the editing tools are not offered.
+//!
+//! Every request carries the tool schemas, so they are kept small: they leave out `$schema`, defaults that say nothing
+//! (`false`, empty), and the selection parameters other than `packages`, and the parameters that tools share are
+//! described once in the server's instructions. A path that names nothing in the selected packages is looked up in
+//! the other workspace members when the call names no packages, and suggestions follow when it still names nothing.
 //!
 //! # Sources
 //!

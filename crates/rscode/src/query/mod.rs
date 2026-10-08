@@ -21,6 +21,7 @@ pub(crate) use snippet::multiline_strings;
 pub use suggest::Suggestions;
 pub use suggest::suggest;
 pub use view::ItemView;
+pub use view::LineNumbers;
 pub use view::View;
 pub use view::ViewMode;
 pub use view::ViewOptions;

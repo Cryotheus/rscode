@@ -414,11 +414,21 @@ fn found_text(
 	let mut text = render::find(workspace.root(), &params.pattern, &page, page_info, from.is_some());
 	let member = pattern_crate(&params.pattern).and_then(|krate| workspace.unloaded_member_with_crate(krate));
 
-	// (with matches, only when the call left the selection to the server)
-	if (total == 0 || !params.selection.names_packages())
-		&& let Some(hint) = unloaded_hint(workspace, member)
-	{
-		writeln!(text, "hint: {hint}").unwrap();
+	let unloaded: Vec<&str> = workspace.unloaded_members().iter().map(|member| member.name.as_str()).collect();
+
+	match total {
+		0 => {
+			if let Some(hint) = unloaded_hint(workspace, member) {
+				writeln!(text, "hint: {hint}").unwrap();
+			}
+		}
+
+		// (only when the call left the selection to the server)
+		_ if !unloaded.is_empty() && !params.selection.names_packages() => {
+			writeln!(text, "note: not searched: {} (members not selected; see `packages`)", unloaded.join(", ")).unwrap();
+		}
+
+		_ => {}
 	}
 
 	text.push_str(&render::load_errors_note(workspace));

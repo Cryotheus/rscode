@@ -66,6 +66,31 @@ pub struct ItemView {
 	pub impls: Vec<ItemView>,
 }
 
+/// When views prefix their lines with line numbers.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LineNumbers {
+	/// Never.
+	#[default]
+	Never,
+
+	/// Always.
+	Always,
+
+	/// Only when the lines shown are not the consecutive lines of the item (or file) from its first line on, as when
+	/// bodies are elided or doc comments left out: otherwise the first line's number tells every line's.
+	Auto,
+}
+
+impl From<bool> for LineNumbers {
+	fn from(line_numbers: bool) -> Self {
+		match line_numbers {
+			true => Self::Always,
+			false => Self::Never,
+		}
+	}
+}
+
 /// Renders views, parsing every file once.
 struct Renderer<'a, 'ws> {
 	resolver: &'a Resolver<'ws>,
@@ -113,7 +138,13 @@ impl Renderer<'_, '_> {
 		};
 
 		let syntax = (self.syntax.entry((item.krate(), source.file_id))).or_insert_with(|| Syntax::of(source.file.text()));
-		let mut snippet = item_snippet(workspace, item, &source, syntax, outline, self.options.docs);
+		let mut snippet = item_snippet(workspace, item, &source, syntax, outline, self.options.docs, self.options.imports);
+		let first_line = source.file.line_col(source.region.start).line;
+		let line_numbers = match self.options.line_numbers {
+			LineNumbers::Never => false,
+			LineNumbers::Always => true,
+			LineNumbers::Auto => !snippet.is_consecutive_from(first_line),
+		};
 
 		snippet.dedent();
 
@@ -124,7 +155,7 @@ impl Renderer<'_, '_> {
 			snippet.lines.insert(0, Line::synthetic(format!("// file: {}", path.display())));
 		}
 
-		snippet.render(self.options.line_numbers)
+		snippet.render(line_numbers)
 	}
 
 	/// The view of an item, with its `impl` blocks if requested.
@@ -199,6 +230,12 @@ impl View {
 		self
 	}
 
+	/// See [`ViewOptions::imports`].
+	pub fn imports(mut self, imports: bool) -> Self {
+		self.options.imports = imports;
+		self
+	}
+
 	/// Adds a parsed path to view.
 	pub fn item_path(mut self, path: ItemPath) -> Self {
 		self.paths.push(path);
@@ -227,9 +264,9 @@ impl View {
 		Ok(views)
 	}
 
-	/// See [`ViewOptions::line_numbers`].
-	pub fn line_numbers(mut self, line_numbers: bool) -> Self {
-		self.options.line_numbers = line_numbers;
+	/// See [`ViewOptions::line_numbers`]; `true` for [`LineNumbers::Always`], `false` for [`LineNumbers::Never`].
+	pub fn line_numbers(mut self, line_numbers: impl Into<LineNumbers>) -> Self {
+		self.options.line_numbers = line_numbers.into();
 		self
 	}
 
@@ -301,8 +338,12 @@ pub struct ViewOptions {
 	/// Include doc comments (and `#[doc = ...]` attributes).
 	pub docs: bool,
 
-	/// Prefix every line with its line number.
-	pub line_numbers: bool,
+	/// When to prefix the lines with their line numbers.
+	pub line_numbers: LineNumbers,
+
+	/// List the `use` items of modules in outlines; otherwise each run of several private `use` items becomes one line
+	/// `use ...;`.
+	pub imports: bool,
 
 	/// After types and traits, also show their `impl` blocks (outlined unless the mode is [`ViewMode::Full`]).
 	pub impls: bool,
@@ -316,7 +357,8 @@ impl Default for ViewOptions {
 		Self {
 			mode: ViewMode::Auto,
 			docs: true,
-			line_numbers: false,
+			line_numbers: LineNumbers::Never,
+			imports: true,
 			impls: false,
 			active_only: false,
 		}

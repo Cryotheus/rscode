@@ -949,6 +949,32 @@ pub mod out;
 	}
 
 	#[test]
+	fn replaces_items_with_source_pasted_from_views() {
+		let dir = dir("replace-pasted");
+		let ws = load(&dir);
+		let expected = LIB.replace("\tleft + right\n", "\tright + left\n");
+
+		// a view's header line and line numbers are no part of the item
+		for source in [
+			"// fixture::add (fn) src/lib.rs:4-7\n/// Adds.\npub fn add(left: i32, right: i32) -> i32 {\n\tright + left\n}\n",
+			"   4 │ /// Adds.\n   5 │ pub fn add(left: i32, right: i32) -> i32 {\n   6 │ \tright + left\n   7 │ }",
+			"// fixture::add (fn) src/lib.rs:4-7 [cfg: unix] [inactive]\n   4 │ /// Adds.\n   5 │ pub fn add(left: i32, right: \
+			 i32) -> i32 {\n   6 │ \tright + left\n     │\n   7 │ }",
+		] {
+			let replacement = replace(&ws, "crate::add", source, &ReplaceOptions::default()).unwrap();
+			let edited = edited(&dir, &replacement.edits, "src/lib.rs");
+
+			assert_eq!(edited.replace("\t\n", "\n").replace("right + left\n\n}", "right + left\n}"), expected, "{source}");
+		}
+
+		// a comment that merely looks like one stays
+		let source = "// add (fn)\n/// Adds.\npub fn add(left: i32, right: i32) -> i32 {\n\tright + left\n}\n";
+		let replacement = replace(&ws, "crate::add", source, &ReplaceOptions::default()).unwrap();
+
+		assert!(edited(&dir, &replacement.edits, "src/lib.rs").contains("// add (fn)\n/// Adds."));
+	}
+
+	#[test]
 	fn replaces_associated_items_at_their_indentation() {
 		let dir = dir("replace-assoc");
 		let ws = load(&dir);

@@ -5,6 +5,8 @@ use super::snippet::Snippet;
 use super::snippet::Syntax;
 use crate::model::ItemDetail;
 use crate::model::ItemId;
+use crate::model::ItemKind;
+use crate::model::Visibility;
 use crate::model::Workspace;
 use crate::source::FileId;
 use crate::source::SourceFile;
@@ -45,6 +47,31 @@ impl<'ws> Source<'ws> {
 			module_file: false,
 		}
 	}
+}
+
+/// Replaces each run of several private `use` items of a module (with the lines between them) with `use ...;`.
+fn collapse_imports(workspace: &Workspace, module: ItemId, edits: &mut Vec<Edit>) {
+	let mut runs: Vec<(TextRange, usize)> = Vec::new();
+	let mut extends = false;
+
+	for child in workspace.children(module) {
+		let data = workspace.item(child);
+		let private_use = data.kind == ItemKind::Use && data.vis == Visibility::Private;
+
+		match runs.last_mut() {
+			Some((range, count)) if private_use && extends => {
+				*range = TextRange::new(range.start, data.range.end);
+				*count += 1;
+			}
+
+			_ if private_use => runs.push((data.range, 1)),
+			_ => {}
+		}
+
+		extends = private_use;
+	}
+
+	edits.extend((runs.into_iter()).filter(|(_, count)| *count > 1).map(|(range, _)| Edit::Replace(range, "use ...;")));
 }
 
 /// Collects the elisions of an item and the items inside of it: bodies of functions and macros (but not of
@@ -102,14 +129,28 @@ fn elide_group(text: &str, inside: TextRange) -> Option<Edit> {
 	(!contents.trim().is_empty()).then(|| Edit::Replace(TextRange::new(open, inside.end + 1), replacement))
 }
 
-/// The lines of an item's [`Source`], outlined if `outline`, and without doc comments unless `docs`.
+/// The lines of an item's [`Source`], outlined if `outline` (listing a module's `use` items if `imports`, see
+/// [`collapse_imports`]), and without doc comments unless `docs`.
 ///
 /// `syntax` must be that of the source's file.
-pub(super) fn item_snippet(workspace: &Workspace, item: ItemId, source: &Source<'_>, syntax: &Syntax, outline: bool, docs: bool) -> Snippet {
+pub(super) fn item_snippet(
+	workspace: &Workspace,
+	item: ItemId,
+	source: &Source<'_>,
+	syntax: &Syntax,
+	outline: bool,
+	docs: bool,
+	imports: bool,
+) -> Snippet {
 	let mut edits = Vec::new();
 
 	if outline {
 		collect_elisions(workspace, item, true, source.file.text(), &mut edits);
+
+		if !imports {
+			collapse_imports(workspace, item, &mut edits);
+		}
+
 		let text = source.file.text();
 		let initializers = within(&syntax.initializers, source.region).iter();
 
@@ -151,7 +192,7 @@ pub fn outline_text(workspace: &Workspace, item: ItemId, docs: bool) -> String {
 	let source = Source::of(workspace, item);
 	let syntax = Syntax::of(source.file.text());
 
-	item_snippet(workspace, item, &source, &syntax, true, docs).render(false)
+	item_snippet(workspace, item, &source, &syntax, true, docs, true).render(false)
 }
 
 /// The ranges (sorted by start) that start inside of `region`.

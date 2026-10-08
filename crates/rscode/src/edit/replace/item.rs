@@ -861,7 +861,7 @@ fn flatten<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 
 /// The length of a line-number gutter of a numbered view at the start of a line (`  12 │ `; `     │ ` for lines that
 /// are not from the file, and `  12 │` for empty lines), if it has one.
-fn gutter_len(line: &str) -> Option<usize> {
+pub(super) fn gutter_len(line: &str) -> Option<usize> {
 	let bar = line.find('│')?;
 	let number = line[..bar].strip_suffix(' ')?.trim_start_matches(' ');
 

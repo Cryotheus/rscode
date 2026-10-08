@@ -37,12 +37,16 @@ published on crates.io, so publish the crates for the same version.
 |---|---|
 | `find <PATTERN>...` | find items by name or path pattern (`*Error`, `crate::m::*`, `**::Circle`) |
 | `view <PATH>...` | print the source of items, or an outline of modules |
+| `refs <PATH>...` | list the references to items, by file, with the item and line of code of each |
 | `fmt [TARGET]...` | sort (Cryotheum ordering) and format items, modules, or whole crates |
 | `sort [TARGET]...` | sort without formatting |
 | `rename <PATH> <NEW_NAME>` | rename an item and update its references across the workspace |
 | `remove <PATH>...` | remove items, the files of out-of-line modules, and (optionally) their imports |
 | `replace <PATH> [SOURCE]` | replace the source of an item |
-| `insert <PARENT> [SOURCE]` | insert items into a module, `impl` block, or trait |
+| `edit <PATH>` | replace exact text inside an item (`--old`/`--new`), or set its visibility, doc comment, or attributes |
+| `insert [PARENT] [SOURCE]` | insert items into a module, `impl` block, or trait (`--after`/`--before` a sibling) |
+| `create-module <PARENT> <NAME> [SOURCE]` | create a module's file and declare it in its parent |
+| `import <MODULE> <PATH>...` | add imports to a module, in sorted position or merged into its `use` items |
 | `mcp` | serve all of the above over the Model Context Protocol (stdio) |
 
 ```sh
@@ -59,9 +63,11 @@ before anything is written, and `--dry-run`/`--check` print a diff instead of wr
 
 ## MCP server
 
-`cargo rscode mcp` offers the tools `workspace_info`, `find_items`, `view_items`, `rename_item`, `remove_items`,
-`replace_item`, `insert_items`, and `format_items`. With `--read-only`, the last five are not offered. The workspace
-is reloaded for every call, so changes made by other tools are always seen.
+`cargo rscode mcp` offers the tools `workspace_info`, `find_items`, `view_items`, `find_references`, and the editing
+tools `rename_item`, `remove_items`, `replace_item`, `edit_item`, `insert_items`, `create_module`, `add_import`, and
+`format_items`. With `--read-only`, the editing tools are not offered. The workspace is reloaded for every call, so
+changes made by other tools are always seen. `edit_item` and `add_import` send only what changes, which costs a model
+fewer tokens than editing the files directly.
 
 ```sh
 claude mcp add rscode -- cargo rscode mcp --manifest-path /abs/path/to/Cargo.toml

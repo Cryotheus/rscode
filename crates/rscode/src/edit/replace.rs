@@ -41,6 +41,7 @@ use parse::parse_source;
 use serde::Deserialize;
 use serde::Serialize;
 use smol_str::SmolStr;
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -447,6 +448,7 @@ fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 /// Fails with [`Error::Collision`] when a new name is already bound in the container (in a module: by an item or a
 /// named import in the same namespace; in an `impl` block: by an associated item), unless [`InsertOptions::force`].
 pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, options: &InsertOptions) -> Result<Insertion, Error> {
+	let source = &*pasted(source);
 	let anchor = match &options.position {
 		InsertPosition::Before(anchor) | InsertPosition::After(anchor) => Some(ItemPath::parse(anchor)?),
 		InsertPosition::End | InsertPosition::Start => None,
@@ -520,6 +522,28 @@ fn is_plain(path: &ItemPath) -> bool {
 	!path.import && path.qualifier.is_none() && path.field.is_none() && !path.macro_call
 }
 
+/// Whether a line is the header line of a view of an item (`// path (kind) file:line-endline`, maybe followed by
+/// `[cfg: …]` and `[inactive]`), which text copied from a view may start with.
+fn is_view_header(line: &str) -> bool {
+	let Some(mut rest) = line.trim().strip_prefix("// ") else {
+		return false;
+	};
+
+	while let Some(marked) = rest.strip_suffix(']') {
+		match marked.rfind(" [") {
+			Some(start) => rest = &marked[..start],
+			None => return false,
+		}
+	}
+
+	let Some((path_kind_file, lines)) = rest.rsplit_once(':') else {
+		return false;
+	};
+	let is_lines = lines.split('-').all(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
+
+	is_lines && path_kind_file.rsplit_once(' ').is_some_and(|(path_kind, _)| path_kind.ends_with(')') && path_kind.contains(" ("))
+}
+
 /// The item an anchor stands for among the items of its container: the item, or for an import its `use` item, and for
 /// an item of an `extern` block or a static of a `thread_local!` the block or invocation (they are transparent).
 fn item_of_container(ws: &Workspace, mut item: ItemId) -> ItemId {
@@ -590,6 +614,23 @@ fn module_namespaces(resolver: &Resolver<'_>, module: ItemId, binding: &NewBindi
 	if resolved.is_empty() { binding.namespaces.to_vec() } else { resolved }
 }
 
+/// Source as it may be pasted from a view: without the view's header line and without line-number gutters
+/// (`  12 │ `), which are no part of the items.
+fn pasted(source: &str) -> Cow<'_, str> {
+	let source = match source.split_once('\n') {
+		Some((first, rest)) if is_view_header(first) => rest,
+		_ => source,
+	};
+	let lines: Vec<&str> = source.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect();
+	let numbered = lines.iter().any(|line| item::gutter_len(line).is_some())
+		&& lines.iter().all(|line| line.trim().is_empty() || item::gutter_len(line).is_some());
+
+	match numbered {
+		true => Cow::Owned(lines.iter().map(|line| &line[item::gutter_len(line).unwrap_or(0)..]).collect::<Vec<_>>().join("\n")),
+		false => Cow::Borrowed(source),
+	}
+}
+
 /// Where the new items go.
 fn placement(
 	resolver: &Resolver<'_>,
@@ -652,6 +693,7 @@ fn push_unique<T: PartialEq>(list: &mut Vec<T>, value: T) {
 /// path tell apart; or items of one crate with the same `cfg`s, like `impl` blocks with the same header, which a
 /// selector tells apart), and [`Error::InvalidSource`] when `source` is not a valid replacement.
 pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: &ReplaceOptions) -> Result<Replacement, Error> {
+	let source = &*pasted(source);
 	let ws = resolver.workspace();
 	let mut resolved = resolver.resolve_item_path(path);
 

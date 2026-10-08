@@ -31,6 +31,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 
+/// The lines of context around the changes in diffs: enough to place them, since the edit says what changed.
+const DIFF_CONTEXT: usize = 1;
+
 /// How many of the items whose references were searched `find_references` lists.
 const MAX_LISTED_TARGETS: usize = 5;
 
@@ -95,7 +98,7 @@ pub(crate) fn diff(root: &Path, changes: &[FileChange], edits: &EditSet) -> Stri
 		})
 		.collect();
 	let created: Vec<PathBuf> = edits.created().map(|path| relative(root, path)).collect();
-	let mut out = crate::edit::unified_diff(&changes, &created, 3);
+	let mut out = crate::edit::unified_diff(&changes, &created, DIFF_CONTEXT);
 
 	if !out.is_empty() && !out.ends_with('\n') {
 		out.push('\n');
@@ -172,12 +175,12 @@ pub(crate) fn find(root: &Path, pattern: &str, matches: &[FindMatch], page: Page
 	out
 }
 
-/// `path  kind  file:line:col-endline:endcol  cfg: …  inactive  -> imported  usable: …`
+/// `path  kind  file:line-endline  cfg: …  inactive  -> imported  usable: …`
 fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
 	let mut columns = vec![
 		found.path.clone(),
 		kind_label(found.kind, found.thread_local, found.entry_macro.as_deref()),
-		format!("{}:{}-{}", display(root, &found.file), found.start, found.end),
+		format!("{}:{}", display(root, &found.file), lines(found.start, found.end)),
 	];
 
 	if let Some(cfg) = &found.cfg {
@@ -363,6 +366,14 @@ fn last_line(start: LineCol, end: LineCol) -> usize {
 	}
 }
 
+/// The lines of a range, given its exclusive end: `line-endline`, or `line` for one line.
+fn lines(start: LineCol, end: LineCol) -> String {
+	match last_line(start, end) {
+		last if last > start.line => format!("{}-{last}", start.line),
+		_ => start.line.to_string(),
+	}
+}
+
 /// A note about load errors, since items of files that failed to load are missing from results. Empty without
 /// errors.
 pub(crate) fn load_errors_note(workspace: &Workspace) -> String {
@@ -432,14 +443,6 @@ fn paged(counted: String, shown: usize, page: Page) -> String {
 	}
 
 	summary
-}
-
-fn reference(root: &Path, reference: &Reference) -> String {
-	format!(
-		"{} ({})",
-		location(root, &reference.path, reference.start),
-		reference_kind(reference.kind)
-	)
 }
 
 fn reference_kind(kind: ReferenceKind) -> &'static str {
@@ -549,6 +552,22 @@ pub(crate) fn references(root: &Path, path: &str, report: &ReferenceReport, page
 	out
 }
 
+/// One line per file: `  file: line:column (kind), ...`, in the order of the references.
+fn references_by_file(root: &Path, references: &[Reference]) -> String {
+	let mut files: Vec<(&Path, Vec<String>)> = Vec::new();
+
+	for reference in references {
+		let at = format!("{} ({})", reference.start, reference_kind(reference.kind));
+
+		match files.iter_mut().find(|(file, _)| *file == reference.path) {
+			Some((_, places)) => places.push(at),
+			None => files.push((&reference.path, vec![at])),
+		}
+	}
+
+	files.iter().map(|(file, places)| format!("  {}: {}\n", display(root, file), places.join(", "))).collect()
+}
+
 /// A path for display: relative to the workspace root when it is inside of it.
 pub(crate) fn relative(root: &Path, path: &Path) -> PathBuf {
 	match path.strip_prefix(root) {
@@ -579,10 +598,7 @@ pub(crate) fn removal(root: &Path, plan: &Removal, dry_run: bool) -> String {
 
 	if !plan.dangling.is_empty() {
 		out.push_str("references left dangling (they will no longer compile):\n");
-
-		for dangling in &plan.dangling {
-			writeln!(out, "  {}", reference(root, dangling)).unwrap();
-		}
+		out.push_str(&references_by_file(root, &plan.dangling));
 	}
 
 	warnings(&mut out, &plan.warnings);
@@ -650,9 +666,7 @@ pub(crate) fn rename(root: &Path, plan: &Rename, new_name: &str, dry_run: bool) 
 	if !plan.uncertain.is_empty() {
 		out.push_str("possible references left unchanged (check them; see `method_calls`, `macro_tokens`, `doc_links`):\n");
 
-		for occurrence in &plan.uncertain {
-			writeln!(out, "  {}", reference(root, occurrence)).unwrap();
-		}
+		out.push_str(&references_by_file(root, &plan.uncertain));
 	}
 
 	if !plan.collisions.is_empty() {
@@ -984,20 +998,20 @@ mod tests {
 		let mut plain = found("demo::a::Foo", ItemKind::Struct, "/ws/src/a.rs", at(3, 1), at(5, 2));
 		let line = find_line(root(), &plain, false);
 
-		assert_eq!(line, "demo::a::Foo  struct  src/a.rs:3:1-5:2");
+		assert_eq!(line, "demo::a::Foo  struct  src/a.rs:3-5");
 
 		plain.cfg = Some("feature = \"x\"".to_owned());
 		plain.active = Tristate::False;
 		assert_eq!(
 			find_line(root(), &plain, false),
-			"demo::a::Foo  struct  src/a.rs:3:1-5:2  cfg: feature = \"x\"  inactive"
+			"demo::a::Foo  struct  src/a.rs:3-5  cfg: feature = \"x\"  inactive"
 		);
 
 		plain.active = Tristate::Unknown;
 		plain.usable_paths = vec!["crate::Foo".to_owned(), "crate::a::Foo".to_owned()];
 		assert_eq!(
 			find_line(root(), &plain, true),
-			"demo::a::Foo  struct  src/a.rs:3:1-5:2  cfg: feature = \"x\"  cfg-unknown  usable: crate::Foo, crate::a::Foo"
+			"demo::a::Foo  struct  src/a.rs:3-5  cfg: feature = \"x\"  cfg-unknown  usable: crate::Foo, crate::a::Foo"
 		);
 
 		let mut import = found("demo::Foo", ItemKind::Import, "src/lib.rs", at(1, 9), at(1, 15));
@@ -1005,17 +1019,17 @@ mod tests {
 		import.import_targets = vec!["demo::a::Foo".to_owned()];
 		assert_eq!(
 			find_line(root(), &import, true),
-			"demo::Foo  import  src/lib.rs:1:9-1:15  -> demo::a::Foo  usable: none (not visible)"
+			"demo::Foo  import  src/lib.rs:1  -> demo::a::Foo  usable: none (not visible)"
 		);
 
 		// statics declared by `thread_local!` and by entries of other macros
 		let mut entry = found("demo::SAY", ItemKind::Static, "src/lib.rs", at(2, 2), at(2, 17));
 
 		entry.entry_macro = Some("commands".to_owned());
-		assert_eq!(find_line(root(), &entry, false), "demo::SAY  static (commands!)  src/lib.rs:2:2-2:17");
+		assert_eq!(find_line(root(), &entry, false), "demo::SAY  static (commands!)  src/lib.rs:2");
 
 		entry.thread_local = true;
-		assert_eq!(find_line(root(), &entry, false), "demo::SAY  static (thread_local!)  src/lib.rs:2:2-2:17");
+		assert_eq!(find_line(root(), &entry, false), "demo::SAY  static (thread_local!)  src/lib.rs:2");
 	}
 
 	#[test]
@@ -1038,7 +1052,7 @@ mod tests {
 
 		assert_eq!(
 			text,
-			"demo::a  mod  src/a.rs:1:1-9:1\ndemo::a::f  fn  src/a.rs:2:1-4:2\n3 matches; showing 1-2; for more, call again with \
+			"demo::a  mod  src/a.rs:1-8\ndemo::a::f  fn  src/a.rs:2-4\n3 matches; showing 1-2; for more, call again with \
 			 `offset` 2\n"
 		);
 	}
@@ -1313,12 +1327,12 @@ mod tests {
 		assert_eq!(
 			removal(root(), &plan, false),
 			"removed 1 item:\n  demo::a (mod) src/lib.rs:2:1\ndeleted src/a.rs\nreferences left dangling (they will no longer \
-			 compile):\n  src/main.rs:3:5 (path)\n"
+			 compile):\n  src/main.rs: 3:5 (path)\n"
 		);
 		assert_eq!(
 			removal(root(), &plan, true),
 			"would remove 1 item:\n  demo::a (mod) src/lib.rs:2:1\nwould delete src/a.rs\nreferences left dangling (they will no \
-			 longer compile):\n  src/main.rs:3:5 (path)\n"
+			 longer compile):\n  src/main.rs: 3:5 (path)\n"
 		);
 	}
 
@@ -1350,7 +1364,7 @@ mod tests {
 			rename(root(), &plan, "new", false),
 			"renamed 1 item to `new`:\n  demo::old\nupdated 2 references in 2 files:\n  src/lib.rs: 1 definition\n  src/main.rs: 2 \
 			 references\nmoved src/old.rs -> src/new.rs\npossible references left unchanged (check them; see \
-			 `method_calls`, `macro_tokens`, `doc_links`):\n  src/main.rs:9:7 (method call)\ncollisions (renamed anyway because \
+			 `method_calls`, `macro_tokens`, `doc_links`):\n  src/main.rs: 9:7 (method call)\ncollisions (renamed anyway because \
 			 of `force`):\n  `new` in demo: demo::new (src/lib.rs:12:1)\nwarning: a macro may use `old`\n"
 		);
 		assert!(rename(root(), &plan, "new", true).starts_with("would rename 1 item to `new`:\n  demo::old\nwould update 2 references"));

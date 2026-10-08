@@ -16,6 +16,7 @@ use crate::edit::RenameOptions;
 use crate::edit::ReplaceOptions;
 use crate::edit::TextReplacement;
 use crate::query::FindReferencesOptions;
+use crate::query::LineNumbers;
 use crate::query::ViewMode;
 use crate::query::ViewOptions;
 use crate::resolve::ReferenceOptions;
@@ -37,11 +38,11 @@ pub(crate) const DEFAULT_FIND_LIMIT: usize = 100;
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct AddImportParams {
-	/// The module to import into (`crate` for the crate root, `crate::a::b`).
+	/// The module to import into (`crate`, `crate::a::b`).
 	pub(crate) module: String,
 
-	/// The imports: `use` trees like `std::fs`, `crate::a::{B, C}`, `x::Y as Z`, `m::*`, or `pub use a::B`; a bare
-	/// name (`Circle`) imports the workspace's item of that name.
+	/// `use` trees: `std::fs`, `crate::a::{B, C}`, `x::Y as Z`, `m::*`, `pub use a::B`; a bare name (`Circle`) imports
+	/// the workspace's item of that name.
 	#[serde(alias = "path", alias = "imports", deserialize_with = "string_list")]
 	pub(crate) paths: Vec<String>,
 
@@ -57,23 +58,19 @@ pub(crate) struct AddImportParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct AttachParams {
-	/// Path of the `Cargo.toml` of the workspace or package (or of the directory it is in). Its directory must be
-	/// exposed by the server (see `list_sources`).
+	/// Path of its `Cargo.toml` (or of the directory it is in).
 	#[serde(alias = "manifest", alias = "path")]
 	pub(crate) manifest_path: String,
 
-	/// The name to refer to the source by: pass it as `attached` to the other tools. ASCII letters, digits, `_`, `-`,
-	/// and `.`. A name that is attached already keeps its source: the response says what it is, and `detach_source`
-	/// frees the name.
+	/// The name to pass as `attached`: ASCII letters, digits, `_`, `-`, and `.`.
 	pub(crate) name: String,
 
-	/// Attach for writing, so that the editing tools can change its files. Refused unless its directory is exposed
-	/// for writing. Without it, the source is read-only (the editing tools can still preview changes with `dry_run`),
-	/// but a writable source attached under the name stays writable.
+	/// Attach for writing (only in directories exposed for writing); otherwise edits can only be previewed with
+	/// `dry_run`.
 	#[serde(default)]
 	pub(crate) write: bool,
 
-	/// Also make it the source that calls without `attached` work on (like `use_source`).
+	/// Also make it the default for calls without `attached` (like use_source).
 	#[serde(default, rename = "use")]
 	pub(crate) use_it: bool,
 }
@@ -82,17 +79,17 @@ pub(crate) struct AttachParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct CreateModuleParams {
-	/// The module to create the new module in (`crate` for the crate root, `crate::a::b`).
+	/// The module to create it in (`crate`, `crate::a::b`).
 	pub(crate) parent: String,
 
-	/// The name of the new module (an identifier).
+	/// The new module's name.
 	pub(crate) name: String,
 
-	/// The contents of the new module's file; may be empty, and may start with `//!` docs and inner attributes.
+	/// The file's contents (may be empty, and may start with `//!` docs).
 	#[serde(default)]
 	pub(crate) source: String,
 
-	/// The visibility of the new module (`pub`, `pub(crate)`, ...); private when empty.
+	/// Its visibility (`pub`, `pub(crate)`, ...); private when empty.
 	#[serde(default)]
 	pub(crate) vis: String,
 
@@ -124,19 +121,18 @@ pub(crate) struct DetachParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct EditItemParams {
-	/// Path of the item to edit; `use crate::a::Name` edits an import's `use` item.
+	/// The item; `use crate::a::Name` edits an import's `use` item.
 	pub(crate) path: String,
 
-	/// Exact text to replace, copied from the item as view_items prints it (with or without line numbers); it must
-	/// occur once in the item.
+	/// Exact text to replace, as view_items prints it (line numbers optional); must occur once in the item.
 	#[serde(default)]
 	pub(crate) old: Option<String>,
 
-	/// The text to put in place of `old`, indented as in the view (an empty string deletes `old`).
+	/// What replaces `old` ("" deletes it).
 	#[serde(default)]
 	pub(crate) new: Option<String>,
 
-	/// More replacements (`{"old": ..., "new": ...}`), applied in order after `old` and `new`.
+	/// More `{old, new}` replacements, applied in order after `old` and `new`.
 	#[serde(default)]
 	pub(crate) edits: Vec<TextEdit>,
 
@@ -144,20 +140,19 @@ pub(crate) struct EditItemParams {
 	#[serde(default, alias = "visibility")]
 	pub(crate) vis: Option<String>,
 
-	/// New doc comment text, without `///`; an empty string removes the doc comment.
+	/// New doc comment, without `///` ("" removes it).
 	#[serde(default)]
 	pub(crate) doc: Option<String>,
 
-	/// Attributes to add, like `derive(Debug)` or `#[must_use]`.
+	/// Attributes to add: `derive(Debug)`, `#[must_use]`.
 	#[serde(default, deserialize_with = "string_list")]
 	pub(crate) add_attributes: Vec<String>,
 
-	/// Attributes to remove: a path like `derive` (of exactly one attribute), or exact text like
-	/// `#[allow(dead_code)]`.
+	/// Attributes to remove: a path (`derive`) or exact text (`#[allow(dead_code)]`).
 	#[serde(default, deserialize_with = "string_list")]
 	pub(crate) remove_attributes: Vec<String>,
 
-	/// Edit every cfg variant that the path names (otherwise only the one that has the `old` texts).
+	/// Edit every cfg variant the path names (else only the one that has the `old` text).
 	#[serde(default)]
 	pub(crate) all_variants: bool,
 
@@ -223,17 +218,14 @@ impl EditItemParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct FindParams {
-	/// Glob pattern for item paths. `*` matches within one path segment, `**` any number of segments:
-	/// `parse_*`, `*Error`, `Config::*` (associated items), `crate::config::**`, `**::tests::*`,
-	/// `<Config as Default>::default`. Patterns not starting with `crate::` or `::` match anywhere:
-	/// `Config::load` finds `my_crate::config::Config::load`. `use` patterns find imports: `use crate::a::*` (every
-	/// import in `a`), `use Config`; field patterns find fields (`Config.*`), and `!` macro invocations (`m::*!`).
+	/// Glob over item paths: `*` within a segment, `**` across segments (`parse_*`, `Config::*`, `crate::config::**`,
+	/// `<Config as Default>::default`). Matches anywhere unless it starts with `crate::` or `::`. `use crate::a::*`
+	/// finds imports, `Config.*` fields, `m::*!` macro invocations.
 	pub(crate) pattern: String,
 
-	/// Only items of these kinds: `mod`, `struct`, `enum`, `union`, `trait`, `trait-alias`, `type`, `fn`,
-	/// `const`, `static`, `macro-rules`, `extern-crate`, `import`, `impl` (with qualified patterns such as
-	/// `<Config as *>`), `assoc-fn`, `assoc-const`, `assoc-type`, `variant`, `field`, `macro-call`, `foreign-fn`,
-	/// `foreign-static`, `foreign-type`. Aliases such as `function`, `method`, and `module` work too.
+	/// Only these kinds: `mod`, `struct`, `enum`, `union`, `trait`, `trait-alias`, `type`, `fn`, `const`, `static`,
+	/// `macro-rules`, `extern-crate`, `import`, `impl`, `assoc-fn`, `assoc-const`, `assoc-type`, `variant`, `field`,
+	/// `macro-call`, `foreign-fn`, `foreign-static`, `foreign-type` (aliases like `method` work).
 	#[serde(default, deserialize_with = "split_list")]
 	pub(crate) kinds: Vec<String>,
 
@@ -241,24 +233,24 @@ pub(crate) struct FindParams {
 	#[serde(default)]
 	pub(crate) ignore_case: bool,
 
-	/// Skip items whose cfg is definitely disabled with the current features and target.
+	/// Skip items whose cfg is definitely disabled.
 	#[serde(default)]
 	pub(crate) active_only: bool,
 
-	/// Also list the paths through which each item can be used from a viewpoint: `crate` (the item's own crate
-	/// root), `::` (another crate: only public paths), or a module path such as `crate::a::b`.
+	/// Also list the paths that reach each item from a viewpoint: `crate`, `::` (other crates: public paths), or a
+	/// module path.
 	#[serde(default)]
 	pub(crate) from: Option<String>,
 
-	/// Also find `use` imports, as `use module::Name` paths that name them (with the paths of what they import).
+	/// Also find imports, as `use module::Name` paths (with what they import).
 	#[serde(default)]
 	pub(crate) include_imports: bool,
 
-	/// Maximum number of matches to list (0 only counts them).
+	/// Most matches to list (0 only counts them).
 	#[serde(default = "default_find_limit")]
 	pub(crate) limit: usize,
 
-	/// Number of matches to skip, to page through many matches.
+	/// Matches to skip, to page.
 	#[serde(default)]
 	pub(crate) offset: usize,
 
@@ -285,30 +277,29 @@ impl FindParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct FormatParams {
-	/// Path patterns of what to format: `crate` (every loaded crate), modules (`crate::a`: their files, and child
-	/// modules' files unless `skip_children`), or any other items (formatted in place, leaving the rest of the file
-	/// untouched). Globs are allowed (`crate::a::*`); `use crate::a::*` matches every import of `a`.
+	/// Path patterns: `crate` (every loaded crate), modules (their files), or other items (formatted in place). Globs
+	/// work.
 	#[serde(default = "crate_root", deserialize_with = "string_list")]
 	pub(crate) targets: Vec<String>,
 
-	/// `rustfmt` (honors the project's rustfmt.toml), `prettyplease` (removes non-doc comments, so it refuses
-	/// files with comments unless `allow_comment_loss`), or `none` (only sort).
+	/// `rustfmt` (honors rustfmt.toml), `prettyplease` (drops non-doc comments, so refuses unless
+	/// `allow_comment_loss`), or `none` (only sort).
 	#[serde(default)]
 	pub(crate) formatter: Formatter,
 
-	/// Sort items first, with the Cryotheum ordering (groups items by kind, then orders them by name).
+	/// Sort items first (Cryotheum order: by kind, then name).
 	#[serde(default = "yes")]
 	pub(crate) sort: bool,
 
-	/// Only process the targets themselves, not child modules.
+	/// Leave child modules' files alone.
 	#[serde(default)]
 	pub(crate) skip_children: bool,
 
-	/// Write nothing: tell whether formatting would change anything, with a unified diff.
+	/// Write nothing: tell whether anything would change, with a diff.
 	#[serde(default, alias = "dry_run", alias = "dryRun", alias = "dry-run")]
 	pub(crate) check: bool,
 
-	/// Let prettyplease remove non-doc comments instead of refusing to format.
+	/// Let prettyplease drop non-doc comments.
 	#[serde(default)]
 	pub(crate) allow_comment_loss: bool,
 
@@ -366,26 +357,23 @@ pub(crate) enum Formatter {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct InsertParams {
-	/// The container: a module (`crate` for the crate root, `crate::a::b`), an impl block (`impl Trait for Type`,
-	/// `impl Type`, `<Type as Trait>`), or a trait. Optional with position `before` or `after`: the anchor's container.
+	/// The container: a module (`crate`, `crate::a`), an impl block (`impl Type`, `impl Trait for Type`), or a trait;
+	/// optional with an `anchor`.
 	#[serde(default)]
 	pub(crate) parent: Option<String>,
 
-	/// The items to insert (one or more, with their doc comments and attributes). Associated items for impl
-	/// blocks and traits.
+	/// The items, with their docs and attributes.
 	pub(crate) source: String,
 
-	/// `end` of the container, `start` (after inner attributes and `//!` docs), or `before`/`after` the sibling
-	/// item named by `anchor`.
+	/// `end`, `start` (after inner attributes and `//!` docs), or `before`/`after` the `anchor`.
 	#[serde(default)]
 	pub(crate) position: Position,
 
-	/// Path of the sibling item, for position `before` or `after` (e.g. `crate::a::b::helper`, or an import's
-	/// `use crate::a::Name`, which stands for its `use` item).
+	/// The sibling for `before`/`after`; an import (`use crate::a::Name`) stands for its `use` item.
 	#[serde(default)]
 	pub(crate) anchor: Option<String>,
 
-	/// Insert even when a name is already taken in the container.
+	/// Insert even when a name is taken.
 	#[serde(default)]
 	pub(crate) force: bool,
 
@@ -462,28 +450,26 @@ pub(crate) enum Position {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct ReferencesParams {
-	/// Path of the item whose references to find.
+	/// The item whose references to find.
 	pub(crate) path: String,
 
-	/// Also find method calls `x.name(..)`, and `T::name` paths through generic parameters whose bounds do not tell
-	/// (uncertain: they are not type-checked).
+	/// Also method calls `x.name()`, and `T::name` through generic bounds (uncertain: not type-checked).
 	#[serde(default)]
 	pub(crate) method_calls: bool,
 
-	/// Also find the name inside of macro invocations and `macro_rules!` transcribers that could not be analyzed
-	/// (uncertain).
+	/// Also names inside macro invocations that could not be analyzed (uncertain).
 	#[serde(default)]
 	pub(crate) macro_tokens: bool,
 
-	/// Also find intra-doc links in doc comments.
+	/// Also intra-doc links.
 	#[serde(default)]
 	pub(crate) doc_links: bool,
 
-	/// Maximum number of references to list (0 only counts them).
+	/// Most references to list (0 only counts them).
 	#[serde(default = "default_find_limit")]
 	pub(crate) limit: usize,
 
-	/// Number of references to skip, to page through many references.
+	/// References to skip, to page.
 	#[serde(default)]
 	pub(crate) offset: usize,
 
@@ -514,15 +500,15 @@ impl ReferencesParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct RemoveParams {
-	/// Paths of the items to remove; `use crate::a::Name` removes an import (not what it imports).
+	/// The items; `use crate::a::Name` removes one import.
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) paths: Vec<String>,
 
-	/// Keep the files of removed out-of-line modules (only their `mod name;` declarations are removed).
+	/// Keep out-of-line modules' files (remove only `mod name;`).
 	#[serde(default)]
 	pub(crate) keep_files: bool,
 
-	/// Also remove the `use` imports of the removed items.
+	/// Also remove the imports of the removed items.
 	#[serde(default)]
 	pub(crate) prune_imports: bool,
 
@@ -552,14 +538,13 @@ impl RemoveParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct RenameParams {
-	/// Path of the item to rename: `crate::config::Config`, `Config::load`, `<Config as Default>::default`,
-	/// `crate::config` (a module: its file is renamed too).
+	/// The item; a module's file is renamed too.
 	pub(crate) path: String,
 
-	/// The new name, an identifier (`r#` for keywords).
+	/// The new identifier (`r#` for keywords).
 	pub(crate) new_name: String,
 
-	/// Rename even when the new name collides with an existing name.
+	/// Rename even when the new name collides.
 	#[serde(default)]
 	pub(crate) force: bool,
 
@@ -567,17 +552,15 @@ pub(crate) struct RenameParams {
 	#[serde(default, alias = "dryRun", alias = "dry-run", alias = "check")]
 	pub(crate) dry_run: bool,
 
-	/// Also rename method calls `x.old_name(..)`, which are not type-checked and may belong to other types, and
-	/// `T::old_name` paths through generic parameters whose bounds do not tell (such as through supertraits).
+	/// Also rename method calls `x.old()`, and `T::old` through generic bounds (not type-checked).
 	#[serde(default)]
 	pub(crate) method_calls: bool,
 
-	/// Also rename occurrences inside of macro invocations and `macro_rules!` transcribers that could not be analyzed
-	/// (paths there, like `module::name` and `name!`, are resolved and renamed anyway).
+	/// Also rename names inside macro invocations that could not be analyzed (paths there are renamed anyway).
 	#[serde(default)]
 	pub(crate) macro_tokens: bool,
 
-	/// Also update intra-doc links (``[`OldName`]``) in doc comments.
+	/// Also update intra-doc links.
 	#[serde(default)]
 	pub(crate) doc_links: bool,
 
@@ -602,18 +585,17 @@ impl RenameParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct ReplaceParams {
-	/// Path of the item to replace; `use crate::a::Name` replaces an import's `use` item.
+	/// The item; `use crate::a::Name` replaces an import's `use` item.
 	pub(crate) path: String,
 
-	/// The complete new source of the item, including its doc comments and attributes.
+	/// The item's complete new source, with its docs and attributes.
 	pub(crate) source: String,
 
-	/// Allow replacing the item with a different kind of item, or with several items.
+	/// Allow another kind of item, or several items.
 	#[serde(default)]
 	pub(crate) allow_kind_change: bool,
 
-	/// When the path names several cfg variants of the item, replace every one of them (otherwise that is an
-	/// error listing the variants).
+	/// Replace every cfg variant the path names (else several are an error).
 	#[serde(default)]
 	pub(crate) all_variants: bool,
 
@@ -644,10 +626,10 @@ impl ReplaceParams {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(default)]
 pub(crate) struct Selection {
-	/// Work on this attached source (the name given to `attach_source`) instead of the server's own workspace.
+	/// The attached source to work on (see `attach_source`), instead of the session's default.
 	pub(crate) attached: Option<String>,
 
-	/// Packages to load (cargo package specs). Default: the server's selection, see `workspace_info`.
+	/// Packages to load (cargo package specs).
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) packages: Vec<String>,
 
@@ -769,15 +751,12 @@ pub(crate) struct UseParams {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct ViewParams {
-	/// Paths of the items to show: `crate::a::Item`, `::crate_name::Item`, `a::Item` (from each crate's root),
-	/// `Type::method`, `Trait::method`, `<Type as Trait>::method`, `impl Trait for Type`, `Enum::Variant`, `Type.field`,
-	/// `crate` (the crate root module), or `use crate::a::Item` (an import, shown as its `use` item).
+	/// The items; `use crate::a::Name` shows an import's `use` item.
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) paths: Vec<String>,
 
-	/// `auto`: an outline for modules and the full source of anything else; `full`: the exact source (for
-	/// out-of-line modules: the module's file); `outline`: function and macro bodies (other than of `thread_local!`,
-	/// whose statics are items) elided, modules as lists of their items.
+	/// `auto` (outline for modules, else full), `full` (exact source; a module's whole file), or `outline` (bodies
+	/// elided).
 	#[serde(default)]
 	pub(crate) mode: Mode,
 
@@ -785,9 +764,13 @@ pub(crate) struct ViewParams {
 	#[serde(default = "yes")]
 	pub(crate) docs: bool,
 
-	/// Prefix every line with its line number in the file.
-	#[serde(default = "yes")]
-	pub(crate) line_numbers: bool,
+	/// Number the lines: true always, false never; by default only when the lines shown are not consecutive.
+	#[serde(default)]
+	pub(crate) line_numbers: Option<bool>,
+
+	/// In outlines, list a module's `use` items (by default, each run of them is one `use ...;` line).
+	#[serde(default)]
+	pub(crate) imports: bool,
 
 	/// Also show the `impl` blocks of types and traits (outlined unless `mode` is `full`).
 	#[serde(default)]
@@ -806,7 +789,8 @@ impl ViewParams {
 		ViewOptions {
 			mode: self.mode.into(),
 			docs: self.docs,
-			line_numbers: self.line_numbers,
+			line_numbers: self.line_numbers.map_or(LineNumbers::Auto, LineNumbers::from),
+			imports: self.imports,
 			impls: self.impls,
 			active_only: self.active_only,
 		}
@@ -894,7 +878,8 @@ mod tests {
 		let view: ViewParams = parse(json!({ "paths": ["crate"] }));
 
 		assert_eq!(view.mode, Mode::Auto);
-		assert!(view.docs && view.line_numbers && !view.impls && !view.active_only);
+		assert!(view.docs && !view.imports && !view.impls && !view.active_only);
+		assert_eq!(view.options().line_numbers, LineNumbers::Auto);
 
 		let format: FormatParams = parse(json!({}));
 
@@ -1168,13 +1153,15 @@ mod tests {
 			"mode": "outline",
 			"docs": false,
 			"line_numbers": false,
+			"imports": true,
 			"impls": true,
 			"active_only": true,
 		}));
 		let options = view.options();
 
 		assert_eq!(options.mode, ViewMode::Outline);
-		assert!(!options.docs && !options.line_numbers && options.impls && options.active_only);
+		assert_eq!(options.line_numbers, LineNumbers::Never);
+		assert!(!options.docs && options.imports && options.impls && options.active_only);
 		assert_eq!(ViewMode::from(Mode::Full), ViewMode::Full);
 		assert_eq!(ViewMode::from(Mode::Auto), ViewMode::Auto);
 	}

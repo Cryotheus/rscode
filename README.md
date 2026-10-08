@@ -42,18 +42,25 @@ cargo rscode find 'crate::shapes::*' -k fn    # functions directly in `crate::sh
 cargo rscode find Circle --show all --from ::  # with cfg, visibility, and the path other crates can use
 cargo rscode view crate::shapes               # an outline of a module (bodies elided)
 cargo rscode view crate::shapes::Circle --impls -n
+cargo rscode refs crate::shapes::Circle       # where it is used, by file, with the line of each use
 cargo rscode rename crate::shapes::Circle Disk --dry-run
 cargo rscode remove crate::util::old --prune-imports
 cargo rscode remove 'use crate::util::Old'      # an import, not what it imports
 cargo rscode replace crate::util::area new_area.rs
-cargo rscode insert '<crate::shapes::Circle>' method.rs --position after --anchor crate::shapes::Circle::new
+cargo rscode edit crate::util::area --old '3.0' --new '3.14'   # change text inside an item
+cargo rscode edit crate::util::area --vis 'pub(crate)' --doc 'The area.' --add-attr must_use
+cargo rscode insert method.rs --after crate::shapes::Circle::new
+cargo rscode import crate::shapes std::fmt 'crate::util::{area, Unit}'
+cargo rscode create-module crate::shapes polygon polygon.rs --vis pub
 cargo rscode fmt crate::ffi --check           # sort and rustfmt one module, show the diff
 cargo rscode sort                             # only sort; formatting is left as it is
 ```
 
 Every subcommand accepts cargo's selection flags (`-p`, `--workspace`, `--exclude`, `--features`,
 `--all-features`, `--no-default-features`, `--manifest-path`, `--lib`, `--bin`, `--tests`, ..., `--target`) plus
-`--cfg` and `--message-format human|json`. `cargo rscode <subcommand> --help` documents everything.
+`--cfg` and `--message-format human|json`. Without `-p` or `--workspace`, a path that names nothing in cargo's default
+members is looked up in the other workspace members (with a note), and a path that still names nothing gets
+suggestions. `cargo rscode <subcommand> --help` documents everything.
 
 ### Item paths
 
@@ -116,10 +123,17 @@ is separated from its neighbours by a blank line; code under `#[rustfmt::skip]` 
 ## MCP server (for AI agents)
 
 `cargo rscode mcp` serves the same operations as tools over stdio: `workspace_info`, `find_items`, `view_items`,
-`rename_item`, `remove_items`, `replace_item`, `insert_items`, and `format_items` (`--read-only` leaves out the last
-five). The workspace is reloaded for every call, so edits made by other tools are always seen, and modifying tools
-support `dry_run` to return a diff instead of writing. With `--expose`, clients can also attach other workspaces and
-packages by name (`attach_source`, `detach_source`, `list_sources`); see below.
+`find_references`, and the editing tools `rename_item`, `remove_items`, `replace_item`, `edit_item`, `insert_items`,
+`create_module`, `add_import`, and `format_items` (`--read-only` leaves them out). The workspace is reloaded for every
+call, so edits made by other tools are always seen, and editing tools support `dry_run` to return a diff instead of
+writing. With `--expose`, clients can also attach other workspaces and packages by name (`attach_source`,
+`detach_source`, `list_sources`, `use_source`); see below.
+
+The server is built to cost a model fewer tokens than reading and editing files directly: `edit_item` sends only the
+changed text (or a new visibility, doc comment, or attribute), `add_import` and `insert_items` take only the new
+lines, views number their lines only when they are not consecutive and outline a module's imports as `use ...;`, and
+the tool schemas are kept small (the rarely used selection parameters are described once in the server's
+instructions rather than in every tool).
 
 Claude Code:
 
@@ -189,7 +203,9 @@ their `Cargo.toml` (or its directory) and a name of their choice, and then pass 
   active), except that attaching the same `Cargo.toml` for writing makes a read-only attachment writable.
   `list_sources` shows the attached sources and the exposed directories.
 - The server's own workspace (`--manifest-path`, or the one containing the working directory) remains the default
-  when a tool call names no `attached` source, and `--expose` does not restrict its edits, like on the command line.
+  when a tool call names no `attached` source, unless `use_source` (or `attach_source` with `use`) makes an attached
+  source the default for the session. `--expose` does not restrict edits of the server's own workspace, like on the
+  command line.
 
 ## Shell completion
 

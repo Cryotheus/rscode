@@ -26,11 +26,11 @@ const EDIT_TOOLS: [&str; 8] = [
 	"replace_item",
 ];
 
-const QUERY_TOOLS: [&str; 4] = ["find_items", "find_references", "view_items", "workspace_info"];
-
 /// Parameters every tool accepts.
-const SELECTION: [&str; 7] = ["packages", "workspace", "features", "all_features", "all_targets", "lib", "bin"];
+/// The parameters of the selection that schemas leave out (the instructions describe them).
+const HIDDEN_SELECTION: [&str; 6] = ["workspace", "features", "all_features", "all_targets", "lib", "bin"];
 
+const QUERY_TOOLS: [&str; 4] = ["find_items", "find_references", "view_items", "workspace_info"];
 const SOURCE_TOOLS: [&str; 4] = ["attach_source", "detach_source", "list_sources", "use_source"];
 
 /// A client talking to a server over an in-process pipe, with newline-delimited JSON-RPC like stdio.
@@ -184,7 +184,7 @@ fn enumerations_and_defaults_are_in_the_schemas() {
 
 	assert_eq!(property("view_items", "mode")["enum"], json!(["auto", "full", "outline"]));
 	assert_eq!(property("view_items", "mode")["default"], "auto");
-	assert_eq!(property("view_items", "line_numbers")["default"], true);
+	assert_eq!(property("view_items", "docs")["default"], true);
 	assert_eq!(property("insert_items", "position")["enum"], json!(["end", "start", "before", "after"]));
 	assert_eq!(property("format_items", "formatter")["enum"], json!(["rustfmt", "prettyplease", "none"]));
 	assert_eq!(property("format_items", "targets")["default"], json!(["crate"]));
@@ -346,11 +346,14 @@ fn input_schemas_are_objects_with_described_properties() {
 
 		assert_eq!(schema["type"], "object", "{}", tool.name);
 
-		for name in SELECTION {
-			assert!(properties.contains_key(name), "{} lacks `{name}`", tool.name);
+		assert!(properties.contains_key("packages"), "{} lacks `packages`", tool.name);
+
+		for name in HIDDEN_SELECTION {
+			assert!(!properties.contains_key(name), "{} shows `{name}`", tool.name);
 		}
 
-		for (name, property) in properties {
+		// (the instructions describe the parameters that tools share)
+		for (name, property) in properties.iter().filter(|(name, _)| !["dry_run", "format", "packages"].contains(&name.as_str())) {
 			let description = property["description"].as_str().unwrap_or_default();
 
 			assert!(description.len() > 10, "{}.{name} is not described: {property}", tool.name);
@@ -361,7 +364,7 @@ fn input_schemas_are_objects_with_described_properties() {
 
 		let description = tool.description.as_deref().unwrap_or_default();
 
-		assert!(description.len() > 100, "{} is not described", tool.name);
+		assert!(description.len() > 60, "{} is not described", tool.name);
 	}
 }
 
@@ -474,6 +477,29 @@ fn required_parameters() {
 }
 
 #[test]
+fn schemas_say_only_what_a_call_needs() {
+	let server = Server::new(ServerOptions::default());
+	let schema = |tool: &str| Value::Object((*server.get_tool(tool).unwrap().input_schema).clone());
+	let edit_item = schema("edit_item");
+
+	assert!(edit_item.get("$schema").is_none(), "{edit_item}");
+
+	// no defaults that say nothing, no `null` types, no descriptions of what the instructions describe
+	assert_eq!(edit_item["properties"]["dry_run"], json!({ "type": "boolean" }));
+	assert_eq!(edit_item["properties"]["packages"], json!({ "type": "array", "items": { "type": "string" } }));
+	assert_eq!(edit_item["properties"]["vis"]["type"], "string");
+	assert!(edit_item["properties"]["vis"].get("default").is_none(), "{edit_item}");
+	assert!(edit_item["properties"]["edits"]["items"].get("description").is_none(), "{edit_item}");
+	assert_eq!(schema("find_items")["properties"]["limit"], json!({ "type": "integer", "default": 100, "description": "Most matches to list (0 only counts them)." }));
+	assert!(schema("view_items")["properties"]["line_numbers"].get("default").is_none());
+
+	// what schemas leave out is still accepted
+	let params: super::params::FindParams = serde_json::from_value(json!({ "pattern": "a", "workspace": true, "bin": "x" })).unwrap();
+
+	assert!(params.selection.workspace && params.selection.bin == ["x"]);
+}
+
+#[test]
 fn server_info() {
 	let info = Server::new(ServerOptions::default()).get_info();
 
@@ -484,18 +510,23 @@ fn server_info() {
 	let instructions = info.instructions.unwrap();
 
 	for needle in [
-		"crate::module::Item",
+		"crate::m::Item",
 		"::crate_name::Item",
 		"`Type::method`",
 		"<Type as Trait>::method",
 		"impl Trait for Type",
-		"`**`",
-		"matches anywhere",
+		"impl Tools[add_bots]",
+		"`Type.field`",
+		"`m::name!`",
 		"all-or-nothing",
 		"must still parse",
-		"dry_run",
-		"loaded from disk again for every call",
-		"`use module::Name`",
+		"`dry_run`",
+		"`format`",
+		"`packages`",
+		"`workspace`",
+		"`bin`",
+		"reads the files again",
+		"`use m::Name`",
 	] {
 		assert!(instructions.contains(needle), "the instructions do not mention {needle}");
 	}
@@ -567,8 +598,8 @@ fn source_tools() {
 	assert_eq!(required("detach_source"), [json!("name")]);
 	assert_eq!(required("list_sources"), Vec::<Value>::new());
 	assert_eq!(required("use_source"), [json!("name")]);
-	assert_eq!(schema("attach_source")["properties"]["write"]["default"], false);
-	assert_eq!(schema("attach_source")["properties"]["use"]["default"], false);
+	assert_eq!(schema("attach_source")["properties"]["write"]["type"], "boolean");
+	assert_eq!(schema("attach_source")["properties"]["use"]["type"], "boolean");
 
 	for name in SOURCE_TOOLS {
 		let tool = server.get_tool(name).unwrap();
@@ -587,7 +618,7 @@ fn source_tools() {
 	let resolved = |exposure: &str| exposure.parse::<Exposure>().unwrap().resolved_pattern().to_owned();
 
 	assert!(instructions.contains("attach_source"), "{instructions}");
-	assert!(instructions.contains("pass that name as `attached`"), "{instructions}");
+	assert!(instructions.contains("named as any tool's `attached`"), "{instructions}");
 	assert!(
 		instructions.ends_with(&format!("\n- read: {}", resolved("read=/nonexistent/refs/*"))),
 		"{instructions}"
@@ -988,7 +1019,7 @@ mod end_to_end {
 		let (failed, text) = client.call("find_items", json!({ "pattern": "Counter.*" })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &[&native("demo::Counter.count  field  src/lib.rs:2:2-3:16")]);
+		assert_contains(&text, &[&native("demo::Counter.count  field  src/lib.rs:2-3")]);
 
 		let (failed, text) = client.call("view_items", json!({ "paths": ["crate::Counter.count"] })).await;
 
@@ -1161,7 +1192,7 @@ mod end_to_end {
 		assert!(!failed, "{text}");
 		assert_contains(
 			&text,
-			&[&native("use demo::Circle  import  src/lib.rs:5:5-5:19  -> demo::shapes::Circle")],
+			&[&native("use demo::Circle  import  src/lib.rs:5  -> demo::shapes::Circle")],
 		);
 
 		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Circle" })).await;
@@ -1504,11 +1535,11 @@ mod end_to_end {
 		// matches in the selection say which members were not searched
 		let (_, text) = client.call("find_items", json!({ "pattern": "add" })).await;
 
-		assert_contains(&text, &["demo::add  fn", "hint: the workspace member `helper` is not selected"]);
+		assert_contains(&text, &["demo::add  fn", "note: not searched: helper (members not selected; see `packages`)"]);
 
 		let (_, text) = client.call("find_items", json!({ "pattern": "add", "packages": "demo" })).await;
 
-		assert!(!text.contains("hint"), "{text}");
+		assert!(!text.contains("hint") && !text.contains("note"), "{text}");
 
 		// edits too, of what one crate has (renames load every member, so `::helper` names the crate anyway)
 		let rename = json!({ "path": "crate::assist", "new_name": "help", "dry_run": true });
@@ -1617,8 +1648,8 @@ mod end_to_end {
 		assert_contains(
 			&text,
 			&[
-				&native("demo::add  fn  src/lib.rs:7:1-10:2"),
-				&native("demo::extra  fn  src/lib.rs:12:1-13:18  cfg: feature = \"extra\"  inactive"),
+				&native("demo::add  fn  src/lib.rs:7-10"),
+				&native("demo::extra  fn  src/lib.rs:12-13  cfg: feature = \"extra\"  inactive"),
 				&native("demo::shapes::Circle::new  assoc-fn  src/shapes.rs:"),
 				"5 matches",
 			],
@@ -1649,9 +1680,22 @@ mod end_to_end {
 				"// error: no item found for `crate::nope`",
 				&format!("// {}", native("demo::add (fn) src/lib.rs:7-10")),
 				"a + b",
-				"│",
 			],
 		);
+
+		// lines are numbered when they are not consecutive, or on request
+		assert!(!text.contains('│'), "{text}");
+
+		for (arguments, numbered) in [
+			(json!({ "paths": "crate::add", "docs": false }), true),
+			(json!({ "paths": "crate::add", "line_numbers": true }), true),
+			(json!({ "paths": "crate", "line_numbers": false }), false),
+			(json!({ "paths": "crate" }), true),
+		] {
+			let (_, text) = client.call("view_items", arguments.clone()).await;
+
+			assert_eq!(text.contains(" │ "), numbered, "{arguments}: {text}");
+		}
 
 		let (failed, text) = client.call("view_items", json!({ "paths": "crate::nope" })).await;
 
@@ -1871,7 +1915,7 @@ mod end_to_end {
 		let (failed, text) = client.call("find_items", json!({ "pattern": "info", "attached": "log" })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &[&native("log::info  fn  src/lib.rs:1:1")]);
+		assert_contains(&text, &[&native("log::info  fn  src/lib.rs:1")]);
 
 		let (_, text) = client.call("workspace_info", json!({ "attached": "log" })).await;
 

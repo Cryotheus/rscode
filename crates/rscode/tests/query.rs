@@ -10,6 +10,7 @@ use rscode::Error;
 use rscode::Find;
 use rscode::ItemId;
 use rscode::ItemKind;
+use rscode::LineNumbers;
 use rscode::PathPattern;
 use rscode::Resolver;
 use rscode::Tristate;
@@ -640,7 +641,7 @@ fn views_without_docs() {
 		])
 	);
 
-	let numbered = ViewOptions { line_numbers: true, ..no_docs };
+	let numbered = ViewOptions { line_numbers: LineNumbers::Always, ..no_docs };
 
 	assert_eq!(
 		text(&resolver, "crate::nested::outer::inner::deep", numbered),
@@ -652,7 +653,7 @@ fn views_without_docs() {
 fn views_with_line_numbers() {
 	let workspace = workspace();
 	let resolver = Resolver::new(&workspace);
-	let numbered = ViewOptions { line_numbers: true, ..ViewOptions::default() };
+	let numbered = ViewOptions { line_numbers: LineNumbers::Always, ..ViewOptions::default() };
 
 	assert_eq!(
 		text(&resolver, "crate::add", numbered.clone()),
@@ -710,6 +711,30 @@ fn views_with_line_numbers() {
 
 	assert!(full.starts_with(&head), "{full}");
 	assert!(full.ends_with(&lines(&["  28 │ \t}", "  29 │ }"])), "{full}");
+
+	// numbered only when the first line's number does not tell every line's
+	let auto = ViewOptions { line_numbers: LineNumbers::Auto, ..ViewOptions::default() };
+
+	assert!(text(&resolver, "crate::add", auto.clone()).starts_with("/// Adds two numbers.\n"));
+	assert!(text(&resolver, "crate::add", ViewOptions { docs: false, ..auto.clone() }).starts_with("  14 │ pub fn add("));
+	assert!(text(&resolver, "crate::impls", auto.clone()).contains("\n   9 │ \tpub fn new(radius: f64) -> Self { ... }\n"));
+	assert!(text(&resolver, "crate::shapes", ViewOptions { mode: ViewMode::Full, ..auto }).contains("\n//! Shapes.\n"));
+}
+
+#[test]
+fn outlines_collapse_imports_on_request() {
+	let workspace = workspace();
+	let resolver = Resolver::new(&workspace);
+	let collapsed = text(&resolver, "crate::impls", ViewOptions { imports: false, ..ViewOptions::default() });
+
+	assert!(collapsed.contains("\n\nuse ...;\n\nimpl Circle {\n"), "{collapsed}");
+	assert!(!collapsed.contains("use crate::shapes"), "{collapsed}");
+
+	// in full, and by default, they are listed
+	let full = ViewOptions { mode: ViewMode::Full, imports: false, ..ViewOptions::default() };
+
+	assert!(text(&resolver, "crate::impls", full).contains("use crate::shapes::Square;"));
+	assert!(text(&resolver, "crate::impls", ViewOptions::default()).contains("use crate::shapes::Square;"));
 }
 
 #[test]
@@ -1159,7 +1184,7 @@ fn views_crlf_files() {
 	workspace.load_crate(CrateSpec::new("query_crlf", fixture("query_crlf/lib.rs")));
 
 	let resolver = Resolver::new(&workspace);
-	let numbered = ViewOptions { line_numbers: true, ..ViewOptions::default() };
+	let numbered = ViewOptions { line_numbers: LineNumbers::Always, ..ViewOptions::default() };
 
 	// line breaks become `\n`, also inside of strings
 	assert_eq!(
@@ -1269,7 +1294,7 @@ fn robustness_on_large_registry_crates() {
 			(ViewMode::Outline, false, true),
 			(ViewMode::Auto, false, false),
 		] {
-			let options = ViewOptions { mode, docs, line_numbers: numbered, ..ViewOptions::default() };
+			let options = ViewOptions { mode, docs, line_numbers: numbered.into(), ..ViewOptions::default() };
 			let views = View::with_options(options).items(&resolver, &items).unwrap();
 
 			assert_eq!(views.len(), items.len());
