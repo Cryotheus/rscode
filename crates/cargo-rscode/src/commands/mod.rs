@@ -7,9 +7,11 @@ mod fmt;
 mod format_edited;
 mod import;
 mod insert;
+mod refs;
 mod remove;
 mod rename;
 mod replace;
+mod retry;
 mod view;
 
 #[cfg(feature = "mcp")]
@@ -68,11 +70,22 @@ fn hint(error: &rscode::Error, resolver: &Resolver<'_>) -> Option<String> {
 			let member = path.as_ref().and_then(|path| workspace.unloaded_member_of(path));
 
 			// (a selector that picks none of the blocks a loaded header names: the members do not matter)
-			let selector = path.as_ref().and_then(|path| resolver.selector_hint(path));
+			if let Some(selector) = path.as_ref().and_then(|path| resolver.selector_hint(path)) {
+				return Some(selector);
+			}
 
-			selector
-				.or_else(|| unloaded_hint(workspace, member))
-				.or_else(|| path.and_then(|path| resolver.import_hint(&path)))
+			// the crate is known: searching the loaded crates would not help
+			if member.is_some() {
+				return unloaded_hint(workspace, member);
+			}
+
+			let hint = (path.as_ref().and_then(|path| resolver.import_hint(path)))
+				.or_else(|| retry::suggestion(resolver, path.as_ref()));
+
+			match (hint, unloaded_hint(workspace, None)) {
+				(Some(hint), Some(unloaded)) => Some(format!("{hint}\nhint: {unloaded}")),
+				(hint, unloaded) => hint.or(unloaded),
+			}
 		}
 
 		_ => None,
@@ -171,6 +184,7 @@ pub(crate) fn run(name: &str, matches: &ArgMatches, ui: &Ui) -> anyhow::Result<E
 	match name {
 		"find" => find::run(matches, ui),
 		"view" => view::run(matches, ui),
+		"refs" => refs::run(matches, ui),
 		"fmt" => fmt::run(matches, ui, false),
 		"sort" => fmt::run(matches, ui, true),
 		"rename" => rename::run(matches, ui),

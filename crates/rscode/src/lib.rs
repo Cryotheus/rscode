@@ -12,6 +12,7 @@
 //! - Resolve: [`Resolver`] resolves `use` imports, paths, `impl` targets, visibility, and usable paths.
 //! - Search: [`Find`] with glob-like [`pattern`]s (no regex).
 //! - View: [`View`] shows full source or outlines (bodies elided).
+//! - References: [`query::find_references`] finds where items are used, with the item and line of each use.
 //! - Edit: [`edit::remove`], [`edit::rename`], [`edit::replace`], [`edit::edit_item`], [`edit::insert`],
 //!   [`edit::create_module`], [`edit::add_imports`], and [`edit::format`] plan changes as an [`EditSet`], which is
 //!   previewed or applied atomically. Comments and formatting outside of the edited ranges are always preserved.

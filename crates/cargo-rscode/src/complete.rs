@@ -790,7 +790,7 @@ mod tests {
 	#[test]
 	fn completes_subcommands_and_values() {
 		assert_eq!(engine(&["cargo-rscode", "f"]), ["find", "fmt"]);
-		assert_eq!(engine(&["cargo-rscode", "re"]), ["rename", "remove", "replace"]);
+		assert_eq!(engine(&["cargo-rscode", "re"]), ["refs", "rename", "remove", "replace"]);
 		assert_eq!(engine(&["cargo-rscode", "cr"]), ["create-module"]);
 		assert_eq!(engine(&["cargo-rscode", "i"]), ["insert", "import"]);
 		assert_eq!(engine(&["cargo-rscode", "find", "x", "--kind", "stru"]), ["struct"]);

@@ -8,6 +8,7 @@
 //! | `workspace_info` | packages (with features), crates, and load problems |
 //! | `find_items` | items whose paths match a glob pattern (`*`, `**`), one line each, with locations and `cfg`s |
 //! | `view_items` | the source (or an outline) of items by path, with line numbers |
+//! | `find_references` | the references to an item, by file, with the item and line of code of each |
 //! | `rename_item` | renames an item and updates the references to it across the workspace |
 //! | `remove_items` | removes items with their attached comments (and out-of-line module files) |
 //! | `replace_item` | replaces the source of an item |
@@ -19,6 +20,7 @@
 //! | `attach_source` | attaches another workspace or package under a name (with [`ServerOptions::exposed`]) |
 //! | `detach_source` | forgets an attached source |
 //! | `list_sources` | the attached sources, the server's own workspace, and the exposed directories |
+//! | `use_source` | makes an attached source the one that calls without `attached` work on |
 //!
 //! Every tool but the ones about sources also accepts `packages`, `workspace`, `features`, `all_features`,
 //! `all_targets`, `lib`, and `bin`, which adjust the server's [`LoadOptions`] for that call (and `attached`, see
@@ -30,7 +32,9 @@
 //! A server works on its own workspace ([`ServerOptions::load`]), and when it exposes directories
 //! ([`ServerOptions::exposed`]), on the cargo workspaces and packages in them that a client attaches: `attach_source`
 //! takes the path of a `Cargo.toml` whose directory an [`Exposure`] matches, a name, and whether the client needs to
-//! write. The tools then take that name as `attached`. A source can only be attached for writing where it is exposed
+//! write. The tools then take that name as `attached`; `use_source` (or `attach_source` with `use`) makes a source the
+//! one that calls without `attached` work on, for the rest of the session (an empty `attached` still names the server's
+//! own workspace). A source can only be attached for writing where it is exposed
 //! for writing, and edits of attached sources are only written below directories exposed for writing, however the
 //! edit reaches them (for example through `#[path]` attributes or other workspace members); edits of the server's own
 //! workspace are not restricted. Sources attached read-only can still be previewed with `dry_run`. Without exposed
@@ -60,6 +64,7 @@
 mod input;
 mod params;
 mod render;
+mod retry;
 mod server;
 mod sources;
 mod tools;

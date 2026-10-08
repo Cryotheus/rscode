@@ -1,5 +1,8 @@
 //! `import`: into a module, as new `use` items or merged into its `use` items.
 
+use super::retry;
+use super::retry::Failure;
+use super::retry::Search;
 use crate::args;
 use crate::args::ImportArgs;
 use crate::args::OutputArgs;
@@ -29,16 +32,20 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let output = OutputArgs::from_matches(matches);
 	let options = args::load_options(matches)?;
 	let module = ItemPath::parse(&args.module)?;
-	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
-	let resolver = Resolver::new(&workspace);
-	let plan = rscode::edit::add_imports(&resolver, &module, &args.paths, &ImportOptions::default())
-		.map_err(|error| hinted(error, &resolver))?;
-	let mut report = ImportReport::new(&plan, &args.module, args.dry_run, &paths);
+	let report = retry::run(ui, &options, output.absolute_paths, Search::OneCrate, |_, _, paths, resolver| {
+		let plan = rscode::edit::add_imports(resolver, &module, &args.paths, &ImportOptions::default()).map_err(|error| match error {
+			Error::NotFound(_) => Failure::NotFound(error),
+			error => Failure::Other(hinted(error, resolver)),
+		})?;
+		let mut report = ImportReport::new(&plan, &args.module, args.dry_run, paths);
 
-	match args.dry_run {
-		true => report.diff = Some(render::edit_diff(&plan.edits, &paths)?),
-		false => report.warnings.extend(plan.edits.apply()?.warnings),
-	}
+		match args.dry_run {
+			true => report.diff = Some(render::edit_diff(&plan.edits, paths).map_err(anyhow::Error::from)?),
+			false => report.warnings.extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings),
+		}
+
+		Ok(report)
+	})?;
 
 	super::print_report(ui, output.format, &report)?;
 	Ok(ExitCode::SUCCESS)

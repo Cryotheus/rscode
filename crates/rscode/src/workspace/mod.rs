@@ -18,6 +18,7 @@ mod plan;
 mod platform;
 mod required;
 mod targets;
+mod widen;
 
 use crate::Error;
 use crate::model::CrateSpec;
@@ -29,6 +30,8 @@ use serde::Serialize;
 use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
+
+pub use widen::Widening;
 
 /// Options for [`plan_workspace`] and [`load_workspace`], mirroring cargo's command-line flags.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]

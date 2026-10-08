@@ -5,6 +5,7 @@
 //! shown is always the canonical (definition) path, visible from where one stands or not, and `--from` adds the
 //! paths usable from a module (`crate`: the item's crate root; `::`: another crate).
 
+use super::retry;
 use crate::args;
 use crate::args::FindArgs;
 use crate::args::FromArg;
@@ -12,6 +13,7 @@ use crate::args::MessageFormat;
 use crate::args::OutputArgs;
 use crate::render;
 use crate::render::MatchRow;
+use crate::render::PathDisplay;
 use crate::ui;
 use crate::ui::Ui;
 use clap::ArgMatches;
@@ -23,16 +25,16 @@ use rscode::MatchOptions;
 use rscode::PathPattern;
 use rscode::Resolver;
 use rscode::Viewpoint;
+use rscode::Workspace;
 use rscode::pattern::IdentPattern;
+use rscode::query::FindMatch;
 use std::process::ExitCode;
 
-pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
-	let args = FindArgs::from_matches(matches);
-	let output = OutputArgs::from_matches(matches);
-	let (workspace, paths) = super::load(ui, &args::load_options(matches)?, output.absolute_paths)?;
-	let resolver = Resolver::new(&workspace);
-	let mut find = search(&args)?;
-	let from = args.from.as_ref().map(|from| viewpoint(&resolver, from)).transpose()?;
+/// The matches of the search in `resolver`'s workspace (up to the `--limit`, which the second value tells when there
+/// were more), with the usable paths that `--from` asks for.
+fn matches_of(resolver: &Resolver<'_>, find: &Find, args: &FindArgs) -> anyhow::Result<(Vec<FindMatch>, Option<usize>)> {
+	let mut find = find.clone();
+	let from = args.from.as_ref().map(|from| viewpoint(resolver, from)).transpose()?;
 
 	if let Some(Some(viewpoint)) = from {
 		find = find.from(viewpoint);
@@ -43,7 +45,7 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		find = find.limit(limit.saturating_add(1));
 	}
 
-	let mut found = find.run_with(&resolver)?;
+	let mut found = find.run_with(resolver)?;
 	let truncated = args.limit.filter(|&limit| found.len() > limit);
 
 	if let Some(limit) = truncated {
@@ -58,17 +60,44 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		}
 	}
 
+	Ok((found, truncated))
+}
+
+/// The crate a pattern starts from (`::name::…`, or `name::…`).
+fn pattern_crate(pattern: &str) -> Option<&str> {
+	let pattern = pattern.trim();
+	let pattern = pattern
+		.strip_prefix("use")
+		.filter(|rest| rest.starts_with(char::is_whitespace))
+		.unwrap_or(pattern)
+		.trim();
+
+	pattern.strip_prefix("::").unwrap_or(pattern).split("::").next()
+}
+
+/// Prints the matches, and notes: that nothing was found, or that there were more than the `--limit`, and the
+/// workspace members that were not searched (unless the command line named the packages).
+fn print(
+	ui: &Ui,
+	args: &FindArgs,
+	output: &OutputArgs,
+	workspace: &Workspace,
+	paths: &PathDisplay,
+	found: (Vec<FindMatch>, Option<usize>),
+	named_packages: bool,
+) -> anyhow::Result<ExitCode> {
+	let (found, truncated) = found;
 	let text = match output.format {
 		MessageFormat::Human => {
-			let rows: Vec<MatchRow> = found.iter().map(|found| MatchRow::new(found, &paths)).collect();
+			let rows: Vec<MatchRow> = found.iter().map(|found| MatchRow::new(found, paths)).collect();
 
 			render::find_human(&rows, &args.show)
 		}
 
-		MessageFormat::Json => render::find_json(&found, &paths)?,
+		MessageFormat::Json => render::find_json(&found, paths)?,
 
 		MessageFormat::FileLines => {
-			let rows: Vec<MatchRow> = found.iter().map(|found| MatchRow::new(found, &paths)).collect();
+			let rows: Vec<MatchRow> = found.iter().map(|found| MatchRow::new(found, paths)).collect();
 
 			render::file_lines(&rows)?
 		}
@@ -78,27 +107,55 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 
 	if found.is_empty() {
 		ui.note("no items found");
-
-		let member = args.patterns.iter().find_map(|pattern| {
-			let pattern = pattern.trim();
-			let pattern = pattern
-				.strip_prefix("use")
-				.filter(|rest| rest.starts_with(char::is_whitespace))
-				.unwrap_or(pattern)
-				.trim();
-			let first = pattern.strip_prefix("::").unwrap_or(pattern).split("::").next()?;
-
-			workspace.unloaded_member_with_crate(first)
-		});
-
-		if let Some(hint) = super::unloaded_hint(&workspace, member) {
-			ui.note(hint);
-		}
 	} else if let Some(limit) = truncated {
 		ui.note(format!("showing the first {limit} items (--limit)"));
 	}
 
+	let member = args.patterns.iter().find_map(|pattern| workspace.unloaded_member_with_crate(pattern_crate(pattern)?));
+
+	// (with matches, only when the command line left the selection to cargo)
+	if (found.is_empty() || !named_packages)
+		&& let Some(hint) = super::unloaded_hint(workspace, member)
+	{
+		ui.note(hint);
+	}
+
 	Ok(ExitCode::SUCCESS)
+}
+
+pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
+	let args = FindArgs::from_matches(matches);
+	let output = OutputArgs::from_matches(matches);
+	let options = args::load_options(matches)?;
+	let find = search(&args)?;
+	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
+	let resolver = Resolver::new(&workspace);
+	let found = matches_of(&resolver, &find, &args)?;
+
+	// nothing found: search the workspace members that the command line did not select
+	let named_packages = options.workspace || !options.packages.is_empty();
+	let member = (args.patterns.iter())
+		.find_map(|pattern| pattern_crate(pattern))
+		.and_then(|krate| ItemPath::parse(krate).ok());
+
+	if found.0.is_empty()
+		&& !named_packages
+		&& let Some(widening) = options.widened(&workspace, member.as_ref())
+	{
+		let (wider, paths) = super::load(ui, &widening.options, output.absolute_paths)?;
+		let resolver = Resolver::new(&wider);
+		let found = matches_of(&resolver, &find, &args)?;
+		let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &widening.members);
+
+		match members.is_empty() {
+			true => ui.note(retry::note(&widening.members, false)),
+			false => ui.note(retry::note(&members, true)),
+		}
+
+		return print(ui, &args, &output, &wider, &paths, found, named_packages);
+	}
+
+	print(ui, &args, &output, &workspace, &paths, found, named_packages)
 }
 
 /// The search: patterns, identifier patterns, kinds, and flags.

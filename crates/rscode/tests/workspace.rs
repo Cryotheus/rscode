@@ -585,6 +585,39 @@ fn records_the_members_that_are_not_loaded() {
 }
 
 #[test]
+fn widens_the_selection_to_find_more() {
+	// the default members are `app` and `tool`
+	let options = virtual_ws();
+	let workspace = plan(&options).load();
+	let path = |text: &str| rscode::ItemPath::parse(text).unwrap();
+
+	// a path of a crate of a member that is not loaded selects that member, besides the selected ones
+	let widening = options.widened(&workspace, Some(&path("::expand::x"))).unwrap();
+
+	assert_eq!(widening.members, ["macros"]);
+	assert_eq!(widening.options.packages, strings(&["app", "tool", "macros"]));
+	assert!(!widening.options.workspace);
+	assert_eq!(package_names(&plan(&widening.options)), ["app", "macros", "tool"]);
+
+	// other paths select every member, also those that are only loaded to find references in them
+	let widening = options.widened(&workspace, Some(&path("crate::x"))).unwrap();
+
+	assert_eq!(widening.members, ["real-core", "extra", "macros"]);
+	assert!(widening.options.workspace && widening.options.packages.is_empty());
+
+	let everything = with(virtual_ws(), |options| options.load_all_members = true);
+	let widening = everything.widened(&plan(&everything).load(), None).unwrap();
+
+	assert_eq!(widening.members, ["real-core", "extra", "macros"]);
+	assert!(widening.options.workspace && widening.options.load_all_members);
+
+	// nothing is left to search
+	let all = with(virtual_ws(), |options| options.workspace = true);
+
+	assert_eq!(all.widened(&plan(&all).load(), None), None);
+}
+
+#[test]
 fn describes_packages() {
 	let plan = plan(&packages(virtual_ws(), &["real-core", "app"]));
 	let core = package(&plan, "real-core");

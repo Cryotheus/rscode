@@ -1,6 +1,9 @@
 //! `edit`: text inside an item, and its attributes, doc comment, and visibility, in place.
 
 use super::format_edited;
+use super::retry;
+use super::retry::Failure;
+use super::retry::Search;
 use crate::args;
 use crate::args::EditArgs;
 use crate::args::OutputArgs;
@@ -10,7 +13,6 @@ use crate::report::ItemEditReport;
 use crate::ui::Ui;
 use clap::ArgMatches;
 use rscode::ItemPath;
-use rscode::Resolver;
 use rscode::edit::ItemEdit;
 use rscode::edit::TextReplacement;
 use std::process::ExitCode;
@@ -49,43 +51,51 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	edit.check()?;
 
 	let path = ItemPath::parse(&args.path)?;
-	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
-	let resolver = Resolver::new(&workspace);
-	let plan = rscode::edit::edit_item(&resolver, &path, &edit, &args.options).map_err(|error| {
-		let hint = super::hint(&error, &resolver);
-		let all_variants = matches!(error, rscode::Error::Ambiguous { .. }) && rscode::edit::replaces_all_variants(&resolver, &path);
+	let report = retry::run(ui, &options, output.absolute_paths, Search::OneCrate, |options, _, paths, resolver| {
+		let plan = rscode::edit::edit_item(resolver, &path, &edit, &args.options).map_err(|error| {
+			if matches!(error, rscode::Error::NotFound(_)) {
+				return Failure::NotFound(error);
+			}
 
-		let hint = match (&error, hint, all_variants) {
-			(rscode::Error::TextMismatch { lines, .. }, ..) if lines.is_empty() => Some(NOT_FOUND.to_owned()),
-			(rscode::Error::TextMismatch { .. }, ..) => Some(SEVERAL.to_owned()),
-			(_, Some(hint), true) => Some(format!("{hint}, or `--all-variants` to edit all")),
-			(_, None, true) => Some(VARIANTS.to_owned()),
-			(_, hint, false) => hint,
-		};
+			let hint = super::hint(&error, resolver);
+			let all_variants =
+				matches!(error, rscode::Error::Ambiguous { .. }) && rscode::edit::replaces_all_variants(resolver, &path);
 
-		super::with_hint(error, hint)
+			let hint = match (&error, hint, all_variants) {
+				(rscode::Error::TextMismatch { lines, .. }, ..) if lines.is_empty() => Some(NOT_FOUND.to_owned()),
+				(rscode::Error::TextMismatch { .. }, ..) => Some(SEVERAL.to_owned()),
+				(_, Some(hint), true) => Some(format!("{hint}, or `--all-variants` to edit all")),
+				(_, None, true) => Some(VARIANTS.to_owned()),
+				(_, hint, false) => hint,
+			};
+
+			Failure::Other(super::with_hint(error, hint))
+		})?;
+		let mut report = ItemEditReport::new(&plan, args.dry_run, paths);
+
+		if args.dry_run {
+			report.diff = Some(render::edit_diff(&plan.edits, paths).map_err(anyhow::Error::from)?);
+
+			if args.format {
+				report.warnings.push("the diff shows the edit before `--fmt` formats it".to_owned());
+			}
+		} else {
+			// what to format is decided before the edit changes the items
+			let targets =
+				(args.format && !plan.spans.is_empty()).then(|| format_edited::replaced(resolver, &path, &plan.files));
+
+			report.warnings.extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings);
+
+			if let Some(targets) = targets {
+				let (formatted, warnings) = format_edited::format(options, targets, paths);
+
+				report.formatted = formatted;
+				report.warnings.extend(warnings);
+			}
+		}
+
+		Ok(report)
 	})?;
-	let mut report = ItemEditReport::new(&plan, args.dry_run, &paths);
-
-	if args.dry_run {
-		report.diff = Some(render::edit_diff(&plan.edits, &paths)?);
-
-		if args.format {
-			report.warnings.push("the diff shows the edit before `--fmt` formats it".to_owned());
-		}
-	} else {
-		// what to format is decided before the edit changes the items
-		let targets = (args.format && !plan.spans.is_empty()).then(|| format_edited::replaced(&resolver, &path, &plan.files));
-
-		report.warnings.extend(plan.edits.apply()?.warnings);
-
-		if let Some(targets) = targets {
-			let (formatted, warnings) = format_edited::format(&options, targets, &paths);
-
-			report.formatted = formatted;
-			report.warnings.extend(warnings);
-		}
-	}
 
 	super::print_report(ui, output.format, &report)?;
 	Ok(ExitCode::SUCCESS)

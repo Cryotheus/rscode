@@ -26,12 +26,12 @@ const EDIT_TOOLS: [&str; 8] = [
 	"replace_item",
 ];
 
-const QUERY_TOOLS: [&str; 3] = ["find_items", "view_items", "workspace_info"];
+const QUERY_TOOLS: [&str; 4] = ["find_items", "find_references", "view_items", "workspace_info"];
 
 /// Parameters every tool accepts.
 const SELECTION: [&str; 7] = ["packages", "workspace", "features", "all_features", "all_targets", "lib", "bin"];
 
-const SOURCE_TOOLS: [&str; 3] = ["attach_source", "detach_source", "list_sources"];
+const SOURCE_TOOLS: [&str; 4] = ["attach_source", "detach_source", "list_sources", "use_source"];
 
 /// A client talking to a server over an in-process pipe, with newline-delimited JSON-RPC like stdio.
 struct Client {
@@ -451,6 +451,7 @@ fn required_parameters() {
 		("create_module", vec!["name", "parent"]),
 		("edit_item", vec!["path"]),
 		("find_items", vec!["pattern"]),
+		("find_references", vec!["path"]),
 		("format_items", vec![]),
 		("insert_items", vec!["source"]),
 		("remove_items", vec!["paths"]),
@@ -565,7 +566,9 @@ fn source_tools() {
 	);
 	assert_eq!(required("detach_source"), [json!("name")]);
 	assert_eq!(required("list_sources"), Vec::<Value>::new());
+	assert_eq!(required("use_source"), [json!("name")]);
 	assert_eq!(schema("attach_source")["properties"]["write"]["default"], false);
+	assert_eq!(schema("attach_source")["properties"]["use"]["default"], false);
 
 	for name in SOURCE_TOOLS {
 		let tool = server.get_tool(name).unwrap();
@@ -1466,26 +1469,70 @@ mod end_to_end {
 			],
 		);
 
-		// and named when paths or patterns match nothing
-		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist"] })).await;
+		// paths that name nothing in the selection are searched in the other members, unless the call names packages
+		let note = "note: found in workspace member `helper`, which is not selected by default (pass `packages` to skip \
+		            this search)";
+		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist", "crate::add"] })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&format!("// {note}"), "pub fn assist() {}", "pub fn add() {}"]);
+
+		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist"], "packages": "demo" })).await;
 
 		assert!(failed);
 		assert_contains(
 			&text,
-			&[
-				"no item found for `::helper::assist`",
-				"`helper` is a workspace member that is not selected",
-			],
+			&["no item found for `::helper::assist`", "`helper` is a workspace member that is not selected"],
 		);
 		assert!(!text.contains("find_items"), "{text}");
 
 		let (_, text) = client.call("find_items", json!({ "pattern": "assist" })).await;
 
+		assert!(text.starts_with(note), "{text}");
+		assert_contains(&text, &["helper::assist  fn"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "assist", "packages": "demo" })).await;
+
 		assert_contains(&text, &["no items match", "the workspace member `helper` is not selected"]);
 
-		let (_, text) = client.call("find_items", json!({ "pattern": "assist", "packages": "helper" })).await;
+		let (_, text) = client.call("find_items", json!({ "pattern": "nothing" })).await;
 
-		assert_contains(&text, &["helper::assist  fn"]);
+		assert!(text.starts_with("note: also searched workspace member `helper`"), "{text}");
+		assert_contains(&text, &["no items match `nothing`"]);
+		assert!(!text.contains("hint"), "{text}");
+
+		// matches in the selection say which members were not searched
+		let (_, text) = client.call("find_items", json!({ "pattern": "add" })).await;
+
+		assert_contains(&text, &["demo::add  fn", "hint: the workspace member `helper` is not selected"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "add", "packages": "demo" })).await;
+
+		assert!(!text.contains("hint"), "{text}");
+
+		// edits too, of what one crate has (renames load every member, so `::helper` names the crate anyway)
+		let rename = json!({ "path": "crate::assist", "new_name": "help", "dry_run": true });
+		let (failed, text) = client.call("rename_item", rename).await;
+
+		assert!(!failed, "{text}");
+		assert!(text.starts_with(note), "{text}");
+		assert_contains(&text, &["+pub fn help() {}"]);
+
+		let (failed, text) = client.call("find_references", json!({ "path": "crate::assist" })).await;
+
+		assert!(!failed, "{text}");
+		assert!(text.starts_with(note), "{text}");
+
+		// what still names nothing comes with suggestions
+		let (failed, text) = client.call("view_items", json!({ "paths": "crate::assists" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no item found for `crate::assists`", "hint: search with `find_items`"]);
+
+		let (failed, text) = client.call("remove_items", json!({ "paths": "crate::helper::assist", "dry_run": true })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no item found for `crate::helper::assist`", "hint: did you mean `helper::assist`?"]);
 
 		// `crate` is the root of the library and of the binary: `lib` or `bin` picks one
 		let (failed, text) = client
@@ -1610,6 +1657,146 @@ mod end_to_end {
 
 		assert!(failed);
 		assert_contains(&text, &["no item found for `crate::nope`", "hint: search with `find_items`"]);
+
+		// a plain path that names nothing stands for the only item whose path ends like it, when reading
+		let (failed, text) = client.call("view_items", json!({ "paths": "area" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"// note: no item found for `area`; using `demo::shapes::Circle::area`, the only item whose path ends like \
+				 it",
+				"pub fn area(&self) -> f64 {",
+			],
+		);
+
+		let replace = json!({ "path": "area", "source": "pub fn area(&self) -> f64 { 0.0 }", "dry_run": true });
+		let (failed, text) = client.call("replace_item", replace).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no item found for `area`", "hint: did you mean `demo::shapes::Circle::area`?"]);
+
+		let (failed, text) = client.call("view_items", json!({ "paths": "crate::area" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["hint: did you mean `demo::shapes::Circle::area`?"]);
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn references() {
+		let fixture = Fixture::new("references");
+		let mut client = Client::connect(fixture.options()).await;
+
+		let (failed, text) = client.call("find_references", json!({ "path": "crate::add" })).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(text, native("1 reference in 1 file\nsrc/lib.rs (demo)\n  16:2 in three: add(1, 2)\n"));
+
+		// imports are in their module; references in `impl` headers are in the block
+		let (_, text) = client.call("find_references", json!({ "path": "Circle" })).await;
+
+		assert_eq!(
+			text,
+			native(
+				"2 references in 2 files\nsrc/lib.rs (demo)\n  5:17: pub use shapes::Circle;\n\
+				 src/shapes.rs (demo::shapes)\n  6:6 in impl Circle: impl Circle {\n"
+			)
+		);
+
+		let (_, text) = client.call("find_references", json!({ "path": "Circle", "limit": 1, "offset": 1 })).await;
+
+		assert_eq!(
+			text,
+			native(
+				"2 references in 2 files; showing 2-2\nsrc/shapes.rs (demo::shapes)\n  6:6 in impl Circle: impl Circle {\n"
+			)
+		);
+
+		let parameters = json!({ "path": "Circle::area", "method_calls": true });
+		let (failed, text) = client.call("find_references", parameters).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["no references to `Circle::area` found (method calls, names inside of macros"]);
+
+		let (failed, text) = client.call("find_references", json!({ "path": "new" })).await;
+
+		assert!(!failed, "{text}");
+		assert!(text.starts_with("note: no item found for `new`; using `demo::shapes::Circle::new`"), "{text}");
+		assert_contains(&text, &["no references to `new` found"]);
+
+		let (failed, text) = client.call("find_references", json!({ "path": "impl Circle" })).await;
+
+		assert!(failed);
+		assert_eq!(text, "`impl demo::shapes::Circle` is an `impl` block, whose references cannot be searched");
+
+		let (failed, text) = client.call("find_references", json!({ "path": "crate::nope" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no item found for `crate::nope`", "hint: search with `find_items`"]);
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn searches_the_members_that_are_not_selected() {
+		let package = |name: &str, workspace: &str| {
+			format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{workspace}")
+		};
+		let workspace = "\n[workspace]\nmembers = [\"left\", \"right\"]\n";
+		let fixture = Fixture::with_files(
+			"unselected",
+			&[
+				("Cargo.toml", &package("demo", workspace)),
+				("src/lib.rs", "pub fn own() {}\n"),
+				("left/Cargo.toml", &package("left", "")),
+				("left/src/lib.rs", "pub fn shared() {}\n\npub fn left_only() {}\n"),
+				("right/Cargo.toml", &package("right", "")),
+				("right/src/lib.rs", "pub fn shared() {}\n"),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		// reading shows what every member has
+		let (failed, text) = client.call("view_items", json!({ "paths": "crate::shared" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"// note: found in workspace members `left`, `right`, which are not selected by default",
+				"// left::shared (fn) ",
+				"// right::shared (fn) ",
+			],
+		);
+
+		// an edit only takes what one crate has
+		let rename = json!({ "path": "crate::shared", "new_name": "common", "dry_run": true });
+		let (failed, text) = client.call("rename_item", rename).await;
+
+		assert!(failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"`crate::shared` is ambiguous",
+				"`left::shared` (fn)",
+				"`right::shared` (fn)",
+				"select one with `packages`",
+			],
+		);
+
+		let rename = json!({ "path": "crate::left_only", "new_name": "only", "dry_run": true });
+		let (failed, text) = client.call("rename_item", rename).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["note: found in workspace member `left`", "+pub fn only() {}"]);
+
+		// several paths of a removal are only searched in the selection
+		let remove = json!({ "paths": ["crate::own", "crate::left_only"], "dry_run": true });
+		let (failed, text) = client.call("remove_items", remove).await;
+
+		assert!(failed, "{text}");
+		assert_contains(&text, &["no item found for `crate::left_only`", "did you mean `left::left_only`?"]);
 		client.close().await.unwrap();
 	}
 
@@ -1836,6 +2023,120 @@ mod end_to_end {
 				"nothing was attached",
 			],
 		);
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn sources_can_be_used_by_default() {
+		let package = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n");
+		let fixture = Fixture::with_files(
+			"default-sources",
+			&[
+				("own/Cargo.toml", &package("own")),
+				("own/src/lib.rs", "pub fn mine() {}\n"),
+				("engine/Cargo.toml", &package("engine")),
+				("engine/src/lib.rs", "pub fn run() {}\n"),
+				("log/Cargo.toml", &package("log")),
+				("log/src/lib.rs", "pub fn info() {}\n"),
+			],
+		);
+		let root = sources::resolve(&fixture.root);
+		let options = ServerOptions {
+			load: LoadOptions {
+				manifest_path: Some(root.join("own/Cargo.toml")),
+				silent: true,
+				..LoadOptions::default()
+			},
+			exposed: vec![Exposure::new(Access::Write, root.join("*").to_str().unwrap()).unwrap()],
+			..ServerOptions::default()
+		};
+		let mut client = Client::connect(options).await;
+		let manifest = |name: &str| root.join(name).join("Cargo.toml");
+		let attach = |name: &str, write: bool, use_it: bool| {
+			json!({ "manifest_path": manifest(name).to_str().unwrap(), "name": name, "write": write, "use": use_it })
+		};
+
+		let (failed, text) = client.call("attach_source", attach("log", false, false)).await;
+
+		assert!(!failed, "{text}");
+
+		// attaching with `use` makes the source the default
+		let (failed, text) = client.call("attach_source", attach("engine", true, true)).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["attached `engine` (read and write)", "calls without `attached` work on it now"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "*" })).await;
+
+		assert_contains(&text, &["engine::run  fn"]);
+
+		let (_, text) = client.call("workspace_info", json!({})).await;
+
+		let header = format!("source `engine` (read and write, used by default): {}\n", manifest("engine").display());
+
+		assert!(text.starts_with(&header), "{text}");
+
+		// a call's own `attached` still wins, and "" is the server's own workspace
+		let (_, text) = client.call("find_items", json!({ "pattern": "*", "attached": "log" })).await;
+
+		assert_contains(&text, &["log::info  fn"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "*", "attached": "" })).await;
+
+		assert_contains(&text, &["own::mine  fn"]);
+
+		// edits go to the default source too
+		let rename = json!({ "path": "crate::run", "new_name": "start" });
+		let (failed, text) = client.call("rename_item", rename).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(fixture.read("engine/src/lib.rs"), "pub fn start() {}\n");
+		assert_eq!(fixture.read("own/src/lib.rs"), "pub fn mine() {}\n");
+
+		// `use_source`, which a read-only default does not let write
+		let (failed, text) = client.call("use_source", json!({ "name": "log" })).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(text, format!("calls without `attached` work on `log` (read-only): {}\n", manifest("log").display()));
+
+		let (_, text) = client.call("list_sources", json!({})).await;
+
+		assert_contains(
+			&text,
+			&["the server's own workspace: ", "calls without `attached` work on `log` (see `use_source`)"],
+		);
+
+		let (failed, text) = client.call("rename_item", json!({ "path": "crate::info", "new_name": "notice" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["source `log` is attached read-only", "the session uses it by default"]);
+
+		let (failed, text) = client.call("use_source", json!({ "name": "nope" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["no source is attached as `nope`", "the attached sources are `engine`, `log`"]);
+
+		// detaching the default goes back to the server's own workspace
+		let (failed, text) = client.call("detach_source", json!({ "name": "log" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["calls without `attached` work on the server's own workspace again"]);
+
+		let (_, text) = client.call("find_items", json!({ "pattern": "*" })).await;
+
+		assert_contains(&text, &["own::mine  fn"]);
+
+		// and so does an empty name
+		client.call("use_source", json!({ "name": "engine" })).await;
+
+		let (failed, text) = client.call("use_source", json!({ "name": "" })).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(text, "calls without `attached` work on the server's own workspace\n");
+
+		let (_, text) = client.call("list_sources", json!({})).await;
+
+		assert_contains(&text, &["the server's own workspace (used without `attached`): "]);
 		client.close().await.unwrap();
 	}
 }

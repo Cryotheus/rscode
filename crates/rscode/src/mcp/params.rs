@@ -15,6 +15,7 @@ use crate::edit::RemoveOptions;
 use crate::edit::RenameOptions;
 use crate::edit::ReplaceOptions;
 use crate::edit::TextReplacement;
+use crate::query::FindReferencesOptions;
 use crate::query::ViewMode;
 use crate::query::ViewOptions;
 use crate::resolve::ReferenceOptions;
@@ -71,6 +72,10 @@ pub(crate) struct AttachParams {
 	/// but a writable source attached under the name stays writable.
 	#[serde(default)]
 	pub(crate) write: bool,
+
+	/// Also make it the source that calls without `attached` work on (like `use_source`).
+	#[serde(default, rename = "use")]
+	pub(crate) use_it: bool,
 }
 
 /// Parameters of `create_module`.
@@ -453,6 +458,58 @@ pub(crate) enum Position {
 	After,
 }
 
+/// Parameters of `find_references`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ReferencesParams {
+	/// Path of the item whose references to find.
+	pub(crate) path: String,
+
+	/// Also find method calls `x.name(..)`, and `T::name` paths through generic parameters whose bounds do not tell
+	/// (uncertain: they are not type-checked).
+	#[serde(default)]
+	pub(crate) method_calls: bool,
+
+	/// Also find the name inside of macro invocations and `macro_rules!` transcribers that could not be analyzed
+	/// (uncertain).
+	#[serde(default)]
+	pub(crate) macro_tokens: bool,
+
+	/// Also find intra-doc links in doc comments.
+	#[serde(default)]
+	pub(crate) doc_links: bool,
+
+	/// Maximum number of references to list (0 only counts them).
+	#[serde(default = "default_find_limit")]
+	pub(crate) limit: usize,
+
+	/// Number of references to skip, to page through many references.
+	#[serde(default)]
+	pub(crate) offset: usize,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
+}
+
+impl ReferencesParams {
+	/// What to search, besides certain references.
+	pub(crate) fn options(&self) -> FindReferencesOptions {
+		FindReferencesOptions {
+			references: ReferenceOptions {
+				method_calls: self.method_calls,
+				macro_tokens: self.macro_tokens,
+				doc_links: self.doc_links,
+			},
+			definitions: false,
+		}
+	}
+
+	/// Whether every kind of uncertain reference (and doc links) is searched.
+	pub(crate) fn searches_everything(&self) -> bool {
+		self.method_calls && self.macro_tokens && self.doc_links
+	}
+}
+
 /// Parameters of `remove_items`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -649,6 +706,12 @@ impl Selection {
 
 		options
 	}
+
+	/// Whether the call chose the packages to load (`packages` or `workspace`), so that paths are only searched in
+	/// those (see [`super::retry`]).
+	pub(crate) fn names_packages(&self) -> bool {
+		self.workspace || !self.packages.is_empty()
+	}
 }
 
 struct StringList;
@@ -692,6 +755,14 @@ pub(crate) struct TextEdit {
 
 	/// The text to put in its place, like `new`.
 	pub(crate) new: String,
+}
+
+/// Parameters of `use_source`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct UseParams {
+	/// The name of an attached source, or "" for the server's own workspace.
+	pub(crate) name: String,
 }
 
 /// Parameters of `view_items`.

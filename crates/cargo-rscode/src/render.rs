@@ -1,7 +1,8 @@
 //! Rendering query results for people (human) and programs (JSON).
 //!
-//! Human output is rendered from display rows ([`MatchRow`], [`ViewRow`]) holding display-ready paths; JSON output
-//! serializes rscode's own result types, with their file paths made display-ready the same way.
+//! Human output is rendered from display rows ([`MatchRow`], [`ReferenceRow`], [`ViewRow`]) holding display-ready
+//! paths; JSON output serializes rscode's own result types (or the rows), with their file paths made display-ready the
+//! same way.
 
 use crate::args::ShowField;
 use rscode::ItemKind;
@@ -10,7 +11,9 @@ use rscode::edit::EditSet;
 use rscode::edit::FileChange;
 use rscode::model::Diagnostic;
 use rscode::query::FindMatch;
+use rscode::query::FoundReference;
 use rscode::query::ItemView;
+use rscode::resolve::ReferenceKind;
 use rscode::source::LineCol;
 use serde::Serialize;
 use std::path::Path;
@@ -112,6 +115,49 @@ impl PathDisplay {
 		}
 
 		absolute
+	}
+}
+
+/// A reference found by `refs`, ready for display (and its JSON form).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub(crate) struct ReferenceRow {
+	pub(crate) file: String,
+	pub(crate) line: usize,
+	pub(crate) column: usize,
+	pub(crate) kind: ReferenceKind,
+
+	/// Whether the reference certainly refers to the item (method calls, for example, might not).
+	pub(crate) certain: bool,
+
+	/// The canonical path of the module whose file the reference is in.
+	pub(crate) module: String,
+
+	/// The canonical path of the innermost item the reference is in, if it is in one below the module.
+	pub(crate) item: Option<String>,
+
+	/// That item's path relative to the module.
+	#[serde(skip)]
+	pub(crate) local_item: Option<String>,
+
+	/// The line of code (trimmed, and cut around the reference when it is long).
+	pub(crate) code: String,
+}
+
+impl ReferenceRow {
+	pub(crate) fn new(found: &FoundReference, paths: &PathDisplay) -> Self {
+		let reference = &found.reference;
+
+		Self {
+			file: paths.display(&reference.path),
+			line: reference.start.line,
+			column: reference.start.column,
+			kind: reference.kind,
+			certain: reference.certain,
+			module: found.module.clone(),
+			item: found.item.clone(),
+			local_item: found.local_item.clone(),
+			code: found.line.clone(),
+		}
 	}
 }
 
@@ -318,6 +364,65 @@ pub(crate) fn last_line(start: LineCol, end: LineCol) -> usize {
 	} else {
 		end.line
 	}
+}
+
+/// References by file: each file once (with its module), followed by one line per reference (or per line of code with
+/// several): `line:column` (`line:column,column`), what it is (unless it is a certain path; `?` marks uncertain ones),
+/// the item it is in (relative to the file's module), and its line of code.
+pub(crate) fn references_human(rows: &[ReferenceRow]) -> String {
+	// references on one line of code, of one kind and in one item, share their output line
+	let mut lines: Vec<(&ReferenceRow, Vec<usize>)> = Vec::new();
+
+	for row in rows {
+		match lines.last_mut() {
+			Some((first, columns))
+				if (&first.file, first.line, first.kind, first.certain, &first.module, &first.item)
+					== (&row.file, row.line, row.kind, row.certain, &row.module, &row.item) =>
+			{
+				columns.push(row.column);
+			}
+
+			_ => lines.push((row, vec![row.column])),
+		}
+	}
+
+	let mut out = String::new();
+	let mut file: Option<(&str, &str)> = None;
+
+	for (row, columns) in lines {
+		if file.is_none_or(|(file, _)| file != row.file) {
+			out.push_str(&format!("{} ({})\n", row.file, row.module));
+			file = Some((&row.file, &row.module));
+		}
+
+		let kind = match row.kind {
+			ReferenceKind::Definition => "definition",
+			ReferenceKind::Import | ReferenceKind::Path => "path",
+			ReferenceKind::MethodCall => "method call",
+			ReferenceKind::MacroToken => "inside of a macro",
+			ReferenceKind::DocLink => "doc link",
+		};
+		let label = match (row.kind, row.certain) {
+			(ReferenceKind::Import | ReferenceKind::Path, true) => String::new(),
+			(_, true) => format!(" ({kind})"),
+			(_, false) => format!(" ({kind}?)"),
+		};
+		let columns: Vec<String> = columns.iter().map(ToString::to_string).collect();
+		let at = format!("{}:{}{label}", row.line, columns.join(","));
+
+		// (a file of several crates may have references of each, in modules of other paths)
+		let item = match file.is_some_and(|(_, module)| module == row.module) {
+			true => row.local_item.as_deref(),
+			false => row.item.as_deref(),
+		};
+
+		match item {
+			Some(item) => out.push_str(&format!("  {at} in {item}: {}\n", row.code)),
+			None => out.push_str(&format!("  {at}: {}\n", row.code)),
+		}
+	}
+
+	out
 }
 
 /// A unified diff of file changes, with the paths of [`PathDisplay::diff_path`].
@@ -591,6 +696,50 @@ mod tests {
 		assert_eq!(
 			find_human(&[import], &[ShowField::Kind]),
 			"demo::Circle  import  -> demo::shapes::Circle\n"
+		);
+	}
+
+	#[test]
+	fn renders_references() {
+		let row = |line, column, kind, certain, item: Option<(&str, &str)>, code: &str| ReferenceRow {
+			file: "src/lib.rs".to_owned(),
+			line,
+			column,
+			kind,
+			certain,
+			module: "demo".to_owned(),
+			item: item.map(|(item, _)| item.to_owned()),
+			local_item: item.map(|(_, local)| local.to_owned()),
+			code: code.to_owned(),
+		};
+		let run = Some(("demo::run", "run"));
+		let rows = [
+			row(2, 5, ReferenceKind::Import, true, None, "use a::T;"),
+			row(9, 2, ReferenceKind::Path, true, run, "T::go(T::A);"),
+			row(9, 9, ReferenceKind::Path, true, run, "T::go(T::A);"),
+			row(10, 4, ReferenceKind::MethodCall, false, run, "t.go();"),
+			row(12, 1, ReferenceKind::Definition, true, Some(("demo::T", "T")), "struct T;"),
+		];
+
+		assert_eq!(
+			references_human(&rows),
+			"src/lib.rs (demo)\n  2:5: use a::T;\n  9:2,9 in run: T::go(T::A);\n  10:4 (method call?) in run: t.go();\n  12:1 \
+			 (definition) in T: struct T;\n"
+		);
+
+		// JSON has a row per reference, with the item's canonical path and the code
+		assert_eq!(
+			serde_json::to_value(&rows[1]).unwrap(),
+			serde_json::json!({
+				"file": "src/lib.rs",
+				"line": 9,
+				"column": 2,
+				"kind": "path",
+				"certain": true,
+				"module": "demo",
+				"item": "demo::run",
+				"code": "T::go(T::A);",
+			})
 		);
 	}
 

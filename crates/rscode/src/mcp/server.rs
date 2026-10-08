@@ -9,15 +9,18 @@ use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
+use super::params::ReferencesParams;
 use super::params::RemoveParams;
 use super::params::RenameParams;
 use super::params::ReplaceParams;
 use super::params::Selection;
+use super::params::UseParams;
 use super::params::ViewParams;
 use super::render;
 use super::sources;
 use super::sources::Access;
 use super::sources::Exposure;
+use super::sources::Session;
 use super::sources::Source;
 use super::sources::Sources;
 use super::sources::Verdict;
@@ -101,7 +104,7 @@ them, then edit.";
 const READ_ONLY_INSTRUCTIONS: &str = "\n\nThis server is read-only: the editing tools are disabled.";
 
 /// The tools about sources, offered when the server exposes directories.
-const SOURCE_TOOLS: [&str; 3] = ["attach_source", "detach_source", "list_sources"];
+const SOURCE_TOOLS: [&str; 4] = ["attach_source", "detach_source", "list_sources", "use_source"];
 
 /// The rscode MCP server.
 pub(crate) struct Server {
@@ -110,8 +113,8 @@ pub(crate) struct Server {
 	/// The exposed directories ([`ServerOptions::exposed`]), shared with the editing calls that check where they write.
 	exposed: Arc<[Exposure]>,
 
-	/// The sources this session attached. The lock is never held across an `await`.
-	sources: std::sync::Mutex<Sources>,
+	/// The sources this session attached, and the one it uses by default. The lock is never held across an `await`.
+	session: std::sync::Mutex<Session>,
 
 	/// Every tool; the editing tools are disabled when the server is read-only, and the tools about sources when it
 	/// exposes no directories.
@@ -275,6 +278,16 @@ impl Server {
 		self.query("find_items", target, move |target| tools::find(&target.load, &params)).await
 	}
 
+	/// Find the references to an item in every crate of the workspace (with trait items, also those of the items
+	/// implementing them). Lists them by file, one line each: `line:column`, the item they are in, and the line of
+	/// code. Method calls, names inside of macros, and doc links are only searched on request.
+	#[tool(annotations(title = "Find references", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+	async fn find_references(&self, Parameters(params): Parameters<ReferencesParams>) -> CallToolResult {
+		let target = self.target(&params.selection, true);
+
+		self.query("find_references", target, move |target| tools::references(&target.load, &params)).await
+	}
+
 	/// Show the source of items by path: in full, or outlined with bodies elided (the default for modules and
 	/// crates). Every item starts with a header line `// path (kind) file:line-endline`, followed by its lines,
 	/// numbered as in the file. An import (`use crate::a::Name`) is shown as its whole `use` item.
@@ -302,12 +315,13 @@ impl Server {
 #[tool_router(router = source_tools)]
 impl Server {
 	/// Attach a cargo workspace or package, by the path of its Cargo.toml, under a name of your choice: afterwards,
-	/// pass that name as `attached` to any other tool to work on it instead of the server's own workspace. Only
-	/// workspaces and packages in the directories the server exposes can be attached, and only those exposed for
-	/// writing can be attached with `write` (see `list_sources`). A name that is attached already keeps its source: the
-	/// response says what is attached under it (in particular, that a writable source is active when a read-only one
-	/// was asked for), and `detach_source` frees the name; attaching the same Cargo.toml again with `write` makes it
-	/// writable. Attaching is cheap: every call loads its source from disk anyway. Names are only known in this session.
+	/// pass that name as `attached` to any other tool to work on it instead of the server's own workspace (or set
+	/// `use` to work on it by default). Only workspaces and packages in the directories the server exposes can be
+	/// attached, and only those exposed for writing can be attached with `write` (see `list_sources`). A name that is
+	/// attached already keeps its source: the response says what is attached under it (in particular, that a writable
+	/// source is active when a read-only one was asked for), and `detach_source` frees the name; attaching the same
+	/// Cargo.toml again with `write` makes it writable. Attaching is cheap: every call loads its source from disk
+	/// anyway. Names are only known in this session.
 	#[tool(annotations(
 		title = "Attach a source",
 		read_only_hint = false,
@@ -342,10 +356,10 @@ impl Server {
 		};
 
 		// a taken name keeps its source: say what it has, before cargo plans anything
-		let verdict = sources::verdict(&name, self.sources().get(&name), &source);
+		let verdict = sources::verdict(&name, self.session().sources.get(&name), &source);
 
 		match verdict {
-			Verdict::Keep(text) => return respond(TOOL, Ok(text)),
+			Verdict::Keep(text) => return respond(TOOL, Ok(self.keep(&name, text, params.use_it))),
 			Verdict::Refuse(message) => return respond(TOOL, Err(message)),
 			Verdict::Attach | Verdict::Upgrade => {}
 		}
@@ -364,22 +378,36 @@ impl Server {
 		};
 
 		// the name may have been attached meanwhile (calls run concurrently): decide again, as the name is attached
-		let verdict = sources::register(&mut self.sources(), &name, &source);
+		let verdict = {
+			let mut session = self.session();
+			let verdict = sources::register(&mut session.sources, &name, &source);
+
+			if params.use_it && matches!(verdict, Verdict::Attach | Verdict::Upgrade) {
+				session.default = Some(name.clone());
+			}
+
+			verdict
+		};
 		let mut text = format!("attached `{name}` ({}): {}\n", source.access.describe(), source.manifest.display());
 
 		match verdict {
-			Verdict::Keep(kept) => return respond(TOOL, Ok(kept)),
+			Verdict::Keep(kept) => return respond(TOOL, Ok(self.keep(&name, kept, params.use_it))),
 			Verdict::Refuse(message) => return respond(TOOL, Err(message)),
 			Verdict::Attach => {}
 			Verdict::Upgrade => text.push_str("it was attached read-only before: the editing tools can write to it now\n"),
 		}
 
-		writeln!(text, "{summary}pass `\"attached\": \"{name}\"` to the other tools to work on it").unwrap();
+		match params.use_it {
+			true => writeln!(text, "{summary}calls without `attached` work on it now").unwrap(),
+			false => writeln!(text, "{summary}pass `\"attached\": \"{name}\"` to the other tools to work on it").unwrap(),
+		}
+
 		respond(TOOL, Ok(text))
 	}
 
 	/// Detach a source attached with `attach_source`: its name is forgotten, and the other tools no longer accept it
-	/// as `attached`. Nothing on disk is touched.
+	/// as `attached` (when it was used by default, calls without `attached` work on the server's own workspace again).
+	/// Nothing on disk is touched.
 	#[tool(annotations(
 		title = "Detach a source",
 		read_only_hint = false,
@@ -390,11 +418,21 @@ impl Server {
 	async fn detach_source(&self, Parameters(params): Parameters<DetachParams>) -> CallToolResult {
 		let name = params.name.trim();
 		let result = {
-			let mut attached = self.sources();
+			let mut session = self.session();
 
-			match attached.remove(name) {
-				Some(source) => Ok(format!("detached `{name}` ({})\n", source.manifest.display())),
-				None => Err(self.unknown(name, &attached)),
+			match session.sources.remove(name) {
+				None => Err(self.unknown(name, &session.sources)),
+
+				Some(source) => {
+					let mut text = format!("detached `{name}` ({})\n", source.manifest.display());
+
+					if session.default.as_deref() == Some(name) {
+						session.default = None;
+						text.push_str("calls without `attached` work on the server's own workspace again\n");
+					}
+
+					Ok(text)
+				}
 			}
 		};
 
@@ -406,6 +444,43 @@ impl Server {
 	#[tool(annotations(title = "List sources", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
 	async fn list_sources(&self) -> CallToolResult {
 		respond("list_sources", Ok(self.describe_sources()))
+	}
+
+	/// Make an attached source the one that calls without `attached` work on, for the rest of the session; an empty
+	/// `name` goes back to the server's own workspace. A call's own `attached` still wins (`""` for the server's own
+	/// workspace).
+	#[tool(annotations(
+		title = "Use a source",
+		read_only_hint = false,
+		destructive_hint = false,
+		idempotent_hint = true,
+		open_world_hint = false
+	))]
+	async fn use_source(&self, Parameters(params): Parameters<UseParams>) -> CallToolResult {
+		let name = params.name.trim();
+		let mut session = self.session();
+		let result = match session.sources.get(name) {
+			_ if name.is_empty() => {
+				session.default = None;
+				Ok("calls without `attached` work on the server's own workspace\n".to_owned())
+			}
+
+			Some(source) => {
+				let text = format!(
+					"calls without `attached` work on `{name}` ({}): {}\n",
+					source.access.describe(),
+					source.manifest.display()
+				);
+
+				session.default = Some(name.to_owned());
+				Ok(text)
+			}
+
+			None => Err(self.unknown(name, &session.sources)),
+		};
+
+		drop(session);
+		respond("use_source", result)
 	}
 }
 
@@ -433,7 +508,7 @@ impl Server {
 		Self {
 			exposed: options.exposed.clone().into(),
 			options,
-			sources: std::sync::Mutex::default(),
+			session: std::sync::Mutex::default(),
 			tool_router,
 			edits: Arc::default(),
 		}
@@ -474,7 +549,11 @@ impl Server {
 	/// What `list_sources` shows.
 	fn describe_sources(&self) -> String {
 		let access = if self.options.read_only { Access::Read } else { Access::Write };
-		let mut text = "the server's own workspace (used without `attached`): ".to_owned();
+		let session = self.session();
+		let mut text = match &session.default {
+			None => "the server's own workspace (used without `attached`): ".to_owned(),
+			Some(_) => "the server's own workspace: ".to_owned(),
+		};
 
 		match (&self.options.load.manifest_path, nearest_manifest()) {
 			(Some(manifest), _) => writeln!(text, "{} ({})", manifest.display(), access.describe()),
@@ -491,20 +570,22 @@ impl Server {
 		}
 		.unwrap();
 
-		{
-			let attached = self.sources();
-			let width = attached.keys().map(String::len).max().unwrap_or(0);
-
-			match attached.is_empty() {
-				true => text.push_str("\nno sources are attached (see `attach_source`)\n"),
-				false => text.push_str("\nattached sources (pass the name as `attached`):\n"),
-			}
-
-			for (name, source) in attached.iter() {
-				writeln!(text, "  {name:width$}  {:14}  {}", source.access.describe(), source.manifest.display()).unwrap();
-			}
+		if let Some(name) = &session.default {
+			writeln!(text, "calls without `attached` work on `{name}` (see `use_source`)").unwrap();
 		}
 
+		let width = session.sources.keys().map(String::len).max().unwrap_or(0);
+
+		match session.sources.is_empty() {
+			true => text.push_str("\nno sources are attached (see `attach_source`)\n"),
+			false => text.push_str("\nattached sources (pass the name as `attached`):\n"),
+		}
+
+		for (name, source) in session.sources.iter() {
+			writeln!(text, "  {name:width$}  {:14}  {}", source.access.describe(), source.manifest.display()).unwrap();
+		}
+
+		drop(session);
 		text.push('\n');
 		text.push_str(&sources::exposed_list(&self.exposed, self.access_cap()));
 		text
@@ -534,7 +615,15 @@ impl Server {
 			&& let Some((source, attached)) = &target.source
 			&& attached.access == Access::Read
 		{
-			return respond(name, Err(self.read_only_source(name, source, attached)));
+			let mut message = self.read_only_source(name, source, attached);
+
+			if target.by_default {
+				message.push_str(
+					"\nhint: the session uses it by default (see `use_source`): pass `attached` to work on another one",
+				);
+			}
+
+			return respond(name, Err(message));
 		}
 
 		let guard = self.edits.clone().lock_owned().await;
@@ -559,6 +648,17 @@ impl Server {
 	/// The lock editing calls hold while they run.
 	pub(crate) fn edit_lock(&self) -> Arc<Mutex<()>> {
 		self.edits.clone()
+	}
+
+	/// The response of `attach_source` for a name that keeps its source (see [`Verdict::Keep`]): with `use_it`, the
+	/// session uses it by default from now on.
+	fn keep(&self, name: &str, text: String, use_it: bool) -> String {
+		if !use_it {
+			return text;
+		}
+
+		self.session().default = Some(name.to_owned());
+		text + "calls without `attached` work on it now\n"
 	}
 
 	/// Runs a read-only tool's job.
@@ -591,17 +691,21 @@ impl Server {
 		format!("source `{name}` is attached read-only, so `{tool}` cannot write to it; nothing was written\nhint: {hint}")
 	}
 
-	/// The attached sources.
-	fn sources(&self) -> MutexGuard<'_, Sources> {
-		self.sources.lock().unwrap_or_else(PoisonError::into_inner)
+	/// What this session attached, and the source it uses by default.
+	fn session(&self) -> MutexGuard<'_, Session> {
+		self.session.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// What a call with `selection` works on: the attached source it names, or the server's own workspace. With
-	/// `everything`, every other target of every workspace member is loaded too, so that references everywhere are
-	/// found.
+	/// What a call with `selection` works on: the attached source it names, or else the session's default source (see
+	/// `use_source`), or the server's own workspace (also for an empty `attached`). With `everything`, every other
+	/// target of every workspace member is loaded too, so that references everywhere are found.
 	fn target(&self, selection: &Selection, everything: bool) -> Result<Target, String> {
-		let name = selection.attached.as_deref().map(str::trim).filter(|name| !name.is_empty());
-		let (defaults, scope, source) = match name {
+		let (name, by_default) = match selection.attached.as_deref().map(str::trim) {
+			Some("") => (None, false),
+			Some(name) => (Some(name.to_owned()), false),
+			None => (self.session().default.clone(), true),
+		};
+		let (defaults, scope, source) = match name.as_deref() {
 			None => {
 				self.check_own_workspace()?;
 				(self.options.load.clone(), WriteScope::Anywhere, None)
@@ -609,9 +713,9 @@ impl Server {
 
 			Some(name) => {
 				let source = {
-					let attached = self.sources();
+					let session = self.session();
 
-					attached.get(name).cloned().ok_or_else(|| self.unknown(name, &attached))?
+					session.sources.get(name).cloned().ok_or_else(|| self.unknown(name, &session.sources))?
 				};
 
 				source.check(name)?;
@@ -635,7 +739,13 @@ impl Server {
 		let mut load = selection.apply(&defaults);
 
 		load.load_all_members |= everything;
-		Ok(Target { load, scope, source })
+
+		Ok(Target {
+			load,
+			scope,
+			by_default: by_default && source.is_some(),
+			source,
+		})
 	}
 
 	/// The tools the server offers.
@@ -709,20 +819,23 @@ struct Target {
 	/// Where its edits may be written.
 	scope: WriteScope,
 
-	/// The attached source, if the call names one (rather than using the server's own workspace).
+	/// The attached source, if the call works on one (rather than on the server's own workspace).
 	source: Option<(String, Source)>,
+
+	/// Whether the source is the session's default (see `use_source`), rather than named by the call.
+	by_default: bool,
 }
 
 impl Target {
 	/// A line naming the attached source, if any.
 	fn header(&self) -> String {
-		match &self.source {
-			None => String::new(),
+		let Some((name, source)) = &self.source else {
+			return String::new();
+		};
 
-			Some((name, source)) => {
-				format!("source `{name}` ({}): {}\n", source.access.describe(), source.manifest.display())
-			}
-		}
+		let default = if self.by_default { ", used by default" } else { "" };
+
+		format!("source `{name}` ({}{default}): {}\n", source.access.describe(), source.manifest.display())
 	}
 }
 
@@ -774,7 +887,8 @@ fn sources_instructions(read_only: bool) -> String {
 	format!(
 		"\n\nOther cargo workspaces and packages can be attached with attach_source: the path of their Cargo.toml, a \
 		 name of your choice{write}. Then pass that name as `attached` to any other tool to work on the source instead \
-		 of the server's own workspace. Names are only known in this session; list_sources lists them. A name keeps its \
+		 of the server's own workspace, or make it the default with use_source. Names are only known in this session; \
+		 list_sources lists them. A name keeps its \
 		 source until detach_source forgets it. Workspaces and packages can be attached when the directory of their \
 		 Cargo.toml matches one of these patterns (`*` matches within one path component, `**` any number of \
 		 components){writing}:"

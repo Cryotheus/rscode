@@ -243,7 +243,20 @@ pub(crate) fn cli() -> Command {
 		.styles(STYLES)
 		.subcommand_required(true)
 		.arg_required_else_help(true)
-		.subcommands([find(), view(), fmt(), sort(), rename(), remove(), replace(), edit(), insert(), create_module(), import()]);
+		.subcommands([
+			find(),
+			view(),
+			refs(),
+			fmt(),
+			sort(),
+			rename(),
+			remove(),
+			replace(),
+			edit(),
+			insert(),
+			create_module(),
+			import(),
+		]);
 
 	#[cfg(feature = "mcp")]
 	let command = command.subcommand(mcp());
@@ -734,6 +747,33 @@ pub(crate) fn parse_key_value(pair: &str) -> Result<(String, String), String> {
 		Some((key, value)) if !key.trim().is_empty() => Ok((key.trim().to_owned(), value.trim().to_owned())),
 		_ => Err("expected KEY=VALUE".to_owned()),
 	}
+}
+
+fn refs() -> Command {
+	let command = Command::new("refs")
+		.about("Find the references to items")
+		.long_about(
+			"Find the references to items (every `cfg` variant, and for trait items also those of the items \
+			 implementing them) in every crate of the workspace, and print them by file: `line:column`, the item they \
+			 are in, and their line of code. Method calls, names inside of macro bodies that are not code, and doc \
+			 links are only searched with the flags below; references in attributes and through aliases \
+			 (`use a::Old as New;`) are not found.",
+		)
+		.arg(item_paths("paths", "PATH", "The items whose references to find"))
+		.arg(flag(
+			"method-calls",
+			"Also find method calls (`x.name()`), which cannot be resolved without types, and `T::name` paths through \
+			 generic parameters whose bounds do not tell",
+		))
+		.arg(flag(
+			"macro-tokens",
+			"Also find matching identifiers in macro bodies that are not expressions (and in `macro_rules!` \
+			 transcribers) outside of the paths resolved there",
+		))
+		.arg(flag("doc-links", "Also find intra-doc links (``[`Name`]``)"))
+		.arg(flag("definitions", "Also list the definitions of the items"));
+
+	output_args(load_args(command), FORMATS)
 }
 
 fn remove() -> Command {

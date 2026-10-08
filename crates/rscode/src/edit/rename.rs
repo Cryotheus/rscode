@@ -390,6 +390,19 @@ fn add_counterparts(resolver: &Resolver<'_>, targets: &mut Vec<ItemId>) {
 	targets.dedup();
 }
 
+/// Adds what the items `targets` name must be searched (or renamed) along with: drops the items of trait `impl`s that
+/// targets of inherent `impl`s shadow (see [`drop_shadowed`]), and adds the counterparts of trait items (see
+/// [`add_counterparts`]) and the copies of targets that other crates load from the same source (see [`add_twins`]).
+pub(crate) fn add_related(resolver: &Resolver<'_>, targets: &mut Vec<ItemId>) {
+	drop_shadowed(resolver, targets);
+	add_counterparts(resolver, targets);
+
+	// (twins of trait items have counterparts of their own)
+	if add_twins(resolver.workspace(), targets) {
+		add_counterparts(resolver, targets);
+	}
+}
+
 /// Adds the items that other crates load from the same source as a target (from a file several crates load as a
 /// module, or modules loaded from the same file), which a rename changes too. Returns whether any was added.
 fn add_twins(ws: &Workspace, targets: &mut Vec<ItemId>) -> bool {
@@ -893,13 +906,7 @@ pub fn rename(resolver: &Resolver<'_>, path: &ItemPath, new_name: &str, options:
 		check_supported(resolver, target)?;
 	}
 
-	drop_shadowed(resolver, &mut targets);
-	add_counterparts(resolver, &mut targets);
-
-	// (twins of trait items have counterparts of their own)
-	if add_twins(ws, &mut targets) {
-		add_counterparts(resolver, &mut targets);
-	}
+	add_related(resolver, &mut targets);
 
 	let mut variant_notes = Vec::new();
 

@@ -1088,6 +1088,49 @@ fn reports_paths_naming_nothing() {
 }
 
 #[test]
+fn suggests_what_paths_naming_nothing_meant() {
+	let workspace = workspace();
+	let resolver = Resolver::new(&workspace);
+	let suggest = |path: &str| rscode::query::suggest(&resolver, &path.parse().unwrap());
+	let helper = "query_dep::inner::helper";
+
+	// the only item whose path ends like a plain path, also in crates that are not selected
+	for path in ["helper", "inner::helper", "Circle::area"] {
+		let suggestions = suggest(path);
+		let expected = match path {
+			"Circle::area" => "<query_basic::shapes::Circle as Shape>::area",
+			_ => helper,
+		};
+
+		assert_eq!(suggestions.unique_suffix.as_deref(), Some(expected), "{path}");
+	}
+
+	// anchored paths only get the items of that name
+	let anchored = suggest("crate::helper");
+
+	assert_eq!((anchored.unique_suffix, anchored.similar, anchored.named), (None, vec![helper.to_owned()], 1));
+
+	// several items: ending like the path first, then shorter paths
+	let area = suggest("Shape::area");
+
+	assert_eq!(area.unique_suffix.as_deref(), Some("query_basic::shapes::Shape::area"));
+	assert_eq!(
+		area.similar,
+		[
+			"query_basic::shapes::Shape::area",
+			"<query_basic::shapes::Circle as Shape>::area",
+			"<query_basic::shapes::Square as Shape>::area",
+		]
+	);
+	assert_eq!(suggest("area").unique_suffix, None);
+
+	// names in another case, when no name is equal; nothing for imports
+	assert_eq!(suggest("crate::HELPER").similar, [helper]);
+	assert_eq!(suggest("crate::nothing"), rscode::query::Suggestions::default());
+	assert_eq!(suggest("use crate::helper"), rscode::query::Suggestions::default());
+}
+
+#[test]
 fn serializes_views() {
 	let workspace = workspace();
 	let resolver = Resolver::new(&workspace);

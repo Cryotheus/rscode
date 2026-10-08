@@ -17,7 +17,9 @@ use crate::model::Package;
 use crate::model::Severity;
 use crate::model::Workspace;
 use crate::query::FindMatch;
+use crate::query::FoundReference;
 use crate::query::ItemView;
+use crate::query::ReferenceReport;
 use crate::resolve::Reference;
 use crate::resolve::ReferenceKind;
 use crate::source::LineCol;
@@ -28,6 +30,9 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
+
+/// How many of the items whose references were searched `find_references` lists.
+const MAX_LISTED_TARGETS: usize = 5;
 
 /// Tool output longer than this many characters is truncated.
 pub(crate) const MAX_OUTPUT_CHARS: usize = 100_000;
@@ -199,9 +204,7 @@ fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
 }
 
 fn find_summary(pattern: &str, shown: usize, page: Page) -> String {
-	let Page { offset, limit, total } = page;
-
-	if total == 0 {
+	if page.total == 0 {
 		let mut summary = format!("no items match `{pattern}`");
 
 		if !pattern.contains('*') {
@@ -217,27 +220,7 @@ fn find_summary(pattern: &str, shown: usize, page: Page) -> String {
 		return summary;
 	}
 
-	let matches = count(total, "match", "matches");
-
-	if shown == total {
-		return matches;
-	}
-
-	if limit == 0 {
-		return format!("{matches} (none listed: `limit` is 0)");
-	}
-
-	if shown == 0 {
-		return format!("{matches}; none left after `offset` {offset}");
-	}
-
-	let mut summary = format!("{matches}; showing {}-{}", offset + 1, offset + shown);
-
-	if offset + shown < total {
-		write!(summary, "; for more, call again with `offset` {}", offset + shown).unwrap();
-	}
-
-	summary
+	paged(count(page.total, "match", "matches"), shown, page)
 }
 
 /// Whether formatting would change the processed files (for `check`).
@@ -426,6 +409,31 @@ pub(crate) fn module_creation(root: &Path, plan: &ModuleCreation, parent: &str, 
 	out
 }
 
+/// `counted` (the count of a search's results), and which of them are shown when not all of them are.
+fn paged(counted: String, shown: usize, page: Page) -> String {
+	let Page { offset, limit, total } = page;
+
+	if shown == total {
+		return counted;
+	}
+
+	if limit == 0 {
+		return format!("{counted} (none listed: `limit` is 0)");
+	}
+
+	if shown == 0 {
+		return format!("{counted}; none left after `offset` {offset}");
+	}
+
+	let mut summary = format!("{counted}; showing {}-{}", offset + 1, offset + shown);
+
+	if offset + shown < total {
+		write!(summary, "; for more, call again with `offset` {}", offset + shown).unwrap();
+	}
+
+	summary
+}
+
 fn reference(root: &Path, reference: &Reference) -> String {
 	format!(
 		"{} ({})",
@@ -443,6 +451,102 @@ fn reference_kind(kind: ReferenceKind) -> &'static str {
 		ReferenceKind::MacroToken => "inside of a macro",
 		ReferenceKind::DocLink => "doc link",
 	}
+}
+
+/// What a reference is, unless it is a certain path (or import): ` (method call?)`, with `?` for uncertain ones.
+fn reference_label(reference: &Reference) -> String {
+	match (reference.kind, reference.certain) {
+		(ReferenceKind::Import | ReferenceKind::Path, true) => String::new(),
+		(kind, true) => format!(" ({})", reference_kind(kind)),
+		(kind, false) => format!(" ({}?)", reference_kind(kind)),
+	}
+}
+
+/// The references of `find_references` (those of `page`): a summary line, the items searched when there are
+/// several, then each file once (with its module) followed by one line per reference (or per line of code with
+/// several): `line:column` (`line:column,column`), what it is (unless it is a certain path), the item it is in
+/// (relative to the file's module), and its line of code. Then the notes of the search.
+///
+/// `everything`: whether every kind of uncertain reference (and doc links) was searched.
+pub(crate) fn references(root: &Path, path: &str, report: &ReferenceReport, page: Page, everything: bool) -> String {
+	let mut out = String::new();
+
+	if report.references.is_empty() {
+		write!(out, "no references to `{path}` found").unwrap();
+
+		if !everything {
+			out.push_str(
+				" (method calls, names inside of macros, and doc links are only searched with `method_calls`, \
+				 `macro_tokens`, and `doc_links`)",
+			);
+		}
+
+		out.push('\n');
+	} else {
+		let shown: Vec<&FoundReference> = report.references.iter().skip(page.offset).take(page.limit).collect();
+		let mut counted = count(page.total, "reference", "references");
+		let uncertain = report.uncertain();
+
+		if uncertain > 0 {
+			write!(counted, " ({uncertain} uncertain)").unwrap();
+		}
+
+		write!(counted, " in {}", count(report.files(), "file", "files")).unwrap();
+		out.push_str(&paged(counted, shown.len(), page));
+		out.push('\n');
+
+		if let [_, _, ..] = report.targets.as_slice() {
+			let more = report.targets.len().saturating_sub(MAX_LISTED_TARGETS);
+			let mut items = report.targets[..report.targets.len() - more].join(", ");
+
+			if more > 0 {
+				write!(items, ", and {more} more").unwrap();
+			}
+
+			writeln!(out, "items: {items}").unwrap();
+		}
+
+		// references on one line of code, of one kind and in one item, share their output line (with the columns of
+		// all of them)
+		let mut lines: Vec<(&FoundReference, Vec<usize>)> = Vec::new();
+
+		for found in shown {
+			match lines.last_mut() {
+				Some((first, columns)) if same_line(first, found) => columns.push(found.reference.start.column),
+				_ => lines.push((found, vec![found.reference.start.column])),
+			}
+		}
+
+		let mut file: Option<(&Path, &str)> = None;
+
+		for (found, columns) in lines {
+			let reference = &found.reference;
+
+			if file.is_none_or(|(path, _)| path != reference.path) {
+				writeln!(out, "{} ({})", display(root, &reference.path), found.module).unwrap();
+				file = Some((&reference.path, &found.module));
+			}
+
+			// (a file of several crates may have references of each, in modules of other paths)
+			let item = match file.is_some_and(|(_, module)| module == found.module) {
+				true => found.local_item.as_deref(),
+				false => found.item.as_deref(),
+			};
+			let columns: Vec<String> = columns.iter().map(ToString::to_string).collect();
+			let at = format!("{}:{}{}", reference.start.line, columns.join(","), reference_label(reference));
+
+			match item {
+				Some(item) => writeln!(out, "  {at} in {item}: {}", found.line).unwrap(),
+				None => writeln!(out, "  {at}: {}", found.line).unwrap(),
+			}
+		}
+	}
+
+	for note in &report.notes {
+		writeln!(out, "note: {note}").unwrap();
+	}
+
+	out
 }
 
 /// A path for display: relative to the workspace root when it is inside of it.
@@ -592,6 +696,16 @@ pub(crate) fn replacement(root: &Path, plan: &Replacement, dry_run: bool) -> Str
 	out
 }
 
+/// Whether two references are on the same line of code, of the same kind and certainty, and in the same item.
+fn same_line(first: &FoundReference, other: &FoundReference) -> bool {
+	let (a, b) = (&first.reference, &other.reference);
+
+	a.path == b.path
+		&& a.start.line == b.start.line
+		&& (a.kind, a.certain) == (b.kind, b.certain)
+		&& (&first.module, &first.item) == (&other.module, &other.item)
+}
+
 /// The server's package and feature selection with a call's overrides, as far as it differs from cargo's defaults.
 fn selection(load: &LoadOptions) -> String {
 	let mut parts = Vec::new();
@@ -659,6 +773,7 @@ pub(crate) fn truncation_hint(tool: &str) -> &'static str {
 		"workspace_info" => "narrow the request: fewer `packages`",
 		"find_items" => "narrow the request: a more specific `pattern`, `kinds`, or a smaller `limit` (or an `offset`)",
 		"view_items" => "narrow the request: fewer or more specific `paths`, or `mode` `outline`",
+		"find_references" => "narrow the request: a smaller `limit` (or an `offset`)",
 		"remove_items" => "narrow the request: fewer `paths`; without `dry_run`, the edit is written and only summarized",
 
 		"format_items" => {
@@ -1121,6 +1236,59 @@ mod tests {
 			start,
 			certain: kind != ReferenceKind::MethodCall,
 		}
+	}
+
+	#[test]
+	fn reference_reports() {
+		let found = |reference: Reference, module: &str, item: Option<(&str, &str)>, line: &str| FoundReference {
+			reference,
+			module: module.to_owned(),
+			item: item.map(|(item, _)| item.to_owned()),
+			local_item: item.map(|(_, local)| local.to_owned()),
+			line: line.to_owned(),
+		};
+		let run = Some(("demo::run", "run"));
+		let shared = |line| reference(ReferenceKind::Path, "/ws/src/shared.rs", at(line, 3));
+		let report = ReferenceReport {
+			targets: (1..=7).map(|index| format!("demo::T{index}")).collect(),
+			references: vec![
+				found(reference(ReferenceKind::Import, "/ws/src/lib.rs", at(2, 5)), "demo", None, "use a::T1;"),
+				// references on one line share their output line
+				found(reference(ReferenceKind::Path, "/ws/src/lib.rs", at(9, 2)), "demo", run, "T1::go(T1::A);"),
+				found(reference(ReferenceKind::Path, "/ws/src/lib.rs", at(9, 9)), "demo", run, "T1::go(T1::A);"),
+				found(reference(ReferenceKind::MethodCall, "/ws/src/lib.rs", at(10, 4)), "demo", run, "t.go();"),
+				// a file that two crates load, in modules with other paths
+				found(shared(1), "demo::shared", Some(("demo::shared::f", "f")), "f(T1)"),
+				found(shared(3), "app::shared", Some(("app::shared::g", "g")), "g(T1)"),
+			],
+			notes: vec!["src/bad.rs:1:1: references in this file were not searched".to_owned()],
+		};
+		let page = |offset, limit, total| Page { offset, limit, total };
+
+		assert_eq!(
+			references(root(), "T1", &report, page(0, 100, 6), false),
+			"6 references (1 uncertain) in 2 files\n\
+			 items: demo::T1, demo::T2, demo::T3, demo::T4, demo::T5, and 2 more\n\
+			 src/lib.rs (demo)\n  2:5: use a::T1;\n  9:2,9 in run: T1::go(T1::A);\n  10:4 (method call?) in run: t.go();\n\
+			 src/shared.rs (demo::shared)\n  1:3 in f: f(T1)\n  3:3 in app::shared::g: g(T1)\n\
+			 note: src/bad.rs:1:1: references in this file were not searched\n"
+		);
+		assert_eq!(
+			references(root(), "T1", &report, page(1, 1, 6), false),
+			"6 references (1 uncertain) in 2 files; showing 2-2; for more, call again with `offset` 2\n\
+			 items: demo::T1, demo::T2, demo::T3, demo::T4, demo::T5, and 2 more\n\
+			 src/lib.rs (demo)\n  9:2 in run: T1::go(T1::A);\n\
+			 note: src/bad.rs:1:1: references in this file were not searched\n"
+		);
+
+		let none = ReferenceReport::default();
+
+		assert_eq!(
+			references(root(), "T1", &none, page(0, 100, 0), false),
+			"no references to `T1` found (method calls, names inside of macros, and doc links are only searched with \
+			 `method_calls`, `macro_tokens`, and `doc_links`)\n"
+		);
+		assert_eq!(references(root(), "T1", &none, page(0, 100, 0), true), "no references to `T1` found\n");
 	}
 
 	#[test]

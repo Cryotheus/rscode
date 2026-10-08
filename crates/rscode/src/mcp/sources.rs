@@ -165,6 +165,17 @@ impl FromStr for Exposure {
 #[error("{0}")]
 pub struct ExposureError(String);
 
+/// What a session attached, and which source its calls work on when they do not say.
+#[derive(Debug, Default)]
+pub(crate) struct Session {
+	/// The attached sources, by name.
+	pub(crate) sources: Sources,
+
+	/// The name of the source that calls without `attached` work on (see `use_source`), instead of the server's own
+	/// workspace.
+	pub(crate) default: Option<String>,
+}
+
 /// A workspace or package attached under a name.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct Source {

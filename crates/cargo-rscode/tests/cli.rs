@@ -263,7 +263,20 @@ fn prints_help_and_version() {
 
 	assert!(help.stdout.contains("Usage: cargo-rscode <COMMAND>"), "{}", help.stdout);
 
-	let subcommands = ["find", "view", "fmt", "sort", "rename", "remove", "replace", "edit", "insert", "create-module", "import"];
+	let subcommands = [
+		"find",
+		"view",
+		"refs",
+		"fmt",
+		"sort",
+		"rename",
+		"remove",
+		"replace",
+		"edit",
+		"insert",
+		"create-module",
+		"import",
+	];
 
 	for subcommand in subcommands {
 		assert!(help.stdout.contains(&format!("\n  {subcommand} ")), "{subcommand}: {}", help.stdout);
@@ -731,6 +744,53 @@ fn views_outlines_and_impls() {
 }
 
 #[test]
+fn finds_references() {
+	let dir = fixture();
+	let refs = run(&dir, &["refs", "crate::add"]).success();
+
+	assert_eq!(
+		refs.stdout,
+		native("src/main.rs (demo)\n  4:49 in main: let circle = demo::Circle::new(f64::from(demo::add(1, 2)));\n")
+	);
+
+	// a trait item with the items implementing it, uncertain method calls, and definitions
+	let refs = run(&dir, &["refs", "crate::shapes::Shape::area", "--method-calls", "--definitions"]).success();
+
+	assert_eq!(
+		refs.lines(),
+		[
+			&native("src/main.rs (demo)"),
+			"  5:20 (method call?) in main: let area = circle.area();",
+			&native("src/shapes.rs (demo::shapes)"),
+			"  17:5 (definition) in <Circle as Shape>::area: fn area(&self) -> f64 {",
+			"  30:5 (definition) in Shape::area: fn area(&self) -> f64;",
+		]
+	);
+
+	let json = run(&dir, &["refs", "crate::add", "--message-format", "json"]).success();
+	let rows: Value = serde_json::from_str(&json.stdout).unwrap();
+
+	assert_eq!(
+		rows,
+		json!([{
+			"file": native("src/main.rs"),
+			"line": 4,
+			"column": 49,
+			"kind": "path",
+			"certain": true,
+			"module": "demo",
+			"item": "demo::main",
+			"code": "let circle = demo::Circle::new(f64::from(demo::add(1, 2)));",
+		}])
+	);
+
+	let none = run(&dir, &["refs", "crate::shapes::Kind"]).success();
+
+	assert_eq!(none.stdout, "");
+	assert!(none.stderr.contains("note: no references found"), "{}", none.stderr);
+}
+
+#[test]
 fn checks_formatting() {
 	let check = run(&fixture(), &["fmt", "--check", "crate::util::alpha"]);
 
@@ -903,9 +963,18 @@ fn errors_name_the_options_that_get_past_them() {
 
 	assert!(lib.stdout.contains("+++ b/src/lib.rs"), "{}", lib.stdout);
 
-	// members that are not selected are not loaded
+	// members that are not selected are not loaded, but searched when a path names nothing in the selected ones
 	let workspace = two_packages("hints");
-	let member = run(&workspace.path().join("b"), &["view", "::a::foo"]);
+	let member = run(&workspace.path().join("b"), &["view", "::a::foo"]).success();
+
+	assert!(member.stdout.contains("pub fn foo() {}"), "{}", member.stdout);
+	assert!(
+		member.stderr.contains("note: found in workspace member `a`, which is not selected by default"),
+		"{}",
+		member.stderr
+	);
+
+	let member = run(&workspace.path().join("b"), &["view", "::a::foo", "-p", "b"]);
 
 	assert_eq!(member.code, Some(1));
 	assert!(member.stderr.contains("`a` is a workspace member that is not selected"), "{}", member.stderr);
@@ -913,8 +982,39 @@ fn errors_name_the_options_that_get_past_them() {
 
 	let found = run(workspace.path(), &["find", "bar"]).success();
 
+	assert!(found.stdout.contains("b::bar  fn"), "{}", found.stdout);
+	assert!(found.stderr.contains("note: found in workspace member `b`"), "{}", found.stderr);
+
+	let found = run(workspace.path(), &["find", "bar", "-p", "a"]).success();
+
+	assert!(found.stderr.contains("the workspace member `b` is not selected"), "{}", found.stderr);
+
+	// matches say which members were not searched
+	let found = run(workspace.path(), &["find", "foo"]).success();
+
 	assert!(found.stderr.contains("the workspace member `b` is not selected"), "{}", found.stderr);
 	assert!(run(workspace.path(), &["view", "::b::bar", "-p", "b"]).success().stdout.contains("a::foo();"));
+
+	// an edit of what one member has, and suggestions for what names nothing
+	let rename = run(workspace.path(), &["rename", "crate::bar", "baz", "--dry-run"]).success();
+
+	assert!(rename.stdout.contains("+pub fn baz() {"), "{}", rename.stdout);
+	assert!(rename.stderr.contains("note: found in workspace member `b`"), "{}", rename.stderr);
+
+	let missing = run(workspace.path(), &["view", "crate::b::bar"]);
+
+	assert_eq!(missing.code, Some(1));
+	assert!(missing.stderr.contains("hint: did you mean `b::bar`?"), "{}", missing.stderr);
+
+	// a plain path that names nothing stands for the only item whose path ends like it, when reading
+	let suffix = run(&fixture(), &["view", "new"]).success();
+
+	assert!(suffix.stdout.contains("pub fn new(radius: f64) -> Self {"), "{}", suffix.stdout);
+	assert!(
+		suffix.stderr.contains("note: no item found for `new`; using `demo::shapes::Circle::new`"),
+		"{}",
+		suffix.stderr
+	);
 }
 
 #[test]
@@ -1310,6 +1410,7 @@ mod mcp {
 			"workspace_info",
 			"find_items",
 			"view_items",
+			"find_references",
 			"rename_item",
 			"remove_items",
 			"replace_item",
@@ -1323,6 +1424,7 @@ mod mcp {
 		let read_only = tools(&["--read-only"]);
 
 		assert!(read_only.contains("find_items") && read_only.contains("view_items"), "{read_only:?}");
+		assert!(read_only.contains("find_references"), "{read_only:?}");
 		assert!(!read_only.contains("rename_item") && !read_only.contains("edit_item"), "{read_only:?}");
 	}
 }

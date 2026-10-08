@@ -13,6 +13,8 @@ use rscode::edit::Rename;
 use rscode::edit::RenameOptions;
 use rscode::model::Dependency;
 use rscode::model::TargetKind;
+use rscode::query::FindReferencesOptions;
+use rscode::query::find_references;
 use rscode::resolve::Reference;
 use rscode::resolve::ReferenceKind;
 use rscode::resolve::ReferenceOptions;
@@ -137,6 +139,26 @@ fn references(ws: &Workspace, item_path: &str, options: &ReferenceOptions) -> Ve
 
 	assert!(found.notes.is_empty(), "{:?}", found.notes);
 	summary(ws, &found.references)
+}
+
+/// [`rscode::query::find_references`] as `file:line:column[?] in item: line` rows (the item relative to the file's
+/// module), with `?` for uncertain references.
+fn found(ws: &Workspace, item_paths: &[&str], options: &FindReferencesOptions) -> Vec<String> {
+	let paths: Vec<ItemPath> = item_paths.iter().map(|text| path(text)).collect();
+	let report = find_references(&Resolver::new(ws), &paths, options).unwrap_or_else(|error| panic!("{error}"));
+
+	assert!(report.notes.is_empty(), "{:?}", report.notes);
+
+	(report.references.iter())
+		.map(|found| {
+			let reference = &found.reference;
+			let file = ws.display_path(&reference.path).display().to_string().replace(std::path::MAIN_SEPARATOR, "/");
+			let certain = if reference.certain { "" } else { "?" };
+			let item = found.local_item.as_deref().map(|item| format!(" in {item}")).unwrap_or_default();
+
+			format!("{file}:{}:{}{certain}{item}: {}", reference.start.line, reference.start.column, found.line)
+		})
+		.collect()
 }
 
 fn plan(ws: &Workspace, item_path: &str, new_name: &str, options: &RenameOptions) -> Result<Rename, Error> {
@@ -590,6 +612,156 @@ fn unparsable_files_are_noted() {
 		found.notes
 	);
 	assert_eq!(found.references.len(), 26);
+}
+
+#[test]
+fn found_references_name_their_items_and_lines() {
+	let ws = load_items(&fixture("rename_items"));
+	let default = FindReferencesOptions::default();
+
+	// code in bodies is in its function (in a nested function too, which is not loaded); through a glob re-export too
+	let line = "println!(\"{circle} {} {}\", rename_items::util::helper(1.0), rename_items::helper(2.0));";
+
+	assert_eq!(
+		found(&ws, &["crate::util::helper"], &default),
+		[
+			format!("src/main.rs:8:49 in main: {line}"),
+			format!("src/main.rs:8:76 in main: {line}"),
+			"src/util.rs:14:24 in shadowing: helper + crate::util::helper(1.0)".to_owned(),
+			"src/util.rs:20:8 in closure: apply(helper(2.0))".to_owned(),
+			"src/util.rs:24:19 in make: Circle { radius: helper(1.0) }".to_owned(),
+			"src/util.rs:43:3 in outer: helper(2.0)".to_owned(),
+			"src/util.rs:59:27 in show: format!(\"{LIMIT} {} {}\", helper(1.0), COUNTER)".to_owned(),
+			"src/util.rs:63:7 in repeated: vec![helper(1.0); 3]".to_owned(),
+		]
+	);
+
+	// imports (and the module's own docs) are in no item; doc links are in the documented item; definitions are only
+	// found on request
+	let options = FindReferencesOptions {
+		references: ReferenceOptions {
+			doc_links: true,
+			..ReferenceOptions::default()
+		},
+		definitions: true,
+	};
+
+	let in_docs: Vec<String> = (found(&ws, &["crate::shapes::Circle"], &options).into_iter())
+		.filter(|row| row.starts_with("src/docs.rs"))
+		.collect();
+
+	let line = "/// A disc, unlike a [`Circle`] (see [the constructor](Circle::new) and [Circle][]).";
+
+	assert_eq!(
+		in_docs,
+		[
+			"src/docs.rs:1:38: //! Docs mentioning [`crate::shapes::Circle`].".to_owned(),
+			"src/docs.rs:3:20: use crate::shapes::Circle;".to_owned(),
+			format!("src/docs.rs:5:24 in Disc: {line}"),
+			format!("src/docs.rs:5:56 in Disc: {line}"),
+			format!("src/docs.rs:5:74 in Disc: {line}"),
+			"src/docs.rs:12:31 in make: /// Makes a [`Circle`](struct@Circle).".to_owned(),
+			"src/docs.rs:13:18 in make: pub fn make() -> Circle {".to_owned(),
+			"src/docs.rs:14:2 in make: Circle::new(2.0)".to_owned(),
+		]
+	);
+	assert_eq!(
+		found(&ws, &["crate::util::COUNTER"], &options),
+		[
+			"src/util.rs:5:12 in COUNTER: pub static COUNTER: u32 = 0;",
+			"src/util.rs:54:28 in check: limit => limit > LIMIT + COUNTER,",
+			"src/util.rs:59:40 in show: format!(\"{LIMIT} {} {}\", helper(1.0), COUNTER)",
+		]
+	);
+
+	// a trait item comes with the items implementing it, which `Square::area` names; items of `impl`s of types of
+	// other modules are named in full
+	let line = "Area::area(square) + <Square as Area>::area(square) + Square::area(square)";
+
+	assert_eq!(
+		found(&ws, &["crate::traits::Area::area"], &default),
+		[
+			format!("src/traits.rs:28:8 in explicit: {line}"),
+			format!("src/traits.rs:28:41 in explicit: {line}"),
+			format!("src/traits.rs:28:64 in explicit: {line}"),
+			"src/traits.rs:32:5 in generic: T::area(shape)".to_owned(),
+			"src/traits.rs:51:5 in bounded_by_where: T::area(shape)".to_owned(),
+			"src/traits.rs:58:6 in Wrapper::inner: T::area(&self.0)".to_owned(),
+			"src/traits.rs:67:6 in Wrapper::bounded_later: T::area(&self.0)".to_owned(),
+		]
+	);
+
+	let definitions: Vec<String> = (found(&ws, &["crate::traits::Area::area"], &options).into_iter())
+		.filter(|row| row.ends_with("fn area(&self) -> f64 {") || row.ends_with("fn area(&self) -> f64;"))
+		.collect();
+
+	assert_eq!(
+		definitions,
+		[
+			"src/traits.rs:2:5 in Area::area: fn area(&self) -> f64;",
+			"src/traits.rs:12:5 in <Square as Area>::area: fn area(&self) -> f64 {",
+			"src/traits.rs:18:5 in <rename_items::shapes::Circle as Area>::area: fn area(&self) -> f64 {",
+			"src/traits.rs:39:6 in local_impl: fn area(&self) -> f64 {",
+		]
+	);
+}
+
+#[test]
+fn found_references_cover_related_items_and_refuse_unnamed_ones() {
+	let ws = load_items(&fixture("rename_items"));
+	let resolver = Resolver::new(&ws);
+	let search = |text: &str, options: &FindReferencesOptions| find_references(&resolver, &[path(text)], options);
+
+	let report = search("crate::traits::Area::area", &FindReferencesOptions::default()).unwrap();
+
+	assert_eq!(
+		report.targets,
+		[
+			"<rename_items::shapes::Circle as Area>::area",
+			"<rename_items::traits::Square as Area>::area",
+			"rename_items::traits::Area::area",
+		]
+	);
+	assert_eq!((report.references.len(), report.files(), report.uncertain()), (7, 1, 0));
+
+	// method calls are uncertain
+	let options = FindReferencesOptions {
+		references: ReferenceOptions::all(),
+		definitions: false,
+	};
+	let report = search("crate::traits::Area::area", &options).unwrap();
+
+	assert_eq!((report.references.len(), report.files(), report.uncertain()), (11, 1, 4));
+
+	match search("crate::nope", &options) {
+		Err(Error::NotFound(path)) => assert_eq!(path, "crate::nope"),
+		other => panic!("{other:?}"),
+	}
+
+	let refused = [
+		(
+			"impl crate::shapes::Circle",
+			"`impl rename_items::shapes::Circle` is an `impl` block, whose references cannot be searched",
+		),
+		(
+			"use crate::util::Circle",
+			"`use rename_items::util::Circle` is an import, whose references cannot be searched: search for the \
+			 references of what it imports instead (its path without `use`)",
+		),
+		("crate", "`rename_items` is a crate root, whose references cannot be searched"),
+		(
+			"crate::shapes::Circle.radius",
+			"`rename_items::shapes::Circle.radius` is a field, whose uses (field accesses, struct literals, and \
+			 patterns) are not tracked",
+		),
+	];
+
+	for (text, message) in refused {
+		match search(text, &options) {
+			Err(Error::Unsupported(found)) => assert_eq!(found, message),
+			other => panic!("{other:?}"),
+		}
+	}
 }
 
 #[test]

@@ -21,6 +21,7 @@ use rscode::edit::InsertPosition;
 use rscode::edit::RemoveOptions;
 use rscode::edit::RenameOptions;
 use rscode::edit::ReplaceOptions;
+use rscode::query::FindReferencesOptions;
 use rscode::query::ViewMode;
 use rscode::query::ViewOptions;
 use rscode::resolve::ReferenceOptions;
@@ -517,6 +518,29 @@ impl OutputArgs {
 	}
 }
 
+/// `refs`
+#[derive(Debug, Clone)]
+pub(crate) struct RefsArgs {
+	pub(crate) paths: Vec<String>,
+	pub(crate) options: FindReferencesOptions,
+}
+
+impl RefsArgs {
+	pub(crate) fn from_matches(matches: &ArgMatches) -> Self {
+		Self {
+			paths: matches._values_of("paths"),
+			options: FindReferencesOptions {
+				references: ReferenceOptions {
+					method_calls: matches.flag("method-calls"),
+					macro_tokens: matches.flag("macro-tokens"),
+					doc_links: matches.flag("doc-links"),
+				},
+				definitions: matches.flag("definitions"),
+			},
+		}
+	}
+}
+
 /// `remove`
 #[derive(Debug, Clone)]
 pub(crate) struct RemoveArgs {
@@ -645,17 +669,17 @@ impl SourceArg {
 		Self::from_value(matches._value_of("source"))
 	}
 
-	/// The source a `SOURCE` value names (`-` and none for stdin).
-	fn from_value(value: Option<&str>) -> Self {
-		value.map_or(Self::Stdin, Self::from_path)
-	}
-
 	/// A file, or stdin for `-`.
 	fn from_path(path: &str) -> Self {
 		match path {
 			"-" => Self::Stdin,
 			path => Self::File(PathBuf::from(path)),
 		}
+	}
+
+	/// The source a `SOURCE` value names (`-` and none for stdin).
+	fn from_value(value: Option<&str>) -> Self {
+		value.map_or(Self::Stdin, Self::from_path)
 	}
 }
 

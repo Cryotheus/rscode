@@ -9,6 +9,7 @@
 //!   the paths usable from a module (`--from crate|::|MODULE`). `--message-format json` is for programs, and
 //!   `--message-format file-lines` prints rustfmt's `--file-lines` JSON.
 //! - `cargo rscode view <PATH>...` prints the source of items; modules are shown as outlines.
+//! - `cargo rscode refs <PATH>...` prints the references to items by file, with the item and line of code of each.
 //! - `cargo rscode fmt [TARGET]...` sorts items (with the Cryotheum ordering schema) and formats them (with rustfmt
 //!   or prettyplease), with rustfmt's `--check`, `--emit`, `--skip-children`, and `--config max_width=80,...`
 //!   (dotted keys and files are cargo's); `cargo rscode sort` only sorts.

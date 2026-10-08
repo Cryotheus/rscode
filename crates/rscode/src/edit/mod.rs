@@ -43,6 +43,7 @@ pub use remove::remove;
 pub use rename::Collision;
 pub use rename::Rename;
 pub use rename::RenameOptions;
+pub(crate) use rename::add_related;
 pub use rename::rename;
 pub use replace::AddedImport;
 pub use replace::CreateModuleOptions;
