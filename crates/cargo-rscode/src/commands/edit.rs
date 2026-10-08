@@ -21,7 +21,8 @@ use std::process::ExitCode;
 const NOT_FOUND: &str = "copy `--old` exactly from the output of `cargo rscode view` (with or without its `-n` line numbers)";
 
 /// How to go on when `--old` occurs several times in the item.
-const SEVERAL: &str = "include more of the surrounding text in `--old`, so that it occurs once";
+const SEVERAL: &str = "include more of the surrounding text in `--old` so that it occurs once, or copy it with the \
+	line numbers of `cargo rscode view -n` to pick one";
 
 /// How to go on when the path names several `cfg` variants.
 const VARIANTS: &str = "give `--old` text that only one of them has, or pass `--all-variants` to edit every one of them";

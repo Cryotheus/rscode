@@ -1699,6 +1699,14 @@ mod inner;
 			}]
 		);
 
+		// (text without line breaks is also printed there: lines after the first of `new` are indented as in views)
+		let plan = edit(&ws, triangle, text("let sides = 3;", "let sides = 3;\n\tlet more = sides;")).unwrap();
+
+		assert_eq!(
+			edited(&dir, &plan.edits, "src/lib.rs"),
+			LIB.replace("let sides = 3;\n", "let sides = 3;\n\t\tlet more = sides;\n")
+		);
+
 		// as views print it: dedented
 		let viewed = view(&ws, triangle, false);
 

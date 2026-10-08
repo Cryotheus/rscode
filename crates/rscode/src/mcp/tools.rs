@@ -234,7 +234,12 @@ pub(crate) fn edit_item(load: &LoadOptions, params: &EditItemParams, permit: &Pe
 					"copy `old` exactly from the output of `view_items` (with or without its line numbers)".to_owned()
 				}
 
-				Error::TextMismatch { .. } => "include more of the surrounding text in `old`, so that it occurs once".to_owned(),
+				Error::TextMismatch { .. } => {
+					"include more of the surrounding text in `old` so that it occurs once, or copy it with the line numbers \
+					 of `view_items` (`line_numbers`) to pick one"
+						.to_owned()
+				}
+
 				error => return retry::fail(error, resolver),
 			};
 

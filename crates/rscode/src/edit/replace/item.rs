@@ -1,9 +1,10 @@
 //! Editing an item in place: exact text inside of it, and its attributes, doc comment, and visibility.
 //!
-//! What a caller sends scales with the change, not with the item. Text to replace is looked for in the item as it is
-//! written in its file, and else as views print it (see [`PrintedText`]: dedented, with `\n` line breaks, and possibly
-//! with the line-number gutters of numbered views), so that text copied from the view of a method matches. The new
-//! text gets the indentation that the view removed and the file's line breaks; nothing else is re-indented.
+//! What a caller sends scales with the change, not with the item. Text to replace is looked for in the item as views
+//! print it (see [`PrintedText`]: dedented, with `\n` line breaks, and possibly with the line-number gutters of
+//! numbered views), so that text copied from the view of a method matches, and as it is written in its file. Where it
+//! is found as printed, the new text gets the indentation that the view removed; it always gets the file's line
+//! breaks, and nothing else is re-indented.
 //!
 //! The text of an out-of-line module (or of a crate root) is its file, as views show it, so its items and inner doc
 //! comments can be edited; its visibility and outer attributes are those of its `mod` declaration. Attributes, doc
@@ -228,6 +229,17 @@ struct NewAttribute {
 	meta: String,
 }
 
+/// Where a text to replace occurs in the text of a region (see [`try_replace`]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct Occurrence {
+	/// Where it is in the text of the region.
+	range: TextRange,
+
+	/// Where it is in the text as views print it (see [`PrintedText`]), when it occurs there; `None` when it only
+	/// occurs as written in the file.
+	printed: Option<(usize, usize)>,
+}
+
 /// The attributes and the visibility of an item, as ranges of the text of its [`Region`].
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct Prefix {
@@ -423,12 +435,14 @@ enum Shape {
 #[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct TextReplacement {
-	/// The text to replace: as written in the file, or as views print it (dedented, with `\n` line breaks, and also
-	/// with their line numbers when every line has one, which tell which occurrence is meant when there are several).
+	/// The text to replace: as views print it (dedented, with `\n` line breaks, and also with their line numbers when
+	/// every line has one, which tell which occurrence is meant when there are several), or as written in the file.
+	/// Text that occurs in both forms at different places occurs several times.
 	pub old: String,
 
 	/// The text to put in its place, in the form of `old`: when `old` is found as views print it, the lines of `new`
-	/// after the first get the indentation that the view removed.
+	/// after the first get the indentation that the view removed. An `old` without line breaks that is found as
+	/// written is found as printed too (unless it starts in that indentation), so its `new` is indented as in views.
 	pub new: String,
 }
 
@@ -490,19 +504,6 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 
 	region.apply(vec![edit]);
 	Ok(())
-}
-
-/// Of several occurrences of a text, the one at `line` (of the file, counting `source`, which maps an occurrence to an
-/// offset of the region's text), if there is exactly one; else all of them.
-fn at_line(region: &Region<'_>, found: Vec<usize>, line: Option<usize>, source: impl Fn(usize) -> usize) -> Vec<usize> {
-	let Some(line) = line.filter(|_| found.len() > 1) else {
-		return found;
-	};
-
-	match found.iter().copied().filter(|&offset| region.line_of(source(offset)) == line).collect::<Vec<_>>()[..] {
-		[at] => vec![at],
-		_ => found,
-	}
 }
 
 /// Parses an attribute to remove (see [`ItemEdit::remove_attributes`]); must run on a parsing thread.
@@ -1354,6 +1355,43 @@ fn set_visibility(regions: &mut Regions<'_>, visibility: Option<&str>, path: &st
 	Ok(None)
 }
 
+/// The error for a text (named `name` in messages) that occurs several times in the text of a region (of the item at
+/// `place`): where it occurs, and in which form when it occurs both as views print it and, elsewhere, as written.
+fn several_occurrences(region: &Region<'_>, found: &[Occurrence], name: &str, place: &str) -> Error {
+	let lines_of = |printed: Option<bool>| -> Vec<usize> {
+		let mut lines: Vec<usize> = (found.iter())
+			.filter(|occurrence| printed.is_none_or(|printed| occurrence.printed.is_some() == printed))
+			.map(|occurrence| region.line_of(occurrence.range.start))
+			.collect();
+
+		lines.dedup();
+		lines
+	};
+	let numbers = |lines: &[usize]| {
+		let numbers: Vec<String> = lines.iter().map(ToString::to_string).collect();
+
+		format!("line{} {}", if lines.len() == 1 { "" } else { "s" }, numbers.join(", "))
+	};
+
+	let lines = lines_of(None);
+	let (printed, written) = (lines_of(Some(true)), lines_of(Some(false)));
+
+	// (text copied from a view that also occurs as written, which gives its lines another indentation)
+	let forms = match printed.is_empty() || written.is_empty() {
+		true => String::new(),
+		false => format!(
+			": as views print it at {}, and as written in the file at {}",
+			numbers(&printed),
+			numbers(&written)
+		),
+	};
+
+	Error::TextMismatch {
+		message: format!("{name} occurs {} times in {place}, at {}{forms}", found.len(), numbers(&lines)),
+		lines,
+	}
+}
+
 /// The length of a shebang line (with its line break) at the start of a module's file: `#!` not followed by `[`.
 fn shebang_len(text: &str) -> usize {
 	match text.strip_prefix("#!") {
@@ -1425,67 +1463,62 @@ fn strip_gutters(old: &str, new: &str) -> Option<(String, String, Option<usize>)
 	Some((strip(old), strip(new), line))
 }
 
-/// Replaces `old` with `new` in a region, where `old` occurs exactly once: as written in the file (with its line
-/// breaks), or as views print the region. Where it occurs several times, `line` (from the line numbers of a numbered
-/// view) may tell which one is meant.
+/// Replaces `old` with `new` in a region, where `old` occurs exactly once, as views print the region or as written in
+/// the file (with its line breaks). What occurs in both forms at the same place occurs once, as printed (so that the
+/// lines of `new` after the first get the indentation that the view removed); what occurs in each form at a different
+/// place occurs several times. Where it occurs several times, `line` (from the line numbers of a numbered view) may
+/// tell which one is meant.
 fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize>, name: &str, place: &str) -> Result<(), Error> {
 	let line_ending = region.line_ending;
-	let with_line_endings = |text: &str| text.replace("\r\n", "\n").replace('\n', line_ending);
-	let several = |region: &Region<'_>, offsets: &[usize]| {
-		let mut lines: Vec<usize> = offsets.iter().map(|&offset| region.line_of(offset)).collect();
-
-		lines.dedup();
-
-		let numbers: Vec<String> = lines.iter().map(ToString::to_string).collect();
-
-		Error::TextMismatch {
-			message: format!(
-				"{name} occurs {} times in {place}, at line{} {}",
-				offsets.len(),
-				if lines.len() == 1 { "" } else { "s" },
-				numbers.join(", ")
-			),
-			lines,
-		}
-	};
-
-	// as written
-	let raw = with_line_endings(old);
-
-	match at_line(region, occurrences(&region.text, &raw), line, |offset| offset)[..] {
-		[at] => {
-			region.text.replace_range(at..at + raw.len(), &with_line_endings(new));
-			return Ok(());
-		}
-
-		[] => {}
-		ref found => return Err(several(region, found)),
-	}
-
-	// as printed
 	let printed = PrintedText::new(&region.prefix, &region.text, &multiline_strings(&region.text));
 	let old = old.replace("\r\n", "\n");
+	let raw = old.replace('\n', line_ending);
 
-	match at_line(region, occurrences(&printed.text, &old), line, |offset| printed.source_offset(offset))[..] {
-		[start] => {
-			let end = start + old.len();
-			let new = reindented(&printed, start, end, new, line_ending);
+	let mut found: Vec<Occurrence> = (occurrences(&printed.text, &old).into_iter())
+		.map(|start| Occurrence {
+			range: TextRange::new(printed.source_offset(start), printed.source_offset(start + old.len())),
+			printed: Some((start, start + old.len())),
+		})
+		.collect();
 
-			region.text.replace_range(printed.source_offset(start)..printed.source_offset(end), &new);
-			Ok(())
-		}
-
-		[] => Err(Error::TextMismatch {
-			message: format!("{name} not found in {place}{}", closest(region, &printed, &old)),
-			lines: Vec::new(),
-		}),
-
-		ref found => {
-			let offsets: Vec<usize> = found.iter().map(|&offset| printed.source_offset(offset)).collect();
-
-			Err(several(region, &offsets))
+	for start in occurrences(&region.text, &raw) {
+		if !found.iter().any(|occurrence| occurrence.range.start == start) {
+			found.push(Occurrence {
+				range: TextRange::new(start, start + raw.len()),
+				printed: None,
+			});
 		}
 	}
+
+	found.sort_by_key(|occurrence| occurrence.range.start);
+
+	// the one at the line of the line numbers
+	if let Some(line) = line.filter(|_| found.len() > 1) {
+		let at: Vec<Occurrence> = (found.iter().copied())
+			.filter(|occurrence| region.line_of(occurrence.range.start) == line)
+			.collect();
+
+		if at.len() == 1 {
+			found = at;
+		}
+	}
+
+	let (range, new) = match found[..] {
+		[Occurrence { range, printed: Some((start, end)) }] => (range, reindented(&printed, start, end, new, line_ending)),
+		[Occurrence { range, printed: None }] => (range, new.replace("\r\n", "\n").replace('\n', line_ending)),
+
+		[] => {
+			return Err(Error::TextMismatch {
+				message: format!("{name} not found in {place}{}", closest(region, &printed, &old)),
+				lines: Vec::new(),
+			});
+		}
+
+		ref found => return Err(several_occurrences(region, found, name, place)),
+	};
+
+	region.text.replace_range(range.as_range(), &new);
+	Ok(())
 }
 
 /// Imports stand for their `use` items: the items to edit, and the imports named for `use` items.
@@ -1596,6 +1629,12 @@ mod tests {
 			"\tfn g() {\r\n\r\n\t\tlet a = 1;\r\n\r\n\t\tlet b = 2;\r\n\t}"
 		);
 
+		// (text without line breaks occurs in both forms at the same place: as printed)
+		assert_eq!(
+			replace("let a = 1;", "let a = 1;\n\tlet c = 3;").unwrap(),
+			"\tfn f() {\r\n\t\tlet a = 1;\r\n\t\tlet c = 3;\r\n\r\n\t\tlet b = 2;\r\n\t}"
+		);
+
 		// text after the replaced text on its line keeps its indentation (and loses what `old` had of it)
 		assert_eq!(
 			replace("1;\n\n", "1;\n").unwrap(),
@@ -1621,6 +1660,40 @@ mod tests {
 		assert_eq!(
 			mismatch("let a = 1;\nlet c").0,
 			"`old` not found in `f`; its first line is at line 3, but what follows differs"
+		);
+	}
+
+	#[test]
+	fn tells_text_as_printed_from_text_as_written() {
+		let text = "impl W {\n\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t}\n\t}\n}\n";
+		let file = SourceFile::new(PathBuf::from("lib.rs"), text);
+		let range = TextRange::new(10, text.len() - 3);
+		let replace = |old: &str, new: &str| {
+			let mut region = Region::item(&file, range);
+			let replacement = TextReplacement {
+				old: old.to_owned(),
+				new: new.to_owned(),
+			};
+
+			replace_text(&mut region, &replacement, "`old`", "`h`").map(|()| region.text)
+		};
+
+		// the closing braces of the `if` and the `for` as views print them are those of the `for` and `h` as written
+		assert_eq!(
+			replace("\t\t}\n\t}", "\t\t}\n\t\tb();\n\t}").unwrap_err().to_string(),
+			"`old` occurs 2 times in `h`, at lines 6, 7: as views print it at line 6, and as written in the file at line 7"
+		);
+
+		// the line numbers of a numbered view tell which one is meant
+		assert_eq!(
+			replace("   6 │ \t\t}\n   7 │ \t}", "   6 │ \t\t}\n\t\tb();\n   7 │ \t}").unwrap(),
+			"\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t\tb();\n\t\t}\n\t}"
+		);
+
+		// (or the one as written, whose `new` is as written too)
+		assert_eq!(
+			replace("   7 │ \t\t}\n   8 │ \t}", "   7 │ \t\t}\n\t\tb();\n   8 │ \t}").unwrap(),
+			"\tfn h(&self) {\n\t\tfor x in xs {\n\t\t\tif x {\n\t\t\t\ta();\n\t\t\t}\n\t\t}\n\t\tb();\n\t}"
 		);
 	}
 
