@@ -3474,6 +3474,44 @@ mod private {
 		assert_eq!(added.count(), 6, "{:?}", outcomes(&addition));
 	}
 
+	/// A bare name whose only item the module cannot name is refused, rather than imported as `use name;`.
+	#[test]
+	fn refuses_bare_names_the_module_cannot_name() {
+		let files = [
+			("src/lib.rs", "mod hidden {\n\tfn secret() {}\n}\n"),
+			("other/lib.rs", "pub fn elsewhere() {}\n"),
+			("app/main.rs", "fn main() {}\n"),
+		];
+		let dir = TempDir::with_files("import-names-unnameable", &files);
+		let mut other = spec(&dir, "other", "other/lib.rs");
+
+		other.selected = false;
+
+		let ws = load_specs(&dir, [spec(&dir, "fixture", "src/lib.rs"), other.clone()]);
+		let refused = |name: &str| match import(&ws, "crate", &[name]) {
+			Err(Error::Unsupported(message)) => message,
+			other => panic!("{other:?}"),
+		};
+
+		assert_eq!(
+			refused("secret"),
+			"`secret` names `fixture::hidden::secret`, which is not visible from `crate`: make it visible there, or \
+			 re-export it"
+		);
+		assert_eq!(
+			refused("elsewhere"),
+			"cannot import `elsewhere`: the only item with that name, `other::elsewhere`, cannot be named from \
+			 `fixture`: its crate `other` is not a dependency of `fixture` (add it to the `[dependencies]` of the package \
+			 `fixture`)"
+		);
+
+		// a crate that depends on the other one imports it
+		let ws = load_specs(&dir, [other, bin_spec(&dir, "app", "app/main.rs", "other")]);
+		let addition = import(&ws, "crate", &["elsewhere"]).unwrap();
+
+		assert_eq!(outcomes(&addition), ["+ other::elsewhere 1"]);
+	}
+
 	#[test]
 	fn refuses_collisions_and_what_is_not_an_import() {
 		let dir = TempDir::with_files("import-refusals", ITEMS);

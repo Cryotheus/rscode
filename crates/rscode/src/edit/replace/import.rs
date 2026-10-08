@@ -1225,6 +1225,11 @@ fn path_of_bare_name(
 		return Ok(None);
 	}
 
+	// (a dependency that is not loaded)
+	if (ws.krate(module.krate()).dependencies().iter()).any(|dependency| dependency.name == unraw(name)) {
+		return Ok(None);
+	}
+
 	let importable = |kind: ItemKind| {
 		use ItemKind::*;
 
@@ -1261,16 +1266,13 @@ fn path_of_bare_name(
 	let Some(path) = resolver.usable_paths(item, Viewpoint::Module(module)).into_iter().next() else {
 		let item_path = resolver.canonical_path(item);
 
-		return Err(Error::Unsupported(match item.krate() == module.krate() {
-			true => format!(
+		return Err(match item.krate() == module.krate() {
+			true => Error::Unsupported(format!(
 				"`{name}` names `{item_path}`, which is not visible from `{module_path}`: make it visible there, or \
 				 re-export it"
-			),
-			false => format!(
-				"`{name}` names `{item_path}`, which `{module_path}` cannot name: it is not public, or its crate is \
-				 not a dependency"
-			),
-		}));
+			)),
+			false => unnameable(resolver, module, item, name),
+		});
 	};
 	let leading_colon = path.starts_with("::");
 	let mut segments: Vec<String> = path.trim_start_matches("::").split("::").map(str::to_owned).collect();
@@ -1297,6 +1299,34 @@ fn shared_segments(tree: &UseTree, leaf: &Leaf, depth: usize) -> usize {
 			.unwrap_or(0),
 		_ => 0,
 	}
+}
+
+/// The error for a bare name whose item `module` cannot name: the item is private, or its crate is not a dependency of
+/// the module's crate.
+fn unnameable(resolver: &Resolver<'_>, module: ItemId, item: ItemId, name: &str) -> Error {
+	let ws = resolver.workspace();
+	let from = ws.krate(module.krate());
+	let krate = ws.krate(item.krate());
+	let depends = (from.dependencies().iter()).any(|dependency| dependency.krate == Some(item.krate()));
+	let why = if item.krate() == module.krate() || depends {
+		"it is private (or in a private module)".to_owned()
+	} else if !krate.kind().is_lib() {
+		format!("it is in the {} crate `{}`, which no crate can depend on", krate.kind(), krate.name())
+	} else {
+		let package = from.package().map_or(from.name(), |package| &ws.package(package).name);
+
+		format!(
+			"its crate `{}` is not a dependency of `{}` (add it to the `[dependencies]` of the package `{package}`)",
+			krate.name(),
+			from.name()
+		)
+	};
+
+	Error::Unsupported(format!(
+		"cannot import `{name}`: the only item with that name, `{}`, cannot be named from `{}`: {why}",
+		resolver.canonical_path(item),
+		resolver.canonical_path(module)
+	))
 }
 
 /// A name without `r#`.
