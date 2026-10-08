@@ -236,6 +236,9 @@ pub(super) fn namespaces(item: &ItemData) -> &'static [Namespace] {
 		| ItemKind::ForeignMacro
 		| ItemKind::Impl
 		| ItemKind::AssocMacro => &[],
+
+		// fields are never bound: code paths do not name them
+		ItemKind::Field => &[],
 	}
 }
 

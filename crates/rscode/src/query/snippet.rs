@@ -6,6 +6,7 @@
 //! indentation). Line breaks (`\n` or `\r\n`) become `\n`.
 
 use crate::edit::trivia::line_indent;
+use crate::load::macro_entries;
 use crate::load::thread_local;
 use crate::source::ParsedFile;
 use crate::source::SourceFile;
@@ -65,6 +66,11 @@ impl Initializers<'_, '_> {
 	fn add(&mut self, eq: Span, expr: &syn::Expr, semi: Option<Span>) {
 		let expr = self.parsed.range_of(expr);
 
+		self.add_range(eq, expr, semi);
+	}
+
+	/// Adds `= value;` for the range of the value (or the initializer), when it spans lines.
+	fn add_range(&mut self, eq: Span, expr: TextRange, semi: Option<Span>) {
 		if self.parsed.text.get(expr.as_range()).is_some_and(|text| text.contains('\n')) {
 			let end = semi.map_or(expr, |semi| self.parsed.range(semi));
 
@@ -85,10 +91,16 @@ impl<'ast> Visit<'ast> for Initializers<'_, '_> {
 		self.add(item.eq_token.span, &item.expr, Some(item.semi_token.span));
 	}
 
-	// the statics of a `thread_local!` (in modules: blocks are skipped)
+	// the statics of a `thread_local!`, and the entries of other macros (in modules: blocks are skipped)
 	fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
 		for declaration in thread_local::declarations(&item.mac).into_iter().flatten() {
 			self.add(declaration.eq_token.span, &declaration.expr, declaration.semi_token.map(|semi| semi.span));
+		}
+
+		for entry in macro_entries::entries(&item.mac).into_iter().flatten() {
+			let value = self.parsed.range_of(&entry.value);
+
+			self.add_range(entry.eq_token.span, value, entry.semi_token.map(|semi| semi.span));
 		}
 	}
 

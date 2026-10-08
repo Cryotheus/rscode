@@ -64,7 +64,12 @@ fn hint(error: &rscode::Error, resolver: &Resolver<'_>) -> Option<String> {
 			let path = ItemPath::parse(path).ok();
 			let member = path.as_ref().and_then(|path| workspace.unloaded_member_of(path));
 
-			unloaded_hint(workspace, member).or_else(|| path.and_then(|path| resolver.import_hint(&path)))
+			// (a selector that picks none of the blocks a loaded header names: the members do not matter)
+			let selector = path.as_ref().and_then(|path| resolver.selector_hint(path));
+
+			selector
+				.or_else(|| unloaded_hint(workspace, member))
+				.or_else(|| path.and_then(|path| resolver.import_hint(&path)))
 		}
 
 		_ => None,

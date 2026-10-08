@@ -478,6 +478,7 @@ mod tests {
 			edits: EditSet::new(),
 			inserted: vec![(ItemKind::Fn, Some("helper".to_owned())), (ItemKind::Impl, None)],
 			imports: Vec::new(),
+			parent: "demo::util".to_owned(),
 			file: PathBuf::from("/ws/src/util.rs"),
 			warnings: Vec::new(),
 		};

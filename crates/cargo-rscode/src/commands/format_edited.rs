@@ -89,6 +89,9 @@ fn child_path(container: &CanonicalPath, name: &str) -> (CanonicalPath, bool) {
 		is_impl: false,
 		is_import: false,
 		name: Some(name.into()),
+		selector: None,
+		is_field: false,
+		is_macro_call: false,
 	};
 
 	(child, false)
@@ -169,8 +172,8 @@ pub(super) fn inserted(
 /// A path naming exactly the item with this canonical path, anchored at its crate: `::krate::m::Item`,
 /// `<::krate::m::Type>::item` or `<::krate::m::Type as Trait>::item` for associated items of `impl`s (`in_impl`, as
 /// their canonical paths look like those of trait items), and `<::krate::m::Type as Trait>` for `impl` blocks, with
-/// the generic arguments of the type and trait, and `use ::krate::m::Name` for imports (a plain path would name what
-/// they import).
+/// the generic arguments of the type and trait, `use ::krate::m::Name` for imports (a plain path would name what
+/// they import), `::krate::m::Type.field` for fields, and `::krate::m::name![2]` for macro invocations.
 /// `None` for `impl`s whose type is not a loaded item, and traits whose name cannot be told.
 fn item_path(path: &CanonicalPath, in_impl: bool) -> Option<ItemPath> {
 	if path.unresolved_self_ty.is_some() {
@@ -187,9 +190,18 @@ fn item_path(path: &CanonicalPath, in_impl: bool) -> Option<ItemPath> {
 	}
 
 	if !(path.is_impl || in_impl) {
+		// (a field follows its owner, which a method of the same name would shadow)
+		let (segments, field) = match path.is_field {
+			true => (path.segments.clone(), path.name.clone()),
+			false => (path.segments.iter().chain(&path.name).cloned().collect(), None),
+		};
+
 		return Some(ItemPath {
 			anchor: Anchor::Global,
-			segments: path.segments.iter().chain(&path.name).cloned().collect(),
+			segments,
+			field,
+			macro_call: path.is_macro_call,
+			selector: path.selector.clone().filter(|_| path.is_macro_call),
 			..ItemPath::default()
 		});
 	}
@@ -214,6 +226,7 @@ fn item_path(path: &CanonicalPath, in_impl: bool) -> Option<ItemPath> {
 		qualifier: Some(Qualifier {
 			self_ty: Box::new(self_ty),
 			trait_path,
+			selector: path.selector.clone(),
 		}),
 		segments: path.name.iter().cloned().collect(),
 		..ItemPath::default()
@@ -300,6 +313,7 @@ fn try_format(options: &LoadOptions, targets: Targets) -> anyhow::Result<Formatt
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use rscode::path::Selector;
 
 	#[test]
 	fn cannot_name_items_of_impls_for_foreign_types() {
@@ -325,6 +339,9 @@ mod tests {
 			is_impl: false,
 			is_import: false,
 			name: name.map(Into::into),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		}
 	}
 
@@ -404,6 +421,17 @@ mod tests {
 			item_path(&canonical(&["demo", "shapes", "Shape"], Some("area")), false),
 			Some(global(&["demo", "shapes", "Shape", "area"]))
 		);
+
+		// fields (which methods of the same name would shadow as `Circle::radius`) and macro invocations
+		let radius = CanonicalPath { is_field: true, ..canonical(&["demo", "shapes", "Circle"], Some("radius")) };
+		let commands = CanonicalPath {
+			is_macro_call: true,
+			selector: Some(Selector::Index(2)),
+			..canonical(&["demo"], Some("commands"))
+		};
+
+		assert_eq!(item_path(&radius, false).unwrap().to_string(), "::demo::shapes::Circle.radius");
+		assert_eq!(item_path(&commands, false).unwrap().to_string(), "::demo::commands![2]");
 	}
 
 	#[test]
@@ -452,6 +480,7 @@ mod tests {
 			qualifier: Some(Qualifier {
 				self_ty: Box::new(global(self_ty)),
 				trait_path: trait_name.map(|name| Box::new(ItemPath::from_segments([name]))),
+				selector: None,
 			}),
 			segments: segments.iter().map(|&segment| segment.into()).collect(),
 			..ItemPath::default()

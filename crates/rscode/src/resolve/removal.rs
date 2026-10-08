@@ -240,8 +240,11 @@ impl Resolver<'_> {
 			return false;
 		}
 
-		let macro_calls =
-			(self.ws.children(module)).any(|child| self.ws.item(child).kind == ItemKind::MacroCall && self.ws.children(child).next().is_none());
+		// (a `thread_local!` declares its statics; other macros, with entries or not, may declare anything)
+		let macro_calls = (self.ws.children(module)).any(|child| {
+			self.ws.item(child).kind == ItemKind::MacroCall
+				&& !(self.ws.children(child).next()).is_some_and(|first| self.ws.item(first).is_thread_local())
+		});
 
 		let uses = self.ws.children(module).filter(|&child| self.ws.item(child).kind == ItemKind::Use);
 		let unresolved = uses.flat_map(|use_item| self.ws.children(use_item)).any(|import| {

@@ -9,6 +9,7 @@ use cargo::util::command_prelude::ArgMatchesExt as _;
 use cargo::util::print_available_packages;
 use cargo::workspace::Target;
 use clap::ArgMatches;
+use clap::parser::ValueSource;
 use rscode::Edition;
 use rscode::ItemKind;
 use rscode::LoadOptions;
@@ -299,7 +300,8 @@ impl FromArg {
 /// `insert`
 #[derive(Debug, Clone)]
 pub(crate) struct InsertArgs {
-	pub(crate) parent: String,
+	/// `None` with `--after` or `--before` and a single positional argument (the source): the anchor's container.
+	pub(crate) parent: Option<String>,
 	pub(crate) source: SourceArg,
 	pub(crate) options: InsertOptions,
 	pub(crate) dry_run: bool,
@@ -310,8 +312,41 @@ pub(crate) struct InsertArgs {
 
 impl InsertArgs {
 	pub(crate) fn from_matches(matches: &ArgMatches) -> anyhow::Result<Self> {
+		let shorthand = match (matches._value_of("after"), matches._value_of("before")) {
+			(Some(anchor), _) => Some(InsertPosition::After(anchor.to_owned())),
+			(None, Some(anchor)) => Some(InsertPosition::Before(anchor.to_owned())),
+			(None, None) => None,
+		};
+
+		// with `--after` or `--before`, a single positional argument is the source (the parent is the anchor's
+		// container)
+		let (parent, source) = match shorthand.is_some() && matches.value_source("source") != Some(ValueSource::CommandLine) {
+			true => (None, SourceArg::from_value(matches._value_of("parent"))),
+			false => (matches._value_of("parent").map(str::to_owned), SourceArg::from_matches(matches)),
+		};
+
+		let position = match shorthand {
+			Some(position) => position,
+			None => Self::position(matches)?,
+		};
+
+		Ok(Self {
+			parent,
+			source,
+			options: InsertOptions {
+				position,
+				force: matches.flag("force"),
+			},
+			dry_run: matches.flag("dry-run"),
+			format: matches.flag("fmt"),
+		})
+	}
+
+	/// The position given by `--position` and `--anchor`.
+	fn position(matches: &ArgMatches) -> anyhow::Result<InsertPosition> {
 		let anchor = matches._value_of("anchor").map(str::to_owned);
-		let position = match (matches._value_of("position").unwrap_or("end"), anchor) {
+
+		Ok(match (matches._value_of("position").unwrap_or("end"), anchor) {
 			("before", Some(anchor)) => InsertPosition::Before(anchor),
 			("after", Some(anchor)) => InsertPosition::After(anchor),
 
@@ -322,17 +357,6 @@ impl InsertArgs {
 			(_, Some(_)) => anyhow::bail!("`--anchor` needs `--position before` or `--position after`"),
 			("start", None) => InsertPosition::Start,
 			(_, None) => InsertPosition::End,
-		};
-
-		Ok(Self {
-			parent: matches._value_of("parent").unwrap_or_default().to_owned(),
-			source: SourceArg::from_matches(matches),
-			options: InsertOptions {
-				position,
-				force: matches.flag("force"),
-			},
-			dry_run: matches.flag("dry-run"),
-			format: matches.flag("fmt"),
 		})
 	}
 }
@@ -497,7 +521,12 @@ pub(crate) enum SourceArg {
 
 impl SourceArg {
 	fn from_matches(matches: &ArgMatches) -> Self {
-		match matches._value_of("source") {
+		Self::from_value(matches._value_of("source"))
+	}
+
+	/// The source a `SOURCE` value names (`-` and none for stdin).
+	fn from_value(value: Option<&str>) -> Self {
+		match value {
 			None | Some("-") => Self::Stdin,
 			Some(path) => Self::File(PathBuf::from(path)),
 		}
@@ -952,7 +981,7 @@ mod tests {
 	fn insert_arguments() {
 		let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", "crate::m"])).unwrap();
 
-		assert_eq!(args.parent, "crate::m");
+		assert_eq!(args.parent.as_deref(), Some("crate::m"));
 		assert_eq!(args.source, SourceArg::Stdin);
 		assert_eq!(args.options.position, InsertPosition::End);
 		assert!(!args.options.force && !args.dry_run && !args.format);
@@ -979,8 +1008,28 @@ mod tests {
 
 		let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", "<Foo as Bar>", "-", "--force", "-n", "--fmt"])).unwrap();
 
-		assert_eq!(args.parent, "<Foo as Bar>");
+		assert_eq!(args.parent.as_deref(), Some("<Foo as Bar>"));
 		assert!(args.options.force && args.dry_run && args.format);
+
+		// `--after` and `--before`, where PARENT may be left out
+		let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", "items.rs", "--after", "Tools::a"])).unwrap();
+
+		assert_eq!((args.parent, args.source), (None, SourceArg::File("items.rs".into())));
+		assert_eq!(args.options.position, InsertPosition::After("Tools::a".to_owned()));
+
+		let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", "--before", "Tools::a", "-n"])).unwrap();
+
+		assert_eq!((args.parent, args.source), (None, SourceArg::Stdin));
+		assert_eq!(args.options.position, InsertPosition::Before("Tools::a".to_owned()));
+
+		let args = InsertArgs::from_matches(&parse(&["cargo-rscode", "insert", "impl Tools", "-", "--before", "a"])).unwrap();
+
+		assert_eq!((args.parent.as_deref(), args.source), (Some("impl Tools"), SourceArg::Stdin));
+		assert_eq!(args.options.position, InsertPosition::Before("a".to_owned()));
+		assert!(cli().try_get_matches_from(["cargo-rscode", "insert", "x.rs", "--after", "a", "--anchor", "b"]).is_err());
+		assert!(cli().try_get_matches_from(["cargo-rscode", "insert", "x.rs", "--after", "a", "--position", "end"]).is_err());
+		assert!(cli().try_get_matches_from(["cargo-rscode", "insert", "--after", "a", "--before", "b"]).is_err());
+		assert!(cli().try_get_matches_from(["cargo-rscode", "insert"]).is_err());
 	}
 
 	#[test]

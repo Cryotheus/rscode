@@ -21,7 +21,9 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
 	let resolver = Resolver::new(&workspace);
 	let plan = rscode::edit::replace(&resolver, &path, &source, &args.options).map_err(|error| {
-		let hint = super::hint(&error, &resolver);
+		// (`Type::name` names a method, and the source is the field `Type.name`)
+		let field = matches!(error, rscode::Error::InvalidSource(_)).then(|| resolver.field_hint(&path)).flatten();
+		let hint = super::hint(&error, &resolver).or(field);
 		let all_variants = matches!(error, rscode::Error::Ambiguous { .. }) && rscode::edit::replaces_all_variants(&resolver, &path);
 		let hint = match (hint, all_variants) {
 			// (`cfg` variants of an import: removing and inserting is not the better way)

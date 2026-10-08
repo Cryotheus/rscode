@@ -7,7 +7,9 @@ use crate::model::ItemKind;
 use crate::model::PathSegmentRef;
 use crate::model::TargetKind;
 use crate::path::Anchor;
+use crate::path::CanonicalPath;
 use crate::path::Qualifier;
+use crate::path::Selector;
 use crate::source::TextRange;
 use crate::test_registry::locked_version;
 use crate::test_registry::registry_crate;
@@ -15,6 +17,26 @@ use rscode_fmt::Edition;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
+
+/// The `impl` block or macro invocation if its canonical path, as displayed, does not name it alone (items of a file
+/// that several crates load count once), unless its type is not a loaded item, its trait cannot be written in a user
+/// path, or it is the invocation of a macro that is not understood. Blocks whose headers name other blocks too, and
+/// invocations of a macro that a module invokes several times, must have a selector.
+fn alone_round_trip_failure(ws: &Workspace, resolver: &Resolver<'_>, item: ItemId) -> Option<String> {
+	let path = resolver.canonical_path(item);
+
+	if path.unresolved_self_ty.is_some() || (ws.item(item).kind == ItemKind::MacroCall && !path.is_macro_call) {
+		return None;
+	}
+
+	let parsed = ItemPath::parse(&path.to_string()).ok()?;
+	let place = |item: ItemId| (ws.file_of(item).path().to_path_buf(), ws.item(item).range);
+	let named = resolver.resolve_item_path(&parsed);
+
+	let alone = named.contains(&item) && named.iter().all(|&named| place(named) == place(item));
+
+	(!alone).then(|| format!("{path} at {:?} (names {})", place(item), named.len()))
+}
 
 fn assert_send_sync<T: Send + Sync>() {}
 
@@ -25,12 +47,17 @@ fn basic_fixture() -> Workspace {
 }
 
 /// Named definitions and imports whose canonical path (as `::crate::...`, or `use ::crate::...`) does not resolve back
-/// to them.
+/// to them, and `impl` blocks and macro invocations whose canonical path (as displayed) does not name them alone.
 fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -> Vec<String> {
 	let mut failures = Vec::new();
 
 	for krate in ws.crates() {
 		for (item, data) in krate.items() {
+			if matches!(data.kind, ItemKind::Impl | ItemKind::MacroCall) {
+				failures.extend(alone_round_trip_failure(ws, resolver, item));
+				continue;
+			}
+
 			// `extern crate`s resolve to what they import
 			let named = data.name.is_some() && data.kind.is_nameable() && data.kind != ItemKind::ExternCrate;
 
@@ -46,7 +73,10 @@ fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -
 
 			let mut segments = path.segments;
 
-			segments.extend(path.name);
+			// (fields follow their struct, union, or variant with a `.`)
+			let field = path.name.clone().filter(|_| path.is_field);
+
+			segments.extend(path.name.filter(|_| !path.is_field));
 
 			let item_path = ItemPath {
 				anchor: Anchor::Global,
@@ -54,6 +84,9 @@ fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -
 				segments,
 				arguments: None,
 				import: path.is_import,
+				field,
+				selector: None,
+				macro_call: false,
 			};
 
 			// the path names the item for edits too: no private import of the same name hides it
@@ -619,6 +652,55 @@ fn external_imports_do_not_shadow_glob_imports() {
 		show_bindings(&resolver, find(&ws, "t::named"), "Level", Namespace::Value),
 		["t::error::Error (import)"]
 	);
+}
+
+#[test]
+fn fields_are_named_by_paths_with_a_dot() {
+	let ws = single(
+		r#"
+		pub struct Point { pub x: u8, y: u8 }
+		pub struct Pair(pub u8, u16);
+		pub enum Shape { Circle { radius: f64 }, Square(f64) }
+		pub union U { a: u8 }
+		pub struct Controlled { frames: u32, len: u32 }
+
+		impl Controlled {
+			pub fn len(&self) -> u32 { self.len }
+		}
+		"#,
+	);
+
+	let resolver = Resolver::new(&ws);
+	let root = root(&ws, "t");
+
+	assert_eq!(resolve(&resolver, "crate::Point.x"), ["t::Point.x"]);
+	assert_eq!(resolve(&resolver, "::t::Pair.1"), ["t::Pair.1"]);
+	assert_eq!(resolve(&resolver, "Shape::Circle.radius"), ["t::Shape::Circle.radius"]);
+	assert_eq!(resolve(&resolver, "Shape::Square.0"), ["t::Shape::Square.0"]);
+	assert_eq!(resolve(&resolver, "U.a"), ["t::U.a"]);
+	assert!(resolve(&resolver, "Point.z").is_empty());
+	assert!(resolve(&resolver, "Pair.2").is_empty());
+	assert!(resolve(&resolver, "Shape.radius").is_empty());
+
+	// `Type::name` names a field when nothing else has that name: an associated item of that name wins
+	assert_eq!(resolve(&resolver, "Controlled::frames"), ["t::Controlled.frames"]);
+	assert_eq!(resolve(&resolver, "Controlled::len"), ["t::Controlled::len"]);
+	assert_eq!(resolve(&resolver, "Controlled.len"), ["t::Controlled.len"]);
+
+	// code paths never reach fields, which are bound nowhere and have no usable paths
+	let x = item(&resolver, "Point.x");
+	let y = item(&resolver, "Point.y");
+	let radius = item(&resolver, "Shape::Circle.radius");
+
+	assert!(resolve_in(&resolver, root, "Point::x", Namespace::Value).is_empty());
+	assert!(resolve_in(&resolver, root, "Controlled::frames", Namespace::Value).is_empty());
+	assert!(resolver.usable_paths(x, Viewpoint::Foreign).is_empty());
+
+	// fields of variants are as visible as their enum
+	assert_eq!(resolver.visibility_scope(x), None);
+	assert_eq!(resolver.visibility_scope(y), Some(root));
+	assert_eq!(resolver.visibility_scope(radius), None);
+	assert_eq!(canonical_path_round_trip_failures(&ws, &resolver), Vec::<String>::new());
 }
 
 fn find(ws: &Workspace, path: &str) -> ItemId {
@@ -1252,16 +1334,51 @@ fn item_path(text: &str) -> ItemPath {
 			Some((self_ty, trait_path)) => (self_ty, Some(trait_path)),
 			None => (&rest[..close], None),
 		};
+		let mut rest = &rest[close + 1..];
+
+		// a selector after the qualifier: `[name]`, `[#attribute]`, or `[index]`
+		let selector = rest.strip_prefix('[').map(|selector| {
+			let (selector, after) = selector.split_once(']').expect("unclosed selector");
+
+			rest = after;
+
+			match (selector.strip_prefix('#'), selector.parse()) {
+				(Some(attribute), _) => Selector::Attribute(attribute.to_owned()),
+				(None, Ok(index)) => Selector::Index(index),
+				(None, Err(_)) => Selector::Item(selector.into()),
+			}
+		});
 
 		return ItemPath {
 			anchor: Anchor::None,
 			qualifier: Some(Qualifier {
 				self_ty: Box::new(item_path(self_ty)),
 				trait_path: trait_path.map(|trait_path| Box::new(item_path(trait_path))),
+				selector,
 			}),
-			segments: segments(rest[close + 1..].trim_start_matches("::")),
+			segments: segments(rest.trim_start_matches("::")),
 			arguments: None,
 			import: false,
+			field: None,
+			selector: None,
+			macro_call: false,
+		};
+	}
+
+	// macro invocations, with an optional index
+	if let Some((name, index)) = text.split_once('!') {
+		return ItemPath {
+			macro_call: true,
+			selector: index.trim_matches(['[', ']']).parse().ok().map(Selector::Index),
+			..item_path(name)
+		};
+	}
+
+	// a field after a `.`
+	if let Some((owner, field)) = text.split_once('.') {
+		return ItemPath {
+			field: Some(field.into()),
+			..item_path(owner)
 		};
 	}
 
@@ -1283,6 +1400,9 @@ fn item_path(text: &str) -> ItemPath {
 		segments: segments(rest),
 		arguments: None,
 		import: false,
+		field: None,
+		selector: None,
+		macro_call: false,
 	}
 }
 
@@ -1338,6 +1458,43 @@ fn long_import_chains_resolve_in_linear_time() {
 
 	// resolving the imports again for every link took minutes (without optimizations); now it takes milliseconds
 	assert!(elapsed.as_secs() < 30, "{elapsed:?}");
+}
+
+#[test]
+fn macro_invocations_are_named_by_their_macro_and_a_bang() {
+	let ws = single(
+		r#"
+		macro_rules! commands { ($($t:tt)*) => {}; }
+
+		commands! { static SAY = 1; }
+		commands! { static QUIT = 2; }
+		other::commands! { static HELP = 3; }
+		crate::single!();
+
+		pub mod m {
+			thread_local! { static COUNTER: u8 = 0; }
+			commands! { static INNER = 4; }
+		}
+
+		impl S { inside!(); }
+		"#,
+	);
+
+	let resolver = Resolver::new(&ws);
+
+	// the invocations of every macro whose path ends with the name; the canonical paths of several have an index
+	assert_eq!(resolve(&resolver, "crate::commands!"), ["t::commands![1]", "t::commands![2]", "t::commands![3]"]);
+	assert_eq!(resolve(&resolver, "commands![2]"), ["t::commands![2]"]);
+	assert_eq!(resolve(&resolver, "::t::single!"), ["t::single!"]);
+	assert_eq!(resolve(&resolver, "m::commands!"), ["t::m::commands!"]);
+	assert_eq!(resolve(&resolver, "m::thread_local!"), ["t::m::thread_local!"]);
+	assert!(resolve(&resolver, "commands![4]").is_empty());
+	assert!(resolve(&resolver, "m::single!").is_empty());
+	assert!(resolve(&resolver, "inside!").is_empty());
+
+	// the macro definition is not an invocation
+	assert_eq!(resolve(&resolver, "crate::commands"), ["t::commands"]);
+	assert_eq!(canonical_path_round_trip_failures(&ws, &resolver), Vec::<String>::new());
 }
 
 #[test]
@@ -1799,16 +1956,17 @@ fn qualified_paths_name_traits_and_types_by_their_last_segments() {
 
 	let resolver = Resolver::new(&ws);
 
-	// neither `Shape` nor `Square` is at the crate root: impls whose trait or type ends with them match
+	// neither `Shape` nor `Square` is at the crate root: impls whose trait or type ends with them match (and so the
+	// first path names both, which its selector tells apart)
 	assert_eq!(
 		resolve(&resolver, "<Circle as Shape>::area"),
-		["<t::shapes::Circle as Shape>::area", "<t::shapes::Circle as self::Shape>::area"]
+		["<t::shapes::Circle as Shape>[1]::area", "<t::shapes::Circle as self::Shape>::area"]
 	);
 	assert_eq!(resolve(&resolver, "<Square as Shape>::area"), ["<t::shapes::Square as Shape>::area"]);
 	assert_eq!(resolve(&resolver, "<shapes::Square as Shape>"), ["impl Shape for t::shapes::Square"]);
 	assert_eq!(
 		resolve(&resolver, "<Circle as shapes::Shape>::area"),
-		["<t::shapes::Circle as Shape>::area"]
+		["<t::shapes::Circle as Shape>[1]::area"]
 	);
 	assert_eq!(
 		resolve(&resolver, "<Circle as other::Shape>::area"),
@@ -2102,6 +2260,68 @@ fn segments(text: &str) -> Vec<SmolStr> {
 }
 
 #[test]
+fn selectors_tell_impl_blocks_with_the_same_header_apart() {
+	let ws = single(
+		r#"
+		pub struct Tools;
+		pub trait Tr { fn f(); }
+
+		#[tool_router(router = edit)]
+		impl Tools { fn add_bots() {} fn shared() {} }
+
+		#[tool_router(router = query)]
+		#[rmcp::handler]
+		impl Tools {}
+
+		impl Tools { fn kick() {} fn shared() {} }
+
+		#[cfg(unix)]
+		impl Tr for Tools { fn f() {} }
+
+		#[cfg(not(unix))]
+		impl Tr for Tools { fn f() {} }
+
+		pub struct Single;
+
+		impl Single { fn new() {} }
+		"#,
+	);
+
+	let resolver = Resolver::new(&ws);
+
+	// the canonical paths of blocks that share a header carry the first selector that tells them apart
+	assert_eq!(
+		resolve(&resolver, "<Tools>"),
+		["impl t::Tools[add_bots]", "impl t::Tools[#rmcp::handler]", "impl t::Tools[kick]"]
+	);
+	assert_eq!(resolve(&resolver, "<Tools as Tr>"), ["impl Tr for t::Tools[1]", "impl Tr for t::Tools[2]"]);
+	assert_eq!(resolve(&resolver, "<Tools as Tr>::f"), ["<t::Tools as Tr>[1]::f", "<t::Tools as Tr>[2]::f"]);
+	assert_eq!(resolve(&resolver, "<Single>"), ["impl t::Single"]);
+	assert_eq!(resolve(&resolver, "Single::new"), ["t::Single::new"]);
+	assert_eq!(resolve(&resolver, "Tools::kick"), ["t::Tools::kick"]);
+
+	// selectors pick blocks by an item, an attribute (or the end of its path), or their place
+	assert_eq!(resolve(&resolver, "<Tools>[shared]"), ["impl t::Tools[add_bots]", "impl t::Tools[kick]"]);
+	assert_eq!(resolve(&resolver, "<Tools>[#tool_router]"), ["impl t::Tools[add_bots]", "impl t::Tools[#rmcp::handler]"]);
+	assert_eq!(resolve(&resolver, "<Tools>[#handler]"), ["impl t::Tools[#rmcp::handler]"]);
+	assert_eq!(resolve(&resolver, "<Tools>[#router]"), Vec::<String>::new());
+	assert_eq!(resolve(&resolver, "<Tools>[3]::kick"), ["t::Tools::kick"]);
+	assert_eq!(resolve(&resolver, "<Tools as Tr>[2]::f"), ["<t::Tools as Tr>[2]::f"]);
+	assert!(resolve(&resolver, "<Tools>[4]").is_empty());
+	assert!(resolve(&resolver, "<Tools>[add_bots]::kick").is_empty());
+	assert!(resolve(&resolver, "<Single>[2]").is_empty());
+	assert_eq!(canonical_path_round_trip_failures(&ws, &resolver), Vec::<String>::new());
+
+	// a selector that picks nothing gets a hint listing the blocks
+	assert_eq!(
+		resolver.selector_hint(&item_path("<Tools as Tr>[3]")).as_deref(),
+		Some("`<Tools as Tr>` names `impl Tr for t::Tools[1]`, `impl Tr for t::Tools[2]`")
+	);
+	assert_eq!(resolver.selector_hint(&item_path("<Tools as Tr>")), None);
+	assert_eq!(resolver.selector_hint(&item_path("<Missing>[1]")), None);
+}
+
+#[test]
 fn self_referential_imports_terminate() {
 	let ws = single(
 		r#"
@@ -2180,12 +2400,14 @@ fn show(resolver: &Resolver<'_>, item: ItemId) -> String {
 	let name = path.name.as_deref().unwrap_or("?");
 
 	match (path.is_impl, &path.unresolved_self_ty, &path.impl_trait) {
-		(true, None, Some(trait_text)) => format!("impl {trait_text} for {segments}"),
-		(true, None, None) => format!("impl {segments}"),
+		(true, None, Some(trait_text)) => format!("impl {trait_text} for {segments}{}", show_selector(&path)),
+		(true, None, None) => format!("impl {segments}{}", show_selector(&path)),
 		(true, Some(ty), Some(trait_text)) => format!("{segments}::<impl {trait_text} for {ty}>"),
 		(true, Some(ty), None) => format!("{segments}::<impl {ty}>"),
-		(false, None, Some(trait_text)) => format!("<{segments} as {trait_text}>::{name}"),
+		(false, None, Some(trait_text)) => format!("<{segments} as {trait_text}>{}::{name}", show_selector(&path)),
 		(false, None, None) if segments.is_empty() => name.to_owned(),
+		(false, None, None) if path.is_field => format!("{segments}.{name}"),
+		(false, None, None) if path.is_macro_call => format!("{segments}::{name}!{}", show_selector(&path)),
 		(false, None, None) => format!("{segments}::{name}"),
 		(false, Some(ty), Some(trait_text)) => format!("{segments}::<impl {trait_text} for {ty}>::{name}"),
 		(false, Some(ty), None) => format!("{segments}::<impl {ty}>::{name}"),
@@ -2221,6 +2443,16 @@ fn show_res(resolver: &Resolver<'_>, res: &[Res]) -> Vec<String> {
 			Res::Builtin(name) => format!("builtin {name}"),
 		})
 		.collect()
+}
+
+/// Formats the selector of a canonical path (`[name]`, `[#attribute]`, `[2]`), if any.
+fn show_selector(path: &CanonicalPath) -> String {
+	match &path.selector {
+		None => String::new(),
+		Some(Selector::Item(name)) => format!("[{name}]"),
+		Some(Selector::Attribute(attribute)) => format!("[#{attribute}]"),
+		Some(Selector::Index(index)) => format!("[{index}]"),
+	}
 }
 
 fn single(source: &str) -> Workspace {

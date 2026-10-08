@@ -220,13 +220,17 @@ fn broken_imports(resolver: &Resolver<'_>, removed: &HashSet<ItemId>) -> BTreeMa
 	broken
 }
 
-/// Refuses a path naming `impl` blocks (or items of them) whose headers differ, such as `impl From<u8> for X` and
-/// `impl From<u16> for X` for `impl From for X`: those are not `cfg` variants of each other, and the path can tell them
-/// apart with generic arguments.
+/// Refuses a path naming `impl` blocks (or items of them) that are not `cfg` variants of each other: blocks whose
+/// headers differ, such as `impl From<u8> for X` and `impl From<u16> for X` for `impl From for X` (generic arguments
+/// in the path tell them apart), and blocks of one crate with the same `cfg`s, such as two `impl X` blocks (a selector
+/// tells them apart).
 fn check_impl_headers(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
 	let ws = resolver.workspace();
+	let in_impls: Vec<ItemId> = (items.iter().copied())
+		.filter(|&item| (ws.parent(item).into_iter().chain([item])).any(|item| ws.item(item).kind == ItemKind::Impl))
+		.collect();
 
-	if !super::impl_headers_differ(ws, items) {
+	if !super::impl_headers_differ(ws, items) && !super::same_cfg_items(ws, &in_impls) {
 		return Ok(());
 	}
 
@@ -259,8 +263,12 @@ fn dangling(
 	warnings: &mut Vec<String>,
 ) -> Vec<Reference> {
 	let ws = resolver.workspace();
+
+	// (the uses of fields are not paths, the fields of tuple structs are named by numbers, and what macros make of
+	// their entries is unknown)
 	let mut targets: Vec<ItemId> = (removed.iter().copied())
-		.filter(|&item| ws.item(item).name.is_some() && ws.item(item).kind != ItemKind::Import)
+		.filter(|&item| ws.item(item).name.is_some() && !matches!(ws.item(item).kind, ItemKind::Import | ItemKind::Field))
+		.filter(|&item| ws.entry_macro(item).is_none())
 		.collect();
 
 	targets.sort();
@@ -336,8 +344,8 @@ fn element_removal_ranges(text: &str, elements: &[TextRange]) -> Vec<TextRange> 
 	blocks.into_iter().map(|block| trivia::list_item_removal_range(text, block)).collect()
 }
 
-/// The `thread_local!` invocations all of whose statics are removed: they are removed as a whole (with their
-/// attributes), rather than left empty.
+/// The `thread_local!` invocations (and other macro invocations with entries) all of whose statics are removed: they
+/// are removed as a whole (with their attributes), rather than left empty.
 fn emptied_thread_locals(ws: &Workspace, targets: &[ItemId]) -> BTreeSet<ItemId> {
 	let invocations: BTreeSet<ItemId> = targets
 		.iter()
@@ -509,7 +517,8 @@ fn push_removed(removed: &mut Vec<RemovedItem>, item: RemovedItem) {
 /// [`Removal::removed`] lists the removed items (items inside of other removed items are not listed), followed by
 /// the pruned imports ([`ItemKind::Import`]). Fails with [`Error::NotFound`] when a path names nothing, with
 /// [`Error::Ambiguous`] when it names `impl` blocks (or their items) with different headers (see
-/// [`ItemPath`]'s generic arguments), and with [`Error::Unsupported`] for crate roots.
+/// [`ItemPath`]'s generic arguments) or several blocks of one crate with the same header and `cfg`s, and with
+/// [`Error::Unsupported`] for crate roots.
 pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptions) -> Result<Removal, Error> {
 	let ws = resolver.workspace();
 	let targets = targets(resolver, paths, options.active_only)?;
@@ -528,7 +537,7 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 
 	for &item in &targets {
 		match ws.item(item).kind {
-			ItemKind::Variant => deletions.element(ws.file_of(item), ws.item(item).range),
+			ItemKind::Variant | ItemKind::Field => deletions.element(ws.file_of(item), ws.item(item).range),
 			ItemKind::Import => pruned.entry(ws.parent(item).unwrap_or(item)).or_default().push(item),
 			_ if ws.parent(item).is_some_and(|parent| emptied.contains(&parent)) => {}
 			_ => deletions.item(ws.file_of(item), ws.item(item).range),
@@ -539,6 +548,21 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 
 	for &invocation in &emptied {
 		deletions.item(ws.file_of(invocation), ws.item(invocation).range);
+	}
+
+	if targets.iter().any(|&item| ws.item(item).kind == ItemKind::Field) {
+		plan.warnings.push(
+			"the uses of removed fields (field accesses, struct literals, and patterns) are not searched for: check them"
+				.to_owned(),
+		);
+	}
+
+	if targets.iter().any(|&item| ws.entry_macro(item).is_some()) {
+		plan.warnings.push(
+			"the uses of removed entries of macro invocations are not searched for (what the macro makes of them is \
+			 unknown): check them"
+				.to_owned(),
+		);
 	}
 
 	let removed = removed_items(ws, &targets, &deletions.ranges());

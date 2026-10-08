@@ -367,6 +367,104 @@ impl G<u16> {
 		}
 	}
 
+	/// `impl` blocks of one crate with the same header and the same `cfg`s are not `cfg` variants: a path naming them all
+	/// is ambiguous for replacements (even with `all_variants`) and removals, which wrote into or deleted every one of
+	/// them before.
+	#[test]
+	fn does_not_take_impl_blocks_with_the_same_header_for_cfg_variants() {
+		let lib = "\
+pub struct Tools;
+
+#[allow(dead_code)]
+impl Tools {
+	pub fn add_bots() {}
+}
+
+impl Tools {
+	pub fn kick() {}
+}
+
+#[cfg(unix)]
+impl Tools {
+	pub fn os() {}
+}
+
+#[cfg(not(unix))]
+impl Tools {
+	pub fn os() {}
+}
+";
+		let dir = TempDir::with_files("remove-same-header-impls", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let all_variants = ReplaceOptions { all_variants: true, ..ReplaceOptions::default() };
+
+		assert_eq!(resolver.resolve_item_path(&path("impl crate::Tools")).len(), 4);
+		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("impl crate::Tools")));
+
+		let replaced = rscode::edit::replace(&resolver, &path("impl crate::Tools"), "impl Tools {}", &all_variants);
+
+		assert!(matches!(replaced, Err(Error::Ambiguous { .. })), "{replaced:?}");
+
+		match rscode::edit::remove(&resolver, &paths(&["impl crate::Tools"]), &RemoveOptions::default()) {
+			Err(Error::Ambiguous { candidates, .. }) => assert_eq!(candidates.len(), 4, "{candidates:?}"),
+			other => panic!("{other:?}"),
+		}
+
+		// a selector names one of them, as the candidates show
+		let candidates = match replaced {
+			Err(Error::Ambiguous { candidates, .. }) => candidates,
+			other => panic!("{other:?}"),
+		};
+
+		assert_eq!(
+			candidates,
+			[
+				"`impl fixture::Tools[add_bots]` (impl) at src/lib.rs:3:1",
+				"`impl fixture::Tools[kick]` (impl) at src/lib.rs:8:1",
+				"`impl fixture::Tools[3]` (impl) at src/lib.rs:12:1 with #[cfg(unix)]",
+				"`impl fixture::Tools[4]` (impl) at src/lib.rs:17:1 with #[cfg(not(unix))]",
+			]
+			.map(native)
+		);
+
+		let source = "impl Tools {}";
+		let replacement = rscode::edit::replace(&resolver, &path("impl fixture::Tools[kick]"), source, &ReplaceOptions::default()).unwrap();
+
+		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs"), lib.replace("impl Tools {\n\tpub fn kick() {}\n}", source));
+		assert_eq!(replacement.replaced, ["impl fixture::Tools[kick]"]);
+
+		let removal = remove(&ws, &["impl crate::Tools[#allow]"], &RemoveOptions::default());
+		let removed = "#[allow(dead_code)]\nimpl Tools {\n\tpub fn add_bots() {}\n}\n\n";
+
+		assert_eq!(edited(&dir, &removal.edits, "src/lib.rs"), lib.replace(removed, ""));
+
+		// found by paths with any selector, and by patterns (with wildcards) with the selectors that canonical paths show
+		let found = |text: &str| -> Vec<u32> {
+			let found = rscode::Find::new().pattern(text).unwrap().run_with(&resolver).unwrap();
+
+			found.iter().map(|found| found.start.line as u32).collect()
+		};
+
+		assert_eq!(found("impl Tools[kick]"), [8]);
+		assert_eq!(found("impl crate::Tools[2]"), [8]);
+		assert_eq!(found("impl crate::Tools[#cfg]"), [12, 17]);
+		assert_eq!(found("impl *Tools[3]"), [12]);
+		assert_eq!(found("impl *Tools[#cfg]"), Vec::<u32>::new());
+
+		// `cfg` variants (of items of such blocks too) still go together
+		assert!(rscode::edit::replaces_all_variants(&resolver, &path("crate::Tools::os")));
+
+		let replacement = rscode::edit::replace(&resolver, &path("crate::Tools::os"), "pub fn os() -> u8 { 0 }", &all_variants).unwrap();
+
+		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs").matches("pub fn os() -> u8 { 0 }").count(), 2);
+
+		let removal = remove(&ws, &["crate::Tools::os"], &RemoveOptions::default());
+
+		assert_eq!(removal.removed.len(), 2);
+		assert!(!edited(&dir, &removal.edits, "src/lib.rs").contains("fn os"));
+	}
+
 	#[test]
 	fn removes_items_with_attached_comments() {
 		let dir = TempDir::with_files("remove-comments", &[("src/lib.rs", COMMENTS)]);
@@ -1068,7 +1166,7 @@ mod insert {
 		source: &str,
 		options: &InsertOptions,
 	) -> Result<rscode::edit::Insertion, Error> {
-		rscode::edit::insert(&Resolver::new(ws), &path(parent), source, options)
+		rscode::edit::insert(&Resolver::new(ws), Some(&path(parent)), source, options)
 	}
 
 	fn at_position(position: InsertPosition) -> InsertOptions {
@@ -1402,11 +1500,12 @@ pub mod out;
 		let dir = TempDir::with_files("insert-ambiguous", &[("src/lib.rs", lib)]);
 		let ws = load(&dir);
 
+		// the candidates' paths tell the blocks apart by a selector
 		match insert(&ws, "<crate::S>", "pub fn c() {}", &InsertOptions::default()) {
 			Err(Error::Ambiguous { candidates, .. }) => {
 				assert_eq!(
 					candidates,
-					["`impl fixture::S` (impl) at src/lib.rs:3:1", "`impl fixture::S` (impl) at src/lib.rs:7:1"]
+					["`impl fixture::S[a]` (impl) at src/lib.rs:3:1", "`impl fixture::S[b]` (impl) at src/lib.rs:7:1"]
 						.map(native)
 				)
 			}
@@ -1417,6 +1516,68 @@ pub mod out;
 			insert(&ws, "<crate::S>", "pub fn c() {}", &at_position(InsertPosition::After("b".to_owned()))).unwrap();
 
 		assert!(edited(&dir, &insertion.edits, "src/lib.rs").ends_with("\tpub fn b() {}\n\n\tpub fn c() {}\n}\n"));
+
+		for parent in ["impl fixture::S[b]", "impl crate::S[2]"] {
+			let insertion = insert(&ws, parent, "pub fn c() {}", &InsertOptions::default()).unwrap();
+
+			assert!(edited(&dir, &insertion.edits, "src/lib.rs").ends_with("\tpub fn b() {}\n\n\tpub fn c() {}\n}\n"));
+		}
+	}
+
+	/// Without a parent, the container of the anchor is the parent.
+	#[test]
+	fn infers_the_parent_from_the_anchor() {
+		let lib = "\
+pub struct S;
+
+impl S {
+	pub fn a() {}
+
+	#[cfg(unix)]
+	pub fn x() {}
+}
+
+impl S {
+	pub fn b() {}
+
+	#[cfg(not(unix))]
+	pub fn x() {}
+}
+
+pub mod m {
+	pub fn f() {}
+}
+";
+		let dir = TempDir::with_files("insert-inferred-parent", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let insert = |position: InsertPosition| rscode::edit::insert(&resolver, None, "pub fn c() {}", &at_position(position));
+
+		let insertion = insert(InsertPosition::After("crate::S::b".to_owned())).unwrap();
+
+		assert_eq!(insertion.parent, "impl fixture::S[b]");
+		assert_eq!(edited(&dir, &insertion.edits, "src/lib.rs"), lib.replace("pub fn b() {}\n", "pub fn b() {}\n\n\tpub fn c() {}\n"));
+
+		let insertion = insert(InsertPosition::Before("m::f".to_owned())).unwrap();
+
+		assert_eq!(insertion.parent, "fixture::m");
+		assert_eq!(edited(&dir, &insertion.edits, "src/lib.rs"), lib.replace("\tpub fn f", "\tpub fn c() {}\n\n\tpub fn f"));
+
+		// the anchor must name items of one container
+		match insert(InsertPosition::After("crate::S::x".to_owned())) {
+			Err(Error::Ambiguous { path, candidates }) => {
+				assert_eq!(path, "crate::S::x");
+				assert_eq!(
+					candidates,
+					["`impl fixture::S[a]` (impl) at src/lib.rs:3:1", "`impl fixture::S[b]` (impl) at src/lib.rs:10:1"].map(native)
+				);
+			}
+			other => panic!("{other:?}"),
+		}
+
+		assert!(matches!(insert(InsertPosition::After("crate::nope".to_owned())), Err(Error::NotFound(path)) if path == "crate::nope"));
+		assert!(matches!(insert(InsertPosition::After("crate".to_owned())), Err(Error::Unsupported(_))));
+		assert!(matches!(insert(InsertPosition::End), Err(Error::Unsupported(_))));
 	}
 
 	#[test]
@@ -1447,7 +1608,7 @@ pub mod out;
 		for (parent, source, position) in insertions {
 			let options = InsertOptions { position, force: false };
 
-			edits.extend(rscode::edit::insert(&resolver, &path(parent), source, &options).unwrap().edits);
+			edits.extend(rscode::edit::insert(&resolver, Some(&path(parent)), source, &options).unwrap().edits);
 		}
 
 		let applied = edits.apply().unwrap();
@@ -1902,7 +2063,7 @@ mod real {
 			if container {
 				for position in [InsertPosition::Start, InsertPosition::End] {
 					let options = InsertOptions { position, force: true };
-					let insertion = rscode::edit::insert(&resolver, &item_path, "fn rscode_inserted() {}", &options)
+					let insertion = rscode::edit::insert(&resolver, Some(&item_path), "fn rscode_inserted() {}", &options)
 						.unwrap_or_else(|error| panic!("inserting into `{item_path}`: {error}"));
 
 					insertion.edits.preview().unwrap_or_else(|error| panic!("inserting into `{item_path}`: {error}"));
@@ -2124,7 +2285,7 @@ pub fn global() -> u8 {
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
 		let options = rscode::edit::InsertOptions { position: InsertPosition::Before("DEPTH".to_owned()), force: false };
-		let insertion = rscode::edit::insert(&resolver, &path("crate::state"), "pub fn f() {}", &options).unwrap();
+		let insertion = rscode::edit::insert(&resolver, Some(&path("crate::state")), "pub fn f() {}", &options).unwrap();
 
 		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("\tpub fn f() {}\n\n\tthread_local! {"));
 	}
@@ -2366,7 +2527,7 @@ pub fn total() -> f64 {
 
 		// an anchor that is an import stands for its `use` item
 		let options = InsertOptions { position: InsertPosition::After("use crate::Circle".to_owned()), force: false };
-		let insertion = rscode::edit::insert(&resolver, &path("crate"), "use shapes::Shape;", &options).unwrap();
+		let insertion = rscode::edit::insert(&resolver, Some(&path("crate")), "use shapes::Shape;", &options).unwrap();
 
 		let text = edited(&dir, &insertion.edits, "src/lib.rs");
 
@@ -2511,7 +2672,7 @@ pub fn make() -> (Qux, Pick) {
 
 		// a single name stands for the `use` items that bind it
 		let options = InsertOptions { position: InsertPosition::After("Pick".to_owned()), force: false };
-		let insertion = rscode::edit::insert(&resolver, &path("crate"), "pub struct Anchored;", &options).unwrap();
+		let insertion = rscode::edit::insert(&resolver, Some(&path("crate")), "pub struct Anchored;", &options).unwrap();
 		let text = edited(&dir, &insertion.edits, "src/lib.rs");
 
 		assert!(text.contains("use shapes::Square as Pick;\n\npub struct Anchored;\n"), "{text}");
@@ -2711,5 +2872,329 @@ pub mod shadowing {
 			shadowing.warnings,
 			["without `use fixture::shadowing::Foo`, `Foo` in `fixture::shadowing` names `fixture::a::Foo` instead of `fixture::b::Foo`"]
 		);
+	}
+}
+
+/// Fields of structs, unions, and variants are items: viewed, replaced, and removed by their paths.
+mod fields {
+	use super::*;
+	use rscode::edit::RenameOptions;
+
+	const LIB: &str = "\
+/// A point.
+pub struct Point {
+	/// The x coordinate.
+	pub x: i32,
+	#[allow(dead_code)]
+	y: i32,
+}
+
+pub struct Pair(pub u8, pub u16);
+
+pub enum Shape {
+	Circle { radius: f64 },
+	Square(f64),
+}
+
+impl Point {
+	pub fn y(&self) -> i32 {
+		self.y
+	}
+}
+";
+
+	/// The file after replacing the item at `path` with `source`, which must give no warnings.
+	fn replaced(dir: &TempDir, ws: &Workspace, path: &str, source: &str) -> String {
+		let replacement = rscode::edit::replace(&Resolver::new(ws), &super::path(path), source, &ReplaceOptions::default())
+			.unwrap_or_else(|error| panic!("{error}"));
+
+		assert_eq!(replacement.warnings, Vec::<String>::new());
+		edited(dir, &replacement.edits, "src/lib.rs")
+	}
+
+	#[test]
+	fn are_viewed_by_their_paths() {
+		let dir = TempDir::with_files("fields-view", &[("src/lib.rs", LIB)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let views = rscode::View::new()
+			.path("crate::Point.x")
+			.unwrap()
+			.path("crate::Pair.1")
+			.unwrap()
+			.run_with(&resolver)
+			.unwrap();
+
+		assert_eq!(
+			views.iter().map(|view| (view.path.as_str(), view.kind, view.text.as_str())).collect::<Vec<_>>(),
+			[
+				("fixture::Point.x", ItemKind::Field, "/// The x coordinate.\npub x: i32"),
+				("fixture::Pair.1", ItemKind::Field, "pub u16"),
+			]
+		);
+
+		// `Point::y` is the method; the field is `Point.y`
+		let named = |text: &str| -> Vec<String> {
+			(resolver.resolve_item_path(&path(text)).into_iter()).map(|item| resolver.canonical_path(item).to_string()).collect()
+		};
+
+		assert_eq!(named("crate::Point::y"), ["fixture::Point::y"]);
+		assert_eq!(named("crate::Point.y"), ["fixture::Point.y"]);
+		assert_eq!(named("crate::Shape::Circle::radius"), ["fixture::Shape::Circle.radius"]);
+	}
+
+	#[test]
+	fn are_replaced_without_their_comma() {
+		let dir = TempDir::with_files("fields-replace", &[("src/lib.rs", LIB)]);
+		let ws = load(&dir);
+
+		assert_eq!(
+			replaced(&dir, &ws, "crate::Point.x", "/// The first coordinate.\npub x: i64,"),
+			LIB.replace("/// The x coordinate.\n\tpub x: i32,", "/// The first coordinate.\n\tpub x: i64,")
+		);
+		assert_eq!(replaced(&dir, &ws, "crate::Pair.1", "pub u32"), LIB.replace("pub u16", "pub u32"));
+		assert_eq!(
+			replaced(&dir, &ws, "crate::Shape::Circle.radius", "radius: f32"),
+			LIB.replace("radius: f64", "radius: f32")
+		);
+
+		// only a field replaces a field
+		let resolver = Resolver::new(&ws);
+		let function = rscode::edit::replace(&resolver, &path("crate::Point.x"), "fn x() {}", &ReplaceOptions::default());
+
+		assert!(matches!(function, Err(Error::InvalidSource(_))), "{function:?}");
+	}
+
+	#[test]
+	fn are_removed_with_their_comma() {
+		let dir = TempDir::with_files("fields-remove", &[("src/lib.rs", LIB)]);
+		let ws = load(&dir);
+		let targets = paths(&["crate::Point.y", "crate::Pair.0", "crate::Shape::Square.0"]);
+		let removal = rscode::edit::remove(&Resolver::new(&ws), &targets, &RemoveOptions::default()).unwrap();
+
+		assert_eq!(
+			edited(&dir, &removal.edits, "src/lib.rs"),
+			LIB.replace("\t#[allow(dead_code)]\n\ty: i32,\n", "")
+				.replace("(pub u8, pub u16)", "(pub u16)")
+				.replace("Square(f64)", "Square()")
+		);
+		assert_eq!(
+			removal.warnings,
+			["the uses of removed fields (field accesses, struct literals, and patterns) are not searched for: check them"]
+		);
+		assert_eq!(
+			removal.removed.iter().map(|removed| (removed.path.as_str(), removed.kind)).collect::<Vec<_>>(),
+			[
+				("fixture::Point.y", ItemKind::Field),
+				("fixture::Pair.0", ItemKind::Field),
+				("fixture::Shape::Square.0", ItemKind::Field)
+			]
+		);
+	}
+
+	#[test]
+	fn are_not_renamed() {
+		let dir = TempDir::with_files("fields-rename", &[("src/lib.rs", LIB)]);
+		let ws = load(&dir);
+
+		match rscode::edit::rename(&Resolver::new(&ws), &path("crate::Point.x"), "z", &RenameOptions::default()) {
+			Err(Error::Unsupported(message)) => assert!(message.starts_with("`fixture::Point.x` is a field, which cannot be renamed"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[test]
+	fn applies_field_edits_and_still_compiles() {
+		let dir = TempDir::with_files(
+			"fields-apply",
+			&[("Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"), ("src/lib.rs", LIB)],
+		);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let mut edits = rscode::edit::replace(&resolver, &path("crate::Point.x"), "pub x: i64", &ReplaceOptions::default())
+			.unwrap()
+			.edits;
+
+		edits.extend(rscode::edit::remove(&resolver, &paths(&["crate::Pair.0"]), &RemoveOptions::default()).unwrap().edits);
+		edits.apply().unwrap();
+
+		assert!(dir.read("src/lib.rs").contains("\tpub x: i64,\n") && dir.read("src/lib.rs").contains("Pair(pub u16);"));
+		cargo_check(&dir);
+	}
+}
+
+/// Item-position macro invocations are named by their module, the macro's name, and `!` (and an index).
+mod macro_calls {
+	use super::*;
+
+	const LIB: &str = "\
+macro_rules! commands {
+	($(static $name:ident = $value:expr;)*) => { $(pub static $name: u8 = $value;)* };
+}
+
+commands! {
+	static SAY = 1;
+	static HELP = 2;
+}
+
+commands! {
+	static QUIT = 3;
+}
+
+pub fn first() -> u8 {
+	SAY + HELP + QUIT
+}
+";
+
+	#[test]
+	fn are_found_viewed_replaced_and_removed() {
+		let dir = TempDir::with_files("macro-calls", &[("src/lib.rs", LIB)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let found = |find: rscode::Find| -> Vec<String> {
+			find.run_with(&resolver).unwrap().into_iter().map(|found| found.path).collect()
+		};
+		let both = ["fixture::commands![1]", "fixture::commands![2]"];
+
+		// found by patterns with `!`, or by their kind, but not by other patterns
+		assert_eq!(found(rscode::Find::new().pattern("**!").unwrap()), both);
+		assert_eq!(found(rscode::Find::new().kind(ItemKind::MacroCall)), both);
+		assert_eq!(found(rscode::Find::new().pattern("commands![2]").unwrap()), both[1..]);
+		assert_eq!(
+			found(rscode::Find::new().pattern("**").unwrap()),
+			["fixture", "fixture::commands", "fixture::SAY", "fixture::HELP", "fixture::QUIT", "fixture::first"]
+		);
+
+		let views = rscode::View::new().path("crate::commands![2]").unwrap().run_with(&resolver).unwrap();
+
+		assert_eq!((views[0].kind, views[0].text.as_str()), (ItemKind::MacroCall, "commands! {\n\tstatic QUIT = 3;\n}"));
+
+		// a path naming several is ambiguous, with copyable candidates
+		let source = "commands! {\n\tstatic QUIT = 4;\n}";
+
+		match rscode::edit::replace(&resolver, &path("crate::commands!"), source, &ReplaceOptions::default()) {
+			Err(Error::Ambiguous { candidates, .. }) => assert_eq!(
+				candidates,
+				[
+					"`fixture::commands![1]` (macro-call) at src/lib.rs:5:1",
+					"`fixture::commands![2]` (macro-call) at src/lib.rs:10:1"
+				]
+				.map(native)
+			),
+			other => panic!("{other:?}"),
+		}
+
+		let replacement = rscode::edit::replace(&resolver, &path("crate::commands![2]"), source, &ReplaceOptions::default()).unwrap();
+
+		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs"), LIB.replace("QUIT = 3", "QUIT = 4"));
+
+		let removal = rscode::edit::remove(&resolver, &paths(&["commands![1]"]), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(
+			edited(&dir, &removal.edits, "src/lib.rs"),
+			LIB.replace("commands! {\n\tstatic SAY = 1;\n\tstatic HELP = 2;\n}\n\n", "")
+		);
+		assert_eq!(removal.removed[0].path, "fixture::commands![1]");
+
+		// next to an invocation, without a parent
+		let options = InsertOptions { position: InsertPosition::After("crate::commands![2]".to_owned()), force: false };
+		let insertion = rscode::edit::insert(&resolver, None, "pub fn second() {}", &options).unwrap();
+
+		assert_eq!(
+			edited(&dir, &insertion.edits, "src/lib.rs"),
+			LIB.replace("QUIT = 3;\n}\n", "QUIT = 3;\n}\n\npub fn second() {}\n")
+		);
+	}
+
+	/// The `static` entries of an invocation are statics of the invocation, named like items of its module when it
+	/// binds nothing else of their name, and bound in no scope.
+	#[test]
+	fn entries_are_found_viewed_replaced_and_removed() {
+		let dir = TempDir::with_files("macro-entries", &[("src/lib.rs", LIB)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let found = rscode::Find::new().pattern("SAY").unwrap().run_with(&resolver).unwrap();
+
+		assert_eq!((found[0].path.as_str(), found[0].kind), ("fixture::SAY", ItemKind::Static));
+		assert_eq!((found[0].thread_local, found[0].entry_macro.as_deref()), (false, Some("commands")));
+
+		let views = rscode::View::new().path("crate::HELP").unwrap().run_with(&resolver).unwrap();
+
+		assert_eq!(views[0].text, "static HELP = 2;");
+		assert_eq!(views[0].entry_macro.as_deref(), Some("commands"));
+
+		// code paths do not reach them: what the macro makes of them is unknown
+		let root = ws.crates()[0].root_module();
+		let say = rscode::model::PathRef {
+			leading_colon: false,
+			segments: vec![rscode::model::PathSegmentRef { name: "SAY".into(), range: Default::default(), has_arguments: false }],
+		};
+
+		assert!(resolver.resolve_path(root, &say, rscode::resolve::Namespace::Value).is_empty());
+
+		// replaced as entries, keeping the `;` they had
+		let replaced = |path: &str, source: &str| {
+			let replacement = rscode::edit::replace(&resolver, &super::path(path), source, &ReplaceOptions::default()).unwrap();
+
+			edited(&dir, &replacement.edits, "src/lib.rs")
+		};
+
+		assert_eq!(replaced("crate::QUIT", "static QUIT = 4"), LIB.replace("QUIT = 3", "QUIT = 4"));
+		assert_eq!(replaced("crate::HELP", "/// Help.\nstatic HELP = 5;"), LIB.replace("static HELP = 2", "/// Help.\n\tstatic HELP = 5"));
+
+		let function = rscode::edit::replace(&resolver, &path("crate::SAY"), "fn say() {}", &ReplaceOptions::default());
+
+		assert!(matches!(function, Err(Error::InvalidSource(_))), "{function:?}");
+
+		// removed with their `;`, and the invocation goes with the last one
+		let removal = rscode::edit::remove(&resolver, &paths(&["crate::HELP"]), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(edited(&dir, &removal.edits, "src/lib.rs"), LIB.replace("\tstatic HELP = 2;\n", ""));
+		assert_eq!(removal.warnings.len(), 1, "{:?}", removal.warnings);
+		assert!(removal.warnings[0].starts_with("the uses of removed entries of macro invocations"), "{:?}", removal.warnings);
+
+		let removal = rscode::edit::remove(&resolver, &paths(&["crate::QUIT"]), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(edited(&dir, &removal.edits, "src/lib.rs"), LIB.replace("commands! {\n\tstatic QUIT = 3;\n}\n\n", ""));
+
+		match rscode::edit::rename(&resolver, &path("crate::SAY"), "TALK", &rscode::edit::RenameOptions::default()) {
+			Err(Error::Unsupported(message)) => assert!(message.contains("is a static declared by a macro invocation"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[test]
+	fn other_bodies_have_no_entries() {
+		let lib = "macro_rules! m {\n\t($($t:tt)*) => {};\n}\n\nm! {\n\tstatic A = 1;\n\tfn f() {}\n}\n\npub static A: u8 = 2;\n";
+		let dir = TempDir::with_files("macro-entries-none", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let named: Vec<String> = (resolver.resolve_item_path(&path("crate::A")).into_iter())
+			.map(|item| resolver.canonical_path(item).to_string())
+			.collect();
+
+		assert_eq!(named, ["fixture::A"]);
+		assert_eq!(ws.children(resolver.resolve_item_path(&path("crate::m!"))[0]).count(), 0);
+	}
+
+	#[test]
+	fn applies_macro_call_edits_and_still_compiles() {
+		let dir = TempDir::with_files(
+			"macro-calls-apply",
+			&[("Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"), ("src/lib.rs", LIB)],
+		);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let source = "commands! {\n\tstatic QUIT = 4;\n\tstatic STOP = 5;\n}";
+		let mut edits = rscode::edit::replace(&resolver, &path("crate::commands![2]"), source, &ReplaceOptions::default())
+			.unwrap()
+			.edits;
+
+		// an entry without its `;`, which the macro needs
+		edits.extend(rscode::edit::replace(&resolver, &path("crate::HELP"), "static HELP = 7", &ReplaceOptions::default()).unwrap().edits);
+		edits.apply().unwrap();
+
+		assert!(dir.read("src/lib.rs").contains("\tstatic HELP = 7;\n}\n") && dir.read("src/lib.rs").contains("\tstatic STOP = 5;\n}\n"));
+		cargo_check(&dir);
 	}
 }

@@ -428,7 +428,7 @@ fn required_parameters() {
 	let expected = [
 		("find_items", vec!["pattern"]),
 		("format_items", vec![]),
-		("insert_items", vec!["parent", "source"]),
+		("insert_items", vec!["source"]),
 		("remove_items", vec!["paths"]),
 		("rename_item", vec!["new_name", "path"]),
 		("replace_item", vec!["path", "source"]),
@@ -767,6 +767,54 @@ mod end_to_end {
 		client.close().await.unwrap();
 	}
 
+	/// Fields are named by paths with a `.`, and `Type::name` names a method of that name.
+	#[tokio::test]
+	async fn fields() {
+		let lib = "pub struct Counter {\n\t/// The count.\n\tpub count: u32,\n}\n\nimpl Counter {\n\tpub fn count(&self) -> u32 {\n\t\tself.count\n\t}\n}\n";
+		let fixture = Fixture::with_files(
+			"fields",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", lib),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "Counter.*" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&native("demo::Counter.count  field  src/lib.rs:2:2-3:16")]);
+
+		let (failed, text) = client.call("view_items", json!({ "paths": ["crate::Counter.count"] })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&native("// demo::Counter.count (field) src/lib.rs:2-3"), "pub count: u32"]);
+
+		// `Counter::count` is the method
+		let replaced = json!({ "path": "crate::Counter::count", "source": "pub count: u64" });
+		let (failed, text) = client.call("replace_item", replaced).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&["hint: `crate::Counter::count` names an associated item or variant; the field is `crate::Counter.count`"],
+		);
+
+		let (failed, text) = client.call("replace_item", json!({ "path": "crate::Counter.count", "source": "pub count: u64," })).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(fixture.read("src/lib.rs"), lib.replace("/// The count.\n\tpub count: u32", "pub count: u64"));
+
+		let (failed, text) = client.call("remove_items", json!({ "paths": ["crate::Counter.count"], "dry_run": true })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["warning: the uses of removed fields"]);
+		client.close().await.unwrap();
+	}
+
 	#[test]
 	fn fixtures_are_cleaned_up() {
 		let root = {
@@ -816,6 +864,75 @@ mod end_to_end {
 			"{}",
 			fixture.read("src/lib.rs")
 		);
+		client.close().await.unwrap();
+	}
+
+	/// `impl` blocks with the same header are named by selectors (which their paths show), and insertions next to an
+	/// associated item need no parent.
+	#[tokio::test]
+	async fn impl_blocks_with_the_same_header() {
+		let lib = "pub struct Tools;\n\n#[allow(dead_code)]\nimpl Tools {\n\tpub fn add_bots() {}\n}\n\nimpl Tools {\n\tpub fn kick() {}\n}\n";
+		let fixture = Fixture::with_files(
+			"impl-blocks",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", lib),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		// the candidates are paths to each block, and `all_variants` is not offered for them
+		let (failed, text) = client.call("replace_item", json!({ "path": "impl Tools", "source": "impl Tools {}" })).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&[
+				&native("`impl demo::Tools[add_bots]` (impl) at src/lib.rs:3:1"),
+				&native("`impl demo::Tools[kick]` (impl) at src/lib.rs:8:1"),
+				"hint: use one of the candidates' paths",
+			],
+		);
+		assert!(!text.contains("all_variants"), "{text}");
+
+		let (failed, text) = client.call("view_items", json!({ "paths": ["impl Tools[#allow]", "<Tools>[2]::kick"] })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&native("// impl demo::Tools[add_bots] (impl) src/lib.rs:3-6"),
+				&native("// demo::Tools::kick (assoc-fn) src/lib.rs:9"),
+			],
+		);
+
+		// the anchor's container is the parent
+		let inserted = json!({ "source": "pub fn ban() {}", "position": "after", "anchor": "Tools::kick" });
+		let (failed, text) = client.call("insert_items", inserted).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &[&native("inserted 1 item into `impl demo::Tools[kick]` (src/lib.rs)")]);
+		assert_eq!(fixture.read("src/lib.rs"), lib.replace("kick() {}\n", "kick() {}\n\n\tpub fn ban() {}\n"));
+
+		// a selector that picks nothing
+		let (failed, text) = client.call("view_items", json!({ "paths": ["impl Tools[3]"] })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["hint: `<Tools>` names `impl demo::Tools[add_bots]`, `impl demo::Tools[kick]`"]);
+
+		let (failed, text) = client.call("insert_items", json!({ "source": "pub fn ban() {}" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["`parent` is required unless `position` is `before` or `after`"]);
+
+		let removed = json!({ "paths": ["impl Tools[ban]"], "dry_run": true });
+		let (failed, text) = client.call("remove_items", removed).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["impl demo::Tools[kick]", "-impl Tools {\n-\tpub fn kick() {}"]);
 		client.close().await.unwrap();
 	}
 
@@ -887,6 +1004,39 @@ mod end_to_end {
 		let (_, text) = client.call("find_items", json!({ "pattern": "use Circl" })).await;
 
 		assert_contains(&text, &["try `use *Circl*`"]);
+		client.close().await.unwrap();
+	}
+
+	/// Item-position macro invocations are named by their macro's name and `!`, with an index for one of several.
+	#[tokio::test]
+	async fn macro_calls() {
+		let lib = "macro_rules! commands {\n\t($($t:tt)*) => {};\n}\n\ncommands! { say }\n\ncommands! { quit }\n";
+		let fixture = Fixture::with_files(
+			"macro-calls",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", lib),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		let (failed, text) = client.call("find_items", json!({ "pattern": "**!" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["demo::commands![1]  macro-call", "demo::commands![2]  macro-call", "2 matches"]);
+
+		let (failed, text) = client.call("view_items", json!({ "paths": ["commands![3]"] })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["hint: `commands!` names `demo::commands![1]`, `demo::commands![2]`"]);
+
+		let (failed, text) = client.call("replace_item", json!({ "path": "crate::commands![2]", "source": "commands! { stop }" })).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(fixture.read("src/lib.rs"), lib.replace("{ quit }", "{ stop }"));
 		client.close().await.unwrap();
 	}
 

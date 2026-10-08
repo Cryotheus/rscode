@@ -8,12 +8,14 @@ use super::text::skip_trivia;
 use super::text::strip_keyword;
 use super::walk::Walker;
 use super::walk::Want;
+use crate::model::ImplInfo;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::PathRef;
 use crate::model::Workspace;
 use crate::resolve::Namespace;
 use crate::resolve::Res;
+use smol_str::SmolStr;
 
 /// Kinds of items an `impl` block can be for (a trait for `impl dyn Trait`).
 const SELF_TYPE_KINDS: &[ItemKind] = &[
@@ -48,9 +50,19 @@ pub(super) struct ImplIndex {
 
 	/// Trait `impl` blocks by trait, in item order.
 	pub(super) by_trait: FxHashMap<ItemId, Vec<ItemId>>,
+
+	/// `impl` blocks by the name of their self type as written (see [`self_name`]), in item order.
+	by_self_name: FxHashMap<SmolStr, Vec<ItemId>>,
 }
 
 impl ImplIndex {
+	/// The `impl` blocks whose self type has the same name as written as that of `impl_block` (`impl_block` included).
+	pub(super) fn same_self_name(&self, ws: &Workspace, impl_block: ItemId) -> &[ItemId] {
+		let name = ws.item(impl_block).impl_info().map(self_name);
+
+		name.and_then(|name| self.by_self_name.get(&name)).map_or(&[], Vec::as_slice)
+	}
+
 	pub(super) fn self_types(&self, impl_block: ItemId) -> &[ItemId] {
 		self.self_types.get(&impl_block).map_or(&[], Vec::as_slice)
 	}
@@ -107,6 +119,7 @@ pub(super) fn build(ws: &Workspace, tables: &Tables) -> ImplIndex {
 			};
 
 			index.all.push(id);
+			index.by_self_name.entry(self_name(info)).or_default().push(id);
 
 			let generics = generic_params(ws, id);
 			let mut walker = Walker::new(ws, tables, ws.module_of(id), PathKind::Code);
@@ -263,6 +276,15 @@ fn resolve_type(walker: &mut Walker<'_>, path: &PathRef) -> Vec<Res> {
 		.into_iter()
 		.map(|found| found.res)
 		.collect()
+}
+
+/// The name of an `impl`'s self type as written: the last segment of its path, or the whole type when it is not a path
+/// (`[u8; 2]`).
+fn self_name(info: &ImplInfo) -> SmolStr {
+	match info.self_ty.base_path().and_then(PathRef::last) {
+		Some(segment) => segment.name.clone(),
+		None => info.self_ty_text.as_str().into(),
+	}
 }
 
 fn starts_with_generic(path: &PathRef, generics: &[&str]) -> bool {

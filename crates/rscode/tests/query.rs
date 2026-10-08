@@ -212,6 +212,16 @@ fn finds_by_path_patterns() {
 		]
 	);
 
+	// fields are found by patterns with a field, or when asked for (the patterns above do not list them)
+	let fields = ["query_basic::shapes::Circle.radius", "query_basic::shapes::Square.0"];
+
+	assert_eq!(found(&resolver, &["shapes::*.*"]), fields);
+	assert_eq!(found(&resolver, &["**.radius"]), fields[..1]);
+	assert_eq!(found(&resolver, &["Square.0"]), fields[1..]);
+	assert_eq!(found(&resolver, &["Circle::radius"]), fields[..1]);
+	assert_eq!(paths(&resolver, Find::new().pattern("shapes::**").unwrap().kind(ItemKind::Field)), fields);
+	assert!(found(&resolver, &["Circle.nope", "Kind.*"]).is_empty());
+
 	// `crate::` anchors at the crate root; the root itself is found too
 	assert_eq!(
 		found(&resolver, &["crate::*"]),
@@ -356,10 +366,13 @@ fn filters_by_kind() {
 	);
 
 	// never found: unnamed items
-	for kind in [ItemKind::Use, ItemKind::MacroCall, ItemKind::ExternBlock] {
+	for kind in [ItemKind::Use, ItemKind::ExternBlock, ItemKind::AssocMacro] {
 		assert!(kinds("*", &[kind]).is_empty(), "{kind}");
 		assert!(paths(&resolver, Find::new().kind(kind)).is_empty(), "{kind}");
 	}
+
+	// macro invocations in modules, by the names of their macros
+	assert_eq!(kinds("*", &[ItemKind::MacroCall]), ["query_basic::nested::thread_local!"]);
 
 	// without patterns, everything of the kinds in the selected crates
 	assert_eq!(

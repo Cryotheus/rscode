@@ -687,6 +687,14 @@ fn views_items() {
 
 	assert_eq!(missing.code, Some(1));
 	assert_eq!(missing.stderr, "error: no item found for `crate::missing`\n");
+
+	// fields
+	let radius = run(&fixture(), &["view", "crate::shapes::Circle.radius", "--lib"]).success();
+
+	assert_eq!(
+		radius.stdout,
+		format!("// {}\npub radius: f64\n", native("demo::shapes::Circle.radius (field) src/shapes.rs:6-6"))
+	);
 }
 
 #[test]
@@ -993,6 +1001,16 @@ fn inserts_items() {
 
 	run_with_stdin(copy.path(), &args, method).success();
 	assert!(copy.read("src/shapes.rs").contains("\tpub fn unit() -> Self {\n\t\tSelf::new(1.0)\n\t}\n}"));
+
+	// with `--after`, the sibling's container is the parent
+	let half = "pub fn half()->Self{Self::new(0.5)}";
+	let after = run_with_stdin(copy.path(), &["insert", "--after", "crate::shapes::Circle::unit", "--fmt"], half).success();
+
+	assert_eq!(
+		after.stdout,
+		native("inserted assoc-fn half into impl demo::shapes::Circle (src/shapes.rs)\nformatted src/shapes.rs\n")
+	);
+	assert!(copy.read("src/shapes.rs").contains("\t}\n\n\tpub fn half() -> Self {\n\t\tSelf::new(0.5)\n\t}\n}"));
 
 	let last =
 		run_with_stdin(copy.path(), &["insert", "crate::util", "--fmt"], "pub(crate) fn last()->u8{3}").success();

@@ -84,6 +84,15 @@ impl<'ws> Files<'ws> {
 				self.add(ws.file_of(parent), edition, FormatTarget::Item(ws.item(parent).range.start));
 			}
 
+			// fields with their struct or union, or the enum of their variant
+			ItemKind::Field => {
+				let owner = (ws.ancestors(item))
+					.find(|&ancestor| ws.item(ancestor).kind != ItemKind::Variant)
+					.unwrap_or(item);
+
+				self.add(ws.file_of(owner), edition, FormatTarget::Item(ws.item(owner).range.start));
+			}
+
 			_ => self.add(ws.file_of(item), edition, FormatTarget::Item(data.range.start)),
 		}
 	}

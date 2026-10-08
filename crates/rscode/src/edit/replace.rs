@@ -85,6 +85,9 @@ pub struct Insertion {
 	/// [`Insertion::inserted`]: their imports are named by `use` paths.
 	pub imports: Vec<(usize, String)>,
 
+	/// The canonical path of the container the items go into (the parent, given or found from the anchor).
+	pub parent: String,
+
 	/// The edited file.
 	pub file: PathBuf,
 
@@ -135,7 +138,8 @@ struct Target<'ws> {
 }
 
 impl<'ws> Target<'ws> {
-	fn new(ws: &'ws Workspace, item: ItemId, parent: &ItemPath) -> Result<Self, Error> {
+	/// The container `item`, which `parent` names (for messages).
+	fn new(ws: &'ws Workspace, item: ItemId, parent: &str) -> Result<Self, Error> {
 		let data = ws.item(item);
 		let unsupported = |why: String| Error::Unsupported(format!("cannot insert into `{parent}`: {why}"));
 
@@ -182,6 +186,54 @@ fn ambiguous(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId], imports
 	Error::Ambiguous {
 		path: path.to_string(),
 		candidates: items.iter().map(|&item| describe(resolver, import_of(item, imports))).collect(),
+	}
+}
+
+/// The container of the sibling that `anchor` names, for an insertion without a parent (see [`insert`]).
+fn anchor_target<'ws>(resolver: &Resolver<'ws>, anchor: Option<&ItemPath>) -> Result<Target<'ws>, Error> {
+	let Some(anchor) = anchor else {
+		return Err(Error::Unsupported(
+			"without a parent, the items go before or after a sibling (the anchor), whose container is the parent".to_owned(),
+		));
+	};
+	let ws = resolver.workspace();
+	let mut items = resolver.resolve_item_path(anchor);
+
+	// like siblings: a path that names nothing may name imports (of items that are not loaded) as a `use` path
+	if items.is_empty() && is_plain(anchor) {
+		items = resolver.resolve_item_path(&ItemPath {
+			import: true,
+			..anchor.clone()
+		});
+	}
+
+	let mut targets: Vec<Target<'ws>> = Vec::new();
+	let mut unsupported = None;
+
+	for &item in &items {
+		let Some(container) = ws.parent(item_of_container(ws, item)) else {
+			unsupported = Some(Error::Unsupported(format!("`{anchor}` is a crate root, which has no siblings")));
+			continue;
+		};
+
+		match Target::new(ws, container, &resolver.canonical_path(container).to_string()) {
+			Ok(target) if targets.iter().any(|known| known.same_place(&target)) => {}
+			Ok(target) => targets.push(target),
+			Err(error) => unsupported = unsupported.or(Some(error)),
+		}
+	}
+
+	match targets.as_slice() {
+		[] => Err(unsupported.unwrap_or_else(|| Error::NotFound(anchor.to_string()))),
+		[target] => Ok(*target),
+
+		// the containers are the candidates, since the parent is what is missing
+		_ => Err(ambiguous(
+			resolver,
+			anchor,
+			&targets.iter().map(|target| target.item).collect::<Vec<_>>(),
+			&[],
+		)),
 	}
 }
 
@@ -346,17 +398,24 @@ fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 /// Items must be valid for the container (e.g. associated items for `impl`s).
 ///
 /// The sibling of [`InsertPosition::Before`] and [`InsertPosition::After`] is a path resolved like `parent`, or the
-/// name of an item of the container. New items are separated from their neighbors by blank lines and indented like
-/// the container's items. Fails with [`Error::Collision`] when a new name is already bound in the container (in
-/// a module: by an item or a named import in the same namespace; in an `impl` block: by an associated item), unless
+/// name of an item of the container. Without a `parent`, the position must be before or after a sibling, whose path
+/// must name items of one container: that container is the parent (an `impl` block or trait for an associated item,
+/// the module for other items). New items are separated from their neighbors by blank lines and indented like the
+/// container's items. Fails with [`Error::Collision`] when a new name is already bound in the container (in a module:
+/// by an item or a named import in the same namespace; in an `impl` block: by an associated item), unless
 /// [`InsertOptions::force`].
-pub fn insert(resolver: &Resolver<'_>, parent: &ItemPath, source: &str, options: &InsertOptions) -> Result<Insertion, Error> {
+pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, options: &InsertOptions) -> Result<Insertion, Error> {
 	let anchor = match &options.position {
 		InsertPosition::Before(anchor) | InsertPosition::After(anchor) => Some(ItemPath::parse(anchor)?),
 		InsertPosition::End | InsertPosition::Start => None,
 	};
 
-	let target = target(resolver, parent, anchor.as_ref())?;
+	let target = match parent {
+		Some(parent) => target(resolver, parent, anchor.as_ref())?,
+		None => anchor_target(resolver, anchor.as_ref())?,
+	};
+	let canonical = resolver.canonical_path(target.item).to_string();
+	let parent = parent.map_or_else(|| canonical.clone(), ToString::to_string);
 	let parsed = parse_source(source, target.container)?;
 
 	if parsed.items.is_empty() {
@@ -387,7 +446,7 @@ pub fn insert(resolver: &Resolver<'_>, parent: &ItemPath, source: &str, options:
 
 	warnings.extend(missing_trait_items(resolver, &target, &parsed.items));
 
-	let placement = placement(resolver, &target, parent, &options.position, anchor.as_ref())?;
+	let placement = placement(resolver, &target, &parent, &options.position, anchor.as_ref())?;
 	let text = target.file.text();
 	let indent = trivia::body_indent(text, target.body);
 	let edit = trivia::insertion(text, placement, &parsed.text, &indent);
@@ -406,9 +465,16 @@ pub fn insert(resolver: &Resolver<'_>, parent: &ItemPath, source: &str, options:
 			.filter(|(_, item)| item.kind == ItemKind::Use)
 			.flat_map(|(index, item)| item.bindings.iter().map(move |binding| (index, binding.name.to_string())))
 			.collect(),
+		parent: canonical,
 		file: target.file.path().to_path_buf(),
 		warnings,
 	})
+}
+
+/// Whether a path is a plain path, which may name items by their name, or imports as a `use` path: not a `use` path, a
+/// qualified path, a field, or macro invocations.
+fn is_plain(path: &ItemPath) -> bool {
+	!path.import && path.qualifier.is_none() && path.field.is_none() && !path.macro_call
 }
 
 /// The item an anchor stands for among the items of its container: the item, or for an import its `use` item, and for
@@ -485,7 +551,7 @@ fn module_namespaces(resolver: &Resolver<'_>, module: ItemId, binding: &NewBindi
 fn placement(
 	resolver: &Resolver<'_>,
 	target: &Target<'_>,
-	parent: &ItemPath,
+	parent: &str,
 	position: &InsertPosition,
 	anchor: Option<&ItemPath>,
 ) -> Result<Placement, Error> {
@@ -539,8 +605,9 @@ fn push_unique<T: PartialEq>(list: &mut Vec<T>, value: T) {
 ///
 /// Comments attached above the item stay, and the replacement gets the line breaks of the file. Fails with
 /// [`Error::NotFound`] when `path` names nothing, [`Error::Ambiguous`] when it names several items (`cfg` variants,
-/// see [`ReplaceOptions::all_variants`], or items of `impl` blocks whose headers differ, which generic arguments in
-/// the path tell apart), and [`Error::InvalidSource`] when `source` is not a valid replacement.
+/// see [`ReplaceOptions::all_variants`]; items of `impl` blocks whose headers differ, which generic arguments in the
+/// path tell apart; or items of one crate with the same `cfg`s, like `impl` blocks with the same header, which a
+/// selector tells apart), and [`Error::InvalidSource`] when `source` is not a valid replacement.
 pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: &ReplaceOptions) -> Result<Replacement, Error> {
 	let ws = resolver.workspace();
 	let mut resolved = resolver.resolve_item_path(path);
@@ -554,9 +621,9 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 		return Err(Error::NotFound(path.to_string()));
 	}
 
-	// (`impl` blocks whose headers differ are not `cfg` variants of each other, and neither are imports of one module
-	// with the same `cfg`s)
-	if items.len() > 1 && (!options.all_variants || super::impl_headers_differ(ws, &items) || same_cfg_imports(ws, &items, &imports)) {
+	// (`impl` blocks whose headers differ are not `cfg` variants of each other, and neither are items of one crate with
+	// the same `cfg`s, such as two `impl` blocks with the same header)
+	if items.len() > 1 && (!options.all_variants || super::impl_headers_differ(ws, &items) || super::same_cfg_items(ws, &items)) {
 		return Err(ambiguous(resolver, path, &items, &imports));
 	}
 
@@ -575,7 +642,7 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 		let canonical = resolver.canonical_path(import_of(item, &imports)).to_string();
 		let container = ws
 			.parent(item)
-			.and_then(|parent| Container::of(ws.item(parent).kind))
+			.and_then(|parent| Container::of_item(ws, parent))
 			.ok_or_else(|| Error::Unsupported(format!("`{path}` is a crate root, which cannot be replaced")))?;
 
 		let source = match parsed.iter().position(|(known, _)| *known == container) {
@@ -606,14 +673,22 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 		}
 
 		// the declarations of a `thread_local!` are separated by `;`, which only the last one may leave out (and the
-		// file still parses without it, since macro bodies are only tokens)
+		// file still parses without it, since macro bodies are only tokens); entries keep a `;` they had
 		let followed = ws.parent(item).is_some_and(|parent| ws.children(parent).last() != Some(item));
+		let separated = match container {
+			Container::ThreadLocal => followed,
+			Container::Entries => ws.item_text(item).ends_with(';'),
+			_ => false,
+		};
 
-		if container == Container::ThreadLocal && followed && !source.ends_with_semicolon {
+		if separated && !source.ends_with_semicolon {
 			if source.trailing_comment {
-				return Err(Error::InvalidSource(format!(
-					"`{path}` is followed by more declarations of its `thread_local!`: end the source with `;`"
-				)));
+				let why = match container {
+					Container::ThreadLocal => "is followed by more declarations of its `thread_local!`",
+					_ => "ends with `;` in its macro invocation",
+				};
+
+				return Err(Error::InvalidSource(format!("`{path}` {why}: end the source with `;`")));
 			}
 
 			let code = replacement.trim_end().len();
@@ -674,7 +749,8 @@ fn replacement_warnings(ws: &Workspace, item: ItemId, path: &str, items: &[NewIt
 		item.name.as_ref() == Some(name) || item.bindings.iter().any(|binding| binding.import.is_none() && binding.name == *name)
 	};
 
-	if let Some(name) = &data.name
+	// (fields of tuple structs and variants are named by their place, which a replacement keeps)
+	if let Some(name) = data.name.as_ref().filter(|_| data.kind != ItemKind::Field || data.name_range.is_some())
 		&& !items.iter().any(|item| defines(item, name))
 	{
 		warnings.push(format!(
@@ -701,8 +777,9 @@ fn replacement_warnings(ws: &Workspace, item: ItemId, path: &str, items: &[NewIt
 }
 
 /// Whether [`ReplaceOptions::all_variants`] lets [`replace`] replace the several items that `path` names, rather than
-/// fail: whether they are `cfg` variants (or items of several crates), and not items of `impl` blocks whose headers
-/// differ, which generic arguments in the path tell apart.
+/// fail: whether they are `cfg` variants (or items of several crates). Items of `impl` blocks whose headers differ
+/// (which generic arguments in the path tell apart) are not, and neither are two items of one crate with the same
+/// `cfg`s (such as two `impl` blocks with the same header, which a selector tells apart).
 pub fn replaces_all_variants(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 	let ws = resolver.workspace();
 	let mut resolved = resolver.resolve_item_path(path);
@@ -711,27 +788,12 @@ pub fn replaces_all_variants(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 		return false;
 	}
 
-	let Ok((items, imports)) = use_items(resolver, resolved) else {
+	let Ok((items, _)) = use_items(resolver, resolved) else {
 		return false;
 	};
 	let items = distinct_places(ws, items);
 
-	items.len() > 1 && !super::impl_headers_differ(ws, &items) && !same_cfg_imports(ws, &items, &imports)
-}
-
-/// Whether two of the `use` items replaced for imports are in the same crate and have the same `cfg`s: they are not
-/// `cfg` variants of each other (like two `use a::Trait as _;` of one module), so they do not get the same text.
-fn same_cfg_imports(ws: &Workspace, items: &[ItemId], imports: &[(ItemId, ItemId)]) -> bool {
-	let use_items: Vec<ItemId> = items
-		.iter()
-		.copied()
-		.filter(|item| imports.iter().any(|(use_item, _)| use_item == item))
-		.collect();
-
-	use_items
-		.iter()
-		.enumerate()
-		.any(|(index, &a)| (use_items[index + 1..].iter()).any(|&b| a.krate() == b.krate() && ws.effective_cfg(a) == ws.effective_cfg(b)))
+	items.len() > 1 && !super::impl_headers_differ(ws, &items) && !super::same_cfg_items(ws, &items)
 }
 
 /// Whether two items are the same text (of a file loaded by several crates).
@@ -746,7 +808,9 @@ fn siblings(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> 
 	let ws = resolver.workspace();
 	let children: Vec<ItemId> = ws.children(target.item).collect();
 
-	if let (Anchor::None, None, false, [name]) = (anchor.anchor, &anchor.qualifier, anchor.import, anchor.segments.as_slice()) {
+	if let (Anchor::None, None, false, [name]) = (anchor.anchor, &anchor.qualifier, anchor.import, anchor.segments.as_slice())
+		&& is_plain(anchor)
+	{
 		let named: Vec<ItemId> = children.iter().copied().filter(|&child| binds_name(ws, child, name)).collect();
 
 		if !named.is_empty() {
@@ -758,7 +822,7 @@ fn siblings(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> 
 	// imports (of items that are not loaded) as a `use` path
 	let mut resolved = resolver.resolve_item_path(anchor);
 
-	if resolved.is_empty() && !anchor.import && anchor.qualifier.is_none() {
+	if resolved.is_empty() && is_plain(anchor) {
 		resolved = resolver.resolve_item_path(&ItemPath {
 			import: true,
 			..anchor.clone()
@@ -782,9 +846,10 @@ fn target<'ws>(resolver: &Resolver<'ws>, parent: &ItemPath, anchor: Option<&Item
 	let items = resolver.resolve_item_path(parent);
 	let mut targets: Vec<Target<'ws>> = Vec::new();
 	let mut unsupported = None;
+	let parent_text = parent.to_string();
 
 	for &item in &items {
-		match Target::new(ws, item, parent) {
+		match Target::new(ws, item, &parent_text) {
 			Ok(target) if targets.iter().any(|known| known.same_place(&target)) => {}
 			Ok(target) => targets.push(target),
 			Err(error) => unsupported = unsupported.or(Some(error)),
@@ -877,7 +942,10 @@ mod tests {
 			let parsed = parse_source(text, container).unwrap_or_else(|error| panic!("{name}: {error}\n{text}"));
 			let found: Vec<(ItemKind, Option<&str>)> = parsed.items.iter().map(|new| (new.kind, new.name.as_deref())).collect();
 
-			assert_eq!(found, [(data.kind, data.name())], "{name}: {text}");
+			// (the fields of tuple structs are named by their place)
+			let expected = data.name().filter(|_| data.kind != ItemKind::Field || data.name_range.is_some());
+
+			assert_eq!(found, [(data.kind, expected)], "{name}: {text}");
 			checked += 1;
 		}
 

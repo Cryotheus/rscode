@@ -71,6 +71,9 @@ pub(crate) trait PathTree {
 	/// The selected crates: their names and roots.
 	fn crates(&self) -> Vec<(String, Self::Node)>;
 
+	/// For a struct, union, or variant: the names (or indexes) of its fields, nameable as `<node path>.<name>`.
+	fn fields(&self, node: Self::Node) -> Vec<String>;
+
 	/// For a module: the names its imports bind, as written in `use` paths (`*` for glob imports, `_` for `as _` ones),
 	/// whatever their visibility.
 	fn imports(&self, node: Self::Node) -> Vec<String>;
@@ -297,6 +300,14 @@ impl PathTree for WorkspaceTree<'_> {
 			.collect()
 	}
 
+	fn fields(&self, node: ItemId) -> Vec<String> {
+		(self.workspace.children(node))
+			.filter(|&id| self.workspace.item(id).kind == ItemKind::Field)
+			.filter_map(|id| self.child(id))
+			.map(|child| child.name)
+			.collect()
+	}
+
 	fn imports(&self, node: ItemId) -> Vec<String> {
 		if self.workspace.item(node).kind != ItemKind::Module {
 			return Vec::new();
@@ -319,6 +330,15 @@ impl PathTree for WorkspaceTree<'_> {
 		names.dedup();
 		names
 	}
+}
+
+/// Completion candidates, with their help, in order and capped at [`MAX_CANDIDATES`].
+fn candidates(found: BTreeMap<String, &'static str>) -> Vec<CompletionCandidate> {
+	found
+		.into_iter()
+		.take(MAX_CANDIDATES)
+		.map(|(value, help)| CompletionCandidate::new(value).help(Some(help.into())))
+		.collect()
 }
 
 /// Candidates for a typed path, one `::` segment at a time: `crate` and crate names first, then the children of the
@@ -352,6 +372,19 @@ fn complete_plain_path<T: PathTree>(
 		None => (false, typed),
 	};
 
+	// a field after a `.`: those of the structs, unions, and variants that the path before it names
+	if filter == Filter::Any
+		&& let Some((owner, partial)) = rest.rsplit_once('.')
+	{
+		let prefix = &typed[..typed.len() - partial.len()];
+		let fields = (nodes_named(tree, &tree.crates(), owner, global).into_iter())
+			.flat_map(|node| tree.fields(node))
+			.filter(|name| matches_prefix(name, partial))
+			.map(|name| (format!("{prefix}{name}"), "field"));
+
+		return candidates(fields.collect());
+	}
+
 	let (head, partial) = match rest.rsplit_once("::") {
 		Some((head, partial)) => (Some(head), partial),
 		None => (None, rest),
@@ -376,22 +409,7 @@ fn complete_plain_path<T: PathTree>(
 		}
 
 		Some(head) => {
-			let mut segments = head.split("::");
-			let first = segments.next().unwrap_or_default();
-			let mut nodes: Vec<T::Node> = crates
-				.iter()
-				.filter(|(name, _)| (first == "crate" && !global) || same_ident(name, first))
-				.map(|(_, node)| *node)
-				.collect();
-
-			for segment in segments {
-				nodes = nodes
-					.into_iter()
-					.flat_map(|node| tree.children(node))
-					.filter(|child| same_ident(&child.name, segment))
-					.map(|child| child.node)
-					.collect();
-			}
+			let nodes = nodes_named(tree, &crates, head, global);
 
 			for &node in &nodes {
 				for (name, help) in extra(node) {
@@ -409,11 +427,7 @@ fn complete_plain_path<T: PathTree>(
 		}
 	}
 
-	found
-		.into_iter()
-		.take(MAX_CANDIDATES)
-		.map(|(value, help)| CompletionCandidate::new(value).help(Some(help.into())))
-		.collect()
+	candidates(found)
 }
 
 /// Candidates for a `use` path: the modules on the way, and the names the imports of the last module bind.
@@ -494,6 +508,29 @@ pub(crate) fn kind_candidates() -> Vec<CompletionCandidate> {
 
 fn matches_prefix(name: &str, partial: &str) -> bool {
 	name.starts_with(partial) || unraw(name).starts_with(partial)
+}
+
+/// The nodes a typed path (without its leading `::`, `global`, and its partial segment) names: the crate roots of
+/// `crate` or of a crate name, then the children named by each segment.
+fn nodes_named<T: PathTree>(tree: &T, crates: &[(String, T::Node)], path: &str, global: bool) -> Vec<T::Node> {
+	let mut segments = path.split("::");
+	let first = segments.next().unwrap_or_default();
+	let mut nodes: Vec<T::Node> = crates
+		.iter()
+		.filter(|(name, _)| (first == "crate" && !global) || same_ident(name, first))
+		.map(|(_, node)| *node)
+		.collect();
+
+	for segment in segments {
+		nodes = nodes
+			.into_iter()
+			.flat_map(|node| tree.children(node))
+			.filter(|child| same_ident(&child.name, segment))
+			.map(|child| child.node)
+			.collect();
+	}
+
+	nodes
 }
 
 /// When `word` is the option (`--long VALUE`, `--long=VALUE`, and with a short form `-s VALUE`, `-sVALUE`, or
@@ -591,7 +628,7 @@ mod tests {
 		/// ```text
 		/// demo (lib)            demo (bin)
 		/// ├── shapes            └── main
-		/// │   ├── Circle { new, area }
+		/// │   ├── Circle { new, area, .radius }
 		/// │   ├── Kind { Round, Square }
 		/// │   └── Shape { area }
 		/// ├── r#type (mod)
@@ -603,7 +640,7 @@ mod tests {
 			let nodes = vec![
 				node("demo", ItemKind::Module, &[1, 12, 13, 14]),
 				node("shapes", ItemKind::Module, &[2, 5, 8]),
-				node("Circle", ItemKind::Struct, &[3, 4]),
+				node("Circle", ItemKind::Struct, &[3, 4, 15]),
 				node("new", ItemKind::AssocFn, &[]),
 				node("area", ItemKind::AssocFn, &[]),
 				node("Kind", ItemKind::Enum, &[6, 7]),
@@ -616,6 +653,7 @@ mod tests {
 				node("r#type", ItemKind::Module, &[]),
 				node("add", ItemKind::Fn, &[]),
 				node("Circle", ItemKind::Import, &[]),
+				node("radius", ItemKind::Field, &[]),
 			];
 
 			Self {
@@ -633,6 +671,7 @@ mod tests {
 			self.nodes[node]
 				.2
 				.iter()
+				.filter(|&&child| self.nodes[child].1 != ItemKind::Field)
 				.map(|&child| Child {
 					name: self.nodes[child].0.clone(),
 					kind: self.nodes[child].1,
@@ -643,6 +682,13 @@ mod tests {
 
 		fn crates(&self) -> Vec<(String, usize)> {
 			self.crates.clone()
+		}
+
+		fn fields(&self, node: usize) -> Vec<String> {
+			(self.nodes[node].2.iter())
+				.filter(|&&child| self.nodes[child].1 == ItemKind::Field)
+				.map(|&child| self.nodes[child].0.clone())
+				.collect()
 		}
 
 		fn imports(&self, node: usize) -> Vec<String> {
@@ -713,6 +759,12 @@ mod tests {
 		assert_eq!(complete("::demo::a"), ["::demo::add"]);
 		assert_eq!(complete("crate::nope::"), Vec::<String>::new());
 		assert_eq!(complete("crate::add::"), Vec::<String>::new());
+
+		// fields after a `.`
+		assert_eq!(complete("crate::shapes::Circle."), ["crate::shapes::Circle.radius"]);
+		assert_eq!(complete("::demo::shapes::Circle.r"), ["::demo::shapes::Circle.radius"]);
+		assert_eq!(complete("crate::shapes::Circle.x"), Vec::<String>::new());
+		assert_eq!(complete("crate::shapes::Kind."), Vec::<String>::new());
 	}
 
 	#[test]
@@ -853,11 +905,11 @@ mod tests {
 	fn offers_the_kinds_find_finds() {
 		let kinds = values(&kind_candidates());
 
-		for kind in ["mod", "struct", "assoc-fn", "variant", "import", "impl", "foreign-fn"] {
+		for kind in ["mod", "struct", "assoc-fn", "variant", "field", "import", "impl", "foreign-fn", "macro-call"] {
 			assert!(kinds.contains(&kind.to_owned()), "{kind}: {kinds:?}");
 		}
 
-		for kind in ["use", "macro-call", "foreign-macro", "assoc-macro", "extern-block"] {
+		for kind in ["use", "foreign-macro", "assoc-macro", "extern-block"] {
 			assert!(!kinds.contains(&kind.to_owned()), "{kind}: {kinds:?}");
 		}
 	}

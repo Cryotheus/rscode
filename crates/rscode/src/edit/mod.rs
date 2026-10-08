@@ -882,6 +882,18 @@ fn restore(path: &Path, original: &str, written: &str) -> io::Result<()> {
 	fs::rename(&file.temporary, &file.target).inspect_err(|_| remove_temporaries(std::slice::from_ref(&file)))
 }
 
+/// Whether two of `items` at distinct places are in the same crate and have the same effective `cfg`: such items are
+/// not `cfg` variants of each other (like two `impl Tools` blocks with the same header, or two `use a::Trait as _;` of
+/// one module), so they neither get the same text nor go away together.
+pub(crate) fn same_cfg_items(ws: &Workspace, items: &[ItemId]) -> bool {
+	let place = |item: ItemId| (ws.file_of(item).path(), ws.item(item).range);
+
+	items.iter().enumerate().any(|(index, &a)| {
+		(items[index + 1..].iter())
+			.any(|&b| a.krate() == b.krate() && place(a) != place(b) && ws.effective_cfg(a) == ws.effective_cfg(b))
+	})
+}
+
 /// Writes contents to a new temporary file in the directory of the file of `path` (which may be a symbolic link to it),
 /// with the file's permissions.
 fn stage<'a>(path: &'a Path, contents: &str) -> Result<Staged<'a>, Failure> {

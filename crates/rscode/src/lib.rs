@@ -4,7 +4,8 @@
 //! predicates, and visibility. Nothing is compiled or expanded; source files are parsed with `syn` and module
 //! files are found by following `mod` declarations the same way rustc does. Items produced by macros are
 //! therefore invisible, except for the statics declared by `thread_local!`, which are loaded as `static` items of the
-//! module the invocation is in.
+//! module the invocation is in. Item-position macro invocations are items themselves, named `module::name!`, and so
+//! are the `static NAME = value;` entries of an invocation whose body is only such entries (`module::NAME`).
 //!
 //! - Load: [`load_workspace`] (a cargo workspace, feature `cargo`), or [`Workspace::load_crate`] with a
 //!   [`CrateSpec`] for a standalone crate root.
@@ -17,8 +18,9 @@
 //! - Serve: the `mcp` feature exposes all of this as a Model Context Protocol server ([`mcp`]).
 //!
 //! Item paths are written like Rust paths: `crate::module::Item`, `::other_crate::Item`, `Type::method`,
-//! `<Type as Trait>::method`, and `use module::Item` for the imports themselves (other paths go through imports). See
-//! [`ItemPath`] and [`pattern`] for the exact syntax.
+//! `<Type as Trait>::method`, `impl Type[method]` for one of several `impl` blocks with the same header, `Type.field`
+//! for fields, and `use module::Item` for the imports themselves (other paths go through imports). See [`ItemPath`]
+//! and [`pattern`] for the exact syntax.
 //!
 //! Formatting and sorting are provided by the [`rscode_fmt`] and [`rscode_sort`] crates, re-exported here.
 //!

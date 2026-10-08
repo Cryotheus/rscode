@@ -37,8 +37,14 @@ impl Resolver<'_> {
 	pub(super) fn compute_item_path(&self, path: &ItemPath) -> Vec<ItemId> {
 		let mut items = match &path.qualifier {
 			_ if path.import => self.resolve_import(path),
+			_ if path.macro_call => self.resolve_macro_call(path),
+			_ if path.field.is_some() => self.resolve_field(path),
 			Some(qualifier) => self.resolve_qualified(qualifier, &path.segments),
-			None => self.resolve_unqualified(path),
+
+			None => match self.resolve_unqualified(path) {
+				items if items.is_empty() => self.resolve_unbound(path),
+				items => items,
+			},
 		};
 
 		items.sort();
@@ -86,6 +92,15 @@ impl Resolver<'_> {
 				Res::External(external) | Res::Builtin(external) => ends_with(&external.split("::").collect::<Vec<_>>(), &wanted),
 				Res::Item(item) => ends_with(&self.flat_path(*item).iter().map(SmolStr::as_str).collect::<Vec<_>>(), &wanted),
 			})
+	}
+
+	/// The fields named `name` of the structs, unions, and variants among `owners`.
+	fn fields_of(&self, owners: Vec<ItemId>, name: &str) -> Vec<ItemId> {
+		(owners.into_iter())
+			.filter(|&owner| matches!(self.ws.item(owner).kind, ItemKind::Struct | ItemKind::Union | ItemKind::Variant))
+			.flat_map(|owner| self.ws.children(owner))
+			.filter(|&child| self.ws.item(child).kind == ItemKind::Field && self.ws.item(child).name() == Some(name))
+			.collect()
 	}
 
 	/// Whether a trait `impl` implements one of `traits` (the loaded traits the user's trait path names), or, when
@@ -172,6 +187,19 @@ impl Resolver<'_> {
 		found
 	}
 
+	/// `Owner.field`: the fields of that name of the structs, unions, and variants that `Owner` names.
+	fn resolve_field(&self, path: &ItemPath) -> Vec<ItemId> {
+		let Some(field) = &path.field else {
+			return Vec::new();
+		};
+		let owner = ItemPath {
+			field: None,
+			..path.clone()
+		};
+
+		self.fields_of(self.compute_item_path(&owner), field)
+	}
+
 	/// `use m::name`: the imports of the module(s) `m` names (every `cfg` variant) that bind `name` (`*`: glob imports,
 	/// `_`: underscore imports), found in the item tree, so that imports that resolve to nothing are named too.
 	fn resolve_import(&self, path: &ItemPath) -> Vec<ItemId> {
@@ -187,12 +215,33 @@ impl Resolver<'_> {
 			.collect()
 	}
 
+	/// `m::name!`: the item-position macro invocations in the module(s) `m` names (every `cfg` variant) of macros whose
+	/// path ends with `name`, found in the item tree; a selector picks one by its index.
+	fn resolve_macro_call(&self, path: &ItemPath) -> Vec<ItemId> {
+		let Some((name, modules)) = self.split_name(path) else {
+			return Vec::new();
+		};
+
+		let mut calls: Vec<ItemId> = (modules.into_iter())
+			.flat_map(|module| self.ws.children(module))
+			.filter(|&child| self.ws.item(child).kind == ItemKind::MacroCall && self.ws.item(child).macro_name() == Some(name))
+			.collect();
+
+		calls.sort();
+		calls.dedup();
+
+		match &path.selector {
+			Some(selector) => self.select(calls, selector),
+			None => calls,
+		}
+	}
+
 	/// `<Type as Trait>::name`, `<Type>::name`, or the `impl` blocks themselves when there are no segments.
 	///
 	/// When the type or the trait is not a loaded item (as a presumed absolute path: `<Circle as Shape>` with a trait
 	/// `crate::shapes::Shape`, or `<u8 as Display>`), `impl` blocks whose type or trait ends with its segments match,
 	/// as written or as resolved. Generic arguments of the type or trait keep the `impl` blocks with the same ones, as
-	/// written (`<Wrapper as From<u8>>`).
+	/// written (`<Wrapper as From<u8>>`), and a selector picks among the rest (`<Tools>[2]`).
 	fn resolve_qualified(&self, qualifier: &Qualifier, segments: &[SmolStr]) -> Vec<ItemId> {
 		let types = self.compute_item_path(&qualifier.self_ty);
 
@@ -236,6 +285,10 @@ impl Resolver<'_> {
 		impls.sort();
 		impls.dedup();
 
+		if let Some(selector) = &qualifier.selector {
+			impls = self.select(impls, selector);
+		}
+
 		match segments {
 			[] => impls,
 
@@ -247,6 +300,36 @@ impl Resolver<'_> {
 
 			_ => Vec::new(),
 		}
+	}
+
+	/// A plain path whose last segment names nothing bound where the other segments lead: `Type::name` names the field
+	/// `name` of the structs, unions, and variants they name (when they have no associated item or variant of that
+	/// name), and `module::NAME` else the statics of that name declared by entries of the macro invocations of the
+	/// modules they name (see [`Workspace::entry_macro`](crate::model::Workspace::entry_macro)).
+	///
+	/// (The other segments are resolved once, so that the cost of a path that names nothing grows linearly with its
+	/// length.)
+	fn resolve_unbound(&self, path: &ItemPath) -> Vec<ItemId> {
+		let Some((name, prefix)) = path.segments.split_last() else {
+			return Vec::new();
+		};
+		let owners = self.compute_item_path(&ItemPath {
+			segments: prefix.to_vec(),
+			..path.clone()
+		});
+		let fields = self.fields_of(owners.clone(), name);
+
+		if !fields.is_empty() {
+			return fields;
+		}
+
+		(owners.into_iter())
+			.filter(|&owner| self.ws.item(owner).kind == ItemKind::Module)
+			.flat_map(|module| self.ws.children(module))
+			.filter(|&child| self.ws.item(child).kind == ItemKind::MacroCall)
+			.flat_map(|call| self.ws.children(call))
+			.filter(|&entry| self.ws.entry_macro(entry).is_some() && self.ws.item(entry).name.as_ref() == Some(name))
+			.collect()
 	}
 
 	fn resolve_unqualified(&self, path: &ItemPath) -> Vec<ItemId> {

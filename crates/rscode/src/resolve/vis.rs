@@ -132,7 +132,8 @@ pub(super) fn declared_vis(ws: &Workspace, item: ItemId) -> Vis {
 
 /// The module an item is declared in: the nearest module strictly above it (the crate root for itself).
 ///
-/// Extern blocks are transparent, and items of `impl` blocks, traits, and enums belong to the enclosing module.
+/// Extern blocks are transparent, and items of `impl` blocks, traits, and enums (and fields) belong to the enclosing
+/// module.
 pub(super) fn home_module(ws: &Workspace, item: ItemId) -> ItemId {
 	match ws.parent(item) {
 		Some(parent) => ws.module_of(parent),
@@ -148,7 +149,8 @@ fn inherited_vis(ws: &Workspace, item: ItemId, home: ItemId) -> Vis {
 	let parent_data = ws.item(parent);
 
 	match parent_data.kind {
-		ItemKind::Enum | ItemKind::Trait => declared_vis(ws, parent),
+		// (the fields of variants are as visible as their enum)
+		ItemKind::Enum | ItemKind::Trait | ItemKind::Variant => declared_vis(ws, parent),
 		ItemKind::Impl if parent_data.impl_info().is_some_and(|info| info.trait_path.is_some()) => Vis::Public,
 		_ => Vis::Module(home),
 	}

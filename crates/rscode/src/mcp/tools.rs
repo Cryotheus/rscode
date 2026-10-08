@@ -103,7 +103,8 @@ fn describe(error: &Error) -> String {
 
 		Error::PathParse(_) => {
 			"paths look like `crate::a::Item`, `::crate_name::Item`, `a::Item`, `Type::method`, `<Type as Trait>::method`, \
-			 `impl Trait for Type`, or `use crate::a::Name` (an import itself); patterns may use `*` and `**`"
+			 `impl Trait for Type`, `impl Type[method]` (one of several blocks), `Type.field`, `a::macro_name!`, or \
+			 `use crate::a::Name` (an import itself); patterns may use `*` and `**`"
 		}
 
 		_ => return error.to_string(),
@@ -122,6 +123,11 @@ fn describe_in(error: &Error, resolver: &Resolver<'_>) -> String {
 	let workspace = resolver.workspace();
 	let path = ItemPath::parse(path).ok();
 	let member = path.as_ref().and_then(|path| workspace.unloaded_member_of(path));
+
+	// a selector that picks none of the blocks a loaded header names: the members do not matter
+	if let Some(hint) = path.as_ref().and_then(|path| resolver.selector_hint(path)) {
+		return format!("{error}\nhint: {hint}");
+	}
 
 	match (member, unloaded_hint(workspace, member)) {
 		// the crate is known: searching the loaded crates would not help
@@ -286,15 +292,21 @@ fn in_several_crates(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 /// `insert_items`
 pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<'_>) -> Output {
 	let options = params.options()?;
-	let parent = parse_path(&params.parent)?;
+	let parent = params.parent().map(parse_path).transpose()?;
 	let workspace = self::load(load)?;
 	let resolver = Resolver::new(&workspace);
-	let plan = edit::insert(&resolver, &parent, &params.source, &options).map_err(|error| match error {
-		Error::Ambiguous { .. } if in_several_crates(&resolver, &parent) => format!("{error}\nhint: {SELECT_ONE_CRATE}"),
-		error => describe_in(&error, &resolver),
+	let plan = edit::insert(&resolver, parent.as_ref(), &params.source, &options).map_err(|error| match (&error, &parent) {
+		(Error::Ambiguous { .. }, Some(parent)) if in_several_crates(&resolver, parent) => {
+			format!("{error}\nhint: {SELECT_ONE_CRATE}")
+		}
+
+		// several containers have the anchor
+		(Error::Ambiguous { .. }, None) => format!("{error}\nhint: pass one of the candidates as `parent`"),
+
+		_ => describe_in(&error, &resolver),
 	})?;
 	let root = workspace.root();
-	let mut text = render::insertion(root, &plan, &params.parent, params.dry_run);
+	let mut text = render::insertion(root, &plan, params.parent().unwrap_or(&plan.parent), params.dry_run);
 
 	if params.format && params.dry_run {
 		text.push_str(UNFORMATTED_DIFF);
@@ -303,6 +315,11 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 
 	if params.format && !params.dry_run {
+		// (the canonical path of the container found from the anchor is a path to it)
+		let parent = match parent {
+			Some(parent) => parent,
+			None => parse_path(&plan.parent)?,
+		};
 		let child = |name: &str, import: bool| {
 			let mut path = ItemPath { import, ..parent.clone() };
 
@@ -431,6 +448,9 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 			Error::Ambiguous { .. } if all_variants => {
 				format!("{error}\nhint: set `all_variants` to replace every one of them")
 			}
+
+			// `Type::name` names a method, and the source is the field `Type.name`
+			Error::InvalidSource(_) if let Some(hint) = resolver.field_hint(&path) => format!("{error}\nhint: {hint}"),
 
 			error => describe_in(&error, &resolver),
 		}

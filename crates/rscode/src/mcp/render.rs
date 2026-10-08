@@ -164,7 +164,7 @@ pub(crate) fn find(root: &Path, pattern: &str, matches: &[FindMatch], page: Page
 fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
 	let mut columns = vec![
 		found.path.clone(),
-		kind_label(found.kind, found.thread_local),
+		kind_label(found.kind, found.thread_local, found.entry_macro.as_deref()),
 		format!("{}:{}-{}", display(root, &found.file), found.start, found.end),
 	];
 
@@ -294,11 +294,12 @@ pub(crate) fn insertion(root: &Path, plan: &Insertion, parent: &str, dry_run: bo
 	out
 }
 
-/// The name of a kind, marking statics declared by `thread_local!`.
-fn kind_label(kind: ItemKind, thread_local: bool) -> String {
-	match thread_local {
-		true => format!("{} (thread_local!)", kind.name()),
-		false => kind.name().to_owned(),
+/// The name of a kind, marking statics declared by `thread_local!` and by entries of other macro invocations.
+fn kind_label(kind: ItemKind, thread_local: bool, entry_macro: Option<&str>) -> String {
+	match (thread_local, entry_macro) {
+		(true, _) => format!("{} (thread_local!)", kind.name()),
+		(false, Some(name)) => format!("{} ({name}!)", kind.name()),
+		(false, None) => kind.name().to_owned(),
 	}
 }
 
@@ -599,7 +600,7 @@ fn view_blocks(root: &Path, view: &ItemView, blocks: &mut Vec<String>) {
 
 fn view_header(root: &Path, view: &ItemView) -> String {
 	let last = last_line(view.start, view.end);
-	let kind = kind_label(view.kind, view.thread_local);
+	let kind = kind_label(view.kind, view.thread_local, view.entry_macro.as_deref());
 	let mut header = format!("// {} ({kind}) {}:{}", view.path, display(root, &view.file), view.start.line);
 
 	if last > view.start.line {
@@ -790,6 +791,15 @@ mod tests {
 			find_line(root(), &import, true),
 			"demo::Foo  import  src/lib.rs:1:9-1:15  -> demo::a::Foo  usable: none (not visible)"
 		);
+
+		// statics declared by `thread_local!` and by entries of other macros
+		let mut entry = found("demo::SAY", ItemKind::Static, "src/lib.rs", at(2, 2), at(2, 17));
+
+		entry.entry_macro = Some("commands".to_owned());
+		assert_eq!(find_line(root(), &entry, false), "demo::SAY  static (commands!)  src/lib.rs:2:2-2:17");
+
+		entry.thread_local = true;
+		assert_eq!(find_line(root(), &entry, false), "demo::SAY  static (thread_local!)  src/lib.rs:2:2-2:17");
 	}
 
 	#[test]
@@ -877,6 +887,7 @@ mod tests {
 			usable_paths: Vec::new(),
 			import_targets: Vec::new(),
 			thread_local: false,
+			entry_macro: None,
 		}
 	}
 
@@ -1025,6 +1036,7 @@ mod tests {
 			edits: EditSet::new(),
 			inserted: vec![(ItemKind::AssocFn, Some("new".to_owned())), (ItemKind::MacroCall, None)],
 			imports: Vec::new(),
+			parent: "impl demo::Foo".to_owned(),
 			file: PathBuf::from("/ws/src/lib.rs"),
 			warnings: Vec::new(),
 		};
@@ -1103,6 +1115,7 @@ mod tests {
 			thread_local: false,
 			text: text.to_owned(),
 			impls: Vec::new(),
+			entry_macro: None,
 		}
 	}
 

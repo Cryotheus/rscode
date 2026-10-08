@@ -17,11 +17,18 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 	let output = OutputArgs::from_matches(matches);
 	let options = args::load_options(matches)?;
 	let source = super::read_source(&args.source, ui)?;
-	let parent = ItemPath::parse(&args.parent)?;
+	let parent = args.parent.as_deref().map(ItemPath::parse).transpose()?;
 	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
 	let resolver = Resolver::new(&workspace);
-	let plan = rscode::edit::insert(&resolver, &parent, &source, &args.options).map_err(|error| super::hinted(error, &resolver))?;
-	let mut report = InsertionReport::new(&plan, &args.parent, args.dry_run, &paths);
+	let plan = rscode::edit::insert(&resolver, parent.as_ref(), &source, &args.options).map_err(|error| match (&error, &parent) {
+		// several containers have the anchor
+		(rscode::Error::Ambiguous { .. }, None) => {
+			super::with_hint(error, Some("pass one of the candidates as PARENT".to_owned()))
+		}
+
+		_ => super::hinted(error, &resolver),
+	})?;
+	let mut report = InsertionReport::new(&plan, args.parent.as_deref().unwrap_or(&plan.parent), args.dry_run, &paths);
 
 	if args.dry_run {
 		report.diff = Some(render::edit_diff(&plan.edits, &paths)?);
@@ -31,6 +38,10 @@ pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
 		}
 	} else {
 		// the container is resolved before the edit changes it
+		let parent = match parent {
+			Some(parent) => parent,
+			None => ItemPath::parse(&plan.parent)?,
+		};
 		let targets = args
 			.format
 			.then(|| format_edited::inserted(&resolver, &parent, &plan.file, &plan.inserted, &plan.imports));

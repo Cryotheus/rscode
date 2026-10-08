@@ -3,6 +3,7 @@
 use super::Container;
 use super::ModDir;
 use super::Walker;
+use super::macro_entries;
 use super::syntax::ident_name;
 use super::thread_local;
 use super::verbatim;
@@ -27,6 +28,7 @@ use proc_macro2::TokenStream;
 use proc_macro2::extra::DelimSpan;
 use quote::ToTokens;
 use syn::Attribute;
+use syn::Field;
 use syn::ForeignItem;
 use syn::ImplItem;
 use syn::Item;
@@ -75,6 +77,27 @@ impl Walker<'_, '_, '_> {
 
 		for member in &item.items {
 			self.foreign_item(index, member);
+		}
+	}
+
+	/// Adds the fields of a struct, union, or variant (`parent`), with the `default` visibility of its kind: named
+	/// fields by their identifiers, those of tuple structs and variants by their index (`0`, `1`, ...). Like variants,
+	/// their range ends with their type, before the comma.
+	fn fields<'a>(&mut self, parent: u32, fields: impl IntoIterator<Item = &'a Field>, default: Visibility) {
+		for (index, field) in fields.into_iter().enumerate() {
+			let vis = self.visibility(&field.vis, default.clone());
+			let mut data = self.new_item(ItemKind::Field, field, &field.attrs, vis);
+
+			match &field.ident {
+				Some(ident) => {
+					self.push_named(parent, data, Some(ident));
+				}
+
+				None => {
+					data.name = Some(index.to_string().into());
+					self.loader.push(parent, data);
+				}
+			}
 		}
 	}
 
@@ -236,11 +259,12 @@ impl Walker<'_, '_, '_> {
 
 		let index = self.push_named(parent, data, ident.filter(|_| rules));
 
+		if container != Container::Module || rules {
+			return;
+		}
+
 		// the statics a `thread_local!` declares live in the module, like the items of `extern` blocks
-		if container == Container::Module
-			&& !rules
-			&& let Some(declarations) = thread_local::declarations(mac)
-		{
+		if let Some(declarations) = thread_local::declarations(mac) {
 			for declaration in &declarations {
 				let vis = self.visibility(&declaration.vis, Visibility::Private);
 				let mut data = self.new_item(ItemKind::Static, declaration, &declaration.attrs, vis);
@@ -251,6 +275,20 @@ impl Walker<'_, '_, '_> {
 				};
 				self.push_named(index, data, Some(&declaration.ident));
 			}
+
+			return;
+		}
+
+		// the entries of other item-like macros (`commands! { static SAY = ... }`), which are bound nowhere
+		for entry in macro_entries::entries(mac).into_iter().flatten() {
+			let vis = self.visibility(&entry.vis, Visibility::Private);
+			let mut data = self.new_item(ItemKind::Static, &entry, &entry.attrs, vis);
+
+			data.detail = ItemDetail::Static {
+				mutable: false,
+				thread_local: false,
+			};
+			self.push_named(index, data, Some(&entry.ident));
 		}
 	}
 
@@ -365,7 +403,10 @@ impl Walker<'_, '_, '_> {
 				let mut data = self.new_item(ItemKind::Struct, item, &item.attrs, vis);
 
 				data.detail = self.fields_detail(&item.fields);
-				self.push_named(parent, data, Some(&item.ident));
+
+				let index = self.push_named(parent, data, Some(&item.ident));
+
+				self.fields(index, &item.fields, Visibility::Private);
 			}
 
 			Item::Trait(item) => self.trait_def(parent, item, item),
@@ -387,7 +428,9 @@ impl Walker<'_, '_, '_> {
 					body: Some(self.inside(&item.fields.brace_token.span)),
 				};
 
-				self.push_named(parent, data, Some(&item.ident));
+				let index = self.push_named(parent, data, Some(&item.ident));
+
+				self.fields(index, &item.fields.named, Visibility::Private);
 			}
 
 			Item::Use(item) => {
@@ -561,7 +604,10 @@ impl Walker<'_, '_, '_> {
 		let mut data = self.new_item(ItemKind::Variant, variant, &variant.attrs, Visibility::Inherited);
 
 		data.detail = self.fields_detail(&variant.fields);
-		self.push_named(parent, data, Some(&variant.ident));
+
+		let index = self.push_named(parent, data, Some(&variant.ident));
+
+		self.fields(index, &variant.fields, Visibility::Inherited);
 	}
 
 	/// Syntax syn does not model, classified by its tokens (see [`verbatim`]).

@@ -31,6 +31,7 @@ pub(crate) struct MatchRow {
 	pub(crate) usable_paths: Vec<String>,
 	pub(crate) import_targets: Vec<String>,
 	pub(crate) thread_local: bool,
+	pub(crate) entry_macro: Option<String>,
 }
 
 impl MatchRow {
@@ -48,6 +49,7 @@ impl MatchRow {
 			usable_paths: found.usable_paths.clone(),
 			import_targets: found.import_targets.clone(),
 			thread_local: found.thread_local,
+			entry_macro: found.entry_macro.clone(),
 		}
 	}
 }
@@ -124,6 +126,7 @@ pub(crate) struct ViewRow {
 	pub(crate) cfg: Option<String>,
 	pub(crate) active: Tristate,
 	pub(crate) thread_local: bool,
+	pub(crate) entry_macro: Option<String>,
 	pub(crate) text: String,
 	pub(crate) impls: Vec<ViewRow>,
 }
@@ -139,6 +142,7 @@ impl ViewRow {
 			cfg: view.cfg.clone(),
 			active: view.active,
 			thread_local: view.thread_local,
+			entry_macro: view.entry_macro.clone(),
 			text: view.text.clone(),
 			impls: view.impls.iter().map(|view| Self::new(view, paths)).collect(),
 		}
@@ -217,7 +221,7 @@ pub(crate) fn find_human(rows: &[MatchRow], show: &[ShowField]) -> String {
 
 		for field in show {
 			match field {
-				ShowField::Kind => columns.push(kind_label(row.kind, row.thread_local)),
+				ShowField::Kind => columns.push(kind_label(row.kind, row.thread_local, row.entry_macro.as_deref())),
 				ShowField::Location => columns.push(format!("{}:{}", row.file, row.start)),
 				ShowField::Span => columns.push(format!("{}:{}-{}", row.file, row.start, row.end)),
 				ShowField::Vis => columns.push(row.visibility.clone()),
@@ -280,11 +284,12 @@ pub(crate) fn json_line(value: &impl Serialize) -> serde_json::Result<String> {
 	serde_json::to_string(value).map(|json| json + "\n")
 }
 
-/// The name of a kind, marking statics declared by `thread_local!`.
-fn kind_label(kind: ItemKind, thread_local: bool) -> String {
-	match thread_local {
-		true => format!("{} (thread_local!)", kind.name()),
-		false => kind.name().to_owned(),
+/// The name of a kind, marking statics declared by `thread_local!` and by entries of other macro invocations.
+fn kind_label(kind: ItemKind, thread_local: bool, entry_macro: Option<&str>) -> String {
+	match (thread_local, entry_macro) {
+		(true, _) => format!("{} (thread_local!)", kind.name()),
+		(false, Some(name)) => format!("{} ({name}!)", kind.name()),
+		(false, None) => kind.name().to_owned(),
 	}
 }
 
@@ -315,7 +320,7 @@ pub(crate) fn unified_diff(changes: &[FileChange], paths: &PathDisplay) -> Strin
 /// text, with a blank line between items.
 pub(crate) fn view_human(rows: &[ViewRow]) -> String {
 	fn blocks(row: &ViewRow, out: &mut Vec<String>) {
-		let kind = kind_label(row.kind, row.thread_local);
+		let kind = kind_label(row.kind, row.thread_local, row.entry_macro.as_deref());
 		let mut block = format!(
 			"// {} ({kind}) {}:{}-{}",
 			row.path,
@@ -581,6 +586,7 @@ mod tests {
 			thread_local: false,
 			text: "impl Circle {\n\tpub fn new(radius: f64) -> Self { ... }\n}".to_owned(),
 			impls: Vec::new(),
+			entry_macro: None,
 		};
 		let circle = ViewRow {
 			path: "demo::shapes::Circle".to_owned(),
@@ -593,6 +599,7 @@ mod tests {
 			thread_local: false,
 			text: "pub struct Circle {\n\tpub radius: f64,\n}\n".to_owned(),
 			impls: vec![method],
+			entry_macro: None,
 		};
 		let extra = ViewRow {
 			path: "demo::extra".to_owned(),
@@ -605,6 +612,7 @@ mod tests {
 			thread_local: false,
 			text: "fn extra() {}".to_owned(),
 			impls: Vec::new(),
+			entry_macro: None,
 		};
 
 		assert_eq!(
@@ -635,6 +643,7 @@ mod tests {
 			usable_paths: Vec::new(),
 			import_targets: Vec::new(),
 			thread_local: false,
+			entry_macro: None,
 		}
 	}
 }

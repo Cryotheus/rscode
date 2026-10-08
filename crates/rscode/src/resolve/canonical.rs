@@ -23,6 +23,9 @@ impl Resolver<'_> {
 			is_impl: false,
 			is_import: false,
 			name: data.name.clone(),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		};
 
 		let Some(parent) = self.ws.parent(item) else {
@@ -31,19 +34,40 @@ impl Resolver<'_> {
 		};
 
 		match (data.kind, self.ws.item(parent).kind) {
+			(ItemKind::Field, _) => {
+				path.segments = self.flat_path(parent);
+				path.is_field = true;
+			}
+
 			(ItemKind::Impl, _) => {
 				self.set_impl_owner(item, &mut path);
 				path.is_impl = true;
 				path.name = None;
+				path.selector = self.impl_selector(item, &path);
 			}
 
-			(_, ItemKind::Impl) => self.set_impl_owner(parent, &mut path),
+			// (items of inherent `impl`s are named by plain paths, which selectors do not apply to)
+			(_, ItemKind::Impl) => {
+				self.set_impl_owner(parent, &mut path);
+
+				if path.impl_trait.is_some() {
+					path.selector = self.compute_canonical_path(parent).selector;
+				}
+			}
 			(_, ItemKind::Trait | ItemKind::Enum) => path.segments = self.flat_path(parent),
 
 			(ItemKind::Import, _) => {
 				path.segments = self.module_segments(home_module(self.ws, item));
 				path.name = data.import_info().map(ImportInfo::path_name);
 				path.is_import = true;
+			}
+
+			// invocations of a macro are named by its name and a `!` (and an index, when the path names others too)
+			(ItemKind::MacroCall, ItemKind::Module) if data.macro_name().is_some() => {
+				path.segments = self.module_segments(home_module(self.ws, item));
+				path.name = data.macro_name().map(SmolStr::from);
+				path.is_macro_call = true;
+				path.selector = self.macro_selector(item, &path);
 			}
 
 			// `#[macro_export]` macros live at the crate root

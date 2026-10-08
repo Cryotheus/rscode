@@ -419,13 +419,21 @@ fn extracts_every_item_kind() {
 	let expected = "\
 mod load_items
   struct Named
+    field a
+    field b
   struct Tuple
+    field 0
+    field 1
   struct Unit
   union Union
+    field a
+    field b
   enum Enum
     variant A
     variant B
+      field 0
     variant C
+      field x
     variant D
   trait Trait
     assoc-const C

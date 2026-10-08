@@ -29,6 +29,7 @@ mod names;
 mod refs;
 mod removal;
 mod scope;
+mod selector;
 mod text;
 mod usable;
 mod user_path;
@@ -48,6 +49,7 @@ use crate::model::PathRef;
 use crate::model::Workspace;
 use crate::path::CanonicalPath;
 use crate::path::ItemPath;
+use crate::path::Qualifier;
 use build::ImportIndex;
 use fxhash::FxHashSet;
 use impls::ImplIndex;
@@ -221,6 +223,24 @@ impl<'ws> Resolver<'ws> {
 		})
 	}
 
+	/// For a plain path `Type::name` that names an associated item (or variant) while `Type` has a field of that name, a
+	/// hint for messages about a replacement that does not fit: the field is `Type.name`.
+	pub fn field_hint(&self, path: &ItemPath) -> Option<String> {
+		if path.field.is_some() || path.import || path.qualifier.is_some() {
+			return None;
+		}
+
+		let (name, owner) = path.segments.split_last().filter(|(_, owner)| !owner.is_empty())?;
+		let field = ItemPath {
+			segments: owner.to_vec(),
+			field: Some(name.clone()),
+			..path.clone()
+		};
+
+		(!self.compute_item_path(&field).is_empty() && !self.compute_item_path(path).is_empty())
+			.then(|| format!("`{path}` names an associated item or variant; the field is `{field}`"))
+	}
+
 	/// References to the targets across all loaded crates.
 	pub fn find_references(&self, targets: &[ItemId], options: &ReferenceOptions) -> References {
 		refs::find_references(self, targets, options)
@@ -377,6 +397,35 @@ impl<'ws> Resolver<'ws> {
 				res
 			})
 			.collect()
+	}
+
+	/// For a path with a selector that names nothing, a hint for messages: the paths of the `impl` blocks (or macro
+	/// invocations) that the path names without its selector (each with the selector that names it, when it needs one).
+	pub fn selector_hint(&self, path: &ItemPath) -> Option<String> {
+		let header = match &path.qualifier {
+			Some(qualifier) if qualifier.selector.is_some() => ItemPath {
+				qualifier: Some(Qualifier {
+					selector: None,
+					..qualifier.clone()
+				}),
+				segments: Vec::new(),
+				..path.clone()
+			},
+
+			None if path.selector.is_some() => ItemPath {
+				selector: None,
+				..path.clone()
+			},
+
+			_ => return None,
+		};
+		let mut blocks: Vec<String> = (self.compute_item_path(&header).into_iter())
+			.map(|block| format!("`{}`", self.compute_canonical_path(block)))
+			.collect();
+
+		blocks.dedup();
+
+		(!blocks.is_empty()).then(|| format!("`{header}` names {}", blocks.join(", ")))
 	}
 
 	/// For an item of a trait: the corresponding items in every `impl` of the trait.

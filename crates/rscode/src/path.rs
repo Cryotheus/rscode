@@ -14,6 +14,10 @@ const KEYWORDS: &[&str] = &[
 	"while", "yield",
 ];
 
+/// Where a [`Selector`] may be written, for messages.
+const SELECTOR_PLACES: &str = "a selector (`[...]`) can only follow an `impl` header (`impl Foo[new]`), a qualifier \
+	(`<Foo>[2]::new`), or a macro name and `!` (`m::name![2]`)";
+
 /// Where a path starts.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "kind", content = "count")]
@@ -42,7 +46,10 @@ pub enum Anchor {
 /// - `my_crate::a::Foo`, `my_crate::a::Foo::new` (inherent associated item), `my_crate::a::Trait::method`,
 ///   `my_crate::a::Enum::Variant`;
 /// - `<my_crate::a::Foo as Display>::fmt` (trait `impl` item), `impl Display for my_crate::a::Foo` (`impl` block);
-/// - `my_crate::a::<impl Trait for Vec<u8>>::method` when the self type is not a loaded item.
+/// - `my_crate::a::<impl Trait for Vec<u8>>::method` when the self type is not a loaded item;
+/// - `impl my_crate::a::Foo[new]` for one of several `impl` blocks with the same header (see [`Selector`]);
+/// - `my_crate::a::Point.x`, `my_crate::a::Pair.0`, `my_crate::a::Shape::Circle.radius` for fields;
+/// - `my_crate::a::commands!` (`my_crate::a::commands![2]`) for (one of several) macro invocations.
 ///
 /// The fields combine as follows:
 ///
@@ -55,6 +62,8 @@ pub enum Anchor {
 /// | `impl` block | crate, modules, type | trait, if any | | `true` | |
 /// | item of an `impl` of an unloaded type | crate, modules | trait, if any | type | | name |
 /// | `impl` block of an unloaded type | crate, modules | trait, if any | type | `true` | |
+/// | field | crate, modules, struct or union (or enum and variant) | | | | name or index |
+/// | macro invocation in a module | crate, modules | | | | the macro's name |
 ///
 /// Names that are keywords display with `r#`. The trait and self type are displayed as written, and so are the generic
 /// arguments of a loaded self type in the qualified forms (`<my_crate::a::Foo<T> as From<T>>::from`,
@@ -86,6 +95,21 @@ pub struct CanonicalPath {
 	/// glob imports, `_` for underscore imports). It displays with `use ` in front (`use my_crate::a::Foo`), a path that
 	/// names the import itself (see [`ItemPath::import`]).
 	pub is_import: bool,
+
+	/// Whether the path denotes a field: the name (or index) follows its struct, union, or variant with a `.`
+	/// (`my_crate::a::Point.x`, see [`ItemPath::field`]).
+	pub is_field: bool,
+
+	/// Whether the path denotes a macro invocation in a module: `name` is the last segment of the macro's path, and
+	/// the path displays with a `!` (`my_crate::a::commands!`, see [`ItemPath::macro_call`]), followed by the index of
+	/// the invocation in its [`CanonicalPath::selector`] when the module has several of that macro.
+	pub is_macro_call: bool,
+
+	/// For an `impl` block (and the items of a trait `impl`) whose path names other blocks too (like several `impl Foo`
+	/// blocks): which one, displayed after the `impl` header (`impl my_crate::Foo[new]`,
+	/// `<my_crate::Foo as Tr>[2]::f`), so that the path names it alone. For a macro invocation: its index among those
+	/// of the same macro in its module (`my_crate::a::commands![2]`), when there are several.
+	pub selector: Option<Selector>,
 }
 
 impl CanonicalPath {
@@ -104,7 +128,10 @@ impl CanonicalPath {
 					unresolved_self_ty: None,
 					is_impl: false,
 					is_import: false,
+					is_field: false,
+					is_macro_call: false,
 					name: name.cloned(),
+					selector: None,
 				};
 
 				format!("<{}{arguments}>::{}", path(&self.segments, None), path(&[], Some(name)))
@@ -152,6 +179,7 @@ impl std::fmt::Display for CanonicalPath {
 			}
 
 			f.write_str(&impl_segment)?;
+			write_selector(f, self.selector.as_ref())?;
 
 			if let Some(name) = self.name.as_deref().filter(|_| !self.is_impl) {
 				f.write_str("::")?;
@@ -171,7 +199,8 @@ impl std::fmt::Display for CanonicalPath {
 			}
 
 			write_segments(f, &self.segments)?;
-			return f.write_str(arguments);
+			f.write_str(arguments)?;
+			return write_selector(f, self.selector.as_ref());
 		}
 
 		let mut separate = !self.segments.is_empty();
@@ -181,6 +210,7 @@ impl std::fmt::Display for CanonicalPath {
 				f.write_str("<")?;
 				write_segments(f, &self.segments)?;
 				write!(f, "{arguments} as {trait_text}>")?;
+				write_selector(f, self.selector.as_ref())?;
 				separate = true;
 			}
 
@@ -188,11 +218,18 @@ impl std::fmt::Display for CanonicalPath {
 		}
 
 		if let Some(name) = &self.name {
-			if separate {
-				f.write_str("::")?;
+			match (self.is_field, separate) {
+				(true, _) => f.write_str(".")?,
+				(false, true) => f.write_str("::")?,
+				(false, false) => {}
 			}
 
 			write_ident(f, name)?;
+		}
+
+		if self.is_macro_call {
+			f.write_str("!")?;
+			write_selector(f, self.selector.as_ref())?;
 		}
 
 		Ok(())
@@ -207,9 +244,18 @@ impl std::fmt::Display for CanonicalPath {
 /// - `<Path [as Path]>(::segment)*`: segments after the qualifier name associated items of the `impl`
 ///   (with no segments, the `impl` block itself);
 /// - `impl [Trait for] Type`: sugar for `<Type as Trait>` / `<Type>`;
+/// - a [`Selector`] in brackets after an `impl` header or a qualifier (`impl Foo[new]`, `<Foo as Tr>[2]::f`) names
+///   one of the `impl` blocks it names. `[` never starts or continues a type in these paths (slice and array types
+///   can only appear inside generic arguments), so the brackets after the header are always a selector;
 /// - `use [::]segment(::segment)*`: the imports (leaves of `use` items) of the module named by all but the last
 ///   segment that bind the last segment, which may be `*` (glob imports) or `_` (underscore imports). Other paths go
-///   through imports to what they import.
+///   through imports to what they import;
+/// - `[::]segment(::segment)*.field`: a field of the structs, unions, or variants the plain path names, by its name
+///   or, in a tuple struct or variant, its index (`crate::Point.x`, `crate::Pair.0`, `Shape::Circle.radius`). A named
+///   field may also be written `Type::name` when the type has no associated item (or variant) of that name;
+/// - `[::]segment(::segment)*![index]`: the item-position macro invocations in the module named by all but the last
+///   segment of a macro whose path ends with the last segment (`crate::m::commands!`), or the `index`th of them
+///   (`crate::m::commands![2]`, see [`Selector::Index`]).
 ///
 /// Details:
 /// - Whitespace is allowed around `::`, `<`, `>`, `as`, and `for`, and around the whole path.
@@ -242,6 +288,22 @@ pub struct ItemPath {
 	/// has no qualifier and no generic arguments.
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub import: bool,
+
+	/// The field after a `.`, unraw'd (its index in tuple structs and variants): the path names the fields of that name
+	/// of the structs, unions, and variants that the segments name. Such a path has no qualifier, no generic arguments,
+	/// and is not a `use` path.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub field: Option<SmolStr>,
+
+	/// Whether the path ends with `!`, naming macro invocations rather than items: the item-position invocations, in
+	/// the module(s) the other segments name, of macros whose path ends with the last segment. Such a path has no
+	/// qualifier, no generic arguments, and no field, and is not a `use` path.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub macro_call: bool,
+
+	/// For a macro invocation path: which of the invocations it names ([`Selector::Index`], `m::name![2]`).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub selector: Option<Selector>,
 }
 
 impl ItemPath {
@@ -294,6 +356,7 @@ impl std::fmt::Display for ItemPath {
 			}
 
 			f.write_str(">")?;
+			write_selector(f, qualifier.selector.as_ref())?;
 
 			for segment in &self.segments {
 				f.write_str("::")?;
@@ -344,6 +407,16 @@ impl std::fmt::Display for ItemPath {
 			f.write_str(arguments)?;
 		}
 
+		if let Some(field) = &self.field {
+			f.write_str(".")?;
+			write_ident(f, field)?;
+		}
+
+		if self.macro_call {
+			f.write_str("!")?;
+			write_selector(f, self.selector.as_ref())?;
+		}
+
 		Ok(())
 	}
 }
@@ -387,7 +460,7 @@ impl<'a> Parser<'a> {
 			Some(token) if token.is_word("impl") => self.parse_impl()?,
 			Some(token) if token.is_word("use") => self.parse_use()?,
 			Some(Token::Lt) => self.parse_qualified()?,
-			Some(_) => self.parse_plain()?,
+			Some(_) => self.parse_field()?,
 		};
 
 		match self.bump() {
@@ -397,8 +470,62 @@ impl<'a> Parser<'a> {
 				Err("generic arguments are only supported in the type and trait of `<Type as Trait>` and `impl Trait for Type`".to_owned())
 			}
 
+			Some(Token::Selector(_)) => Err(SELECTOR_PLACES.to_owned()),
+			Some(Token::Dot) if path.field.is_some() => Err("fields have no fields: a path names one field".to_owned()),
+			Some(Token::Dot) => Err("a field (`.name`) can only follow the plain path of a struct, union, or variant".to_owned()),
+			Some(Token::Bang) => Err("`!` (naming macro invocations) can only follow a plain path: `crate::m::name!`".to_owned()),
+			Some(Token::PathSep) if path.qualifier.is_some() && path.segments.is_empty() => {
+				let message = "an `impl` path ends with the header and selector: write `<Type>[selector]::name` for an item \
+				               of the block";
+
+				Err(message.to_owned())
+			}
+
 			Some(token) => Err(format!("unexpected `{token}`")),
 		}
+	}
+
+	/// A plain path, with an optional `.field` (an identifier, or a tuple index), or a `!` and optional index selector.
+	fn parse_field(&mut self) -> Result<ItemPath, String> {
+		let mut path = self.parse_plain()?;
+
+		if self.peek() == Some(Token::Bang) {
+			self.bump();
+
+			if path.segments.is_empty() {
+				return Err(format!("expected a macro name before `!`, found `{path}`"));
+			}
+
+			path.macro_call = true;
+			path.selector = self.parse_selector()?;
+
+			if path.selector.as_ref().is_some_and(|selector| !matches!(selector, Selector::Index(_))) {
+				return Err("only an index selects one of several macro invocations: `name![2]`".to_owned());
+			}
+
+			return Ok(path);
+		}
+
+		if self.peek() != Some(Token::Dot) {
+			return Ok(path);
+		}
+
+		self.bump();
+
+		if path.segments.is_empty() {
+			return Err(format!("expected the path of a struct, union, or variant before `.`, found `{path}`"));
+		}
+
+		path.field = Some(match self.bump() {
+			Some(Token::TupleIndex(index)) => index.into(),
+			Some(Token::Ident { text, raw: true }) => text.into(),
+			Some(Token::Ident { text, raw: false }) if !is_keyword(text) && !is_unrawable(text) => text.into(),
+			Some(Token::Ident { text, .. }) => return Err(format!("`{text}` is a keyword; write `r#{text}` for a field named `{text}`")),
+			Some(token) => return Err(format!("expected a field name or index after `.`, found `{token}`")),
+			None => return Err("expected a field name or index after `.`".to_owned()),
+		});
+
+		Ok(path)
 	}
 
 	/// `impl [Trait for] Type`
@@ -407,17 +534,21 @@ impl<'a> Parser<'a> {
 
 		let first = self.parse_nested("a type after `impl`")?;
 
-		let qualifier = if self.eat_keyword("for") {
+		let mut qualifier = if self.eat_keyword("for") {
 			Qualifier {
 				self_ty: self.parse_nested("a type after `for`")?,
 				trait_path: Some(first),
+				selector: None,
 			}
 		} else {
 			Qualifier {
 				self_ty: first,
 				trait_path: None,
+				selector: None,
 			}
 		};
+
+		qualifier.selector = self.parse_selector()?;
 
 		Ok(ItemPath {
 			qualifier: Some(qualifier),
@@ -520,6 +651,7 @@ impl<'a> Parser<'a> {
 			None => return Err("expected `>`".to_owned()),
 		}
 
+		let selector = self.parse_selector()?;
 		let mut segments = Vec::new();
 
 		while self.peek() == Some(Token::PathSep) {
@@ -528,7 +660,11 @@ impl<'a> Parser<'a> {
 		}
 
 		Ok(ItemPath {
-			qualifier: Some(Qualifier { self_ty, trait_path }),
+			qualifier: Some(Qualifier {
+				self_ty,
+				trait_path,
+				selector,
+			}),
 			segments,
 			..ItemPath::default()
 		})
@@ -558,6 +694,16 @@ impl<'a> Parser<'a> {
 			Some(token) => Err(format!("expected {expected}, found `{token}`")),
 			None => Err(format!("expected {expected}")),
 		}
+	}
+
+	/// An optional [`Selector`] in brackets.
+	fn parse_selector(&mut self) -> Result<Option<Selector>, String> {
+		let Some(Token::Selector(text)) = self.peek() else {
+			return Ok(None);
+		};
+
+		self.bump();
+		Selector::parse(text).map(Some)
 	}
 
 	/// `use [::]segment(::segment)*`, whose last segment may be `*` or `_`.
@@ -608,6 +754,80 @@ pub struct Qualifier {
 
 	/// The implemented trait (`None` for inherent `impl`s).
 	pub trait_path: Option<Box<ItemPath>>,
+
+	/// Which of the `impl` blocks the qualifier names (`impl Foo[new]`, `<Foo>[2]::new`), if given.
+	pub selector: Option<Selector>,
+}
+
+/// Which one of several `impl` blocks a path names, written in brackets after the `impl` header or qualifier
+/// (`impl Tools[add_bots]`, `impl Tools[#tool_router]`, `<Tools>[2]::new`), or which of several macro invocations
+/// (`m::commands![2]`, only by index). It picks among the blocks (or invocations) that the path names without it.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(rename_all = "kebab-case", tag = "kind", content = "value")]
+pub enum Selector {
+	/// `[name]`: the block with an associated item named `name` (unraw'd).
+	Item(SmolStr),
+
+	/// `[#path]`: the block with an outer attribute whose path is `path` or ends with it (`[#tool_router]` picks
+	/// `#[tool_router(router = edit_tools)]` and `#[rmcp::tool_router]`). Doc comments and `cfg_attr` attributes do
+	/// not count.
+	Attribute(String),
+
+	/// `[n]`: the `n`th block (or invocation), counting from 1, ordered by file path and then by position (one in a file
+	/// that several crates load counts once).
+	Index(u32),
+}
+
+impl Selector {
+	/// Parses the text between the brackets.
+	pub(crate) fn parse(text: &str) -> Result<Self, String> {
+		let text = text.trim_matches(is_whitespace);
+		let expected = "expected an associated item name, `#` and an attribute path, or an index from 1 in the selector";
+
+		if text.is_empty() {
+			return Err(expected.to_owned());
+		}
+
+		if let Some(path) = text.strip_prefix('#') {
+			let segments: Vec<&str> = path.split("::").map(|segment| segment.trim_matches(is_whitespace)).collect();
+
+			if segments.iter().any(|segment| !is_ident_lexeme(segment.strip_prefix("r#").unwrap_or(segment))) {
+				return Err(format!("`{}` is not an attribute path", path.trim_matches(is_whitespace)));
+			}
+
+			return Ok(Self::Attribute(segments.join("::")));
+		}
+
+		if text.bytes().all(|byte| byte.is_ascii_digit()) {
+			return match text.parse() {
+				Ok(0) => Err("selector indexes start at 1".to_owned()),
+				Ok(index) => Ok(Self::Index(index)),
+				Err(_) => Err(format!("`{text}` is too large for a selector index")),
+			};
+		}
+
+		match text.strip_prefix("r#") {
+			Some(name) if is_valid_ident(text) => Ok(Self::Item(name.into())),
+			None if is_valid_ident(text) => Ok(Self::Item(text.into())),
+			None if is_keyword(text) => Err(format!("`{text}` is a keyword; write `r#{text}` for an item named `{text}`")),
+			_ => Err(format!("{expected}, found `{text}`")),
+		}
+	}
+}
+
+/// Formats in the input syntax, with the brackets (`[new]`, `[#tool_router]`, `[2]`).
+impl std::fmt::Display for Selector {
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		f.write_str("[")?;
+
+		match self {
+			Self::Item(name) => write_ident(f, name)?,
+			Self::Attribute(path) => write!(f, "#{path}")?,
+			Self::Index(index) => write!(f, "{index}")?,
+		}
+
+		f.write_str("]")
+	}
 }
 
 /// A token of an [`ItemPath`].
@@ -630,6 +850,18 @@ enum Token<'a> {
 
 	/// `*`, the name of glob imports at the end of a `use` path.
 	Star,
+
+	/// A [`Selector`] in brackets: the text between them.
+	Selector(&'a str),
+
+	/// `.`, before a field.
+	Dot,
+
+	/// `!`, after the name of the macro of invocations.
+	Bang,
+
+	/// The index of a field of a tuple struct or variant, after a `.`.
+	TupleIndex(&'a str),
 }
 
 impl Token<'_> {
@@ -649,6 +881,10 @@ impl std::fmt::Display for Token<'_> {
 			Token::Gt => f.write_str(">"),
 			Token::Arguments(text) => f.write_str(text),
 			Token::Star => f.write_str("*"),
+			Token::Selector(text) => write!(f, "[{text}]"),
+			Token::Dot => f.write_str("."),
+			Token::Bang => f.write_str("!"),
+			Token::TupleIndex(text) => f.write_str(text),
 		}
 	}
 }
@@ -811,6 +1047,15 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 			'<' => (Token::Lt, 1),
 			'>' => (Token::Gt, 1),
 
+			'[' => {
+				let length = rest.find(']').ok_or("expected `]` to close the selector")?;
+
+				(Token::Selector(&rest[1..length]), length + 1)
+			}
+
+			'.' => (Token::Dot, 1),
+			'!' => (Token::Bang, 1),
+
 			_ if rest.starts_with("r#") => {
 				let name = &rest[2..2 + word_len(&rest[2..])];
 
@@ -827,6 +1072,17 @@ fn tokenize(text: &str) -> Result<Vec<Token<'_>>, String> {
 
 			_ if is_word_char(c) => {
 				let word = &rest[..word_len(rest)];
+
+				// the index of a tuple field, written like Rust's (`0`, `12`, not `01`)
+				if tokens.last() == Some(&Token::Dot) && word.bytes().all(|byte| byte.is_ascii_digit()) {
+					if word.len() > 1 && word.starts_with('0') {
+						return Err(format!("`{word}` is not a valid tuple index"));
+					}
+
+					tokens.push(Token::TupleIndex(word));
+					position += word.len();
+					continue;
+				}
 
 				if !is_ident_lexeme(word) {
 					return Err(format!("`{word}` is not a valid identifier"));
@@ -884,6 +1140,14 @@ fn write_segments(f: &mut Formatter<'_>, segments: &[SmolStr]) -> std::fmt::Resu
 	Ok(())
 }
 
+/// Writes a selector, if any.
+fn write_selector(f: &mut Formatter<'_>, selector: Option<&Selector>) -> std::fmt::Result {
+	match selector {
+		Some(selector) => write!(f, "{selector}"),
+		None => Ok(()),
+	}
+}
+
 /// [`last_segment_arguments`] as written.
 pub(crate) fn written_arguments(text: &str) -> Option<&str> {
 	let start = text.find('<')?;
@@ -914,6 +1178,9 @@ mod tests {
 			is_impl: false,
 			is_import: false,
 			name: name.map(SmolStr::from),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		}
 	}
 
@@ -925,6 +1192,14 @@ mod tests {
 		assert_eq!(canonical(&["my_crate", "type"], Some("match")).to_string(), "my_crate::r#type::r#match");
 		assert_eq!(canonical(&["my_crate", "a"], Some("*")).to_string(), "my_crate::a::*");
 		assert_eq!(canonical(&["my_crate", "a"], Some("_")).to_string(), "my_crate::a::_");
+
+		// fields follow their owner with a `.`
+		let field = |segments: &[&str], name: &str| CanonicalPath { is_field: true, ..canonical(segments, Some(name)) };
+
+		assert_eq!(field(&["my_crate", "Point"], "x").to_string(), "my_crate::Point.x");
+		assert_eq!(field(&["my_crate", "Pair"], "0").to_string(), "my_crate::Pair.0");
+		assert_eq!(field(&["my_crate", "Shape", "Circle"], "type").to_string(), "my_crate::Shape::Circle.r#type");
+		assert_eq!(field(&["my_crate", "Pair"], "0").flat_segments(), ["my_crate", "Pair", "0"]);
 
 		let trait_item = CanonicalPath {
 			impl_trait: Some("Display".to_owned()),
@@ -954,6 +1229,17 @@ mod tests {
 		};
 
 		assert_eq!(inherent_block.to_string(), "impl my_crate::a::Foo");
+
+		// selectors after the `impl` header
+		let selected = |selector: Selector, path: &CanonicalPath| CanonicalPath { selector: Some(selector), ..path.clone() };
+
+		assert_eq!(selected(Selector::Item("new".into()), &inherent_block).to_string(), "impl my_crate::a::Foo[new]");
+		assert_eq!(selected(Selector::Index(2), &impl_block).to_string(), "impl Display for my_crate::a::Foo[2]");
+		assert_eq!(selected(Selector::Index(2), &trait_item).to_string(), "<my_crate::a::Foo as Display>[2]::fmt");
+		assert_eq!(
+			selected(Selector::Attribute("a::b".to_owned()), &inherent_block).distinct(),
+			"impl my_crate::a::Foo[#a::b]"
+		);
 
 		// the generic arguments of the type, in the qualified forms
 		let arguments = Some("<T, u8>".to_owned());
@@ -1055,6 +1341,17 @@ mod tests {
 			("use *", "use *"),
 			("use r#use::r#type", "use r#use::r#type"),
 			("r#use", "r#use"),
+			("impl Foo [ new ]", "<Foo>[new]"),
+			("impl Display for Foo<u8>[#tool_router]", "<Foo<u8> as Display>[#tool_router]"),
+			("<Foo>[ # rmcp :: tool_router ]::new", "<Foo>[#rmcp::tool_router]::new"),
+			("<Foo as Tr>[02]::r#type", "<Foo as Tr>[2]::r#type"),
+			("impl Foo[r#type]", "<Foo>[r#type]"),
+			("crate::Point . x", "crate::Point.x"),
+			("Pair.0", "Pair.0"),
+			("::dep::Shape::Circle.r#type", "::dep::Shape::Circle.r#type"),
+			("crate::m::commands !", "crate::m::commands!"),
+			("commands! [ 2 ]", "commands![2]"),
+			("::dep::r#try!", "::dep::r#try!"),
 		];
 
 		for (input, displayed) in cases {
@@ -1158,6 +1455,21 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_fields() {
+		let field = |text: &str| {
+			let path = parse(text);
+
+			(path.anchor, path.segments.iter().map(SmolStr::as_str).collect::<Vec<_>>().join("::"), path.field)
+		};
+
+		assert_eq!(field("crate::Point.x"), (Anchor::Crate, "Point".to_owned(), Some("x".into())));
+		assert_eq!(field("Pair.0"), (Anchor::None, "Pair".to_owned(), Some("0".into())));
+		assert_eq!(field("Pair.12"), (Anchor::None, "Pair".to_owned(), Some("12".into())));
+		assert_eq!(field("Shape::Circle.r#match"), (Anchor::None, "Shape::Circle".to_owned(), Some("match".into())));
+		assert_eq!(field("crate::Point"), (Anchor::Crate, "Point".to_owned(), None));
+	}
+
+	#[test]
 	fn parses_generic_arguments_of_qualifiers() {
 		let from = |arguments: &str| with_arguments(plain(Anchor::None, &["From"]), arguments);
 		let wrapper = with_arguments(plain(Anchor::Crate, &["Wrapper"]), "<u8>");
@@ -1197,6 +1509,16 @@ mod tests {
 			parse("<X as r#as<u8>>").qualifier.unwrap().trait_path.unwrap().arguments.as_deref(),
 			Some("<u8>")
 		);
+	}
+
+	#[test]
+	fn parses_macro_call_paths() {
+		let path = parse("crate::m::commands!");
+
+		assert!(path.macro_call && path.selector.is_none() && path.field.is_none());
+		assert_eq!((path.anchor, path.segments.as_slice()), (Anchor::Crate, ["m", "commands"].map(SmolStr::new).as_slice()));
+		assert_eq!(parse("commands![3]").selector, Some(Selector::Index(3)));
+		assert!(!parse("crate::m::commands").macro_call);
 	}
 
 	#[test]
@@ -1244,6 +1566,26 @@ mod tests {
 	}
 
 	#[test]
+	fn parses_selectors() {
+		let selector = |text: &str| parse(text).qualifier.and_then(|qualifier| qualifier.selector);
+
+		assert_eq!(selector("impl Tools[add_bots]"), Some(Selector::Item("add_bots".into())));
+		assert_eq!(selector("impl Tools[r#match]"), Some(Selector::Item("match".into())));
+		assert_eq!(selector("impl Tools[#tool_router]"), Some(Selector::Attribute("tool_router".to_owned())));
+		assert_eq!(selector("impl Tools[#a::b]"), Some(Selector::Attribute("a::b".to_owned())));
+		assert_eq!(selector("impl Tr for Tools<u8>[2]"), Some(Selector::Index(2)));
+		assert_eq!(selector("<Tools as Tr>[3]::f"), Some(Selector::Index(3)));
+		assert_eq!(selector("<Tools>::f"), None);
+		assert_eq!(parse("<Tools>[f]::f").segments, ["f"]);
+
+		// brackets inside generic arguments are part of the type
+		let path = parse("impl Tr<[u8; 2]> for Tools[1]");
+
+		assert_eq!(path.qualifier.as_ref().unwrap().trait_path.as_ref().unwrap().arguments.as_deref(), Some("<[u8;2]>"));
+		assert_eq!(path.qualifier.unwrap().selector, Some(Selector::Index(1)));
+	}
+
+	#[test]
 	fn parses_use_paths() {
 		let path = parse("use crate::a::B");
 
@@ -1270,6 +1612,7 @@ mod tests {
 			qualifier: Some(Qualifier {
 				self_ty: Box::new(self_ty),
 				trait_path: trait_path.map(Box::new),
+				selector: None,
 			}),
 			segments: segments.iter().copied().map(SmolStr::from).collect(),
 			..ItemPath::default()
@@ -1281,7 +1624,7 @@ mod tests {
 	fn random_paths_round_trip() {
 		const PIECES: &[&str] = &[
 			"::", ":", "<", ">", " as ", " for ", "impl ", "use ", "crate", "self", "super", "Self", "r#", "a", "b", "type", "é", "_", "1", " ",
-			"\u{200e}", "😀", "-", "#", "*",
+			"\u{200e}", "😀", "-", "#", "*", "[", "]", "2", ".", "0", "!",
 		];
 
 		// xorshift, for reproducible inputs without dependencies
@@ -1393,6 +1736,58 @@ mod tests {
 		assert_eq!(parse_error("impl X for Y::fmt>"), "unexpected `>`");
 		assert_eq!(parse_error("a::<Foo>"), "expected an identifier after `::`, found `<`");
 		assert_eq!(parse_error("x>"), "unexpected `>`");
+
+		// fields
+		let follows = "a field (`.name`) can only follow the plain path of a struct, union, or variant";
+
+		assert_eq!(parse_error("Point."), "expected a field name or index after `.`");
+		assert_eq!(parse_error("Point.x.y"), "fields have no fields: a path names one field");
+		assert_eq!(parse_error("Point.x::y"), "unexpected `::`");
+		assert_eq!(parse_error("crate.x"), "expected the path of a struct, union, or variant before `.`, found `crate`");
+		assert_eq!(parse_error(".x"), "expected an identifier, found `.`");
+		assert_eq!(parse_error("Pair.01"), "`01` is not a valid tuple index");
+		assert_eq!(parse_error("Pair.0x"), "`0x` is not a valid identifier");
+		assert_eq!(parse_error("Point.type"), "`type` is a keyword; write `r#type` for a field named `type`");
+		assert_eq!(parse_error("Point.self"), "`self` is a keyword; write `r#self` for a field named `self`");
+		assert_eq!(parse_error("Point.*"), "wildcards are only supported in patterns (for example by `find`)");
+		assert_eq!(parse_error("Point::0"), "`0` is not a valid identifier");
+		assert_eq!(parse_error("use a::B.x"), follows);
+		assert_eq!(parse_error("<A>::b.x"), follows);
+		assert_eq!(parse_error("impl A.x"), follows);
+
+		// macro invocations
+		let bang = "`!` (naming macro invocations) can only follow a plain path: `crate::m::name!`";
+
+		assert_eq!(parse_error("crate!"), "expected a macro name before `!`, found `crate`");
+		assert_eq!(parse_error("m::x!::y"), "unexpected `::`");
+		assert_eq!(parse_error("m::x!!"), bang);
+		assert_eq!(parse_error("<A>::x!"), bang);
+		assert_eq!(parse_error("use a::x!"), bang);
+		assert_eq!(parse_error("Point.x!"), bang);
+		assert_eq!(parse_error("x![name]"), "only an index selects one of several macro invocations: `name![2]`");
+		assert_eq!(parse_error("x![0]"), "selector indexes start at 1");
+
+		// selectors
+		let places = "a selector (`[...]`) can only follow an `impl` header (`impl Foo[new]`), a qualifier (`<Foo>[2]::new`), or a \
+		              macro name and `!` (`m::name![2]`)";
+
+		assert_eq!(parse_error("crate::Foo[2]"), places);
+		assert_eq!(parse_error("<Foo>::new[2]"), places);
+		assert_eq!(parse_error("impl Foo[1][2]"), places);
+		assert_eq!(parse_error("use a::b[1]"), places);
+		assert_eq!(parse_error("<Foo[1] as Tr>"), "expected `as` or `>`, found `[1]`");
+		assert_eq!(parse_error("impl Foo[1"), "expected `]` to close the selector");
+		assert_eq!(parse_error("impl Foo[0]"), "selector indexes start at 1");
+		assert_eq!(parse_error("impl Foo[99999999999]"), "`99999999999` is too large for a selector index");
+		assert_eq!(parse_error("impl Foo[#]"), "`` is not an attribute path");
+		assert_eq!(parse_error("impl Foo[#a::]"), "`a::` is not an attribute path");
+		assert_eq!(parse_error("impl Foo[fn]"), "`fn` is a keyword; write `r#fn` for an item named `fn`");
+		assert!(parse_error("impl Foo[]").starts_with("expected an associated item name, `#` and an attribute path"));
+		assert!(parse_error("impl Foo[a b]").ends_with("found `a b`"));
+		assert_eq!(
+			parse_error("impl Foo[new]::new"),
+			"an `impl` path ends with the header and selector: write `<Type>[selector]::name` for an item of the block"
+		);
 	}
 
 	#[test]

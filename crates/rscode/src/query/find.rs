@@ -75,17 +75,25 @@ impl Find {
 		named: &HashSet<ItemId>,
 	) -> Option<FindMatch> {
 		let workspace = resolver.workspace();
-		let name = candidate_name(data).filter(|_| self.options.wants_kind(data.kind))?;
+
+		// (a path without wildcards names fields like other items, `Type::name` included, and macro invocations)
+		let named_field = matches!(data.kind, ItemKind::Field | ItemKind::MacroCall) && self.options.kinds.is_empty() && named.contains(&item);
+		let name = candidate_name(data).filter(|_| self.options.wants_kind(data.kind) || named_field)?;
 		let path = resolver.canonical_path(item);
 		let selected = workspace.krate(item.krate()).is_selected();
 
-		// imports searched only for `use` patterns are only matched by those
+		// imports searched only for `use` patterns are only matched by those, fields for patterns with fields, and macro
+		// invocations for patterns with `!`
 		let use_patterns_only = data.kind == ItemKind::Import && !self.options.searches_imports();
+		let field_patterns_only = data.kind == ItemKind::Field && !self.options.kinds.contains(&ItemKind::Field);
+		let macro_patterns_only = data.kind == ItemKind::MacroCall && !self.options.kinds.contains(&ItemKind::MacroCall);
 
 		let matched = self.options.patterns.is_empty()
 			|| named.contains(&item)
 			|| (patterns.iter())
-				.filter(|(pattern, _)| (pattern.is_import() || !use_patterns_only) && may_match(pattern, data.kind, name))
+				.filter(|(pattern, _)| (pattern.is_import() || !use_patterns_only) && (pattern.is_field() || !field_patterns_only))
+				.filter(|(pattern, _)| pattern.is_macro_call() || !macro_patterns_only)
+				.filter(|(pattern, _)| may_match(pattern, data.kind, name))
 				.any(|(pattern, resolved)| {
 					matches(workspace, pattern, item, &path, selected) || resolved.matches_owner(resolver, item, &path, selected)
 				});
@@ -131,6 +139,7 @@ impl Find {
 				_ => Vec::new(),
 			},
 			thread_local: data.is_thread_local(),
+			entry_macro: workspace.entry_macro(item).map(str::to_owned),
 		}
 	}
 
@@ -275,6 +284,10 @@ pub struct FindMatch {
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub thread_local: bool,
 
+	/// For a static declared by an entry of a macro invocation other than `thread_local!`: the macro's name.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub entry_macro: Option<String>,
+
 	/// For imports: the canonical paths of what they import (for glob imports, of the modules and enums they import
 	/// from), and paths outside of the loaded crates as written.
 	#[serde(skip_serializing_if = "Vec::is_empty")]
@@ -288,7 +301,9 @@ pub struct FindOptions {
 	pub patterns: Vec<PathPattern>,
 
 	/// Only these kinds (all kinds when empty). [`ItemKind::Import`]s are included when asked for here, by
-	/// [`FindOptions::imports`], or by a `use` pattern; `use` items, macro invocations, and `extern` blocks never match.
+	/// [`FindOptions::imports`], or by a `use` pattern, [`ItemKind::Field`]s when asked for here or by a pattern with a
+	/// field (`Point.*`), and [`ItemKind::MacroCall`]s (in modules) when asked for here or by a pattern ending with `!`;
+	/// `use` items, other macro invocations, and `extern` blocks never match.
 	pub kinds: Vec<ItemKind>,
 
 	/// Exclude items whose `cfg` is definitely disabled.
@@ -315,6 +330,8 @@ impl FindOptions {
 	fn wants_kind(&self, kind: ItemKind) -> bool {
 		match kind {
 			ItemKind::Import => self.searches_imports() || self.patterns.iter().any(PathPattern::is_import),
+			ItemKind::Field => self.kinds.contains(&kind) || self.patterns.iter().any(PathPattern::is_field),
+			ItemKind::MacroCall => self.kinds.contains(&kind) || self.patterns.iter().any(PathPattern::is_macro_call),
 			kind => self.kinds.is_empty() || self.kinds.contains(&kind),
 		}
 	}
@@ -372,11 +389,13 @@ impl Resolved {
 }
 
 /// The name an item is matched by (the last segment of its canonical path), or `None` if it is never found: `use`
-/// items, macro invocations, `extern` blocks, and unnamed items (`const _`). `impl` blocks have an empty name, glob
-/// imports `*`, and underscore imports `_`.
+/// items, macro invocations outside of modules (and of macros that were not understood), `extern` blocks, and unnamed
+/// items (`const _`). `impl` blocks have an empty name, glob imports `*`, underscore imports `_`, and macro
+/// invocations the name of their macro.
 fn candidate_name(data: &ItemData) -> Option<&str> {
 	match data.kind {
 		ItemKind::Impl => Some(""),
+		ItemKind::MacroCall => data.macro_name(),
 
 		// like `ImportInfo::path_name`
 		ItemKind::Import => match &data.name {
@@ -427,8 +446,11 @@ fn may_match(pattern: &PathPattern, kind: ItemKind, name: &str) -> bool {
 
 		_ if is_impl => false,
 
-		// `use` patterns match imports, and only those
+		// `use` patterns match imports, and only those, patterns with a field fields, and patterns with `!` macro
+		// invocations
 		_ if pattern.is_import() && kind != ItemKind::Import => false,
+		_ if pattern.is_macro_call() && kind != ItemKind::MacroCall => false,
+		_ if pattern.is_field() => kind == ItemKind::Field && pattern.field.as_ref().is_some_and(|field| field.matches(name)),
 
 		Some(SegmentPattern::Ident(last)) => last.matches(name),
 		_ => true,

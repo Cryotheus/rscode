@@ -114,6 +114,9 @@ Item paths are written like Rust paths:
   Type::name             an associated item, a trait item, or a variant
   <Type as Trait>::name  an item of a trait impl (<Type>::name: inherent)
   impl Trait for Type    an impl block (also <Type as Trait>, <Type>)
+  impl Type[name]        one of several impl blocks with one header: [name] has that item, [#attr] that attribute, [2]
+  Type.field             a field (Tuple.0, Enum::Variant.field; Type::field when no associated item has the name)
+  m::name!               the invocations of the macro `name` in m (name![2]: the second)
   'use m::Name'          the imports binding Name in m (use m::*: globs, use m::_: `as _` ones)
 Generic arguments of the type and trait pick impl blocks: impl From<u8> for W, <W<u16>>::get.
 Every `cfg` variant of an item is addressed by its path. Paths go through imports to what they import, except `use` \
@@ -404,13 +407,19 @@ fn insert() -> Command {
 		.long_about(
 			"Insert items into a module (`crate` for the crate root), an impl block (`<Type as Trait>`, `<Type>`), or a \
 			 trait. The items must be valid there, their names must not be taken (unless --force), and they are \
-			 indented like the container's items.",
+			 indented like the container's items.\n\n\
+			 With --after or --before, PARENT may be left out: the sibling's container is the parent, and a single \
+			 positional argument is the SOURCE (`insert items.rs --after 'Tools::add_bots'`).",
 		)
-		.arg(item_path(
-			"parent",
-			"PARENT",
-			"The container: a module (`crate` for the crate root), an impl block (`<Type as Trait>`), or a trait",
-		))
+		.arg(
+			item_path(
+				"parent",
+				"PARENT",
+				"The container: a module (`crate` for the crate root), an impl block (`<Type as Trait>`), or a trait",
+			)
+			.required(false)
+			.required_unless_present_any(["after", "before"]),
+		)
 		.arg(source_arg("The items to insert: a file, or `-` for stdin"))
 		.arg(
 			opt("position", "Where to insert the items")
@@ -426,6 +435,18 @@ fn insert() -> Command {
 			.value_name("PATH")
 			.required_if_eq_any([("position", "before"), ("position", "after")])
 			.add(ArgValueCompleter::new(complete::item_paths)),
+		)
+		.arg(
+			opt("after", "Insert after this sibling item (`--position after --anchor PATH`; PARENT may be left out)")
+				.value_name("PATH")
+				.conflicts_with_all(["position", "anchor", "before"])
+				.add(ArgValueCompleter::new(complete::item_paths)),
+		)
+		.arg(
+			opt("before", "Insert before this sibling item (`--position before --anchor PATH`; PARENT may be left out)")
+				.value_name("PATH")
+				.conflicts_with_all(["position", "anchor"])
+				.add(ArgValueCompleter::new(complete::item_paths)),
 		)
 		.arg(flag("force", "Insert even when a name is already taken in the container"))
 		.arg(dry_run())
@@ -547,7 +568,10 @@ fn not_found_because(kind: ItemKind) -> &'static str {
 	match kind {
 		ItemKind::Use => "`use` declarations are not found as a whole; `--kind import` finds their imports",
 		ItemKind::ExternBlock => "`extern` blocks have no names; their items are found in the enclosing module",
-		_ => "macro invocations have no names, so no pattern matches them",
+		_ => {
+			"macro invocations in `impl` blocks, traits, and `extern` blocks have no names (`--kind macro-call` finds those \
+			 in modules)"
+		}
 	}
 }
 
@@ -986,10 +1010,9 @@ mod tests {
 			error.contains("tip: `use` declarations are not found as a whole; `--kind import` finds their imports"),
 			"{error}"
 		);
-		assert!(!error.contains("macro-call"), "the possible values are the ones found: {error}");
-		assert!(refused("macro-call").contains("tip: macro invocations have no names"));
-		assert!(refused("assoc_macro").contains("tip: macro invocations have no names"));
-		assert!(refused("foreign-macro").contains("tip: macro invocations have no names"));
+		assert!(error.contains("macro-call") && !error.contains("assoc-macro"), "the possible values are the ones found: {error}");
+		assert!(refused("assoc_macro").contains("tip: macro invocations in `impl` blocks, traits, and `extern` blocks have no names"));
+		assert!(refused("foreign-macro").contains("tip: macro invocations in `impl` blocks"));
 
 		// by name or alias
 		assert!(refused("extern-block").contains("tip: `extern` blocks have no names"));
@@ -999,7 +1022,7 @@ mod tests {
 		let help = cli().find_subcommand_mut("find").unwrap().render_long_help().to_string();
 
 		assert!(
-			help.contains("assoc-fn") && help.contains("import") && !help.contains("macro-call"),
+			help.contains("assoc-fn") && help.contains("import") && help.contains("macro-call") && !help.contains("assoc-macro"),
 			"{help}"
 		);
 	}

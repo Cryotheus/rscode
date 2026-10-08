@@ -101,6 +101,29 @@ impl Builder<'_> {
 		FileId(self.files.len() as u32 - 1)
 	}
 
+	/// Adds the fields of a struct, union, or variant (`parent`) like the loader: named ones by their identifiers, those
+	/// of tuple structs and variants by their index.
+	fn fields<'a>(
+		&mut self,
+		parent: u32,
+		parsed: &ParsedFile<'_>,
+		fields: impl IntoIterator<Item = &'a syn::Field>,
+		default: Visibility,
+		dirs: &Dirs,
+	) {
+		for (index, field) in fields.into_iter().enumerate() {
+			let field_vis = vis(parsed, &field.vis, default.clone());
+			let range = parsed.range_of(field);
+			let mut data = data(parsed, dirs, ItemKind::Field, field.ident.as_ref(), &field.attrs, field_vis, range, ItemDetail::None);
+
+			if field.ident.is_none() {
+				data.name = Some(index.to_string().into());
+			}
+
+			self.push(parent, data);
+		}
+	}
+
 	fn foreign_item(&mut self, parent: u32, parsed: &ParsedFile<'_>, item: &syn::ForeignItem, dirs: &Dirs) {
 		let range = parsed.range_of(item);
 
@@ -317,10 +340,14 @@ impl Builder<'_> {
 						range,
 						detail,
 					);
+					let variant_index = self.push(index, data);
 
-					self.push(index, data);
+					self.fields(variant_index, parsed, &variant.fields, Visibility::Inherited, dirs);
 				}
 			}
+
+			syn::Item::Struct(item) => self.fields(index, parsed, &item.fields, Visibility::Private, dirs),
+			syn::Item::Union(item) => self.fields(index, parsed, &item.fields.named, Visibility::Private, dirs),
 
 			syn::Item::Trait(item) => {
 				for trait_item in &item.items {

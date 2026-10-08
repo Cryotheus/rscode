@@ -473,17 +473,28 @@ fn check_supported(resolver: &Resolver<'_>, target: ItemId) -> Result<(), Error>
 
 	let what = match data.kind {
 		_ if target.is_crate_root() => "a crate root",
+		_ if resolver.workspace().entry_macro(target).is_some() => "a static declared by a macro invocation",
 		ItemKind::Impl => "an `impl` block",
 		ItemKind::Use | ItemKind::Import => "an import",
 		ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro => "a macro invocation",
 		ItemKind::ExternBlock => "an `extern` block",
 		ItemKind::ExternCrate => "an `extern crate` item",
+		ItemKind::Field => "a field",
 		_ if data.name.as_ref().is_none_or(|name| name == "_") => "an unnamed item",
 		_ => return Ok(()),
 	};
 
 	let hint = match data.kind {
 		ItemKind::Import => ": rename what it imports instead, or replace its `use` item (for example with `use a::Name as NewName;`)",
+		ItemKind::Field => {
+			" (the uses of fields, in field accesses, struct literals, and patterns, are not found): replace the field, \
+			 and update its uses by hand"
+		}
+
+		_ if resolver.workspace().entry_macro(target).is_some() => {
+			" (what the macro makes of it is unknown, so its uses are not found): replace the entry, and update its uses \
+			 by hand"
+		}
 		_ => "",
 	};
 

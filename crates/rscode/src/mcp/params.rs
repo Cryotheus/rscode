@@ -65,13 +65,13 @@ pub(crate) struct FindParams {
 	/// `parse_*`, `*Error`, `Config::*` (associated items), `crate::config::**`, `**::tests::*`,
 	/// `<Config as Default>::default`. Patterns not starting with `crate::` or `::` match anywhere:
 	/// `Config::load` finds `my_crate::config::Config::load`. `use` patterns find imports: `use crate::a::*` (every
-	/// import in `a`), `use Config`.
+	/// import in `a`), `use Config`; field patterns find fields (`Config.*`), and `!` macro invocations (`m::*!`).
 	pub(crate) pattern: String,
 
 	/// Only items of these kinds: `mod`, `struct`, `enum`, `union`, `trait`, `trait-alias`, `type`, `fn`,
 	/// `const`, `static`, `macro-rules`, `extern-crate`, `import`, `impl` (with qualified patterns such as
-	/// `<Config as *>`), `assoc-fn`, `assoc-const`, `assoc-type`, `variant`, `foreign-fn`, `foreign-static`,
-	/// `foreign-type`. Aliases such as `function`, `method`, and `module` work too.
+	/// `<Config as *>`), `assoc-fn`, `assoc-const`, `assoc-type`, `variant`, `field`, `macro-call`, `foreign-fn`,
+	/// `foreign-static`, `foreign-type`. Aliases such as `function`, `method`, and `module` work too.
 	#[serde(default, deserialize_with = "split_list")]
 	pub(crate) kinds: Vec<String>,
 
@@ -205,8 +205,9 @@ pub(crate) enum Formatter {
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct InsertParams {
 	/// The container: a module (`crate` for the crate root, `crate::a::b`), an impl block (`impl Trait for Type`,
-	/// `impl Type`, `<Type as Trait>`), or a trait.
-	pub(crate) parent: String,
+	/// `impl Type`, `<Type as Trait>`), or a trait. Optional with position `before` or `after`: the anchor's container.
+	#[serde(default)]
+	pub(crate) parent: Option<String>,
 
 	/// The items to insert (one or more, with their doc comments and attributes). Associated items for impl
 	/// blocks and traits.
@@ -241,6 +242,13 @@ pub(crate) struct InsertParams {
 impl InsertParams {
 	pub(crate) fn options(&self) -> Result<InsertOptions, String> {
 		let anchor = self.anchor.as_deref().map(str::trim).filter(|anchor| !anchor.is_empty());
+
+		if self.parent().is_none() && !matches!(self.position, Position::Before | Position::After) {
+			return Err("`parent` is required unless `position` is `before` or `after` (an `anchor`'s container is then the \
+			            parent)"
+				.to_owned());
+		}
+
 		let position = match (self.position, anchor) {
 			(Position::End, None) => InsertPosition::End,
 			(Position::Start, None) => InsertPosition::Start,
@@ -257,6 +265,11 @@ impl InsertParams {
 		};
 
 		Ok(InsertOptions { position, force: self.force })
+	}
+
+	/// The `parent`, unless it is missing or blank.
+	pub(crate) fn parent(&self) -> Option<&str> {
+		self.parent.as_deref().map(str::trim).filter(|parent| !parent.is_empty())
 	}
 }
 
@@ -518,7 +531,7 @@ impl<'de> Visitor<'de> for StringList {
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct ViewParams {
 	/// Paths of the items to show: `crate::a::Item`, `::crate_name::Item`, `a::Item` (from each crate's root),
-	/// `Type::method`, `Trait::method`, `<Type as Trait>::method`, `impl Trait for Type`, `Enum::Variant`,
+	/// `Type::method`, `Trait::method`, `<Type as Trait>::method`, `impl Trait for Type`, `Enum::Variant`, `Type.field`,
 	/// `crate` (the crate root module), or `use crate::a::Item` (an import, shown as its `use` item).
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) paths: Vec<String>,
@@ -768,6 +781,13 @@ mod tests {
 		let insert: InsertParams = parse(json!({ "parent": "crate", "source": "", "force": true }));
 
 		assert!(insert.options().unwrap().force);
+
+		// without a parent, the anchor's container is the parent
+		let insert = |position: &str| parse::<InsertParams>(json!({ "source": "", "position": position, "anchor": "a::b", "parent": " " }));
+
+		assert_eq!(insert("after").options().map(|options| options.position), Ok(InsertPosition::After("a::b".to_owned())));
+		assert_eq!(insert("after").parent(), None);
+		assert!(insert("end").options().unwrap_err().starts_with("`parent` is required unless `position` is `before` or `after`"));
 	}
 
 	#[test]
@@ -794,8 +814,8 @@ mod tests {
 		assert_eq!(
 			message,
 			"unknown item kind `func`; expected one of: mod, struct, enum, union, trait, trait-alias, type, fn, const, static, \
-			 macro-rules, import, extern-crate, foreign-fn, foreign-static, foreign-type, impl, assoc-fn, assoc-const, \
-			 assoc-type, variant"
+			 macro-rules, macro-call, import, extern-crate, foreign-fn, foreign-static, foreign-type, impl, assoc-fn, \
+			 assoc-const, assoc-type, variant, field"
 		);
 	}
 

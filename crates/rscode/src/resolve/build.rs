@@ -618,9 +618,9 @@ fn add_definitions(ws: &Workspace, krate: &Crate, tables: &mut Tables) {
 			continue;
 		};
 
-		// module members; extern blocks and `thread_local!` invocations (the only macro calls with children) are
-		// transparent
-		if !matches!(ws.item(parent).kind, ItemKind::Module | ItemKind::ExternBlock | ItemKind::MacroCall) {
+		// module members; extern blocks and `thread_local!` invocations are transparent (not other macro invocations:
+		// their entries may declare anything)
+		if !matches!(ws.item(parent).kind, ItemKind::Module | ItemKind::ExternBlock | ItemKind::MacroCall) || ws.entry_macro(id).is_some() {
 			continue;
 		}
 

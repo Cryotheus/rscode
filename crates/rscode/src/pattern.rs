@@ -26,9 +26,16 @@
 //!
 //! Qualified patterns `<TypePattern as TraitPattern>::name` match associated items of `impl` blocks, and
 //! `<TypePattern>::name` those of inherent `impl`s. Without trailing segments (`<Foo as Display>`), or written as
-//! `impl TraitPattern for TypePattern` / `impl TypePattern`, they match the `impl` blocks themselves.
+//! `impl TraitPattern for TypePattern` / `impl TypePattern`, they match the `impl` blocks themselves. A selector after
+//! the qualifier (`impl Foo[new]`, `<Foo>[2]::*`, see [`Selector`]) is matched exactly, against the selectors that
+//! canonical paths show.
 //! Unqualified patterns match `impl` items through their owner (`Foo::fmt` matches `<Foo as Display>::fmt`), but
 //! never `impl` blocks.
+//!
+//! Patterns with a field after a `.` (`Point.*`, `**.radius`, `Shape::Circle.0`) only match fields, of the structs,
+//! unions, and variants their segments match, and patterns ending with `!` (`**::commands!`, `m::*!`) only match
+//! macro invocations, by the name of their macro (and an index, `commands![2]`). Other patterns match fields and macro
+//! invocations like other items (`Point::*` matches `Point.x`), when the caller searches them.
 //!
 //! `use` patterns (`use crate::a::*`, `use Circle`) only match imports (the leaves of `use` items), whose paths are
 //! those of their modules followed by the names they bind (`*` for glob imports, `_` for underscore imports). Other
@@ -39,6 +46,7 @@ use crate::path::CanonicalPath;
 use crate::path::ItemPath;
 use crate::path::PathParseError;
 use crate::path::Qualifier;
+use crate::path::Selector;
 use crate::path::generic_arguments_len;
 use crate::path::is_ident_continuation;
 use crate::path::is_ident_lexeme;
@@ -126,6 +134,19 @@ impl IdentPattern {
 	}
 
 	/// The identifier an exact, case-sensitive pattern matches, if it can name an item.
+	/// The field name or index this pattern matches exactly, if it matches one.
+	fn exact_field(&self) -> Option<SmolStr> {
+		let [part] = self.parts.as_slice() else {
+			return None;
+		};
+		let index = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+
+		match index {
+			true => (self.is_exact() && (part.len() == 1 || !part.starts_with('0'))).then(|| part.into()),
+			false => self.exact_ident(),
+		}
+	}
+
 	fn exact_ident(&self) -> Option<SmolStr> {
 		let [part] = self.parts.as_slice() else {
 			return None;
@@ -267,6 +288,17 @@ pub struct PathPattern {
 
 	/// Whether the pattern is a `use` pattern, which only matches imports (see [`CanonicalPath::is_import`]).
 	pub import: bool,
+
+	/// The selector after the qualifier (or the `!` of a macro invocation pattern), which must be the
+	/// [`CanonicalPath::selector`] of what matches.
+	pub selector: Option<Selector>,
+
+	/// The pattern of a field's name (or index) after a `.`: the pattern only matches fields, whose struct, union, or
+	/// variant the segments match.
+	pub field: Option<IdentPattern>,
+
+	/// Whether the pattern ends with `!`, and so only matches macro invocations (see [`CanonicalPath::is_macro_call`]).
+	pub macro_call: bool,
 }
 
 impl PathPattern {
@@ -283,6 +315,9 @@ impl PathPattern {
 				.collect(),
 			arguments: path.arguments.clone(),
 			import: path.import,
+			selector: (path.qualifier.as_ref()).and_then(|qualifier| qualifier.selector.clone()).or_else(|| path.selector.clone()),
+			field: (path.field.as_ref()).map(|field| IdentPattern::exact(field, MatchOptions::default())),
+			macro_call: path.macro_call,
 		}
 	}
 
@@ -294,6 +329,9 @@ impl PathPattern {
 			segments: vec![SegmentPattern::Ident(name)],
 			arguments: None,
 			import: false,
+			selector: None,
+			field: None,
+			macro_call: false,
 		}
 	}
 
@@ -305,9 +343,19 @@ impl PathPattern {
 		})
 	}
 
+	/// Whether the pattern has a field (`Point.*`), and so only matches fields.
+	pub fn is_field(&self) -> bool {
+		self.field.is_some()
+	}
+
 	/// Whether the pattern is a `use` pattern, which only matches imports.
 	pub fn is_import(&self) -> bool {
 		self.import
+	}
+
+	/// Whether the pattern ends with `!`, and so only matches macro invocations.
+	pub fn is_macro_call(&self) -> bool {
+		self.macro_call
 	}
 
 	/// Whether the pattern has an `impl` qualifier (`<Type as Trait>`), and so only matches `impl` blocks and their
@@ -329,9 +377,19 @@ impl PathPattern {
 			return false;
 		}
 
+		if self.macro_call && (!path.is_macro_call || (self.selector.is_some() && self.selector != path.selector)) {
+			return false;
+		}
+
 		match &self.qualifier {
 			Some((self_ty, trait_pattern)) => self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref()),
 			None if path.is_impl => false,
+
+			None if let Some(field) = &self.field => {
+				let owner: Vec<&str> = path.segments.iter().map(SmolStr::as_str).collect();
+
+				path.is_field && path.name.as_ref().is_some_and(|name| field.matches(name)) && self.matches_from_crate(&owner, is_selected)
+			}
 
 			None => {
 				// most candidates fail on their name, which needs no flattening
@@ -373,7 +431,7 @@ impl PathPattern {
 			_ => false,
 		};
 
-		if !trait_matches {
+		if !trait_matches || (self.selector.is_some() && self.selector != path.selector) {
 			return false;
 		}
 
@@ -450,6 +508,7 @@ impl PathPattern {
 					Some(trait_pattern) => Some(Box::new(trait_pattern.to_item_path()?)),
 					None => None,
 				},
+				selector: self.selector.clone(),
 			}),
 		};
 
@@ -459,6 +518,12 @@ impl PathPattern {
 			segments,
 			arguments: self.arguments.clone(),
 			import: self.import,
+			field: match &self.field {
+				Some(field) => Some(field.exact_field()?),
+				None => None,
+			},
+			selector: self.selector.clone().filter(|_| self.macro_call),
+			macro_call: self.macro_call,
 		})
 	}
 }
@@ -478,6 +543,10 @@ impl std::fmt::Display for PathPattern {
 			}
 
 			f.write_str(">")?;
+
+			if let Some(selector) = &self.selector {
+				write!(f, "{selector}")?;
+			}
 
 			for segment in &self.segments {
 				write!(f, "::{segment}")?;
@@ -525,6 +594,18 @@ impl std::fmt::Display for PathPattern {
 
 		if let Some(arguments) = &self.arguments {
 			f.write_str(arguments)?;
+		}
+
+		if let Some(field) = &self.field {
+			write!(f, ".{field}")?;
+		}
+
+		if self.macro_call {
+			f.write_str("!")?;
+
+			if let Some(selector) = &self.selector {
+				write!(f, "{selector}")?;
+			}
 		}
 
 		Ok(())
@@ -658,6 +739,10 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			return Err("`use` patterns match the imports of modules, and cannot be qualified".to_owned());
 		}
 
+		if pattern.field.is_some() || pattern.macro_call {
+			return Err("`use` patterns match the imports of modules, and cannot have fields or `!`".to_owned());
+		}
+
 		if pattern.segments.is_empty() {
 			return Err(format!("expected a pattern of the names imports bind after `use {rest}`"));
 		}
@@ -671,6 +756,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			return Err("`impl` cannot appear inside of a qualifier".to_owned());
 		}
 
+		let (rest, selector) = split_selector_suffix(rest)?;
 		let (trait_text, self_text) = match split_word(rest, "for") {
 			Some((trait_text, self_text)) => (Some(trait_text), self_text),
 			None => (None, rest),
@@ -690,6 +776,9 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			segments: Vec::new(),
 			arguments: None,
 			import: false,
+			selector,
+			field: None,
+			macro_call: false,
 		});
 	}
 
@@ -702,7 +791,7 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			return Err("expected `>` to close `<`".to_owned());
 		};
 		let inside = &text[1..length - 1];
-		let after = text[length..].trim_start();
+		let (after, selector) = split_selector_prefix(text[length..].trim_start())?;
 
 		if after.contains(['<', '>']) {
 			return Err(ONLY_QUALIFIER_ARGUMENTS.to_owned());
@@ -734,8 +823,36 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			segments,
 			arguments: None,
 			import: false,
+			selector,
+			field: None,
+			macro_call: false,
 		});
 	}
+
+	// macro invocations, by the name of the macro and `!` (and an index)
+	let (text, macro_call, selector) = split_macro_suffix(text)?;
+
+	if macro_call && nested {
+		return Err("`!` cannot appear inside of a qualifier".to_owned());
+	}
+
+	if macro_call && text.is_empty() {
+		return Err("expected a pattern of a macro name before `!`".to_owned());
+	}
+
+	// a field after a `.`
+	let (text, field) = match text.split_once('.') {
+		Some(_) if macro_call => return Err("macro invocation patterns cannot have fields".to_owned()),
+		None => (text, None),
+		Some(_) if nested => return Err("fields cannot appear inside of a qualifier".to_owned()),
+		Some((_, field)) if field.contains('.') => return Err("fields have no fields: a pattern names one field".to_owned()),
+		Some((owner, _)) if owner.trim().is_empty() => return Err("expected a pattern of a struct, union, or variant before `.`".to_owned()),
+
+		Some((owner, field)) => match field.trim() {
+			"" => return Err("expected a field pattern after `.`".to_owned()),
+			field => (owner.trim_end(), Some(parse_ident_pattern(field, options)?)),
+		},
+	};
 
 	// the type and trait of a qualifier may end with generic arguments
 	let (text, arguments) = match text.find('<') {
@@ -792,12 +909,23 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 		return Err(format!("expected a pattern with at least one segment, found `{text}`"));
 	}
 
+	if field.is_some() && segments.is_empty() {
+		return Err(format!("expected a pattern of a struct, union, or variant before `.`, found `{text}`"));
+	}
+
+	if macro_call && segments.is_empty() {
+		return Err(format!("expected a pattern of a macro name before `!`, found `{text}`"));
+	}
+
 	Ok(PathPattern {
 		anchor,
 		qualifier: None,
 		segments,
 		arguments,
 		import: false,
+		selector,
+		field,
+		macro_call,
 	})
 }
 
@@ -915,6 +1043,51 @@ fn simplify_written_path(text: &str) -> String {
 
 	simplified.truncate(simplified.trim_end().len());
 	simplified
+}
+
+/// Splits the `!` of a macro invocation pattern off its end, with an index selector after it (`commands![2]`).
+fn split_macro_suffix(text: &str) -> Result<(&str, bool, Option<Selector>), String> {
+	let text = text.trim_end();
+
+	if let Some(name) = text.strip_suffix('!') {
+		return Ok((name.trim_end(), true, None));
+	}
+
+	let Some((name, selector)) = text.strip_suffix(']').and_then(|inside| inside.rsplit_once('[')) else {
+		return Ok((text, false, None));
+	};
+
+	let Some(name) = name.trim_end().strip_suffix('!') else {
+		return Ok((text, false, None));
+	};
+
+	match Selector::parse(selector)? {
+		Selector::Index(index) => Ok((name.trim_end(), true, Some(Selector::Index(index)))),
+		_ => Err("only an index selects one of several macro invocations: `name![2]`".to_owned()),
+	}
+}
+
+/// Splits a [`Selector`] off the start of the text after a qualifier (`[2]::new`).
+fn split_selector_prefix(text: &str) -> Result<(&str, Option<Selector>), String> {
+	let Some(inside) = text.strip_prefix('[') else {
+		return Ok((text, None));
+	};
+	let end = inside.find(']').ok_or("expected `]` to close the selector")?;
+
+	Ok((inside[end + 1..].trim_start(), Some(Selector::parse(&inside[..end])?)))
+}
+
+/// Splits a [`Selector`] off the end of an `impl` header (`impl Foo[new]`). A `]` cannot end a type or trait pattern
+/// otherwise (types in patterns are paths, and the generic arguments that may hold slices end with `>`).
+fn split_selector_suffix(text: &str) -> Result<(&str, Option<Selector>), String> {
+	let text = text.trim_end();
+
+	let Some(inside) = text.strip_suffix(']') else {
+		return Ok((text, None));
+	};
+	let start = inside.rfind('[').ok_or("expected `[` to open the selector")?;
+
+	Ok((&inside[..start], Some(Selector::parse(&inside[start + 1..])?)))
 }
 
 /// Splits `text` at the first whitespace-separated occurrence of `word`, trimming both sides.
@@ -1155,6 +1328,9 @@ mod tests {
 			is_impl: true,
 			is_import: false,
 			name: None,
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		}
 	}
 
@@ -1179,6 +1355,9 @@ mod tests {
 			is_impl: false,
 			is_import: false,
 			name: Some(name.into()),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		}
 	}
 
@@ -1223,6 +1402,9 @@ mod tests {
 			is_impl: false,
 			is_import: false,
 			name: Some("my_crate".into()),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		};
 
 		assert!(pattern("Foo").matches(&foo, true));
@@ -1339,6 +1521,52 @@ mod tests {
 		assert_eq!(pattern("impl * for crate::**"), pattern("<crate::** as *>"));
 		assert_eq!(pattern("<*>::new").qualifier.unwrap().1, None);
 		assert!(!pattern("Foo::new").is_qualified());
+
+		// fields
+		let field = pattern("a::Point . x*");
+
+		assert_eq!((field.segments, field.field), (pattern("a::Point").segments, Some(pattern("x*").segments[0].clone()).and_then(|segment| match segment {
+			SegmentPattern::Ident(ident) => Some(ident),
+			SegmentPattern::AnyDepth => None,
+		})));
+		assert_eq!(pattern("**.0").to_string(), "**.0");
+		assert_eq!(pattern("crate::Pair.0").to_item_path().unwrap().to_string(), "crate::Pair.0");
+		assert_eq!(pattern("crate::Pair.00").to_item_path(), None);
+		assert_eq!(pattern("Point.x").to_item_path().unwrap().field.as_deref(), Some("x"));
+		assert_eq!(pattern("Point.*").to_item_path(), None);
+		assert_eq!(pattern_error(".x"), "expected a pattern of a struct, union, or variant before `.`");
+		assert_eq!(pattern_error("crate.x"), "expected a pattern of a struct, union, or variant before `.`, found `crate`");
+		assert_eq!(pattern_error("Point."), "expected a field pattern after `.`");
+		assert_eq!(pattern_error("Point.x.y"), "fields have no fields: a pattern names one field");
+		assert_eq!(pattern_error("use a.b"), "`use` patterns match the imports of modules, and cannot have fields or `!`");
+		assert_eq!(pattern_error("<A.x>::b"), "fields cannot appear inside of a qualifier");
+
+		// macro invocations
+		let commands = pattern("m::commands !");
+
+		assert!(commands.is_macro_call() && commands.selector.is_none());
+		assert_eq!(commands.segments, pattern("m::commands").segments);
+		assert_eq!(pattern("**::*! [2]").selector, Some(Selector::Index(2)));
+		assert_eq!(pattern("**::*![2]").to_string(), "**::*![2]");
+		assert_eq!(pattern("crate::m::x![2]").to_item_path().unwrap().to_string(), "crate::m::x![2]");
+		assert!(pattern_error("a::b[2]").starts_with("'[' is not allowed in identifier patterns"));
+		assert_eq!(pattern_error("!"), "expected a pattern of a macro name before `!`");
+		assert_eq!(pattern_error("crate!"), "expected a pattern of a macro name before `!`, found `crate`");
+		assert_eq!(pattern_error("x![name]"), "only an index selects one of several macro invocations: `name![2]`");
+		assert_eq!(pattern_error("use x!"), "`use` patterns match the imports of modules, and cannot have fields or `!`");
+		assert_eq!(pattern_error("a.b!"), "macro invocation patterns cannot have fields");
+		assert_eq!(pattern_error("<a!>"), "`!` cannot appear inside of a qualifier");
+
+		// selectors
+		assert_eq!(pattern("impl Foo [new]").selector, Some(Selector::Item("new".into())));
+		assert_eq!(pattern("impl Tr<[u8; 2]> for Foo[#a::b]").selector, Some(Selector::Attribute("a::b".to_owned())));
+		assert_eq!(pattern("<Foo as *> [2] :: *").selector, Some(Selector::Index(2)));
+		assert_eq!(pattern("<Foo as *>[2]::*").to_string(), "<Foo as *>[2]::*");
+		assert_eq!(pattern("impl Foo[2]").to_item_path().unwrap().to_string(), "<Foo>[2]");
+		assert_eq!(pattern("<Foo>").selector, None);
+		assert_eq!(pattern_error("impl Foo[0]"), "selector indexes start at 1");
+		assert_eq!(pattern_error("<Foo>[2::new"), "expected `]` to close the selector");
+		assert_eq!(pattern_error("impl Foo 2]"), "expected `[` to open the selector");
 	}
 
 	fn pattern(text: &str) -> PathPattern {
@@ -1398,6 +1626,40 @@ mod tests {
 		assert!(!pattern("<Foo>::*").matches(&impl_block(&["c", "a", "Foo"], None), true));
 		assert!(!pattern("<Foo as Display>::fmt::x").matches(&display_fmt, true));
 		assert!(pattern("<Foo as Display>::**").matches(&display_fmt, true));
+
+		// patterns with fields match fields, whose owner the segments match; others match fields like other items
+		let field = CanonicalPath { is_field: true, ..item(&["c", "a", "Foo"], "x") };
+
+		assert!(pattern("Foo.x").matches(&field, true));
+		assert!(pattern("crate::a::Foo.*").matches(&field, true));
+		assert!(pattern("**.x").matches(&field, true));
+		assert!(!pattern("crate::a::Foo.y").matches(&field, true));
+		assert!(!pattern("crate::a.Foo").matches(&field, true));
+		assert!(!pattern("Foo.x").matches(&item(&["c", "a", "Foo"], "x"), true));
+		assert!(pattern("Foo::*").matches(&field, true));
+
+		// patterns with `!` match macro invocations (and their index), whose name the last segment matches
+		let call = CanonicalPath { is_macro_call: true, ..item(&["c", "m"], "commands") };
+		let second = CanonicalPath { selector: Some(Selector::Index(2)), ..call.clone() };
+
+		assert!(pattern("m::commands!").matches(&call, true));
+		assert!(pattern("**::*!").matches(&second, true));
+		assert!(pattern("commands![2]").matches(&second, true));
+		assert!(!pattern("commands![1]").matches(&second, true));
+		assert!(!pattern("m::commands!").matches(&item(&["c", "m"], "commands"), true));
+		assert!(pattern("m::*").matches(&call, true));
+
+		// selectors must be those of the canonical path
+		let selected = |selector: Selector, path: &CanonicalPath| CanonicalPath { selector: Some(selector), ..path.clone() };
+		let block = selected(Selector::Item("new".into()), &impl_block(&["c", "a", "Foo"], None));
+		let second_fmt = selected(Selector::Index(2), &display_fmt);
+
+		assert!(pattern("impl Foo[new]").matches(&block, true));
+		assert!(pattern("impl Foo").matches(&block, true));
+		assert!(!pattern("impl Foo[2]").matches(&block, true));
+		assert!(!pattern("impl Foo[new]").matches(&impl_block(&["c", "a", "Foo"], None), true));
+		assert!(pattern("<Foo as Display>[2]::*").matches(&second_fmt, true));
+		assert!(!pattern("<Foo as Display>[1]::fmt").matches(&second_fmt, true));
 	}
 
 	#[test]
@@ -1605,6 +1867,9 @@ mod tests {
 			is_impl: name.is_none(),
 			is_import: false,
 			name: name.map(SmolStr::from),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		}
 	}
 
@@ -1618,6 +1883,9 @@ mod tests {
 			is_impl: false,
 			name: Some(name.into()),
 			is_import: true,
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		};
 		let item = |segments: &[&str], name: &str| CanonicalPath {
 			is_import: false,

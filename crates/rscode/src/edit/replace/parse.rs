@@ -5,6 +5,7 @@
 //! tokenizes (`Verbatim` items such as `fn f();` or `const trait T {}`).
 
 use crate::Error;
+use crate::load::macro_entries::Entry;
 use crate::load::thread_local;
 use crate::load::thread_local::Declaration;
 use crate::model::ItemKind;
@@ -16,6 +17,7 @@ use proc_macro2::TokenTree;
 use quote::ToTokens;
 use smol_str::SmolStr;
 use syn::Attribute;
+use syn::Field;
 use syn::Fields;
 use syn::ForeignItem;
 use syn::Ident;
@@ -49,8 +51,15 @@ pub(super) enum Container {
 	Extern,
 	Enum,
 
+	/// A struct, union, or variant, whose fields are named (`name: Type`) or, in tuple structs and variants, not
+	/// (`Type`).
+	Fields,
+
 	/// A `thread_local!` invocation, whose declarations are statics.
 	ThreadLocal,
+
+	/// Another macro invocation whose body is entries (`static NAME = value;`), which are statics.
+	Entries,
 }
 
 impl Container {
@@ -62,11 +71,23 @@ impl Container {
 			ItemKind::Trait => Some(Self::Trait),
 			ItemKind::ExternBlock => Some(Self::Extern),
 			ItemKind::Enum => Some(Self::Enum),
+			ItemKind::Struct | ItemKind::Union | ItemKind::Variant => Some(Self::Fields),
 
-			// the only macro calls with children
+			// the macro calls with children (whose entries are `Entries`, see `Container::of_item`)
 			ItemKind::MacroCall => Some(Self::ThreadLocal),
 
 			_ => None,
+		}
+	}
+
+	/// The container that `item` (of `ws`) holds its children in, if any: [`Container::of`] its kind, except for the
+	/// entries of macro invocations other than `thread_local!`.
+	pub(super) fn of_item(ws: &crate::model::Workspace, item: crate::model::ItemId) -> Option<Self> {
+		let entries = ws.children(item).next().is_some_and(|child| ws.entry_macro(child).is_some());
+
+		match Self::of(ws.item(item).kind)? {
+			Self::ThreadLocal if entries => Some(Self::Entries),
+			container => Some(container),
 		}
 	}
 
@@ -74,13 +95,13 @@ impl Container {
 		match self {
 			Self::Module => Some(ItemKind::Const),
 			Self::Impl | Self::Trait => Some(ItemKind::AssocConst),
-			Self::Extern | Self::Enum | Self::ThreadLocal => None,
+			Self::Extern | Self::Enum | Self::Fields | Self::ThreadLocal | Self::Entries => None,
 		}
 	}
 
 	fn fn_kind(self) -> ItemKind {
 		match self {
-			Self::Module | Self::Enum | Self::ThreadLocal => ItemKind::Fn,
+			Self::Module | Self::Enum | Self::Fields | Self::ThreadLocal | Self::Entries => ItemKind::Fn,
 			Self::Impl | Self::Trait => ItemKind::AssocFn,
 			Self::Extern => ItemKind::ForeignFn,
 		}
@@ -94,14 +115,16 @@ impl Container {
 			Self::Trait => "trait items",
 			Self::Extern => "items of an `extern` block",
 			Self::Enum => "enum variants",
+			Self::Fields => "fields (`name: Type`, or `Type` in a tuple struct or variant)",
 			Self::ThreadLocal => "declarations of a `thread_local!` (`static NAME: Type = initializer;`)",
+			Self::Entries => "entries of a macro invocation (`static NAME = value;`)",
 		}
 	}
 
 	/// The kind of a macro invocation (and of syntax that is not understood).
 	fn macro_kind(self) -> ItemKind {
 		match self {
-			Self::Module | Self::Enum | Self::ThreadLocal => ItemKind::MacroCall,
+			Self::Module | Self::Enum | Self::Fields | Self::ThreadLocal | Self::Entries => ItemKind::MacroCall,
 			Self::Impl | Self::Trait => ItemKind::AssocMacro,
 			Self::Extern => ItemKind::ForeignMacro,
 		}
@@ -109,15 +132,15 @@ impl Container {
 
 	fn static_kind(self) -> Option<ItemKind> {
 		match self {
-			Self::Module | Self::ThreadLocal => Some(ItemKind::Static),
+			Self::Module | Self::ThreadLocal | Self::Entries => Some(ItemKind::Static),
 			Self::Extern => Some(ItemKind::ForeignStatic),
-			Self::Impl | Self::Trait | Self::Enum => None,
+			Self::Impl | Self::Trait | Self::Enum | Self::Fields => None,
 		}
 	}
 
 	fn type_kind(self) -> ItemKind {
 		match self {
-			Self::Module | Self::Enum | Self::ThreadLocal => ItemKind::TypeAlias,
+			Self::Module | Self::Enum | Self::Fields | Self::ThreadLocal | Self::Entries => ItemKind::TypeAlias,
 			Self::Impl | Self::Trait => ItemKind::AssocType,
 			Self::Extern => ItemKind::ForeignType,
 		}
@@ -424,6 +447,37 @@ fn module_verbatim(rest: &[TokenTree]) -> Option<NewItem> {
 	}
 }
 
+/// Named fields (`a: u8, pub b: u16`), or else unnamed ones (`u8, pub u16`), whose trailing comma is removed (the field
+/// being replaced keeps the comma after it). Unnamed fields have no name (their index depends on their place).
+fn parse_fields(text: &str) -> syn::Result<Parsed> {
+	let parser = |named: bool| {
+		move |input: ParseStream<'_>| {
+			reject_inner_attributes(input)?;
+
+			let fields = match named {
+				true => Punctuated::<Field, Token![,]>::parse_terminated_with(input, Field::parse_named)?,
+				false => Punctuated::<Field, Token![,]>::parse_terminated_with(input, Field::parse_unnamed)?,
+			};
+			let mut end = fields.last().map_or(0, |field| end_of(field, 0));
+			let trailing_comma = (fields.pairs().next_back()).and_then(|pair| pair.punct().map(|comma| comma.span.byte_range()));
+
+			if let Some(comma) = &trailing_comma {
+				// the comma is removed, and what follows it moves back
+				end = comma.start;
+			}
+
+			let items = fields
+				.iter()
+				.map(|field| NewItem::with_name(ItemKind::Field, field.ident.as_ref().and_then(ident_name), &[]))
+				.collect();
+
+			Ok((items, end, trailing_comma))
+		}
+	};
+
+	parser(true).parse_str(text).or_else(|named| parser(false).parse_str(text).map_err(|_| named))
+}
+
 fn parse_list<T: Parse + ToTokens>(text: &str, classify: impl Fn(&T) -> NewItem) -> syn::Result<Parsed> {
 	let parser = |input: ParseStream<'_>| {
 		reject_inner_attributes(input)?;
@@ -462,9 +516,15 @@ fn parse_source_here(source: &str, container: Container) -> Result<ParsedSource,
 		Container::Trait => parse_list(text, |item: &TraitItem| trait_item(item)),
 		Container::Extern => parse_list(text, |item: &ForeignItem| foreign_item(item)),
 		Container::Enum => parse_variants(text),
+		Container::Fields => parse_fields(text),
 
 		Container::ThreadLocal => parse_list(text, |declaration: &Declaration| {
 			NewItem::named(ItemKind::Static, &declaration.ident, VALUE)
+		}),
+
+		// (entries are bound nowhere)
+		Container::Entries => parse_list(text, |entry: &Entry| {
+			NewItem::with_name(ItemKind::Static, ident_name(&entry.ident), &[])
 		}),
 	};
 

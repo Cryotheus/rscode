@@ -21,6 +21,9 @@ fn demo_paths() -> Vec<CanonicalPath> {
 			is_impl: false,
 			is_import: false,
 			name: name.map(Into::into),
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
 		}
 	}
 

@@ -54,6 +54,10 @@ pub struct ItemView {
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub thread_local: bool,
 
+	/// For a static declared by an entry of a macro invocation other than `thread_local!`: the macro's name.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub entry_macro: Option<String>,
+
 	/// The rendered text.
 	pub text: String,
 
@@ -92,6 +96,7 @@ impl Renderer<'_, '_> {
 			cfg: workspace.effective_cfg(item).map(|cfg| cfg.to_string()),
 			active: workspace.is_active(item),
 			thread_local: data.is_thread_local(),
+			entry_macro: workspace.entry_macro(item).map(str::to_owned),
 			text: self.text(shown, mode),
 			impls: Vec::new(),
 		}

@@ -345,7 +345,7 @@ pub struct ItemData {
 	pub kind: ItemKind,
 
 	/// The unraw'd name. `None` for unnamed items (`impl`, `use`, `extern` blocks, macro calls, `const _`,
-	/// glob and `_` imports).
+	/// glob and `_` imports). The index (`0`, `1`, ...) for fields of tuple structs and variants.
 	pub name: Option<SmolStr>,
 
 	/// Syntactic parent (index into the same crate). `None` only for the crate root.
@@ -371,7 +371,7 @@ pub struct ItemData {
 	/// token for `self` imports).
 	pub range: TextRange,
 
-	/// The identifier token (including any `r#`) that names the item.
+	/// The identifier token (including any `r#`) that names the item (`None` for fields of tuple structs and variants).
 	pub name_range: Option<TextRange>,
 
 	/// The visibility as written.
@@ -429,6 +429,20 @@ impl ItemData {
 	/// Whether the item is a static declared by `thread_local!`.
 	pub fn is_thread_local(&self) -> bool {
 		matches!(self.detail, ItemDetail::Static { thread_local: true, .. })
+	}
+
+	/// For a macro invocation: the name of the invoked macro, the last segment of its path (unraw'd; `None` for syntax
+	/// that was not understood).
+	pub fn macro_name(&self) -> Option<&str> {
+		let ItemDetail::Macro { path, .. } = &self.detail else {
+			return None;
+		};
+		let name = path.rsplit("::").next().unwrap_or_default().trim();
+		let name = name.strip_prefix("r#").unwrap_or(name);
+
+		let invocation = matches!(self.kind, ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro);
+
+		(invocation && !name.is_empty()).then_some(name)
 	}
 
 	/// The details of a module.
@@ -599,11 +613,16 @@ pub enum ItemKind {
 	MacroRules,
 
 	/// An item-position macro invocation (`foo! { ... }`).
-	/// `macro_rules!` definitions are [`ItemKind::MacroRules`] instead.
+	/// `macro_rules!` definitions are [`ItemKind::MacroRules`] instead. Invocations in modules are named by the path of
+	/// their module and the macro's name, with a `!` (`crate::m::foo!`, see
+	/// [`ItemPath::macro_call`](crate::path::ItemPath::macro_call)).
 	///
 	/// A `thread_local!` invocation in a module has the statics it declares as [`ItemKind::Static`] children
 	/// ([`ItemDetail::Static`] with `thread_local`). Like an `extern` block, it is transparent for paths: they live in
-	/// the enclosing module. Other macro invocations have no children.
+	/// the enclosing module. An invocation in a module whose body is a list of `static` entries (`commands! { static
+	/// SAY = ...; }`, `lazy_static!`) has them as [`ItemKind::Static`] children too (see [`Workspace::entry_macro`]),
+	/// which are bound in no scope (paths name them when the module binds nothing else of their name). Other macro
+	/// invocations have no children.
 	MacroCall,
 
 	/// A whole `use` item. Its children are [`ItemKind::Import`]s.
@@ -649,6 +668,12 @@ pub enum ItemKind {
 
 	/// Enum variant.
 	Variant,
+
+	/// A field of a struct, union, or variant, named by its identifier, or by its index (`0`, `1`, ...) in a tuple
+	/// struct or variant. Fields are named by paths with a `.` (`crate::Point.x`, `crate::Pair.0`,
+	/// `crate::Shape::Circle.radius`, see [`ItemPath::field`](crate::path::ItemPath::field)), and are never bound in
+	/// scopes: code paths do not reach them.
+	Field,
 }
 
 impl ItemKind {
@@ -680,6 +705,7 @@ impl ItemKind {
 		Self::AssocType,
 		Self::AssocMacro,
 		Self::Variant,
+		Self::Field,
 	];
 
 	/// Whether the item is inside of an `impl` block or `trait`.
@@ -687,18 +713,27 @@ impl ItemKind {
 		matches!(self, Self::AssocFn | Self::AssocConst | Self::AssocType | Self::AssocMacro)
 	}
 
-	/// Whether the item holds other items (modules, `impl` blocks, `trait`s, `extern` blocks, `enum`s, `use`s).
-	/// `thread_local!` invocations also hold the statics they declare, but most macro invocations hold nothing.
+	/// Whether the item holds other items (modules, `impl` blocks, `trait`s, `extern` blocks, `enum`s, `use`s, and the
+	/// fields of structs, unions, and variants). `thread_local!` invocations also hold the statics they declare (and other
+	/// invocations their `static` entries), but most macro invocations hold nothing.
 	pub fn is_container(self) -> bool {
-		matches!(self, Self::Module | Self::Impl | Self::Trait | Self::ExternBlock | Self::Enum | Self::Use)
+		matches!(
+			self,
+			Self::Module
+				| Self::Impl
+				| Self::Trait
+				| Self::ExternBlock
+				| Self::Enum
+				| Self::Use
+				| Self::Struct
+				| Self::Union
+				| Self::Variant
+		)
 	}
 
-	/// Whether items of this kind can be named by a path.
+	/// Whether items of this kind can be named by a path (macro invocations in modules by a path ending with `!`).
 	pub fn is_nameable(self) -> bool {
-		!matches!(
-			self,
-			Self::MacroCall | Self::Use | Self::ExternBlock | Self::Impl | Self::ForeignMacro | Self::AssocMacro
-		)
+		!matches!(self, Self::Use | Self::ExternBlock | Self::Impl | Self::ForeignMacro | Self::AssocMacro)
 	}
 
 	/// A short, kebab-case name (`mod`, `struct`, `fn`, `assoc-fn`, ...).
@@ -730,6 +765,7 @@ impl ItemKind {
 			Self::AssocType => "assoc-type",
 			Self::AssocMacro => "assoc-macro",
 			Self::Variant => "variant",
+			Self::Field => "field",
 		}
 	}
 }
@@ -755,6 +791,7 @@ impl std::str::FromStr for ItemKind {
 			"method" | "assoc-function" => Self::AssocFn,
 			"extern" => Self::ExternBlock,
 			"variant" | "enum-variant" => Self::Variant,
+			"struct-field" => Self::Field,
 
 			other => {
 				return Self::ALL
@@ -1026,7 +1063,7 @@ pub enum Visibility {
 	Private,
 
 	/// No visibility keyword on an item whose visibility comes from its parent
-	/// (trait items, items of trait `impl`s, enum variants).
+	/// (trait items, items of trait `impl`s, enum variants and their fields).
 	Inherited,
 }
 
@@ -1102,6 +1139,15 @@ impl Workspace {
 		let inherited = self.ancestors(id).filter_map(|ancestor| self.item(ancestor).cfg.as_ref());
 
 		CfgExpr::all(own.chain(inherited).cloned())
+	}
+
+	/// For a static declared by an entry of a macro invocation other than `thread_local!`
+	/// (`commands! { static SAY = ... }`): the name of the macro.
+	pub fn entry_macro(&self, id: ItemId) -> Option<&str> {
+		let data = self.item(id);
+		let parent = self.parent(id).filter(|_| data.kind == ItemKind::Static && !data.is_thread_local())?;
+
+		(self.item(parent).kind == ItemKind::MacroCall).then(|| self.item(parent).macro_name()).flatten()
 	}
 
 	/// The file an item is defined in.

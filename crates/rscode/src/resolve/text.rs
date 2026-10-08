@@ -1,5 +1,21 @@
 //! Scanning source text for the few things name resolution needs that the model does not record.
 
+/// The paths of the outer attributes at the start of an item's text, without whitespace (`tool_router` for
+/// `#[tool_router(router = x)]`, `rmcp::tool_router` for `#[rmcp::tool_router]`), except for doc comments and `doc`
+/// and `cfg_attr` attributes.
+pub(super) fn attribute_paths(item: &str) -> Vec<String> {
+	(outer_attributes(item).into_iter())
+		.filter_map(|attribute| {
+			let end = attribute
+				.find(|char: char| !(is_ident_char(char) || char == ':' || char.is_whitespace()))
+				.unwrap_or(attribute.len());
+			let path: String = attribute[..end].chars().filter(|char| !char.is_whitespace()).collect();
+
+			(!matches!(path.as_str(), "" | "doc" | "cfg_attr")).then_some(path)
+		})
+		.collect()
+}
+
 /// The position of the `]` that closes an attribute whose `[` was consumed, past nested delimiters and strings.
 fn closing_bracket(text: &str) -> Option<usize> {
 	let mut depth = 0usize;
@@ -146,6 +162,14 @@ pub(super) fn words(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn finds_attribute_paths() {
+		let item = "/// Docs.\n#[tool_router(router = x)]\n#[ rmcp :: handler ]\n#[doc = \"]\"]\n#[cfg_attr(a, b)]\n#[cfg(c)] impl X {}";
+
+		assert_eq!(attribute_paths(item), ["tool_router", "rmcp::handler", "cfg"]);
+		assert_eq!(attribute_paths("impl X {}"), Vec::<String>::new());
+	}
 
 	#[test]
 	fn finds_inner_attributes() {

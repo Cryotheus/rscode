@@ -41,6 +41,7 @@
 
 mod attrs;
 mod items;
+pub(crate) mod macro_entries;
 mod syntax;
 pub(crate) mod thread_local;
 mod verbatim;
