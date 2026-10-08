@@ -23,65 +23,86 @@ use rscode::query::ItemView;
 use std::process::ExitCode;
 
 pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
-	let args = ViewArgs::from_matches(matches);
-	let output = OutputArgs::from_matches(matches);
-	let options = args::load_options(matches)?;
-	let targets = args.paths.iter().map(|path| ItemPath::parse(path)).collect::<Result<Vec<_>, _>>()?;
-	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
-	let resolver = Resolver::new(&workspace);
-	let mut notes = Vec::new();
-	let (found, missing) = retry::split(&resolver, &targets, &mut notes);
-	let mut views = view(&args, &resolver, &found).map_err(|error| super::hinted(error, &resolver))?;
+    let args = ViewArgs::from_matches(matches);
+    let output = OutputArgs::from_matches(matches);
+    let options = args::load_options(matches)?;
+    let targets = args
+        .paths
+        .iter()
+        .map(|path| ItemPath::parse(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
+    let resolver = Resolver::new(&workspace);
+    let mut notes = Vec::new();
+    let (found, missing) = retry::split(&resolver, &targets, &mut notes);
+    let mut views =
+        view(&args, &resolver, &found).map_err(|error| super::hinted(error, &resolver))?;
 
-	// (only the paths that name nothing: with more crates selected, the others could name more items)
-	if let Some(first) = missing.first() {
-		let load = retry::Load {
-			ui,
-			options: &options,
-			absolute_paths: output.absolute_paths,
-		};
-		let error = rscode::Error::NotFound(first.to_string());
+    // (only the paths that name nothing: with more crates selected, the others could name more items)
+    if let Some(first) = missing.first() {
+        let load = retry::Load {
+            ui,
+            options: &options,
+            absolute_paths: output.absolute_paths,
+        };
+        let error = rscode::Error::NotFound(first.to_string());
 
-		views.extend(retry::again(load, Search::Everything, &resolver, error, &missing, |_, _, _, resolver| {
-			let (found, missing) = retry::split(resolver, &missing, &mut notes);
+        views.extend(retry::again(
+            load,
+            Search::Everything,
+            &resolver,
+            error,
+            &missing,
+            |_, _, _, resolver| {
+                let (found, missing) = retry::split(resolver, &missing, &mut notes);
 
-			if let Some(first) = missing.first() {
-				return Err(Failure::NotFound(rscode::Error::NotFound(first.to_string())));
-			}
+                if let Some(first) = missing.first() {
+                    return Err(Failure::NotFound(rscode::Error::NotFound(
+                        first.to_string(),
+                    )));
+                }
 
-			view(&args, resolver, &found).map_err(|error| retry::fail(error, resolver))
-		})?);
-	}
+                view(&args, resolver, &found).map_err(|error| retry::fail(error, resolver))
+            },
+        )?);
+    }
 
-	let text = match output.format {
-		MessageFormat::Json => render::view_json(&views, &paths)?,
+    let text = match output.format {
+        MessageFormat::Json => render::view_json(&views, &paths)?,
 
-		MessageFormat::Human | MessageFormat::FileLines => {
-			let rows: Vec<ViewRow> = views.iter().map(|view| ViewRow::new(view, &paths)).collect();
+        MessageFormat::Human | MessageFormat::FileLines => {
+            let rows: Vec<ViewRow> = views
+                .iter()
+                .map(|view| ViewRow::new(view, &paths))
+                .collect();
 
-			render::view_human(&rows)
-		}
-	};
+            render::view_human(&rows)
+        }
+    };
 
-	for note in notes {
-		ui.note(note);
-	}
+    for note in notes {
+        ui.note(note);
+    }
 
-	ui::print(&text)?;
-	Ok(ExitCode::SUCCESS)
+    ui::print(&text)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The views of the items that `paths` name in `resolver`'s workspace.
-fn view(args: &ViewArgs, resolver: &Resolver<'_>, paths: &[ItemPath]) -> Result<Vec<ItemView>, rscode::Error> {
-	if paths.is_empty() {
-		return Ok(Vec::new());
-	}
+fn view(
+    args: &ViewArgs,
+    resolver: &Resolver<'_>,
+    paths: &[ItemPath],
+) -> Result<Vec<ItemView>, rscode::Error> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
 
-	let mut view = View::with_options(args.options.clone());
+    let mut view = View::with_options(args.options.clone());
 
-	for path in paths {
-		view = view.item_path(path.clone());
-	}
+    for path in paths {
+        view = view.item_path(path.clone());
+    }
 
-	view.run_with(resolver)
+    view.run_with(resolver)
 }

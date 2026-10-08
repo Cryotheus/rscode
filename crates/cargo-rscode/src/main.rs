@@ -82,59 +82,63 @@ use std::process::ExitCode;
 use ui::Ui;
 
 fn main() -> ExitCode {
-	if complete::is_requested() {
-		// completers run on every TAB and stdout is their reply: a panic message would garble the prompt
-		std::panic::set_hook(Box::new(|_| {}));
-	}
+    if complete::is_requested() {
+        // completers run on every TAB and stdout is their reply: a panic message would garble the prompt
+        std::panic::set_hook(Box::new(|_| {}));
+    }
 
-	// first: it edits the environment, which is only sound while the process has a single thread
-	CompleteEnv::with_factory(cli::cli)
-		.var(complete::COMPLETE_VAR)
-		.shells(shells::SHELLS)
-		.complete();
+    // first: it edits the environment, which is only sound while the process has a single thread
+    CompleteEnv::with_factory(cli::cli)
+        .var(complete::COMPLETE_VAR)
+        .shells(shells::SHELLS)
+        .complete();
 
-	let (args, via_cargo) = cli::normalize_args(std::env::args_os().collect());
+    let (args, via_cargo) = cli::normalize_args(std::env::args_os().collect());
 
-	// only the usage, help, and error texts change (clap would take the name the binary was started with, like
-	// `cargo-rscode.exe`)
-	let bin_name = match via_cargo {
-		true => format!("cargo {}", cli::CARGO_SUBCOMMAND),
-		false => cli::BIN_NAME.to_owned(),
-	};
-	let command = cli::cli().color(cli::color_choice(&args)).bin_name(bin_name);
-	let matches = command.try_get_matches_from(args).unwrap_or_else(|error| error.exit());
+    // only the usage, help, and error texts change (clap would take the name the binary was started with, like
+    // `cargo-rscode.exe`)
+    let bin_name = match via_cargo {
+        true => format!("cargo {}", cli::CARGO_SUBCOMMAND),
+        false => cli::BIN_NAME.to_owned(),
+    };
+    let command = cli::cli()
+        .color(cli::color_choice(&args))
+        .bin_name(bin_name);
+    let matches = command
+        .try_get_matches_from(args)
+        .unwrap_or_else(|error| error.exit());
 
-	// `subcommand_required` has clap refuse a missing subcommand
-	let Some((name, matches)) = matches.subcommand() else {
-		return ExitCode::from(2);
-	};
+    // `subcommand_required` has clap refuse a missing subcommand
+    let Some((name, matches)) = matches.subcommand() else {
+        return ExitCode::from(2);
+    };
 
-	let ui = Ui::new(matches);
+    let ui = Ui::new(matches);
 
-	// parsing and formatting recurse as deep as the code is nested, which can exhaust the main thread's stack
-	let result = std::thread::scope(|scope| {
-		std::thread::Builder::new()
-			.name("rscode".to_owned())
-			.stack_size(rscode::rscode_fmt::RECOMMENDED_STACK_SIZE)
-			.spawn_scoped(scope, || commands::run(name, matches, &ui))
-			.map(|thread| thread.join())
-	});
+    // parsing and formatting recurse as deep as the code is nested, which can exhaust the main thread's stack
+    let result = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("rscode".to_owned())
+            .stack_size(rscode::rscode_fmt::RECOMMENDED_STACK_SIZE)
+            .spawn_scoped(scope, || commands::run(name, matches, &ui))
+            .map(|thread| thread.join())
+    });
 
-	// a closed stdout is no error (see `ui::print`), so the exit code is always the command's own
-	match result {
-		Ok(Ok(Ok(code))) => code,
+    // a closed stdout is no error (see `ui::print`), so the exit code is always the command's own
+    match result {
+        Ok(Ok(Ok(code))) => code,
 
-		Ok(Ok(Err(error))) => {
-			ui.error(format_args!("{error:#}"));
-			ExitCode::FAILURE
-		}
+        Ok(Ok(Err(error))) => {
+            ui.error(format_args!("{error:#}"));
+            ExitCode::FAILURE
+        }
 
-		// the panic message was already printed by the panic hook
-		Ok(Err(_)) => ExitCode::FAILURE,
+        // the panic message was already printed by the panic hook
+        Ok(Err(_)) => ExitCode::FAILURE,
 
-		Err(error) => {
-			ui.error(format_args!("failed to start a thread: {error}"));
-			ExitCode::FAILURE
-		}
-	}
+        Err(error) => {
+            ui.error(format_args!("failed to start a thread: {error}"));
+            ExitCode::FAILURE
+        }
+    }
 }

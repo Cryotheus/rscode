@@ -17,47 +17,74 @@ use rscode::edit::ImportOptions;
 use std::process::ExitCode;
 
 /// How to import a bare name that names no item of the workspace.
-const OTHER_CRATE_HINT: &str = "name an item of another crate by its path (like `std::collections::HashSet`)";
+const OTHER_CRATE_HINT: &str =
+    "name an item of another crate by its path (like `std::collections::HashSet`)";
 
 /// An error of [`rscode::edit::add_imports`], with a hint naming the argument that gets past it.
 fn hinted(error: Error, resolver: &Resolver<'_>) -> anyhow::Error {
-	let hint = match &error {
-		Error::Collision { .. } => {
-			"import it under another name ('x::Y as Z'), or remove what has the name (it names something else)"
-		}
-		Error::InvalidSource(_) => "each PATH is a `use` tree, such as `std::fs`, 'crate::a::{B, C}', or 'x::Y as Z'",
-		_ => return super::hinted(error, resolver),
-	};
+    let hint = match &error {
+        Error::Collision { .. } => {
+            "import it under another name ('x::Y as Z'), or remove what has the name (it names something else)"
+        }
 
-	super::with_hint(error, Some(hint.to_owned()))
+        Error::InvalidSource(_) => {
+            "each PATH is a `use` tree, such as `std::fs`, 'crate::a::{B, C}', or 'x::Y as Z'"
+        }
+
+        _ => return super::hinted(error, resolver),
+    };
+
+    super::with_hint(error, Some(hint.to_owned()))
 }
 
 pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
-	let args = ImportArgs::from_matches(matches);
-	let output = OutputArgs::from_matches(matches);
-	let options = args::load_options(matches)?;
-	let module = ItemPath::parse(&args.module)?;
-	let report = retry::run(ui, &options, output.absolute_paths, Search::OneCrate, |options, workspace, paths, resolver| {
-		// (no workspace member is left to search for a bare name)
-		let searched = options.workspace || !options.packages.is_empty() || options.widened(workspace, None).is_none();
-		let plan = rscode::edit::add_imports(resolver, &module, &args.paths, &ImportOptions::default()).map_err(|error| match error {
-			Error::NotFound(ref name) if searched && !name.contains("::") && *name != module.to_string() => {
-				Failure::Other(super::with_hint(error, Some(OTHER_CRATE_HINT.to_owned())))
-			}
+    let args = ImportArgs::from_matches(matches);
+    let output = OutputArgs::from_matches(matches);
+    let options = args::load_options(matches)?;
+    let module = ItemPath::parse(&args.module)?;
+    let report = retry::run(
+        ui,
+        &options,
+        output.absolute_paths,
+        Search::OneCrate,
+        |options, workspace, paths, resolver| {
+            // (no workspace member is left to search for a bare name)
+            let searched = options.workspace
+                || !options.packages.is_empty()
+                || options.widened(workspace, None).is_none();
+            let plan = rscode::edit::add_imports(
+                resolver,
+                &module,
+                &args.paths,
+                &ImportOptions::default(),
+            )
+            .map_err(|error| match error {
+                Error::NotFound(ref name)
+                    if searched && !name.contains("::") && *name != module.to_string() =>
+                {
+                    Failure::Other(super::with_hint(error, Some(OTHER_CRATE_HINT.to_owned())))
+                }
 
-			Error::NotFound(_) => Failure::NotFound(error),
-			error => Failure::Other(hinted(error, resolver)),
-		})?;
-		let mut report = ImportReport::new(&plan, &args.module, args.dry_run, paths);
+                Error::NotFound(_) => Failure::NotFound(error),
+                error => Failure::Other(hinted(error, resolver)),
+            })?;
+            let mut report = ImportReport::new(&plan, &args.module, args.dry_run, paths);
 
-		match args.dry_run {
-			true => report.diff = Some(render::edit_diff(&plan.edits, paths).map_err(anyhow::Error::from)?),
-			false => report.warnings.extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings),
-		}
+            match args.dry_run {
+                true => {
+                    report.diff =
+                        Some(render::edit_diff(&plan.edits, paths).map_err(anyhow::Error::from)?)
+                }
 
-		Ok(report)
-	})?;
+                false => report
+                    .warnings
+                    .extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings),
+            }
 
-	super::print_report(ui, output.format, &report)?;
-	Ok(ExitCode::SUCCESS)
+            Ok(report)
+        },
+    )?;
+
+    super::print_report(ui, output.format, &report)?;
+    Ok(ExitCode::SUCCESS)
 }

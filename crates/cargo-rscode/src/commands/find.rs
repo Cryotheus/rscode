@@ -34,208 +34,272 @@ use std::process::ExitCode;
 /// were more), with the usable paths that `--from` asks for (from a module of the `selected` packages, when it names
 /// modules of several; see [`viewpoint`]).
 fn matches_of(
-	resolver: &Resolver<'_>,
-	find: &Find,
-	args: &FindArgs,
-	selected: &[&str],
+    resolver: &Resolver<'_>,
+    find: &Find,
+    args: &FindArgs,
+    selected: &[&str],
 ) -> anyhow::Result<(Vec<FindMatch>, Option<usize>)> {
-	let mut find = find.clone();
-	let from = args.from.as_ref().map(|from| viewpoint(resolver, from, selected)).transpose()?;
+    let mut find = find.clone();
+    let from = args
+        .from
+        .as_ref()
+        .map(|from| viewpoint(resolver, from, selected))
+        .transpose()?;
 
-	if let Some(Some(viewpoint)) = from {
-		find = find.from(viewpoint);
-	}
+    if let Some(Some(viewpoint)) = from {
+        find = find.from(viewpoint);
+    }
 
-	// one more than the limit tells whether there were more
-	if let Some(limit) = args.limit {
-		find = find.limit(limit.saturating_add(1));
-	}
+    // one more than the limit tells whether there were more
+    if let Some(limit) = args.limit {
+        find = find.limit(limit.saturating_add(1));
+    }
 
-	let mut found = find.run_with(resolver)?;
-	let truncated = args.limit.filter(|&limit| found.len() > limit);
+    let mut found = find.run_with(resolver)?;
+    let truncated = args.limit.filter(|&limit| found.len() > limit);
 
-	if let Some(limit) = truncated {
-		found.truncate(limit);
-	}
+    if let Some(limit) = truncated {
+        found.truncate(limit);
+    }
 
-	if let Some(None) = from {
-		for found in &mut found {
-			let root = ItemId::crate_root(found.item.krate());
+    if let Some(None) = from {
+        for found in &mut found {
+            let root = ItemId::crate_root(found.item.krate());
 
-			found.usable_paths = resolver.usable_paths(found.item, Viewpoint::Module(root));
-		}
-	}
+            found.usable_paths = resolver.usable_paths(found.item, Viewpoint::Module(root));
+        }
+    }
 
-	Ok((found, truncated))
+    Ok((found, truncated))
 }
 
 /// The crate a pattern starts from (`::name::…`, or `name::…`).
 fn pattern_crate(pattern: &str) -> Option<&str> {
-	let pattern = pattern.trim();
-	let pattern = pattern
-		.strip_prefix("use")
-		.filter(|rest| rest.starts_with(char::is_whitespace))
-		.unwrap_or(pattern)
-		.trim();
+    let pattern = pattern.trim();
+    let pattern = pattern
+        .strip_prefix("use")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .unwrap_or(pattern)
+        .trim();
 
-	pattern.strip_prefix("::").unwrap_or(pattern).split("::").next()
+    pattern
+        .strip_prefix("::")
+        .unwrap_or(pattern)
+        .split("::")
+        .next()
 }
 
 /// Prints the matches, and notes: that nothing was found, or that there were more than the `--limit`, and the
 /// workspace members that were not searched (unless the command line named the packages).
 fn print(
-	ui: &Ui,
-	args: &FindArgs,
-	output: &OutputArgs,
-	workspace: &Workspace,
-	paths: &PathDisplay,
-	found: (Vec<FindMatch>, Option<usize>),
-	named_packages: bool,
+    ui: &Ui,
+    args: &FindArgs,
+    output: &OutputArgs,
+    workspace: &Workspace,
+    paths: &PathDisplay,
+    found: (Vec<FindMatch>, Option<usize>),
+    named_packages: bool,
 ) -> anyhow::Result<ExitCode> {
-	let (found, truncated) = found;
-	let text = match output.format {
-		MessageFormat::Human => {
-			let rows: Vec<MatchRow> = found.iter().map(|found| MatchRow::new(found, paths)).collect();
+    let (found, truncated) = found;
+    let text = match output.format {
+        MessageFormat::Human => {
+            let rows: Vec<MatchRow> = found
+                .iter()
+                .map(|found| MatchRow::new(found, paths))
+                .collect();
 
-			render::find_human(&rows, &args.show)
-		}
+            render::find_human(&rows, &args.show)
+        }
 
-		MessageFormat::Json => render::find_json(&found, paths)?,
+        MessageFormat::Json => render::find_json(&found, paths)?,
 
-		MessageFormat::FileLines => {
-			let rows: Vec<MatchRow> = found.iter().map(|found| MatchRow::new(found, paths)).collect();
+        MessageFormat::FileLines => {
+            let rows: Vec<MatchRow> = found
+                .iter()
+                .map(|found| MatchRow::new(found, paths))
+                .collect();
 
-			render::file_lines(&rows)?
-		}
-	};
+            render::file_lines(&rows)?
+        }
+    };
 
-	ui::print(&text)?;
+    ui::print(&text)?;
 
-	if found.is_empty() {
-		ui.note("no items found");
-	} else if let Some(limit) = truncated {
-		ui.note(format!("showing the first {limit} items (--limit)"));
-	}
+    if found.is_empty() {
+        ui.note("no items found");
+    } else if let Some(limit) = truncated {
+        ui.note(format!("showing the first {limit} items (--limit)"));
+    }
 
-	let member = args.patterns.iter().find_map(|pattern| workspace.unloaded_member_with_crate(pattern_crate(pattern)?));
+    let member = args
+        .patterns
+        .iter()
+        .find_map(|pattern| workspace.unloaded_member_with_crate(pattern_crate(pattern)?));
 
-	// (with matches, only when the command line left the selection to cargo)
-	if (found.is_empty() || !named_packages)
-		&& let Some(hint) = super::unloaded_hint(workspace, member)
-	{
-		ui.note(hint);
-	}
+    // (with matches, only when the command line left the selection to cargo)
+    if (found.is_empty() || !named_packages)
+        && let Some(hint) = super::unloaded_hint(workspace, member)
+    {
+        ui.note(hint);
+    }
 
-	Ok(ExitCode::SUCCESS)
+    Ok(ExitCode::SUCCESS)
 }
 
 pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
-	let args = FindArgs::from_matches(matches);
-	let output = OutputArgs::from_matches(matches);
-	let options = args::load_options(matches)?;
-	let find = search(&args)?;
-	let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
-	let resolver = Resolver::new(&workspace);
-	let found = matches_of(&resolver, &find, &args, &[])?;
+    let args = FindArgs::from_matches(matches);
+    let output = OutputArgs::from_matches(matches);
+    let options = args::load_options(matches)?;
+    let find = search(&args)?;
+    let (workspace, paths) = super::load(ui, &options, output.absolute_paths)?;
+    let resolver = Resolver::new(&workspace);
+    let found = matches_of(&resolver, &find, &args, &[])?;
 
-	// nothing found: search the workspace members that the command line did not select
-	let named_packages = retry::named_packages(&options);
-	let member = (args.patterns.iter())
-		.find_map(|pattern| pattern_crate(pattern))
-		.and_then(|krate| ItemPath::parse(krate).ok());
+    // nothing found: search the workspace members that the command line did not select
+    let named_packages = retry::named_packages(&options);
+    let member = (args.patterns.iter())
+        .find_map(|pattern| pattern_crate(pattern))
+        .and_then(|krate| ItemPath::parse(krate).ok());
 
-	if found.0.is_empty()
-		&& !named_packages
-		&& let Some(widening) = options.widened(&workspace, member.as_ref())
-	{
-		let (wider, wider_paths) = super::load(ui, &widening.options, output.absolute_paths)?;
-		let searched = widening.searched(&wider);
+    if found.0.is_empty()
+        && !named_packages
+        && let Some(widening) = options.widened(&workspace, member.as_ref())
+    {
+        let (wider, wider_paths) = super::load(ui, &widening.options, output.absolute_paths)?;
+        let searched = widening.searched(&wider);
 
-		// (the target options left out the crates of every member to search)
-		if searched.is_empty() {
-			return print(ui, &args, &output, &workspace, &paths, found, named_packages);
-		}
+        // (the target options left out the crates of every member to search)
+        if searched.is_empty() {
+            return print(
+                ui,
+                &args,
+                &output,
+                &workspace,
+                &paths,
+                found,
+                named_packages,
+            );
+        }
 
-		let resolver = Resolver::new(&wider);
-		let selected: Vec<&str> = widening.selected.iter().map(|package| package.as_str()).collect();
-		let found = matches_of(&resolver, &find, &args, &selected)?;
-		let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &searched);
+        let resolver = Resolver::new(&wider);
+        let selected: Vec<&str> = widening
+            .selected
+            .iter()
+            .map(|package| package.as_str())
+            .collect();
+        let found = matches_of(&resolver, &find, &args, &selected)?;
+        let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &searched);
 
-		match members.is_empty() {
-			true => ui.note(retry::note(&searched, false)),
-			false => ui.note(retry::note(&members, true)),
-		}
+        match members.is_empty() {
+            true => ui.note(retry::note(&searched, false)),
+            false => ui.note(retry::note(&members, true)),
+        }
 
-		return print(ui, &args, &output, &wider, &wider_paths, found, named_packages);
-	}
+        return print(
+            ui,
+            &args,
+            &output,
+            &wider,
+            &wider_paths,
+            found,
+            named_packages,
+        );
+    }
 
-	print(ui, &args, &output, &workspace, &paths, found, named_packages)
+    print(
+        ui,
+        &args,
+        &output,
+        &workspace,
+        &paths,
+        found,
+        named_packages,
+    )
 }
 
 /// The search: patterns, identifier patterns, kinds, and flags.
 fn search(args: &FindArgs) -> Result<Find, rscode::Error> {
-	let options = MatchOptions {
-		ignore_case: args.ignore_case,
-	};
-	let mut find = Find::new()
-		.ignore_case(args.ignore_case)
-		.active_only(args.active_only)
-		.imports(args.imports);
+    let options = MatchOptions {
+        ignore_case: args.ignore_case,
+    };
+    let mut find = Find::new()
+        .ignore_case(args.ignore_case)
+        .active_only(args.active_only)
+        .imports(args.imports);
 
-	for pattern in &args.patterns {
-		find = find.pattern(pattern)?;
-	}
+    for pattern in &args.patterns {
+        find = find.pattern(pattern)?;
+    }
 
-	let identifiers = args
-		.contains
-		.iter()
-		.map(|text| IdentPattern::contains(text, options))
-		.chain(args.starts_with.iter().map(|text| IdentPattern::starts_with(text, options)))
-		.chain(args.ends_with.iter().map(|text| IdentPattern::ends_with(text, options)));
+    let identifiers = args
+        .contains
+        .iter()
+        .map(|text| IdentPattern::contains(text, options))
+        .chain(
+            args.starts_with
+                .iter()
+                .map(|text| IdentPattern::starts_with(text, options)),
+        )
+        .chain(
+            args.ends_with
+                .iter()
+                .map(|text| IdentPattern::ends_with(text, options)),
+        );
 
-	for identifier in identifiers {
-		find = find.path_pattern(PathPattern::from_ident(identifier));
-	}
+    for identifier in identifiers {
+        find = find.path_pattern(PathPattern::from_ident(identifier));
+    }
 
-	for &kind in &args.kinds {
-		find = find.kind(kind);
-	}
+    for &kind in &args.kinds {
+        find = find.kind(kind);
+    }
 
-	Ok(find)
+    Ok(find)
 }
 
 /// The viewpoint of `--from`; `None` for `crate`, which is each found item's own crate root. When the path names
 /// modules of several crates and only one of them is of the `selected` packages (those of the command line's own
 /// selection, after a search of more workspace members), it names that one.
-fn viewpoint(resolver: &Resolver<'_>, from: &FromArg, selected: &[&str]) -> anyhow::Result<Option<Viewpoint>> {
-	let text = match from {
-		FromArg::CrateRoot => return Ok(None),
-		FromArg::Foreign => return Ok(Some(Viewpoint::Foreign)),
-		FromArg::Module(text) => text,
-	};
+fn viewpoint(
+    resolver: &Resolver<'_>,
+    from: &FromArg,
+    selected: &[&str],
+) -> anyhow::Result<Option<Viewpoint>> {
+    let text = match from {
+        FromArg::CrateRoot => return Ok(None),
+        FromArg::Foreign => return Ok(Some(Viewpoint::Foreign)),
+        FromArg::Module(text) => text,
+    };
 
-	let workspace = resolver.workspace();
-	let modules: Vec<ItemId> = resolver
-		.resolve_item_path(&ItemPath::parse(text)?)
-		.into_iter()
-		.filter(|&item| workspace.item(item).kind == ItemKind::Module)
-		.collect();
-	let of_selected: Vec<ItemId> = (modules.iter().copied())
-		.filter(|module| {
-			let package = workspace.krate(module.krate()).package();
+    let workspace = resolver.workspace();
+    let modules: Vec<ItemId> = resolver
+        .resolve_item_path(&ItemPath::parse(text)?)
+        .into_iter()
+        .filter(|&item| workspace.item(item).kind == ItemKind::Module)
+        .collect();
+    let of_selected: Vec<ItemId> = (modules.iter().copied())
+        .filter(|module| {
+            let package = workspace.krate(module.krate()).package();
 
-			package.is_some_and(|package| selected.contains(&workspace.package(package).name.as_str()))
-		})
-		.collect();
+            package
+                .is_some_and(|package| selected.contains(&workspace.package(package).name.as_str()))
+        })
+        .collect();
 
-	match (modules.as_slice(), of_selected.as_slice()) {
-		([module], _) | (_, [module]) => Ok(Some(Viewpoint::Module(*module))),
-		([], _) => anyhow::bail!("`--from {text}` does not name a module"),
+    match (modules.as_slice(), of_selected.as_slice()) {
+        ([module], _) | (_, [module]) => Ok(Some(Viewpoint::Module(*module))),
+        ([], _) => anyhow::bail!("`--from {text}` does not name a module"),
 
-		_ => {
-			let candidates: Vec<String> = modules.iter().map(|&module| resolver.canonical_path(module).to_string()).collect();
+        _ => {
+            let candidates: Vec<String> = modules
+                .iter()
+                .map(|&module| resolver.canonical_path(module).to_string())
+                .collect();
 
-			anyhow::bail!("`--from {text}` names several modules:\n{}", candidates.join("\n"))
-		}
-	}
+            anyhow::bail!(
+                "`--from {text}` names several modules:\n{}",
+                candidates.join("\n")
+            )
+        }
+    }
 }

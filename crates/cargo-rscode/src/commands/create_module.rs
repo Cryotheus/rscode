@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 /// An error of [`rscode::edit::create_module`], with a hint naming the argument or option that gets past it.
 fn hinted(error: Error, resolver: &Resolver<'_>, name: &str) -> anyhow::Error {
-	let hint = match &error {
+    let hint = match &error {
 		Error::Collision { .. } => "choose another NAME".to_owned(),
 		Error::InvalidIdent(_) => "NAME is the identifier of the new module alone (such as `render`), not a path".to_owned(),
 
@@ -36,33 +36,47 @@ fn hinted(error: Error, resolver: &Resolver<'_>, name: &str) -> anyhow::Error {
 		_ => return super::hinted(error, resolver),
 	};
 
-	super::with_hint(error, Some(hint))
+    super::with_hint(error, Some(hint))
 }
 
 pub(super) fn run(matches: &ArgMatches, ui: &Ui) -> anyhow::Result<ExitCode> {
-	let args = CreateModuleArgs::from_matches(matches);
-	let output = OutputArgs::from_matches(matches);
-	let options = args::load_options(matches)?;
-	let source = match &args.source {
-		Some(source) => super::read_source(source, ui)?,
-		None => String::new(),
-	};
-	let parent = ItemPath::parse(&args.parent)?;
-	let report = retry::run(ui, &options, output.absolute_paths, Search::OneCrate, |_, _, paths, resolver| {
-		let plan = rscode::edit::create_module(resolver, &parent, &args.name, &source, &args.options).map_err(|error| match error {
-			Error::NotFound(_) => Failure::NotFound(error),
-			error => Failure::Other(hinted(error, resolver, &args.name)),
-		})?;
-		let mut report = ModuleReport::new(&plan, &args.parent, args.dry_run, paths);
+    let args = CreateModuleArgs::from_matches(matches);
+    let output = OutputArgs::from_matches(matches);
+    let options = args::load_options(matches)?;
+    let source = match &args.source {
+        Some(source) => super::read_source(source, ui)?,
+        None => String::new(),
+    };
+    let parent = ItemPath::parse(&args.parent)?;
+    let report = retry::run(
+        ui,
+        &options,
+        output.absolute_paths,
+        Search::OneCrate,
+        |_, _, paths, resolver| {
+            let plan =
+                rscode::edit::create_module(resolver, &parent, &args.name, &source, &args.options)
+                    .map_err(|error| match error {
+                        Error::NotFound(_) => Failure::NotFound(error),
+                        error => Failure::Other(hinted(error, resolver, &args.name)),
+                    })?;
+            let mut report = ModuleReport::new(&plan, &args.parent, args.dry_run, paths);
 
-		match args.dry_run {
-			true => report.diff = Some(render::edit_diff(&plan.edits, paths).map_err(anyhow::Error::from)?),
-			false => report.warnings.extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings),
-		}
+            match args.dry_run {
+                true => {
+                    report.diff =
+                        Some(render::edit_diff(&plan.edits, paths).map_err(anyhow::Error::from)?)
+                }
 
-		Ok(report)
-	})?;
+                false => report
+                    .warnings
+                    .extend(plan.edits.apply().map_err(anyhow::Error::from)?.warnings),
+            }
 
-	super::print_report(ui, output.format, &report)?;
-	Ok(ExitCode::SUCCESS)
+            Ok(report)
+        },
+    )?;
+
+    super::print_report(ui, output.format, &report)?;
+    Ok(ExitCode::SUCCESS)
 }
