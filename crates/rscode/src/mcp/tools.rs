@@ -63,12 +63,12 @@ pub(crate) type Output = Result<String, String>;
 /// text it shows (see [`shown_item`]), and its path.
 type ViewKey = (bool, ItemId, String);
 
+/// How to import a bare name that names no item of the workspace.
+pub(super) const OTHER_CRATE_HINT: &str = "name an item of another crate by its path (like `std::collections::HashSet`)";
+
 /// How to search for the path of an item.
 pub(super) const SEARCH_HINT: &str = "search with `find_items` (e.g. the pattern `*name*` with `ignore_case`, and \
 	`include_imports` for imports) for the exact path";
-
-/// How to import a bare name that names no item of the workspace.
-pub(super) const OTHER_CRATE_HINT: &str = "name an item of another crate by its path (like `std::collections::HashSet`)";
 
 /// How to pick one of several crates that a path names items of.
 const SELECT_ONE_CRATE: &str = "the path names items of several crates (such as the library and a binary of a \
