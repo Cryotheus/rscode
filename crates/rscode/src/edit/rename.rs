@@ -244,16 +244,18 @@ impl Collisions<'_, '_> {
 
 /// A validated new name.
 #[derive(Debug, Clone)]
-struct NewName {
+pub(super) struct NewName {
 	/// The name, without `r#`.
-	bare: SmolStr,
+	pub(super) bare: SmolStr,
 
 	/// The identifier to write (`r#name` for keywords).
-	written: String,
+	pub(super) written: String,
 }
 
 impl NewName {
-	fn parse(text: &str) -> Result<Self, Error> {
+	/// Validates an identifier, with or without `r#` (which keywords get); fails with [`Error::InvalidIdent`] for
+	/// what is not one, and for `crate`, `self`, `super`, `Self`, and `_`.
+	pub(super) fn parse(text: &str) -> Result<Self, Error> {
 		let bare = text.strip_prefix("r#").unwrap_or(text);
 		let written = if is_keyword(bare) { format!("r#{bare}") } else { bare.to_owned() };
 
@@ -505,7 +507,7 @@ fn check_supported(resolver: &Resolver<'_>, target: ItemId) -> Result<(), Error>
 }
 
 /// The directory of the files of a module's child modules declared without `#[path]` (like the loader finds them).
-fn child_dir(ws: &Workspace, module: ItemId) -> Option<PathBuf> {
+pub(super) fn child_dir(ws: &Workspace, module: ItemId) -> Option<PathBuf> {
 	let data = ws.item(module);
 	let info = data.module_info()?;
 

@@ -243,7 +243,7 @@ pub(crate) fn cli() -> Command {
 		.styles(STYLES)
 		.subcommand_required(true)
 		.arg_required_else_help(true)
-		.subcommands([find(), view(), fmt(), sort(), rename(), remove(), replace(), edit(), insert()]);
+		.subcommands([find(), view(), fmt(), sort(), rename(), remove(), replace(), edit(), insert(), create_module(), import()]);
 
 	#[cfg(feature = "mcp")]
 	let command = command.subcommand(mcp());
@@ -274,6 +274,34 @@ pub(crate) fn color_choice(args: &[OsString]) -> ColorChoice {
 		Some("never") => ColorChoice::Never,
 		_ => ColorChoice::Auto,
 	}
+}
+
+fn create_module() -> Command {
+	let command = Command::new("create-module")
+		.about("Create a module: its file, and its `mod` declaration")
+		.long_about(
+			"Create the module NAME in PARENT (`crate` for the crate root): write its file where rustc looks for it \
+			 (`NAME.rs` in the directory of PARENT's modules, or `NAME/mod.rs` when they are in `mod.rs` files) with \
+			 SOURCE, or empty, and declare it with `mod NAME;` where `cargo rscode sort` would put it.",
+		)
+		.arg(
+			Arg::new("parent")
+				.value_name("PARENT")
+				.help("The module to create the module in (`crate` for the crate root)")
+				.required(true)
+				.add(ArgValueCompleter::new(complete::module_paths)),
+		)
+		.arg(Arg::new("name").value_name("NAME").help("The name of the new module").required(true))
+		.arg(
+			Arg::new("source")
+				.value_name("SOURCE")
+				.help("The contents of the module's file: a file, or `-` for stdin (empty without it)")
+				.value_hint(ValueHint::FilePath),
+		)
+		.arg(opt("vis", "The visibility of the module (`pub`, `pub(crate)`, ...); private without it").value_name("VIS"))
+		.arg(dry_run());
+
+	output_args(load_args(command), FORMATS)
 }
 
 fn dry_run() -> Arg {
@@ -456,13 +484,42 @@ fn fmt() -> Command {
 	})
 }
 
+fn import() -> Command {
+	let command = Command::new("import")
+		.about("Import into a module")
+		.long_about(
+			"Import into MODULE (`crate` for the crate root): each leaf of the `use` trees gets a `use` item where \
+			 `cargo rscode sort` would put it, or joins a `use` item of the module when the module groups its \
+			 imports (by module, or more). What the module imports already is left alone.",
+		)
+		.arg(
+			Arg::new("module")
+				.value_name("MODULE")
+				.help("The module to import into (`crate` for the crate root)")
+				.required(true)
+				.add(ArgValueCompleter::new(complete::module_paths)),
+		)
+		.arg(
+			Arg::new("paths")
+				.value_name("PATH")
+				.help("`use` trees to import: `std::fs`, 'crate::a::{B, C}', 'x::Y as Z', 'm::*', or 'pub use a::B'")
+				.num_args(1..)
+				.required(true)
+				.action(ArgAction::Append),
+		)
+		.arg(dry_run());
+
+	output_args(load_args(command), FORMATS)
+}
+
 fn insert() -> Command {
 	let command = Command::new("insert")
 		.about("Insert items into a module, impl block, or trait")
 		.long_about(
 			"Insert items into a module (`crate` for the crate root), an impl block (`<Type as Trait>`, `<Type>`), or a \
 			 trait. The items must be valid there, their names must not be taken (unless --force), and they are \
-			 indented like the container's items.\n\n\
+			 indented like the container's items, and separated from their neighbors by blank lines, except that \
+			 one-line `use` items, `mod x;` declarations, and the like join one-line siblings of their kind.\n\n\
 			 With --after or --before, PARENT may be left out: the sibling's container is the parent, and a single \
 			 positional argument is the SOURCE (`insert items.rs --after 'Tools::add_bots'`).",
 		)

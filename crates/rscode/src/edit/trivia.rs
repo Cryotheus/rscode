@@ -7,7 +7,8 @@
 //! item that follows them, and part of its range.
 //!
 //! - [`removal_ranges`], [`list_item_removal_range`]: what to delete to remove items.
-//! - [`insertion`]: the edit inserting new items before or after a sibling, or at the end of a container.
+//! - [`insertion`]: the edit inserting new items before or after a sibling, or at the end of a container, with or
+//!   without blank lines next to them ([`layouts`] tells how the siblings are laid out).
 //! - [`reindent`], [`line_indent`], [`body_indent`], [`indent_unit`], [`line_ending`]: layout of new text.
 //!
 //! Offsets are expected at token boundaries (item ranges of the model are). Offsets past the end of the text or
@@ -52,6 +53,31 @@ enum Edge {
 	Content,
 }
 
+/// New items for [`insertion`], and the line breaks around them: one, or two for a blank line (see [`Spacing`]).
+#[derive(Debug, Clone, Copy)]
+struct Inserted<'a> {
+	/// The items, laid out for their place (with the indentation of their first line).
+	items: &'a str,
+
+	/// The indentation of the items.
+	indent: &'a str,
+
+	line_ending: &'a str,
+	spacing: Spacing,
+}
+
+impl Inserted<'_> {
+	/// The line breaks between the code above and the new items.
+	fn above(&self) -> String {
+		self.line_ending.repeat(if self.spacing.compact_above { 1 } else { 2 })
+	}
+
+	/// The line breaks between the new items and the code below.
+	fn below(&self) -> String {
+		self.line_ending.repeat(if self.spacing.compact_below { 1 } else { 2 })
+	}
+}
+
 /// The kind of a [`Piece`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Kind {
@@ -75,6 +101,20 @@ impl Kind {
 	fn is_trivia(self) -> bool {
 		matches!(self, Self::Space | Self::LineBreak | Self::Comment)
 	}
+}
+
+/// How an item sits among the lines of its text (see [`layouts`]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct Layout {
+	/// Whether the item has its lines to itself: only whitespace and comments precede it on its first line and follow
+	/// it on its last.
+	pub(crate) alone: bool,
+
+	/// Whether comments are attached above the item (with no blank line between them and the item).
+	pub(crate) comments_above: bool,
+
+	/// Whether blank lines follow the item's line, before the next code or comment.
+	pub(crate) blank_below: bool,
 }
 
 /// The lines above an item, as far as they belong to it.
@@ -260,6 +300,17 @@ struct SourceLine<'a> {
 
 	/// Whether the line starts inside of a string literal.
 	verbatim: bool,
+}
+
+/// Whether [`insertion`] separates new items from the code next to them with a blank line, or puts them on the
+/// next line. Blank lines already there stay either way.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct Spacing {
+	/// The new items follow the code above them without a blank line.
+	pub(crate) compact_above: bool,
+
+	/// The code below the new items follows them without a blank line.
+	pub(crate) compact_below: bool,
 }
 
 /// The lines below an item, as far as they belong to it.
@@ -493,24 +544,25 @@ fn indent_unit_in(lexed: &Lexed<'_>) -> String {
 	}
 }
 
-fn insert_after(lexed: &Lexed<'_>, sibling: TextRange, item: &str, indent: &str, line_ending: &str) -> (TextRange, String) {
+fn insert_after(lexed: &Lexed<'_>, sibling: TextRange, new: Inserted<'_>) -> (TextRange, String) {
 	let trailing = trailing(lexed, sibling.end);
+	let (above, below, items, indent) = (new.above(), new.below(), new.items, new.indent);
 
 	if !trailing.ends_line {
 		// code follows the sibling on its line: move that code to a line of its own
-		let replacement = format!("{line_ending}{line_ending}{item}{line_ending}{line_ending}{indent}");
+		let replacement = format!("{above}{items}{below}{indent}");
 
 		return (TextRange::new(sibling.end, trailing.space_end), replacement);
 	}
 
-	let separator = if trailing.below == Edge::Content && !trailing.has_blank_below() {
-		line_ending
-	} else {
-		""
+	// (the line break after the sibling ends the new items' line)
+	let separator = match trailing.below == Edge::Content && !trailing.has_blank_below() {
+		true => &below[new.line_ending.len()..],
+		false => "",
 	};
 	let at = trailing.break_start;
 
-	(TextRange::new(at, at), format!("{line_ending}{line_ending}{item}{separator}"))
+	(TextRange::new(at, at), format!("{above}{items}{separator}"))
 }
 
 fn insert_at_end(lexed: &Lexed<'_>, body: TextRange, item: &str, line_ending: &str) -> (TextRange, String) {
@@ -552,24 +604,25 @@ fn insert_at_end(lexed: &Lexed<'_>, body: TextRange, item: &str, line_ending: &s
 	(rest, replacement)
 }
 
-fn insert_before(lexed: &Lexed<'_>, sibling: TextRange, item: &str, indent: &str, line_ending: &str) -> (TextRange, String) {
+fn insert_before(lexed: &Lexed<'_>, sibling: TextRange, new: Inserted<'_>) -> (TextRange, String) {
 	let leading = leading(lexed, sibling.start);
+	let (above, below, items, indent) = (new.above(), new.below(), new.items, new.indent);
 
 	if !leading.starts_line {
 		// code precedes the sibling on its line: move the sibling to a line of its own
-		let replacement = format!("{line_ending}{line_ending}{item}{line_ending}{line_ending}{indent}");
+		let replacement = format!("{above}{items}{below}{indent}");
 
 		return (TextRange::new(leading.space_start, sibling.start), replacement);
 	}
 
-	let separator = if leading.above == Edge::Content && !leading.has_blank_above() {
-		line_ending
-	} else {
-		""
+	// (the line break before the sibling's block ends the line above)
+	let separator = match leading.above == Edge::Content && !leading.has_blank_above() {
+		true => &above[new.line_ending.len()..],
+		false => "",
 	};
 	let at = leading.block_start;
 
-	(TextRange::new(at, at), format!("{separator}{item}{line_ending}{line_ending}"))
+	(TextRange::new(at, at), format!("{separator}{items}{below}"))
 }
 
 /// The edit inserting the items of `source` into `text` at `placement`, indented with `indent` (see [`reindent`]
@@ -577,15 +630,23 @@ fn insert_before(lexed: &Lexed<'_>, sibling: TextRange, item: &str, indent: &str
 ///
 /// The new items are separated from the item they are placed next to by a blank line, and from their other
 /// neighbor by a blank line unless it is the start or end of the container, keeping any blank lines already there.
-/// An empty braced body gets the items on their own lines, with the closing brace on its own line.
-pub(crate) fn insertion(text: &str, placement: Placement, source: &str, indent: &str) -> TextEdit {
+/// Next to a sibling, `spacing` may leave out the blank line above or below them: the line breaks are then single
+/// (blank lines already there stay). An empty braced body gets the items on their own lines, with the closing brace
+/// on its own line.
+pub(crate) fn insertion(text: &str, placement: Placement, source: &str, indent: &str, spacing: Spacing) -> TextEdit {
 	let lexed = Lexed::new(text);
 	let line_ending = line_ending(text);
 	let item = format!("{indent}{}", reindent_with(source, indent, line_ending, &indent_unit_in(&lexed)));
+	let new = Inserted {
+		items: &item,
+		indent,
+		line_ending,
+		spacing,
+	};
 
 	let (range, replacement) = match placement {
-		Placement::Before(sibling) => insert_before(&lexed, clamp(text, sibling), &item, indent, line_ending),
-		Placement::After(sibling) => insert_after(&lexed, clamp(text, sibling), &item, indent, line_ending),
+		Placement::Before(sibling) => insert_before(&lexed, clamp(text, sibling), new),
+		Placement::After(sibling) => insert_after(&lexed, clamp(text, sibling), new),
 		Placement::End(body) => insert_at_end(&lexed, clamp(text, body), &item, line_ending),
 	};
 
@@ -598,6 +659,25 @@ fn is_closing_delimiter(c: char) -> bool {
 
 fn is_opening_delimiter(c: char) -> bool {
 	matches!(c, '{' | '(' | '[')
+}
+
+/// How each item (ranges in `text`) sits among the lines of the text.
+pub(crate) fn layouts(text: &str, items: &[TextRange]) -> Vec<Layout> {
+	let lexed = Lexed::new(text);
+
+	(items.iter())
+		.map(|&item| {
+			let item = clamp(text, item);
+			let leading = leading(&lexed, item.start);
+			let trailing = trailing(&lexed, item.end);
+
+			Layout {
+				alone: leading.starts_line && trailing.ends_line,
+				comments_above: leading.starts_line && !text[leading.block_start..item.start].trim().is_empty(),
+				blank_below: trailing.ends_line && trailing.has_blank_below(),
+			}
+		})
+		.collect()
 }
 
 fn leading(lexed: &Lexed<'_>, offset: usize) -> Leading {
@@ -1114,6 +1194,12 @@ fn trailing(lexed: &Lexed<'_>, offset: usize) -> Trailing {
 mod tests {
 	use super::*;
 
+	/// Blank lines next to new items, on both sides.
+	const LOOSE: Spacing = Spacing {
+		compact_above: false,
+		compact_below: false,
+	};
+
 	/// Source files of this crate, which have doc comments, attributes, strings with comment-like contents, and
 	/// raw strings.
 	const REAL_FILES: &[(&str, &str)] = &[
@@ -1274,6 +1360,7 @@ mod tests {
 			Placement::After(find(text, "fn a() {}")),
 			"fn x() {\n    if y {\n        z();\n    }\n}",
 			"\t",
+			LOOSE,
 		);
 
 		assert_eq!(
@@ -1297,7 +1384,7 @@ mod tests {
 		];
 
 		for (placement, indent, source) in placements {
-			let inserted = apply(text, &insertion(text, placement, source, indent));
+			let inserted = apply(text, &insertion(text, placement, source, indent, LOOSE));
 
 			assert_parses(&inserted);
 			assert!(inserted.contains(source), "{inserted}");
@@ -1307,31 +1394,31 @@ mod tests {
 	#[test]
 	fn inserts_after_items() {
 		let text = "fn a() {} // a\nfn b() {}\n";
-		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {}", "");
+		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {}", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "fn a() {} // a\n\nfn x() {}\n\nfn b() {}\n");
 
 		let text = "fn a() {}\n\nfn b() {}\n";
-		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {}\n", "");
+		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {}\n", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "fn a() {}\n\nfn x() {}\n\nfn b() {}\n");
 
-		let edit = insertion(text, Placement::After(find(text, "fn b() {}")), "fn x() {}", "");
+		let edit = insertion(text, Placement::After(find(text, "fn b() {}")), "fn x() {}", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "fn a() {}\n\nfn b() {}\n\nfn x() {}\n");
 
 		let text = "impl X {\n    fn a() {}\n}\n";
-		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {\n    y();\n}", "    ");
+		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {\n    y();\n}", "    ", LOOSE);
 
 		assert_eq!(apply(text, &edit), "impl X {\n    fn a() {}\n\n    fn x() {\n        y();\n    }\n}\n");
 
 		let text = "fn a() {}";
-		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {}", "");
+		let edit = insertion(text, Placement::After(find(text, "fn a() {}")), "fn x() {}", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "fn a() {}\n\nfn x() {}");
 
 		let text = "struct A; struct B;\n";
-		let edit = insertion(text, Placement::After(find(text, "struct A;")), "struct X;", "");
+		let edit = insertion(text, Placement::After(find(text, "struct A;")), "struct X;", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "struct A;\n\nstruct X;\n\nstruct B;\n");
 	}
@@ -1345,22 +1432,22 @@ mod tests {
 		};
 
 		let text = "mod m {}\n";
-		let edit = insertion(text, Placement::End(body(text, "mod m {")), "fn x() {}", "    ");
+		let edit = insertion(text, Placement::End(body(text, "mod m {")), "fn x() {}", "    ", LOOSE);
 
 		assert_eq!(apply(text, &edit), "mod m {\n    fn x() {}\n}\n");
 
 		let text = "    impl X { }\n";
-		let edit = insertion(text, Placement::End(body(text, "impl X {")), "fn x() {\n    y();\n}", "        ");
+		let edit = insertion(text, Placement::End(body(text, "impl X {")), "fn x() {\n    y();\n}", "        ", LOOSE);
 
 		assert_eq!(apply(text, &edit), "    impl X {\n        fn x() {\n            y();\n        }\n    }\n");
 
 		let text = "mod m {\n    #![allow(x)]\n    // dangling\n}\n";
-		let edit = insertion(text, Placement::End(body(text, "mod m {")), "fn x() {}", "    ");
+		let edit = insertion(text, Placement::End(body(text, "mod m {")), "fn x() {}", "    ", LOOSE);
 
 		assert_eq!(apply(text, &edit), "mod m {\n    #![allow(x)]\n    // dangling\n\n    fn x() {}\n}\n");
 
 		let text = "mod m { #![allow(x)] }";
-		let edit = insertion(text, Placement::End(body(text, "mod m {")), "fn x() {}", "    ");
+		let edit = insertion(text, Placement::End(body(text, "mod m {")), "fn x() {}", "    ", LOOSE);
 
 		assert_eq!(apply(text, &edit), "mod m { #![allow(x)]\n\n    fn x() {}\n}");
 
@@ -1375,7 +1462,7 @@ mod tests {
 			("fn a() {}\n\n\n", "fn a() {}\n\nfn x() {}\n\n\n"),
 			("#!/bin/x\r\n", "#!/bin/x\r\n\r\nfn x() {}\r\n"),
 		] {
-			let edit = insertion(text, Placement::End(whole(text)), "fn x() {}", "");
+			let edit = insertion(text, Placement::End(whole(text)), "fn x() {}", "", LOOSE);
 
 			assert_eq!(apply(text, &edit), expected, "{text:?}");
 		}
@@ -1384,34 +1471,98 @@ mod tests {
 	#[test]
 	fn inserts_before_items() {
 		let text = "fn a() {}\n// about b\nfn b() {}\n";
-		let edit = insertion(text, Placement::Before(find(text, "fn b() {}")), "fn x() {}", "");
+		let edit = insertion(text, Placement::Before(find(text, "fn b() {}")), "fn x() {}", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "fn a() {}\n\nfn x() {}\n\n// about b\nfn b() {}\n");
 
 		let text = "fn a() {}\n\nfn b() {}\n";
-		let edit = insertion(text, Placement::Before(find(text, "fn b() {}")), "fn x() {}", "");
+		let edit = insertion(text, Placement::Before(find(text, "fn b() {}")), "fn x() {}", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "fn a() {}\n\nfn x() {}\n\nfn b() {}\n");
 
 		let text = "mod m {\n    fn a() {}\n}\n";
-		let edit = insertion(text, Placement::Before(find(text, "fn a() {}")), "fn x() {}", "    ");
+		let edit = insertion(text, Placement::Before(find(text, "fn a() {}")), "fn x() {}", "    ", LOOSE);
 
 		assert_eq!(apply(text, &edit), "mod m {\n    fn x() {}\n\n    fn a() {}\n}\n");
 
 		let text = "//! docs\n\n// license\n\nuse a;\n";
-		let edit = insertion(text, Placement::Before(find(text, "use a;")), "use b;", "");
+		let edit = insertion(text, Placement::Before(find(text, "use a;")), "use b;", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "//! docs\n\n// license\n\nuse b;\n\nuse a;\n");
 
 		let text = "#![allow(x)]\nuse a;\n";
-		let edit = insertion(text, Placement::Before(find(text, "use a;")), "use b;", "");
+		let edit = insertion(text, Placement::Before(find(text, "use a;")), "use b;", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "#![allow(x)]\n\nuse b;\n\nuse a;\n");
 
 		let text = "struct A; struct B;\n";
-		let edit = insertion(text, Placement::Before(find(text, "struct B;")), "struct X;", "");
+		let edit = insertion(text, Placement::Before(find(text, "struct B;")), "struct X;", "", LOOSE);
 
 		assert_eq!(apply(text, &edit), "struct A;\n\nstruct X;\n\nstruct B;\n");
+	}
+
+	#[test]
+	fn inserts_without_blank_lines() {
+		let compact = |above: bool, below: bool| Spacing {
+			compact_above: above,
+			compact_below: below,
+		};
+		let insert = |text: &str, placement: Placement, source: &str, indent: &str, spacing: Spacing| {
+			apply(text, &insertion(text, placement, source, indent, spacing))
+		};
+		let both = compact(true, true);
+		let after = |text: &str, sibling: &str, new: &str| insert(text, Placement::After(find(text, sibling)), new, "", both);
+		let before = |text: &str, sibling: &str, new: &str| insert(text, Placement::Before(find(text, sibling)), new, "", both);
+
+		let text = "mod a;\nmod c;\n";
+
+		assert_eq!(after(text, "mod a;", "mod b;"), "mod a;\nmod b;\nmod c;\n");
+		assert_eq!(before(text, "mod c;", "mod b;"), "mod a;\nmod b;\nmod c;\n");
+		assert_eq!(after(text, "mod c;", "mod d;"), "mod a;\nmod c;\nmod d;\n");
+		assert_eq!(before(text, "mod a;", "mod b;"), "mod b;\nmod a;\nmod c;\n");
+
+		// a blank line on the other side is added, or kept
+		let above = compact(true, false);
+
+		for text in ["mod a;\nfn f() {}\n", "mod a;\n\nfn f() {}\n"] {
+			let inserted = insert(text, Placement::After(find(text, "mod a;")), "mod b;", "", above);
+
+			assert_eq!(inserted, "mod a;\nmod b;\n\nfn f() {}\n", "{text:?}");
+		}
+
+		let text = "/// docs\nmod a;\n\nmod c;\n";
+		let inserted = insert(text, Placement::Before(find(text, "mod c;")), "mod b;", "", compact(false, true));
+
+		assert_eq!(inserted, "/// docs\nmod a;\n\nmod b;\nmod c;\n");
+
+		// blank lines that are there stay
+		let text = "use a;\n\nuse c;\n";
+
+		assert_eq!(after(text, "use a;", "use b;"), "use a;\nuse b;\n\nuse c;\n");
+		assert_eq!(before(text, "use c;", "use b;"), "use a;\n\nuse b;\nuse c;\n");
+
+		// indented, with the line breaks of the text, and at the start of a body
+		let text = "mod m {\r\n\tuse a;\r\n\tuse c;\r\n}\r\n";
+		let inserted = insert(text, Placement::After(find(text, "use a;")), "use b;", "\t", both);
+
+		assert_eq!(inserted, "mod m {\r\n\tuse a;\r\n\tuse b;\r\n\tuse c;\r\n}\r\n");
+
+		let text = "mod m {\n    use b;\n}\n";
+		let inserted = insert(text, Placement::Before(find(text, "use b;")), "use a;", "    ", both);
+
+		assert_eq!(inserted, "mod m {\n    use a;\n    use b;\n}\n");
+
+		// siblings sharing a line get lines of their own
+		let text = "use a; use c;\n";
+
+		assert_eq!(after(text, "use a;", "use b;"), "use a;\nuse b;\nuse c;\n");
+		assert_eq!(before(text, "use c;", "use b;"), "use a;\nuse b;\nuse c;\n");
+
+		// (`End` is for bodies without items: what is there ends with a blank line)
+		let text = "//! docs\n";
+		let inserted = insert(text, Placement::End(TextRange::new(0, text.len())), "use a;", "", both);
+
+		assert_eq!(inserted, "//! docs\n\nuse a;\n");
 	}
 
 	#[test]
@@ -1447,6 +1598,28 @@ mod tests {
 		// the comment above belongs to the whole line
 		assert_eq!(remove("// c\nstruct A; struct B;\n", "struct A;"), "// c\nstruct B;\n");
 		assert_eq!(remove("mod m { fn a() {} }\n", "fn a() {}"), "mod m { }\n");
+	}
+
+	#[test]
+	fn lays_out_items_among_lines() {
+		let text = "mod a;\n// about b\nmod b; // b\n\n\nmod c; mod d;\n";
+		let layout = |alone, comments_above, blank_below| Layout {
+			alone,
+			comments_above,
+			blank_below,
+		};
+		let items = ["mod a;", "mod b;", "mod c;", "mod d;"].map(|item| find(text, item));
+
+		assert_eq!(
+			layouts(text, &items),
+			[
+				layout(true, false, false),
+				layout(true, true, true),
+				layout(false, false, false),
+				layout(false, false, false)
+			]
+		);
+		assert_eq!(layouts("/* x */ mod a;", &[find("/* x */ mod a;", "mod a;")]), [layout(true, true, false)]);
 	}
 
 	#[test]
@@ -1586,7 +1759,7 @@ mod tests {
 			let _ = (body_indent(&text, range), reindent(&text, "\t", &text));
 
 			for placement in [Placement::Before(range), Placement::After(range), Placement::End(range)] {
-				let edit = insertion(&text, placement, &text, "  ");
+				let edit = insertion(&text, placement, &text, "  ", LOOSE);
 
 				in_text(&text, edit.range);
 			}
@@ -1723,7 +1896,7 @@ mod tests {
 				assert!(syn::parse_file(&removed).is_ok(), "{name}: removing {shown:?} breaks the file");
 
 				for placement in [Placement::Before(item), Placement::After(item)] {
-					let edit = insertion(text, placement, "fn inserted() {}", line_indent(text, item.start));
+					let edit = insertion(text, placement, "fn inserted() {}", line_indent(text, item.start), LOOSE);
 
 					assert!(syn::parse_file(&apply(text, &edit)).is_ok(), "{name}: inserting at {placement:?}");
 				}

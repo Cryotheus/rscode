@@ -13,6 +13,8 @@
 //! | `replace_item` | replaces the source of an item |
 //! | `edit_item` | replaces exact text inside an item, and sets its visibility, doc comment, or attributes |
 //! | `insert_items` | inserts items into a module, `impl` block, or trait |
+//! | `create_module` | creates a module's file and declares it in its parent |
+//! | `add_import` | imports into a module: new `use` items in sorted position, or merged into its `use` items |
 //! | `format_items` | sorts and formats items with rustfmt or prettyplease |
 //! | `attach_source` | attaches another workspace or package under a name (with [`ServerOptions::exposed`]) |
 //! | `detach_source` | forgets an attached source |

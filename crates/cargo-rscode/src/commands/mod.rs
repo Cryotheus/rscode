@@ -1,9 +1,11 @@
 //! The subcommands.
 
+mod create_module;
 mod edit;
 mod find;
 mod fmt;
 mod format_edited;
+mod import;
 mod insert;
 mod remove;
 mod rename;
@@ -176,6 +178,8 @@ pub(crate) fn run(name: &str, matches: &ArgMatches, ui: &Ui) -> anyhow::Result<E
 		"replace" => replace::run(matches, ui),
 		"edit" => edit::run(matches, ui),
 		"insert" => insert::run(matches, ui),
+		"create-module" => create_module::run(matches, ui),
+		"import" => import::run(matches, ui),
 
 		#[cfg(feature = "mcp")]
 		"mcp" => mcp::run(matches),

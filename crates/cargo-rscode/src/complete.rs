@@ -510,6 +510,18 @@ fn matches_prefix(name: &str, partial: &str) -> bool {
 	name.starts_with(partial) || unraw(name).starts_with(partial)
 }
 
+/// Module paths (`create-module PARENT`).
+pub(crate) fn module_paths(current: &OsStr) -> Vec<CompletionCandidate> {
+	let (words, index) = completion_words();
+
+	// clap also asks for positional values after an option with an optional value, though the word is its value
+	if follows_option_with_optional_value(&words, index) {
+		return Vec::new();
+	}
+
+	workspace_paths(current, Filter::Modules)
+}
+
 /// The nodes a typed path (without its leading `::`, `global`, and its partial segment) names: the crate roots of
 /// `crate` or of a crate name, then the children named by each segment.
 fn nodes_named<T: PathTree>(tree: &T, crates: &[(String, T::Node)], path: &str, global: bool) -> Vec<T::Node> {
@@ -779,6 +791,8 @@ mod tests {
 	fn completes_subcommands_and_values() {
 		assert_eq!(engine(&["cargo-rscode", "f"]), ["find", "fmt"]);
 		assert_eq!(engine(&["cargo-rscode", "re"]), ["rename", "remove", "replace"]);
+		assert_eq!(engine(&["cargo-rscode", "cr"]), ["create-module"]);
+		assert_eq!(engine(&["cargo-rscode", "i"]), ["insert", "import"]);
 		assert_eq!(engine(&["cargo-rscode", "find", "x", "--kind", "stru"]), ["struct"]);
 		assert_eq!(
 			engine(&["cargo-rscode", "find", "x", "-k", "fn,assoc-"]),

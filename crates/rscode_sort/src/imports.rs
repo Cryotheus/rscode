@@ -296,6 +296,27 @@ fn unraw(name: &str) -> &str {
 	name.trim_start_matches("r#")
 }
 
+/// How rustfmt orders two trees of a `use` group (the elements of `{...}`, such as `fs` and `io::Write`) in
+/// `style_edition`, which it sorts (`reorder_imports`).
+///
+/// ```
+/// use rscode_sort::{StyleEdition, use_tree_cmp};
+/// use std::cmp::Ordering;
+///
+/// let tree = |text: &str| syn::parse_str::<syn::UseTree>(text).unwrap();
+///
+/// assert_eq!(use_tree_cmp(&tree("self"), &tree("fs"), StyleEdition::E2024), Ordering::Less);
+/// assert_eq!(use_tree_cmp(&tree("io::Write"), &tree("fs"), StyleEdition::E2024), Ordering::Greater);
+/// assert_eq!(use_tree_cmp(&tree("Zeta"), &tree("alpha"), StyleEdition::E2024), Ordering::Less);
+/// assert_eq!(use_tree_cmp(&tree("Zeta"), &tree("alpha"), StyleEdition::E2021), Ordering::Greater);
+/// ```
+pub fn use_tree_cmp(a: &syn::UseTree, b: &syn::UseTree, style_edition: StyleEdition) -> Ordering {
+	let version_sorting = style_edition >= StyleEdition::E2024;
+	let key = |tree| UseKey::nested(tree, version_sorting).normalize(false, false);
+
+	key(a).rustfmt_cmp(&key(b))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

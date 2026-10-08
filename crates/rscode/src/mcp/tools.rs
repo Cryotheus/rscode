@@ -3,6 +3,8 @@
 //! Each call loads the workspace from disk, so changes made by anything else are always seen. Failures become
 //! messages for the client (tool errors), with hints for the common mistakes.
 
+use super::params::AddImportParams;
+use super::params::CreateModuleParams;
 use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
@@ -32,6 +34,7 @@ use crate::edit::Applied;
 use crate::edit::EditSet;
 use crate::edit::FileChange;
 use crate::edit::FmtOptions;
+use crate::edit::ImportOptions;
 use crate::model::UnloadedMember;
 use crate::query::shown_item;
 use crate::rscode_fmt::FormatOptions;
@@ -77,6 +80,79 @@ impl UsableFrom {
 			Self::Viewpoint(viewpoint) => viewpoint,
 		}
 	}
+}
+
+/// `add_import`
+pub(crate) fn add_import(load: &LoadOptions, params: &AddImportParams, permit: &Permit<'_>) -> Output {
+	let imports: Vec<String> = (params.paths.iter())
+		.map(|import| import.trim())
+		.filter(|import| !import.is_empty())
+		.map(str::to_owned)
+		.collect();
+
+	if imports.is_empty() {
+		return Err("`paths` is empty: give the imports, such as `std::fs` or `crate::a::{B, C}`".to_owned());
+	}
+
+	let module = parse_path(&params.module)?;
+	let workspace = self::load(load)?;
+	let resolver = Resolver::new(&workspace);
+	let plan = edit::add_imports(&resolver, &module, &imports, &ImportOptions::default()).map_err(|error| {
+		let hint = match &error {
+			Error::Ambiguous { .. } if in_several_crates(&resolver, &module) => SELECT_ONE_CRATE,
+			Error::Collision { .. } => "import it under another name (`x::Y as Z`), or remove what has the name",
+			Error::InvalidSource(_) => "each of `paths` is a `use` tree: `std::fs`, `crate::a::{B, C}`, or `x::Y as Z`",
+			_ => return describe_in(&error, &resolver),
+		};
+
+		format!("{error}\nhint: {hint}")
+	})?;
+	let root = workspace.root();
+	let mut text = render::import_addition(root, &plan, params.dry_run);
+
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
+	Ok(text)
+}
+
+/// `create_module`
+pub(crate) fn create_module(load: &LoadOptions, params: &CreateModuleParams, permit: &Permit<'_>) -> Output {
+	let name = params.name.trim();
+
+	if name.is_empty() {
+		return Err("`name` is empty: give the name of the new module (an identifier)".to_owned());
+	}
+
+	let parent = parse_path(&params.parent)?;
+	let workspace = self::load(load)?;
+	let resolver = Resolver::new(&workspace);
+	let plan = edit::create_module(&resolver, &parent, name, &params.source, &params.options()).map_err(|error| {
+		let hint = match &error {
+			Error::Ambiguous { .. } if in_several_crates(&resolver, &parent) => SELECT_ONE_CRATE.to_owned(),
+			Error::InvalidIdent(_) => "`name` is the new module's identifier alone (e.g. `render`), not a path".to_owned(),
+			Error::Collision { .. } => "choose another `name`".to_owned(),
+
+			Error::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists => format!(
+				"declare the existing file with `insert_items` (`source` `mod {name};`), or choose another `name`"
+			),
+
+			Error::InvalidSource(message) if message.starts_with("the source") => {
+				"`source` is the whole file of the module: items, after `//!` docs and inner attributes if any".to_owned()
+			}
+
+			Error::InvalidSource(_) => {
+				"`vis` is `pub`, `pub(crate)`, `pub(super)`, or `pub(in path)`; leave it out for a private module".to_owned()
+			}
+
+			_ => return describe_in(&error, &resolver),
+		};
+
+		format!("{error}\nhint: {hint}")
+	})?;
+	let root = workspace.root();
+	let mut text = render::module_creation(root, &plan, &params.parent, params.dry_run);
+
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
+	Ok(text)
 }
 
 /// A message for the client, with a hint on how to go on after common mistakes.
@@ -188,12 +264,17 @@ pub(crate) fn edit_item(load: &LoadOptions, params: &EditItemParams, permit: &Pe
 	Ok(text)
 }
 
-/// Fails when a file no longer has the contents the edits were planned on.
-fn ensure_unchanged(root: &Path, changes: &[FileChange]) -> Result<(), String> {
-	for change in changes {
-		let current = std::fs::read_to_string(&change.path).ok();
+/// Fails when a file no longer has the contents the edits were planned on, or a file that `edits` creates exists.
+fn ensure_unchanged(root: &Path, changes: &[FileChange], edits: &EditSet) -> Result<(), String> {
+	let created: HashSet<&Path> = edits.created().collect();
 
-		if current.as_deref() != Some(change.original.as_str()) {
+	for change in changes {
+		let unchanged = match created.contains(change.path.as_path()) {
+			true => std::fs::symlink_metadata(&change.path).is_err(),
+			false => std::fs::read_to_string(&change.path).ok().as_deref() == Some(change.original.as_str()),
+		};
+
+		if !unchanged {
 			return Err(format!(
 				"{} changed on disk while the edit was being planned; nothing was written (try again)",
 				render::relative(root, &change.path).display()
@@ -262,7 +343,7 @@ fn finish(root: &Path, edits: &EditSet, dry_run: bool, permit: &Permit<'_>, text
 	match dry_run {
 		true => {
 			let changes = edits.preview().map_err(|error| describe(&error))?;
-			let diff = render::diff(root, &changes, edits.moves(), edits.deletions());
+			let diff = render::diff(root, &changes, edits);
 
 			text.push_str("nothing was written (dry run)\n");
 
@@ -297,7 +378,7 @@ pub(crate) fn format(load: &LoadOptions, params: &FormatParams, permit: &Permit<
 
 	if params.check {
 		let mut text = render::format_check(root, &formatting.changes, &formatting.warnings);
-		let diff = render::diff(root, &formatting.changes, &[], &[]);
+		let diff = render::diff(root, &formatting.changes, &formatting.edits);
 
 		if !diff.is_empty() {
 			text.push('\n');
@@ -705,7 +786,7 @@ pub(crate) fn workspace_info(load: &LoadOptions) -> Output {
 fn write(root: &Path, edits: &EditSet, permit: &Permit<'_>) -> Result<Applied, String> {
 	let changes = edits.preview().map_err(|error| describe(&error))?;
 
-	ensure_unchanged(root, &changes)?;
+	ensure_unchanged(root, &changes, edits)?;
 	permit.scope.check(root, edits)?;
 
 	if (permit.cancelled)() {
@@ -791,16 +872,31 @@ mod tests {
 			formatted: "fn b() {}\n".to_owned(),
 		};
 
-		assert_eq!(ensure_unchanged(&dir, &[change("fn a() {}\n")]), Ok(()));
+		let edits = EditSet::new();
+
+		assert_eq!(ensure_unchanged(&dir, &[change("fn a() {}\n")], &edits), Ok(()));
 		assert_eq!(
-			ensure_unchanged(&dir, &[change("fn z() {}\n")]),
+			ensure_unchanged(&dir, &[change("fn z() {}\n")], &edits),
 			Err("lib.rs changed on disk while the edit was being planned; nothing was written (try again)".to_owned())
 		);
+
+		// a file to create must not exist
+		let mut creating = EditSet::new();
+		let created = FileChange {
+			path: dir.join("new.rs"),
+			original: String::new(),
+			formatted: "fn n() {}\n".to_owned(),
+		};
+
+		creating.create_file(dir.join("new.rs"), "fn n() {}\n");
+		assert_eq!(ensure_unchanged(&dir, std::slice::from_ref(&created), &creating), Ok(()));
+		std::fs::write(dir.join("new.rs"), "").unwrap();
+		assert!(ensure_unchanged(&dir, &[created], &creating).is_err());
 
 		std::fs::remove_dir_all(&dir).unwrap();
 
 		// a deleted file changed too
-		assert!(ensure_unchanged(&dir, &[change("fn a() {}\n")]).is_err());
+		assert!(ensure_unchanged(&dir, &[change("fn a() {}\n")], &edits).is_err());
 	}
 
 	#[test]

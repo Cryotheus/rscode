@@ -5,8 +5,11 @@ use crate::render::PathDisplay;
 use crate::ui::Level;
 use rscode::ItemKind;
 use rscode::edit::Collision;
+use rscode::edit::ImportAddition;
+use rscode::edit::ImportOutcome;
 use rscode::edit::Insertion;
 use rscode::edit::ItemSpan;
+use rscode::edit::ModuleCreation;
 use rscode::edit::Removal;
 use rscode::edit::Rename;
 use rscode::edit::Replacement;
@@ -96,6 +99,99 @@ impl FormatReport {
 
 		self.files.iter().map(|file| format!("{verb} {file}\n")).collect()
 	}
+}
+
+/// `import`
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct ImportReport {
+	pub(crate) module: String,
+	pub(crate) imports: Vec<ImportRow>,
+	pub(crate) file: String,
+	pub(crate) warnings: Vec<String>,
+	pub(crate) dry_run: bool,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) diff: Option<String>,
+}
+
+impl ImportReport {
+	pub(crate) fn new(plan: &ImportAddition, module: &str, dry_run: bool, paths: &PathDisplay) -> Self {
+		Self {
+			module: module.to_owned(),
+			imports: (plan.imports.iter())
+				.map(|import| ImportRow {
+					path: import.path.clone(),
+					outcome: match &import.outcome {
+						ImportOutcome::Added => "added",
+						ImportOutcome::Merged(_) => "merged",
+						ImportOutcome::Present => "present",
+					},
+					item: match &import.outcome {
+						ImportOutcome::Merged(item) => Some(item.clone()),
+						_ => None,
+					},
+					line: import.line,
+				})
+				.collect(),
+			file: paths.display(&plan.file),
+			warnings: plan.warnings.clone(),
+			dry_run,
+			diff: None,
+		}
+	}
+}
+
+impl EditReport for ImportReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
+	fn dry_run(&self) -> bool {
+		self.dry_run
+	}
+
+	fn messages(&self) -> Vec<(Level, String)> {
+		self.warnings.iter().map(|warning| (Level::Warning, warning.clone())).collect()
+	}
+
+	fn summary(&self) -> String {
+		let mut out = String::new();
+
+		for import in &self.imports {
+			let (path, file, line) = (&import.path, &self.file, import.line);
+
+			out.push_str(&match (import.outcome, &import.item) {
+				("added", _) => format!("{} `{path}` ({file}:{line})\n", done(self.dry_run, "import", "imported")),
+
+				("merged", Some(item)) if !item.contains('\n') => {
+					format!("{} `{path}` into `{item}` ({file}:{line})\n", done(self.dry_run, "merge", "merged"))
+				}
+
+				("merged", _) => {
+					format!("{} `{path}` into the `use` item at {file}:{line}\n", done(self.dry_run, "merge", "merged"))
+				}
+
+				_ => format!("`{path}` is already imported ({file}:{line})\n"),
+			});
+		}
+
+		out
+	}
+}
+
+/// An import of an [`ImportReport`].
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ImportRow {
+	pub(crate) path: String,
+
+	/// `added`, `merged`, or `present`.
+	pub(crate) outcome: &'static str,
+
+	/// The new text of the `use` item it was merged into.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) item: Option<String>,
+
+	pub(crate) line: usize,
 }
 
 /// An inserted item.
@@ -270,6 +366,70 @@ impl Location {
 impl Display for Location {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		write!(f, "{}:{}:{}", self.file, self.line, self.column)
+	}
+}
+
+/// `create-module`
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct ModuleReport {
+	pub(crate) parent: String,
+
+	/// The new module's file.
+	pub(crate) created: String,
+
+	/// The module's declaration (`mod name;`).
+	pub(crate) declaration: String,
+
+	/// The file of the declaration, and its line there.
+	pub(crate) file: String,
+	pub(crate) line: usize,
+
+	pub(crate) warnings: Vec<String>,
+	pub(crate) dry_run: bool,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) diff: Option<String>,
+}
+
+impl ModuleReport {
+	pub(crate) fn new(plan: &ModuleCreation, parent: &str, dry_run: bool, paths: &PathDisplay) -> Self {
+		Self {
+			parent: parent.to_owned(),
+			created: paths.display(&plan.file),
+			declaration: plan.declaration.clone(),
+			file: paths.display(&plan.declared_in),
+			line: plan.line,
+			warnings: plan.warnings.clone(),
+			dry_run,
+			diff: None,
+		}
+	}
+}
+
+impl EditReport for ModuleReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
+	fn dry_run(&self) -> bool {
+		self.dry_run
+	}
+
+	fn messages(&self) -> Vec<(Level, String)> {
+		self.warnings.iter().map(|warning| (Level::Warning, warning.clone())).collect()
+	}
+
+	fn summary(&self) -> String {
+		format!(
+			"{} {}; {} `{}` into {} ({}:{})\n",
+			done(self.dry_run, "create", "created"),
+			self.created,
+			done(self.dry_run, "insert", "inserted"),
+			self.declaration,
+			self.parent,
+			self.file,
+			self.line
+		)
 	}
 }
 
@@ -575,6 +735,41 @@ mod tests {
 	}
 
 	#[test]
+	fn builds_import_reports() {
+		let import = |path: &str, outcome: ImportOutcome, line: usize| rscode::edit::AddedImport {
+			path: path.to_owned(),
+			outcome,
+			line,
+		};
+		let plan = ImportAddition {
+			edits: EditSet::new(),
+			imports: vec![
+				import("std::env", ImportOutcome::Added, 2),
+				import("std::fs", ImportOutcome::Merged("use std::{fs, io};".to_owned()), 1),
+				import("std::fmt", ImportOutcome::Present, 3),
+			],
+			file: PathBuf::from("/ws/src/lib.rs"),
+			warnings: Vec::new(),
+		};
+		let report = ImportReport::new(&plan, "crate", false, &paths());
+
+		assert_eq!(
+			report.summary(),
+			"imported `std::env` (src/lib.rs:2)\nmerged `std::fs` into `use std::{fs, io};` (src/lib.rs:1)\n\
+			 `std::fmt` is already imported (src/lib.rs:3)\n"
+		);
+		assert_eq!(
+			serde_json::to_value(&report).unwrap()["imports"],
+			serde_json::json!([
+				{"path": "std::env", "outcome": "added", "line": 2},
+				{"path": "std::fs", "outcome": "merged", "item": "use std::{fs, io};", "line": 1},
+				{"path": "std::fmt", "outcome": "present", "line": 3},
+			])
+		);
+		assert!(ImportReport::new(&plan, "crate", true, &paths()).summary().starts_with("would import `std::env`"));
+	}
+
+	#[test]
 	fn builds_insertion_reports() {
 		let plan = Insertion {
 			edits: EditSet::new(),
@@ -638,6 +833,40 @@ mod tests {
 		};
 
 		assert_eq!(ItemEditReport::new(&unchanged, true, &paths()).summary(), "nothing would change\n");
+	}
+
+	#[test]
+	fn builds_module_reports() {
+		let plan = ModuleCreation {
+			edits: EditSet::new(),
+			file: PathBuf::from("/ws/src/util/render.rs"),
+			declaration: "pub mod render;".to_owned(),
+			declared_in: PathBuf::from("/ws/src/util.rs"),
+			line: 3,
+			warnings: Vec::new(),
+		};
+		let report = ModuleReport::new(&plan, "crate::util", false, &paths());
+
+		assert_eq!(
+			report.summary(),
+			"created src/util/render.rs; inserted `pub mod render;` into crate::util (src/util.rs:3)\n"
+		);
+		assert_eq!(
+			serde_json::to_value(&report).unwrap(),
+			serde_json::json!({
+				"parent": "crate::util",
+				"created": "src/util/render.rs",
+				"declaration": "pub mod render;",
+				"file": "src/util.rs",
+				"line": 3,
+				"warnings": [],
+				"dry_run": false,
+			})
+		);
+		assert_eq!(
+			ModuleReport::new(&plan, "crate::util", true, &paths()).summary(),
+			"would create src/util/render.rs; would insert `pub mod render;` into crate::util (src/util.rs:3)\n"
+		);
 	}
 
 	#[test]

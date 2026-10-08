@@ -615,6 +615,27 @@ mod tests {
 		}
 	}
 
+	/// Files that an edit creates (and their new directories) must be in a directory exposed for writing too.
+	#[test]
+	fn created_files_must_be_writable() {
+		let tree = Tree::new("created", &["project/src", "refs/log/src"]);
+		let exposed = [tree.exposure(Access::Write, "project"), tree.exposure(Access::Read, "refs/*")];
+		let scope = WriteScope::Exposed {
+			source: "project".to_owned(),
+			exposed: exposed.into(),
+		};
+		let mut edits = EditSet::new();
+
+		edits.create_file(tree.path("project/src/new/deep.rs"), "");
+		assert_eq!(scope.check(&tree.path("project"), &edits), Ok(()));
+
+		edits.create_file(tree.path("refs/log/src/new.rs"), "");
+
+		let error = scope.check(&tree.path("project"), &edits).unwrap_err();
+
+		assert!(error.contains("new.rs, which is not in a directory exposed for writing"), "{error}");
+	}
+
 	/// Moving or deleting a link affects the link, wherever it leads.
 	#[cfg(unix)]
 	#[test]

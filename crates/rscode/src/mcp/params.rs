@@ -5,6 +5,7 @@
 //! of strings is expected.
 
 use crate::ItemKind;
+use crate::edit::CreateModuleOptions;
 use crate::edit::EditItemOptions;
 use crate::edit::FmtOptions;
 use crate::edit::InsertOptions;
@@ -31,6 +32,26 @@ use serde::de::Visitor;
 /// Default of `find_items`' `limit`.
 pub(crate) const DEFAULT_FIND_LIMIT: usize = 100;
 
+/// Parameters of `add_import`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct AddImportParams {
+	/// The module to import into (`crate` for the crate root, `crate::a::b`).
+	pub(crate) module: String,
+
+	/// The imports: `use` trees like `std::fs`, `crate::a::{B, C}`, `x::Y as Z`, `m::*`, or `pub use a::B`; a bare
+	/// name (`Circle`) imports the workspace's item of that name.
+	#[serde(alias = "path", alias = "imports", deserialize_with = "string_list")]
+	pub(crate) paths: Vec<String>,
+
+	/// Write nothing: return the summary and a unified diff of the changes.
+	#[serde(default, alias = "dryRun", alias = "dry-run", alias = "check")]
+	pub(crate) dry_run: bool,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
+}
+
 /// Parameters of `attach_source`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -50,6 +71,40 @@ pub(crate) struct AttachParams {
 	/// but a writable source attached under the name stays writable.
 	#[serde(default)]
 	pub(crate) write: bool,
+}
+
+/// Parameters of `create_module`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct CreateModuleParams {
+	/// The module to create the new module in (`crate` for the crate root, `crate::a::b`).
+	pub(crate) parent: String,
+
+	/// The name of the new module (an identifier).
+	pub(crate) name: String,
+
+	/// The contents of the new module's file; may be empty, and may start with `//!` docs and inner attributes.
+	#[serde(default)]
+	pub(crate) source: String,
+
+	/// The visibility of the new module (`pub`, `pub(crate)`, ...); private when empty.
+	#[serde(default)]
+	pub(crate) vis: String,
+
+	/// Write nothing: return the summary and a unified diff of the changes.
+	#[serde(default, alias = "dryRun", alias = "dry-run", alias = "check")]
+	pub(crate) dry_run: bool,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
+}
+
+impl CreateModuleParams {
+	pub(crate) fn options(&self) -> CreateModuleOptions {
+		CreateModuleOptions {
+			vis: self.vis.trim().to_owned(),
+		}
+	}
 }
 
 /// Parameters of `detach_source`.

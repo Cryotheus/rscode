@@ -1,7 +1,9 @@
 //! The server: tool definitions (their descriptions are what a model reads) and the protocol handler.
 
 use super::ServerOptions;
+use super::params::AddImportParams;
 use super::params::AttachParams;
+use super::params::CreateModuleParams;
 use super::params::DetachParams;
 use super::params::EditItemParams;
 use super::params::FindParams;
@@ -86,9 +88,10 @@ find_items takes glob patterns: `*` matches within one path segment (`parse_*`, 
 segments (`crate::config::**`, `**::tests::*`). A pattern that does not start with `crate::` or `::` matches anywhere: \
 `Config::load` finds `my_crate::config::Config::load`.
 
-Edits (rename_item, remove_items, replace_item, edit_item, insert_items, format_items) are all-or-nothing: every \
-changed file must still parse, or nothing is written. Set `dry_run` (`check` for format_items) to get a unified diff without \
-writing anything. Comments and formatting outside of the edited items are preserved.
+Edits (rename_item, remove_items, replace_item, edit_item, insert_items, create_module, add_import, format_items) \
+are all-or-nothing: every changed file must still parse, or nothing is written. Set `dry_run` (`check` for \
+format_items) to get a unified diff without writing anything. Comments and formatting outside of the edited items \
+are preserved.
 
 The workspace is loaded from disk again for every call, so changes made by other tools are always seen. Lines and \
 columns are 1-based. Typically: workspace_info to see the crates, find_items to locate items, view_items to read \
@@ -121,6 +124,44 @@ pub(crate) struct Server {
 
 #[tool_router(router = edit_tools)]
 impl Server {
+	/// Import into a module: each leaf of the `use` trees in `paths` gets a `use` item where `cargo rscode sort`
+	/// would put it, or joins a `use` item of the module when the module groups its imports. What the module imports
+	/// already is left alone. Set `dry_run` to review the diff first.
+	#[tool(annotations(
+		title = "Add imports",
+		read_only_hint = false,
+		destructive_hint = false,
+		idempotent_hint = true,
+		open_world_hint = false
+	))]
+	async fn add_import(&self, Parameters(params): Parameters<AddImportParams>, context: RequestContext<RoleServer>) -> CallToolResult {
+		let target = self.target(&params.selection, false);
+		let dry_run = params.dry_run;
+
+		self.edit("add_import", context, target, dry_run, move |load, permit| tools::add_import(load, &params, permit))
+			.await
+	}
+
+	/// Create a module: write its file with `source` (may be empty) where rustc looks for it, and declare it in
+	/// `parent` (`mod name;`, with `vis`) where `cargo rscode sort` would put it. Set `dry_run` to review the diff
+	/// first.
+	#[tool(annotations(
+		title = "Create a module",
+		read_only_hint = false,
+		destructive_hint = false,
+		idempotent_hint = false,
+		open_world_hint = false
+	))]
+	async fn create_module(&self, Parameters(params): Parameters<CreateModuleParams>, context: RequestContext<RoleServer>) -> CallToolResult {
+		let target = self.target(&params.selection, false);
+		let dry_run = params.dry_run;
+
+		self.edit("create_module", context, target, dry_run, move |load, permit| {
+			tools::create_module(load, &params, permit)
+		})
+		.await
+	}
+
 	/// Edit one item in place, sending only the change: replace exact text inside it (`old` must occur once in the
 	/// item; copy it from view_items), and/or set its visibility, doc comment, or attributes. Cheaper than replace_item
 	/// for small changes.
@@ -158,8 +199,9 @@ impl Server {
 	/// Insert new items into a module (`crate` for the crate root; set `lib` or `bin` to pick the library or a binary
 	/// of a package that has both), an impl block (`impl Trait for Type`, `impl Type`), or a trait: at its end, at its
 	/// start, or before or after a sibling item (`anchor`; then `parent` may be left out). The items are indented to fit
-	/// and separated by blank lines. Refuses names that are already taken unless `force`. Set `dry_run` to review the
-	/// diff first.
+	/// and separated by blank lines, except that one-line `use` items, `mod x;` declarations, and the like join one-line
+	/// siblings of their kind. Refuses names that are already taken unless `force`. Set `dry_run` to review the diff
+	/// first.
 	#[tool(annotations(title = "Insert items", read_only_hint = false, destructive_hint = false, open_world_hint = false))]
 	async fn insert_items(&self, Parameters(params): Parameters<InsertParams>, context: RequestContext<RoleServer>) -> CallToolResult {
 		let target = self.target(&params.selection, false);

@@ -9,6 +9,7 @@
 
 use crate::StyleEdition;
 use crate::imports::UseKey;
+use crate::tokens::tie_text;
 use crate::version_cmp;
 use proc_macro2::TokenTree;
 use quote::ToTokens;
@@ -118,6 +119,135 @@ impl ImplKey {
 	}
 }
 
+/// Where [`insertion_point`] puts a new item: next to an item of the container (by its index).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum InsertionPoint {
+	/// Before the item at this index (above the comments attached to it).
+	Before(usize),
+
+	/// After the item at this index (below the comment trailing it on its last line).
+	After(usize),
+}
+
+/// Where an item goes in the Cryotheum order of its container's items: the group it belongs to, and how it compares
+/// with the other items of its group.
+///
+/// Placing a new item at the [`insertion_point`] of its order puts it where sorting would, so that sorting a sorted
+/// container after the insertion leaves its items where they are.
+///
+/// ```
+/// use rscode_sort::{InsertionPoint, ItemOrder, StyleEdition, insertion_point};
+///
+/// let file = syn::parse_file("mod alfa;\nmod charlie;\n\nuse bravo::Delta;\n").unwrap();
+/// let items: Vec<ItemOrder> = file.items.iter().map(|item| ItemOrder::of_item(item, StyleEdition::E2024)).collect();
+/// let new = ItemOrder::of_item(&syn::parse_str("mod bravo;").unwrap(), StyleEdition::E2024);
+///
+/// assert_eq!(insertion_point(&items, &new), Some(InsertionPoint::Before(1)));
+/// assert!(new.same_group(&items[0]) && new.is_compact());
+/// ```
+#[derive(Debug, Clone)]
+pub struct ItemOrder {
+	group: OrderGroup,
+	key: Key,
+
+	/// The text that breaks ties between equal keys (see [`tie_text`]).
+	tie: String,
+}
+
+impl ItemOrder {
+	/// The order of an item of an `impl` block.
+	pub fn of_impl_item(item: &syn::ImplItem) -> Self {
+		let (group, key) = classify_impl_item(item);
+
+		Self {
+			group: OrderGroup::Associated(group),
+			key,
+			tie: item.to_token_stream().to_string(),
+		}
+	}
+
+	/// The order of an item of a module (a file root or an inline module), with `use` items ordered like rustfmt
+	/// orders them in `style_edition`.
+	pub fn of_item(item: &syn::Item, style_edition: StyleEdition) -> Self {
+		let (group, key) = match classify_item(item, style_edition) {
+			Some((group, key)) => (OrderGroup::Item(group), key),
+			None => (OrderGroup::Impl, Key::Stable),
+		};
+
+		Self {
+			group,
+			key,
+			tie: tie_text(item),
+		}
+	}
+
+	/// The order of an item of a `trait` definition.
+	pub fn of_trait_item(item: &syn::TraitItem) -> Self {
+		let (group, key) = classify_trait_item(item);
+
+		Self {
+			group: OrderGroup::Associated(group),
+			key,
+			tie: item.to_token_stream().to_string(),
+		}
+	}
+
+	/// How sorting orders two items of a container: by group, then within their group. `None` when that is not known
+	/// from the two items alone: for barriers, which never move, for an `impl` block and a data type or an item after
+	/// them (`impl` blocks follow the data type they are for, if their module defines it), and for items of different
+	/// kinds of containers.
+	pub fn compare(&self, other: &Self) -> Option<Ordering> {
+		if self.is_barrier() || other.is_barrier() {
+			return None;
+		}
+
+		let groups = match (self.group, other.group) {
+			(OrderGroup::Item(a), OrderGroup::Item(b)) => a.cmp(&b),
+			(OrderGroup::Associated(a), OrderGroup::Associated(b)) => a.cmp(&b),
+
+			// `impl` blocks go with the data types, or right after them
+			(OrderGroup::Impl, OrderGroup::Item(other)) => impl_cmp(other)?,
+			(OrderGroup::Item(other), OrderGroup::Impl) => impl_cmp(other)?.reverse(),
+
+			_ => return None,
+		};
+
+		let ordering = groups.then_with(|| self.key.compare(&other.key)).then_with(|| match self.key {
+			Key::Stable => Ordering::Equal,
+			_ => version_cmp(&self.tie, &other.tie),
+		});
+
+		Some(ordering)
+	}
+
+	/// Whether the item is a barrier: a macro definition or invocation, or an item with `#[macro_use]`. Barriers never
+	/// move, no item moves across them, and each is a group of its own.
+	pub fn is_barrier(&self) -> bool {
+		self.spacing() == Spacing::Barrier
+	}
+
+	/// Whether the items of the group follow each other directly when each fits on one line (and has no attributes, doc
+	/// comments, or comments above it): `use` items, `mod foo;` declarations, constants, and so on (see the
+	/// [crate documentation](crate#comments-and-layout)). Items of other groups are separated by a blank line.
+	pub fn is_compact(&self) -> bool {
+		self.spacing() == Spacing::Compact
+	}
+
+	/// Whether two items are in the same group, which sorting keeps together (and separates from other groups with a
+	/// blank line). A barrier is in no group.
+	pub fn same_group(&self, other: &Self) -> bool {
+		self.group == other.group && !self.is_barrier()
+	}
+
+	fn spacing(&self) -> Spacing {
+		match self.group {
+			OrderGroup::Item(group) => group.spacing(),
+			OrderGroup::Impl => Spacing::Loose,
+			OrderGroup::Associated(group) => group.spacing(),
+		}
+	}
+}
+
 /// How items compare within their group.
 #[derive(Debug, Clone)]
 enum Key {
@@ -195,6 +325,18 @@ impl PartialOrd for NameKey {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
+}
+
+/// The group of an [`ItemOrder`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum OrderGroup {
+	Item(OrderingSchemaItem),
+
+	/// An `impl` block of a module, which follows the data type it is for when the module defines it, and else goes
+	/// with the other `impl` blocks of types defined elsewhere.
+	Impl,
+
+	Associated(OrderingSchemaAssociated),
 }
 
 /// Items inside an `impl` block or `trait` definition
@@ -479,6 +621,17 @@ fn attachment(block: &syn::ItemImpl, types: &HashMap<String, usize>, traits: &Ha
 	traits.get(&local_ident(path)?.unraw().to_string()).copied()
 }
 
+/// The group and sort key of an item of an `impl` block.
+fn classify_impl_item(item: &syn::ImplItem) -> (OrderingSchemaAssociated, Key) {
+	match item {
+		syn::ImplItem::Type(item) => (OrderingSchemaAssociated::Type, Key::name(&item.ident)),
+		syn::ImplItem::Const(item) => (OrderingSchemaAssociated::Const, Key::name(&item.ident)),
+		syn::ImplItem::Fn(item) => (function_group(&item.sig), Key::name(&item.sig.ident)),
+		syn::ImplItem::Macro(_) => (OrderingSchemaAssociated::MacroInvocation, Key::Stable),
+		_ => (OrderingSchemaAssociated::Other, Key::Stable),
+	}
+}
+
 /// The group and sort key of a module item, or `None` for `impl` blocks, which need their container's data types.
 fn classify_item(item: &syn::Item, style_edition: StyleEdition) -> Option<(OrderingSchemaItem, Key)> {
 	use OrderingSchemaItem as Group;
@@ -518,6 +671,17 @@ fn classify_item(item: &syn::Item, style_edition: StyleEdition) -> Option<(Order
 	};
 
 	Some(classified)
+}
+
+/// The group and sort key of an item of a `trait` definition.
+fn classify_trait_item(item: &syn::TraitItem) -> (OrderingSchemaAssociated, Key) {
+	match item {
+		syn::TraitItem::Type(item) => (OrderingSchemaAssociated::Type, Key::name(&item.ident)),
+		syn::TraitItem::Const(item) => (OrderingSchemaAssociated::Const, Key::name(&item.ident)),
+		syn::TraitItem::Fn(item) => (function_group(&item.sig), Key::name(&item.sig.ident)),
+		syn::TraitItem::Macro(_) => (OrderingSchemaAssociated::MacroInvocation, Key::Stable),
+		_ => (OrderingSchemaAssociated::Other, Key::Stable),
+	}
 }
 
 /// Whether sibling `extern` blocks may merge into one: `None` for blocks that must never merge.
@@ -564,6 +728,71 @@ fn has_macro_use(attrs: &[syn::Attribute]) -> bool {
 				&& matches!(&attr.meta, syn::Meta::List(list) if list.tokens.clone().into_iter().any(
 					|token| matches!(token, TokenTree::Ident(ident) if ident == "macro_use")
 				)))
+	})
+}
+
+/// How an `impl` block of a module sorts relative to an item of the group `other`: after the groups before the data
+/// types, and before the groups after the loose `impl` blocks. `None` for data types and loose `impl` blocks, among
+/// which it goes depending on the data types its module defines.
+fn impl_cmp(other: OrderingSchemaItem) -> Option<Ordering> {
+	match other {
+		_ if other < OrderingSchemaItem::DataType => Some(Ordering::Greater),
+		_ if other > OrderingSchemaItem::LooseImpl => Some(Ordering::Less),
+		_ => None,
+	}
+}
+
+/// Where sorting would put a new item of the order `new` among `items`, the orders of the items of one container in
+/// source order: next to the items of its group, in order, or where its group goes. When the container is sorted,
+/// sorting it again after inserting the new item there leaves every item where it is. `None` when there are no
+/// items.
+///
+/// Barriers split the items into segments that are sorted on their own. The new item goes into the last segment with
+/// items of its group, or else into the last segment with items that go before it, or else before the first item of
+/// the last segment (so that it follows the macros defined before it); after the last barrier when there are only
+/// barriers.
+pub fn insertion_point(items: &[ItemOrder], new: &ItemOrder) -> Option<InsertionPoint> {
+	let last = items.len().checked_sub(1)?;
+	let mut segments: Vec<std::ops::Range<usize>> = Vec::new();
+	let mut start = 0;
+
+	for (index, item) in items.iter().enumerate() {
+		if item.is_barrier() {
+			segments.push(start..index);
+			start = index + 1;
+		}
+	}
+
+	segments.push(start..items.len());
+	segments.retain(|segment| !segment.is_empty());
+
+	let in_group = |index: &usize| items[*index].same_group(new);
+	let sorts_before = |index: &usize| items[*index].compare(new) == Some(Ordering::Less);
+	let sorts_after = |index: &usize| items[*index].compare(new) == Some(Ordering::Greater);
+
+	// next to the items of its group: before the first that sorts after it
+	if let Some(segment) = segments.iter().rev().find(|&segment| segment.clone().any(|index| in_group(&index))) {
+		let point = match segment.clone().filter(in_group).find(sorts_after) {
+			Some(index) => InsertionPoint::Before(index),
+			None => InsertionPoint::After(segment.clone().rfind(in_group).unwrap_or(segment.end - 1)),
+		};
+
+		return Some(point);
+	}
+
+	// where its group goes: after the items of the groups before it
+	if let Some(segment) = segments.iter().rev().find(|&segment| segment.clone().any(|index| sorts_before(&index))) {
+		let point = match segment.clone().find(sorts_after) {
+			Some(index) => InsertionPoint::Before(index),
+			None => InsertionPoint::After(segment.clone().rfind(sorts_before).unwrap_or(segment.end - 1)),
+		};
+
+		return Some(point);
+	}
+
+	Some(match segments.last() {
+		Some(segment) => InsertionPoint::Before(segment.start),
+		None => InsertionPoint::After(last),
 	})
 }
 
@@ -684,13 +913,7 @@ fn plan_groups<G: Copy + Ord>(classified: impl Iterator<Item = (G, Key)>, ties: 
 
 /// Orders the items of an `impl` block.
 pub(crate) fn plan_impl_items(items: &[&syn::ImplItem], ties: &[String]) -> Plan {
-	let classified = items.iter().map(|item| match item {
-		syn::ImplItem::Type(item) => (OrderingSchemaAssociated::Type, Key::name(&item.ident)),
-		syn::ImplItem::Const(item) => (OrderingSchemaAssociated::Const, Key::name(&item.ident)),
-		syn::ImplItem::Fn(item) => (function_group(&item.sig), Key::name(&item.sig.ident)),
-		syn::ImplItem::Macro(_) => (OrderingSchemaAssociated::MacroInvocation, Key::Stable),
-		_ => (OrderingSchemaAssociated::Other, Key::Stable),
-	});
+	let classified = items.iter().map(|item| classify_impl_item(item));
 
 	plan_groups(classified, ties, OrderingSchemaAssociated::spacing)
 }
@@ -786,13 +1009,7 @@ fn plan_module_segment(
 
 /// Orders the items of a `trait` definition.
 pub(crate) fn plan_trait_items(items: &[&syn::TraitItem], ties: &[String]) -> Plan {
-	let classified = items.iter().map(|item| match item {
-		syn::TraitItem::Type(item) => (OrderingSchemaAssociated::Type, Key::name(&item.ident)),
-		syn::TraitItem::Const(item) => (OrderingSchemaAssociated::Const, Key::name(&item.ident)),
-		syn::TraitItem::Fn(item) => (function_group(&item.sig), Key::name(&item.sig.ident)),
-		syn::TraitItem::Macro(_) => (OrderingSchemaAssociated::MacroInvocation, Key::Stable),
-		_ => (OrderingSchemaAssociated::Other, Key::Stable),
-	});
+	let classified = items.iter().map(|item| classify_trait_item(item));
 
 	plan_groups(classified, ties, OrderingSchemaAssociated::spacing)
 }
@@ -1083,6 +1300,141 @@ mod tests {
 			 trait Tr, impl Tr for u8 \
 			 | impl Other"
 		);
+	}
+
+	/// Inserting an item at its insertion point into sorted items keeps them sorted: sorting leaves every item where it
+	/// is.
+	#[test]
+	fn insertion_points_keep_sorted_items_sorted() {
+		const POOL: &[&str] = &[
+			"extern crate alloc;",
+			"extern crate core as kernel;",
+			"#[macro_use] mod macros;",
+			"macro_rules! m { () => {} }",
+			"mod alfa;",
+			"mod charlie;",
+			"pub mod echo;",
+			"#[cfg(unix)] mod unix;",
+			"#[cfg(test)] mod tests;",
+			"use std::fmt;",
+			"use std::io::Write;",
+			"use crate::alfa::Bravo;",
+			"use self::charlie::*;",
+			"m!();",
+			"use super::x as y;",
+			"use ::abs::Path;",
+			"use std::{fs, io};",
+			"pub use alfa::Echo;",
+			"pub(crate) use charlie::Delta;",
+			"type Alias = u8;",
+			"const C: u8 = 0;",
+			"const A: u8 = 0;",
+			"static S: u8 = 0;",
+			"static mut M: u8 = 0;",
+			"struct Delta;",
+			"impl Delta {}",
+			"impl Display for Delta {}",
+			"enum Bravo {}",
+			"impl Loose {}",
+			"trait Tr {}",
+			"fn main() {}",
+			"fn alfa() {}",
+			"mod inline {}",
+			"#[cfg(test)] mod tests {}",
+		];
+		const NEW: &[&str] = &[
+			"extern crate std;",
+			"mod bravo;",
+			"mod zulu;",
+			"mod a;",
+			"pub(crate) mod delta;",
+			"use std::env;",
+			"use crate::zulu::Z;",
+			"use a::b;",
+			"use zzz::Z;",
+			"pub use bravo::B;",
+			"type T = u8;",
+			"const B: u8 = 1;",
+			"static T: u8 = 1;",
+			"static mut N: u8 = 0;",
+			"fn bravo() {}",
+			"fn zulu() {}",
+			"mod inline_b {}",
+		];
+
+		// xorshift, for reproducible inputs without dependencies
+		let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+		let mut random = |bound: u64| {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			state % bound
+		};
+
+		for _ in 0..200 {
+			let chosen: Vec<&str> = POOL.iter().copied().filter(|_| random(3) == 0).collect();
+			let items = parse_items(&chosen.join("\n"));
+			let plan = plan_of(&items, false);
+			let sorted: Vec<syn::Item> = plan.entries().map(|entry| items[entry.index].clone()).collect();
+			let edition = StyleEdition::E2024;
+			let orders: Vec<ItemOrder> = sorted.iter().map(|item| ItemOrder::of_item(item, edition)).collect();
+
+			for new in NEW {
+				let item: syn::Item = syn::parse_str(new).unwrap();
+				let mut inserted = sorted.clone();
+
+				match insertion_point(&orders, &ItemOrder::of_item(&item, edition)) {
+					None => inserted.push(item),
+					Some(InsertionPoint::Before(index)) => inserted.insert(index, item),
+					Some(InsertionPoint::After(index)) => inserted.insert(index + 1, item),
+				}
+
+				let order: Vec<usize> = plan_of(&inserted, false).entries().map(|entry| entry.index).collect();
+				let shown: Vec<String> = inserted.iter().map(describe).collect();
+
+				assert_eq!(order, (0..inserted.len()).collect::<Vec<_>>(), "inserting `{new}`: {}", shown.join(", "));
+			}
+		}
+	}
+
+	#[test]
+	fn item_orders_tell_groups_and_spacing() {
+		let order = |source: &str| ItemOrder::of_item(&syn::parse_str(source).unwrap(), StyleEdition::E2024);
+		let (alfa, bravo, reexport) = (order("mod alfa;"), order("pub mod bravo;"), order("pub use x::Y;"));
+
+		assert!(alfa.same_group(&bravo) && alfa.is_compact());
+		assert_eq!(alfa.compare(&bravo), Some(Ordering::Less));
+		assert!(!alfa.same_group(&order("#[cfg(unix)] mod unix;")));
+		assert!(!reexport.same_group(&order("use x::Y;")) && reexport.is_compact());
+		assert_eq!(reexport.compare(&order("use z::Z;")), Some(Ordering::Greater));
+		assert!(!order("fn f() {}").is_compact());
+		assert!(!order("static mut M: u8 = 0;").same_group(&order("static S: u8 = 0;")));
+
+		// barriers are in no group, and `impl` blocks go among the data types
+		let barrier = order("m!();");
+
+		assert!(barrier.is_barrier() && !barrier.same_group(&barrier.clone()) && barrier.compare(&alfa).is_none());
+		assert_eq!(order("impl X {}").compare(&reexport), Some(Ordering::Greater));
+		assert_eq!(order("impl X {}").compare(&order("fn f() {}")), Some(Ordering::Less));
+		assert_eq!(order("impl X {}").compare(&order("struct X;")), None);
+
+		// associated items
+		let file = syn::parse_file("impl X { type A = u8; const B: u8 = 0; fn new() {} }").unwrap();
+		let syn::Item::Impl(block) = &file.items[0] else { panic!() };
+		let associated: Vec<ItemOrder> = block.items.iter().map(ItemOrder::of_impl_item).collect();
+
+		assert!(associated[0].is_compact() && associated[1].is_compact() && !associated[2].is_compact());
+		assert_eq!(associated[0].compare(&associated[1]), Some(Ordering::Less));
+		assert_eq!(associated[0].compare(&alfa), None);
+
+		let file = syn::parse_file("trait T { const A: u8; const B: u8; }").unwrap();
+		let syn::Item::Trait(block) = &file.items[0] else { panic!() };
+		let associated: Vec<ItemOrder> = block.items.iter().map(ItemOrder::of_trait_item).collect();
+
+		assert!(associated[0].same_group(&associated[1]));
+		assert_eq!(insertion_point(&associated[..1], &associated[1]), Some(InsertionPoint::After(0)));
+		assert_eq!(insertion_point(&[], &alfa), None);
+		assert_eq!(insertion_point(&[barrier], &alfa), Some(InsertionPoint::After(0)));
 	}
 
 	#[test]

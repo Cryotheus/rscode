@@ -1,4 +1,5 @@
-//! Planning and applying `remove`, `replace`, `edit_item`, `insert`, and `format` on crates on disk.
+//! Planning and applying `remove`, `replace`, `edit_item`, `insert`, `create_module`, `add_imports`, and `format` on
+//! crates on disk.
 //!
 //! Tests copy the `edit_ops` fixture (or write small crates) to a temporary directory, load the crates from there,
 //! and check the planned edits with [`EditSet::preview`], or apply them and check the files (and that the fixture
@@ -199,6 +200,19 @@ fn at(line: usize, column: usize) -> LineCol {
 /// `text` with `/` replaced by the platform's path separator, which the paths in messages have.
 fn native(text: &str) -> String {
 	text.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// Asserts that sorting the library crate in `dir` like `cargo rscode sort` does changes nothing.
+#[track_caller]
+fn assert_sorted(dir: &TempDir) {
+	let ws = load(dir);
+	let options = FmtOptions {
+		format: FormatOptions::new().formatter(RsFormatter::None).sort(Some(SortOptions::new())),
+		..FmtOptions::default()
+	};
+	let formatting = rscode::edit::format(&Resolver::new(&ws), &[pattern("crate")], &options).unwrap();
+
+	assert!(formatting.edits.is_empty(), "{:?}", changes(dir, &formatting.edits));
 }
 
 /// Proves that the edited crate in `dir` still compiles.
@@ -2143,6 +2157,110 @@ pub mod m {
 		assert!(matches!(insert(InsertPosition::End), Err(Error::Unsupported(_))));
 	}
 
+	/// A crate root laid out like `cargo rscode sort` lays it out, and a module whose `mod` declarations are separated
+	/// by blank lines.
+	const COMPACT: &[(&str, &str)] = &[
+		(
+			"src/lib.rs",
+			"\
+//! Docs.
+
+extern crate alloc;
+
+mod a;
+mod c;
+mod spaced;
+
+use std::fmt;
+use std::io;
+
+pub use a::A;
+
+const X: u8 = 1;
+
+/// Documented.
+const Y: u8 = 2;
+
+pub struct S;
+
+impl S {
+	const A: u8 = 1;
+
+	fn f() {}
+}
+
+mod tail {
+	use std::fmt;
+}
+",
+		),
+		("src/a.rs", "pub struct A;\n\npub struct B;\n"),
+		("src/c.rs", ""),
+		("src/spaced.rs", "mod a;\n\nmod c;\n"),
+		("src/spaced/a.rs", ""),
+		("src/spaced/c.rs", ""),
+	];
+
+	/// One-line items without attributes join one-line siblings of their group without blank lines, as sorting lays
+	/// them out, unless blank lines separate those siblings already. Other items get blank lines.
+	#[test]
+	fn joins_one_line_siblings_of_their_group() {
+		let dir = TempDir::with_files("insert-compact", COMPACT);
+		let ws = load(&dir);
+		let lib = COMPACT[0].1;
+		let inserted = |parent: &str, source: &str, position: InsertPosition, file: &str| {
+			let insertion = insert(&ws, parent, source, &at_position(position)).unwrap();
+
+			edited(&dir, &insertion.edits, file)
+		};
+		let after = |anchor: &str| InsertPosition::After(anchor.to_owned());
+		let before = |anchor: &str| InsertPosition::Before(anchor.to_owned());
+
+		let sorted_with = |old: &str, new: &str| {
+			let text = lib.replace(old, new);
+
+			// sorting changes nothing
+			assert_eq!(rscode::rscode_sort::sort_str(&text).unwrap(), text);
+			text
+		};
+
+		let cases = [
+			("crate", "mod b;", after("crate::a"), "mod a;\nmod c;", "mod a;\nmod b;\nmod c;"),
+			("crate", "mod b;", before("crate::c"), "mod a;\nmod c;", "mod a;\nmod b;\nmod c;"),
+			("crate", "mod t;\nmod u;", after("crate::spaced"), "mod spaced;\n", "mod spaced;\nmod t;\nmod u;\n"),
+			("crate", "use std::env;", before("use crate::fmt"), "\nuse std::fmt;", "\nuse std::env;\nuse std::fmt;"),
+			("crate", "pub use a::B;", after("use crate::A"), "pub use a::A;\n", "pub use a::A;\npub use a::B;\n"),
+			("crate", "const XX: u8 = 3;", after("crate::X"), "X: u8 = 1;\n", "X: u8 = 1;\nconst XX: u8 = 3;\n"),
+			("crate", "use std::io;", InsertPosition::End, "\tuse std::fmt;\n", "\tuse std::fmt;\n\tuse std::io;\n"),
+			("<crate::S>", "const B: u8 = 2;", after("A"), "= 1;\n\n\tfn f", "= 1;\n\tconst B: u8 = 2;\n\n\tfn f"),
+		];
+
+		for (parent, source, position, old, new) in cases {
+			let parent = if position == InsertPosition::End { "crate::tail" } else { parent };
+
+			let text = inserted(parent, source, position.clone(), "src/lib.rs");
+
+			assert_eq!(text, sorted_with(old, new), "{source} {position:?}");
+		}
+
+		// next to an item with docs, other kinds of items, items with docs, and items of several groups
+		let cases = [
+			("const Z: u8 = 3;", after("crate::Y"), "const Y: u8 = 2;\n", "const Y: u8 = 2;\n\nconst Z: u8 = 3;\n"),
+			("fn g() {}", after("crate::a"), "mod a;\n", "mod a;\n\nfn g() {}\n\n"),
+			("/// B.\nmod b;", after("crate::a"), "mod a;\n", "mod a;\n\n/// B.\nmod b;\n\n"),
+			("mod b;\nuse b::B;", after("crate::a"), "mod a;\n", "mod a;\n\nmod b;\nuse b::B;\n\n"),
+		];
+
+		for (source, position, old, new) in cases {
+			assert_eq!(inserted("crate", source, position, "src/lib.rs"), lib.replace(old, new), "{source}");
+		}
+
+		// siblings separated by blank lines keep them
+		let text = inserted("crate::spaced", "mod b;", after("crate::spaced::a"), "src/spaced.rs");
+
+		assert_eq!(text, "mod a;\n\nmod b;\n\nmod c;\n");
+	}
+
 	#[test]
 	fn applies_insertions_and_still_compiles() {
 		let dir = TempDir::fixture("insert-apply");
@@ -2554,6 +2672,511 @@ mod format {
 }
 
 /// Planning edits of every kind on this crate's own source (never applied): the plans preview as parsable files.
+mod create_module {
+	use super::*;
+	use rscode::edit::CreateModuleOptions;
+	use rscode::edit::ModuleCreation;
+
+	fn create(ws: &Workspace, parent: &str, name: &str, source: &str) -> Result<ModuleCreation, Error> {
+		create_with(ws, parent, name, source, "")
+	}
+
+	fn create_with(ws: &Workspace, parent: &str, name: &str, source: &str, vis: &str) -> Result<ModuleCreation, Error> {
+		let options = CreateModuleOptions { vis: vis.to_owned() };
+
+		rscode::edit::create_module(&Resolver::new(ws), &path(parent), name, source, &options)
+	}
+
+	/// A crate laid out like `cargo rscode sort` lays it out.
+	const SORTED: &[(&str, &str)] = &[
+		("src/lib.rs", "//! Docs.\n\nextern crate alloc;\n\nmod b;\nmod d;\n\nuse std::fmt;\n\npub fn f() {}\n"),
+		("src/b.rs", "use std::fmt;\n\npub fn g() {}\n"),
+		("src/d.rs", "//! Docs of d.\n"),
+	];
+
+	/// The new module goes where sorting puts it, on a line next to the other `mod` declarations, and sorting the
+	/// parent afterwards changes nothing.
+	#[test]
+	fn declares_new_modules_where_sorting_puts_them() {
+		let dir = TempDir::with_files("create-sorted", SORTED);
+		let ws = load(&dir);
+		let lib = SORTED[0].1;
+
+		for (name, old, new) in [
+			("a", "mod b;\n", "mod a;\nmod b;\n"),
+			("c", "mod b;\n", "mod b;\nmod c;\n"),
+			("e", "mod d;\n", "mod d;\nmod e;\n"),
+		] {
+			let creation = create(&ws, "crate", name, "").unwrap();
+			let text = edited(&dir, &creation.edits, "src/lib.rs");
+
+			assert_eq!(text, lib.replace(old, new), "{name}");
+			assert_eq!(rscode::rscode_sort::sort_str(&text).unwrap(), text, "{name}");
+			assert_eq!(creation.line, text.lines().position(|line| line == format!("mod {name};")).unwrap() + 1);
+		}
+
+		// modules without `mod` declarations: after `extern crate` items, before `use` items and the rest, or after
+		// what ends the body when there are no items
+		for (parent, file, old, new) in [
+			("crate::b", "src/b.rs", "use std::fmt;", "mod x;\n\nuse std::fmt;"),
+			("crate::d", "src/d.rs", "//! Docs of d.\n", "//! Docs of d.\n\nmod x;\n"),
+		] {
+			let creation = create(&ws, parent, "x", "").unwrap();
+			let text = edited(&dir, &creation.edits, file);
+
+			assert_eq!(text, SORTED.iter().find(|(path, _)| *path == file).unwrap().1.replace(old, new), "{parent}");
+			assert_eq!(rscode::rscode_sort::sort_str(&text).unwrap(), text, "{parent}");
+		}
+
+		// and once written, as `cargo rscode sort` sorts the crate
+		let mut edits = EditSet::new();
+
+		for (parent, name) in [("crate", "c"), ("crate", "a"), ("crate::b", "x")] {
+			edits.extend(create(&ws, parent, name, "").unwrap().edits);
+		}
+
+		edits.apply().unwrap();
+		assert_sorted(&dir);
+	}
+
+	#[test]
+	fn creates_files_where_rustc_finds_them() {
+		let dir = TempDir::fixture("create-files");
+		let ws = load_fixture(&dir, false);
+		let source = "//! Rendering.\n\npub fn draw() {\n    todo!()\n}\n";
+		let creation = create(&ws, "crate", "render", source).unwrap();
+
+		assert_eq!(creation.file, dir.path("src/render.rs"));
+		assert_eq!(creation.declaration, "mod render;");
+		assert_eq!(creation.declared_in, dir.path("src/lib.rs"));
+		assert_eq!(creation.edits.created().collect::<Vec<_>>(), [dir.path("src/render.rs")]);
+
+		// with the indentation style of the parent's file
+		let changed = changes(&dir, &creation.edits);
+
+		assert_eq!(changed["src/render.rs"], "//! Rendering.\n\npub fn draw() {\n\ttodo!()\n}\n");
+		assert!(changed["src/lib.rs"].contains("pub mod placed;\n\nmod render;\npub mod shapes;\nmod util;\n"));
+		assert_eq!(creation.line, 8);
+
+		// in the directory of the parent's modules: of a `mod.rs` file, of a file of another name, of a module loaded
+		// with `#[path]`, and of an inline module, whose declaration goes inside of its braces
+		for (parent, file, declared, layout) in [
+			("crate::nested", "src/nested/x.rs", "src/nested/mod.rs", "pub mod deep;\nmod x;\n\n/// Something"),
+			("crate::shapes", "src/shapes/x.rs", "src/shapes.rs", "pub mod round;\nmod x;\n\nuse round::Radius;"),
+			("crate::placed", "src/custom/x.rs", "src/custom/placed.rs", "mod x;\n\n/// A module loaded with `#[path]`."),
+			("crate::inline", "src/inline/x.rs", "src/lib.rs", "mod inline {\n\tmod x;\n\n\t/// A function"),
+		] {
+			let creation = create(&ws, parent, "x", "").unwrap();
+
+			assert_eq!(creation.file, dir.path(file), "{parent}");
+			assert!(edited(&dir, &creation.edits, declared).contains(layout), "{parent}");
+			assert_eq!(creation.edits.created().collect::<Vec<_>>(), [dir.path(file)], "{parent}");
+		}
+
+		// with a visibility, and a raw name
+		let creation = create_with(&ws, "crate", "type", "", "pub(crate)").unwrap();
+
+		assert_eq!(creation.declaration, "pub(crate) mod r#type;");
+		assert_eq!(creation.file, dir.path("src/type.rs"));
+	}
+
+	#[test]
+	fn follows_mod_rs_files() {
+		let files = [("src/lib.rs", "mod a;\nmod c;\n"), ("src/a/mod.rs", ""), ("src/c/mod.rs", "")];
+		let dir = TempDir::with_files("create-mod-rs", &files);
+		let ws = load(&dir);
+		let creation = create(&ws, "crate", "b", "struct B;").unwrap();
+
+		assert_eq!(creation.file, dir.path("src/b/mod.rs"));
+		assert_eq!(changes(&dir, &creation.edits)["src/b/mod.rs"], "struct B;\n");
+		assert_eq!(edited(&dir, &creation.edits, "src/lib.rs"), "mod a;\nmod b;\nmod c;\n");
+	}
+
+	#[test]
+	fn refuses_taken_names_existing_files_and_invalid_source() {
+		let dir = TempDir::fixture("create-refusals");
+
+		dir.write("src/orphan.rs", "");
+		dir.write("src/stray/mod.rs", "");
+
+		let ws = load_fixture(&dir, false);
+
+		match create(&ws, "crate", "util", "") {
+			Err(Error::Collision { name, collisions }) => {
+				assert_eq!(name, "util");
+				assert!(collisions[0].starts_with("`util`: `edit_ops::util` (mod) at src/lib.rs:"), "{collisions:?}");
+			}
+			other => panic!("{other:?}"),
+		}
+
+		for (name, file) in [("orphan", "src/orphan.rs"), ("stray", "src/stray/mod.rs")] {
+			match create(&ws, "crate", name, "") {
+				Err(Error::Io { path, source }) => {
+					assert_eq!(path, dir.path(file));
+					assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+					assert!(source.to_string().contains("exists already"), "{source}");
+				}
+				other => panic!("{other:?}"),
+			}
+		}
+
+		for name in ["1x", "self", "a::b", ""] {
+			assert!(matches!(create(&ws, "crate", name, ""), Err(Error::InvalidIdent(_))), "{name}");
+		}
+
+		match create(&ws, "crate", "x", "fn x( {}") {
+			Err(Error::InvalidSource(message)) => {
+				assert!(message.starts_with("the source does not parse as the file of a module at 1:"), "{message}")
+			}
+			other => panic!("{other:?}"),
+		}
+
+		for vis in ["pub(nope)", "unsafe", "#[cfg(test)]"] {
+			match create_with(&ws, "crate", "x", "", vis) {
+				Err(Error::InvalidSource(message)) => assert!(message.contains("is not a visibility"), "{message}"),
+				other => panic!("{vis}: {other:?}"),
+			}
+		}
+
+		match create(&ws, "<crate::shapes::Circle>", "x", "") {
+			Err(Error::Unsupported(message)) => assert!(message.starts_with("cannot create a module in"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+
+		assert!(matches!(create(&ws, "crate::nope", "x", ""), Err(Error::NotFound(_))));
+	}
+
+	#[test]
+	fn applies_new_modules_and_still_compiles() {
+		let dir = TempDir::fixture("create-apply");
+		let ws = load_fixture(&dir, false);
+		let mut edits = EditSet::new();
+
+		let modules = [
+			("crate", "render", "/// Draws.\npub fn draw() -> u8 {\n    super::util::double(1) as u8\n}", "pub"),
+			("crate::nested", "extra", "#![allow(dead_code)]\n\nstruct Extra;", ""),
+			("crate::inline", "inner_child", "", "pub(crate)"),
+		];
+
+		for (parent, name, source, vis) in modules {
+			edits.extend(create_with(&ws, parent, name, source, vis).unwrap().edits);
+		}
+
+		let applied = edits.apply().unwrap();
+
+		assert_eq!(
+			dir.relative(&applied.created),
+			["src/inline/inner_child.rs", "src/nested/extra.rs", "src/render.rs"]
+		);
+		assert_eq!(dir.read("src/render.rs"), "/// Draws.\npub fn draw() -> u8 {\n\tsuper::util::double(1) as u8\n}\n");
+		cargo_check(&dir);
+	}
+}
+
+mod add_imports {
+	use super::*;
+	use rscode::edit::ImportAddition;
+	use rscode::edit::ImportOptions;
+	use rscode::edit::ImportOutcome;
+
+	fn import(ws: &Workspace, module: &str, imports: &[&str]) -> Result<ImportAddition, Error> {
+		let imports: Vec<String> = imports.iter().map(|import| import.to_string()).collect();
+
+		rscode::edit::add_imports(&Resolver::new(ws), &path(module), &imports, &ImportOptions::default())
+	}
+
+	/// The imports' paths, outcomes (`+` added, `=` present, `>` merged), and lines.
+	fn outcomes(addition: &ImportAddition) -> Vec<String> {
+		(addition.imports.iter())
+			.map(|import| {
+				let outcome = match import.outcome {
+					ImportOutcome::Added => "+",
+					ImportOutcome::Present => "=",
+					ImportOutcome::Merged(_) => ">",
+				};
+
+				format!("{outcome} {} {}", import.path, import.line)
+			})
+			.collect()
+	}
+
+	/// Asserts that sorting the text changes nothing, and returns it.
+	#[track_caller]
+	fn sorted(text: String) -> String {
+		assert_eq!(rscode::rscode_sort::sort_str(&text).unwrap(), text);
+		text
+	}
+
+	/// A crate with one import per `use` item, laid out like `cargo rscode sort` lays it out.
+	const ITEMS: &[(&str, &str)] = &[
+		(
+			"src/lib.rs",
+			"\
+//! Docs.
+
+mod a;
+
+use crate::a::B;
+use std::fmt;
+use std::io;
+
+pub use a::A;
+
+pub fn f() {}
+
+mod inline {
+	use std::fmt;
+}
+",
+		),
+		("src/a.rs", "pub struct A;\n\npub struct B;\n\npub struct C;\n\nfn g() {}\n"),
+	];
+
+	#[test]
+	fn adds_use_items_where_sorting_puts_them() {
+		let dir = TempDir::with_files("import-items", ITEMS);
+		let ws = load(&dir);
+		let lib = ITEMS[0].1;
+		let cases: &[(&[&str], &str, &str, &[&str])] = &[
+			(&["std::env"], "use crate::a::B;\n", "use crate::a::B;\nuse std::env;\n", &["+ std::env 6"]),
+			(&["use std::io::Write;"], "use std::io;\n", "use std::io;\nuse std::io::Write;\n", &["+ std::io::Write 8"]),
+			(
+				&["crate::a::{B, C}"],
+				"use crate::a::B;\n",
+				"use crate::a::B;\nuse crate::a::C;\n",
+				&["= crate::a::B 5", "+ crate::a::C 6"],
+			),
+			(&["pub use a::Z"], "pub use a::A;\n", "pub use a::A;\npub use a::Z;\n", &["+ pub use a::Z 10"]),
+			(
+				&["std::env", "alloc::vec::Vec", "zzz::Z"],
+				"use crate::a::B;\nuse std::fmt;\nuse std::io;\n",
+				"use crate::a::B;\nuse alloc::vec::Vec;\nuse std::env;\nuse std::fmt;\nuse std::io;\nuse zzz::Z;\n",
+				&["+ std::env 7", "+ alloc::vec::Vec 6", "+ zzz::Z 10"],
+			),
+		];
+
+		for &(imports, old, new, expected) in cases {
+			let addition = import(&ws, "crate", imports).unwrap();
+			let text = sorted(edited(&dir, &addition.edits, "src/lib.rs"));
+
+			assert_eq!(text, lib.replace(old, new), "{imports:?}");
+			assert_eq!(outcomes(&addition), expected, "{imports:?}");
+			assert_eq!(addition.file, dir.path("src/lib.rs"));
+		}
+
+		// and once written, as `cargo rscode sort` sorts the crate
+		import(&ws, "crate", &["std::env", "alloc::vec::Vec", "zzz::Z", "pub use a::C"]).unwrap().edits.apply().unwrap();
+		assert_sorted(&dir);
+
+		// what is imported already changes nothing
+		let addition = import(&ws, "crate", &["std::fmt", "std::fmt"]).unwrap();
+
+		assert!(addition.edits.is_empty());
+		assert_eq!(outcomes(&addition), ["= std::fmt 6", "= std::fmt 6"]);
+
+		// in an inline module, indented
+		let addition = import(&ws, "crate::inline", &["std::io"]).unwrap();
+		let text = sorted(edited(&dir, &addition.edits, "src/lib.rs"));
+
+		assert_eq!(text, lib.replace("\tuse std::fmt;\n", "\tuse std::fmt;\n\tuse std::io;\n"));
+
+		// a module without `use` items: before the items that sort after them, or after what ends the body
+		let addition = import(&ws, "crate::a", &["std::fmt"]).unwrap();
+
+		assert_eq!(edited(&dir, &addition.edits, "src/a.rs"), format!("use std::fmt;\n\n{}", ITEMS[1].1));
+	}
+
+	/// In modules that group their `use` items by where the paths are from, imports go into their group.
+	#[test]
+	fn joins_the_group_of_their_origin() {
+		let lib = "\
+use std::fmt;
+use std::io;
+
+use serde::Serialize;
+
+use crate::a::B;
+
+mod a;
+";
+		let dir = TempDir::with_files("import-origins", &[("src/lib.rs", lib), ("src/a.rs", "pub struct B;\npub struct C;\n")]);
+		let ws = load(&dir);
+
+		for (import, old, new) in [
+			("crate::a::C", "use crate::a::B;\n", "use crate::a::B;\nuse crate::a::C;\n"),
+			("anyhow::Result", "use serde::Serialize;", "use anyhow::Result;\nuse serde::Serialize;"),
+			("std::env", "use std::fmt;", "use std::env;\nuse std::fmt;"),
+			("std::path::Path", "use std::io;\n", "use std::io;\nuse std::path::Path;\n"),
+		] {
+			let addition = self::import(&ws, "crate", &[import]).unwrap();
+
+			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace(old, new), "{import}");
+		}
+
+		// without such groups, sorting decides
+		let lib = "use std::fmt;\n\nuse crate::a::B;\nuse serde::Serialize;\n\nmod a;\n";
+		let dir = TempDir::with_files("import-origins-mixed", &[("src/lib.rs", lib), ("src/a.rs", "pub struct B;\n")]);
+		let ws = load(&dir);
+		let addition = self::import(&ws, "crate", &["anyhow::Result"]).unwrap();
+
+		assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace("use std", "use anyhow::Result;\nuse std"));
+	}
+
+	/// A bare name that names nothing in the module imports the item of that name.
+	#[test]
+	fn imports_items_by_their_names() {
+		let dir = TempDir::with_files("import-names", ITEMS);
+		let ws = load(&dir);
+		let addition = import(&ws, "crate::inline", &["C", "pub(crate) use C as See"]).unwrap();
+
+		assert_eq!(outcomes(&addition), ["+ crate::a::C 14", "+ pub(crate) use crate::a::C as See 17"]);
+		let text = edited(&dir, &addition.edits, "src/lib.rs");
+
+		assert!(text.ends_with("\tuse crate::a::C;\n\tuse std::fmt;\n\n\tpub(crate) use crate::a::C as See;\n}\n"), "{text}");
+		assert!(matches!(import(&ws, "crate", &["Nope"]), Err(Error::NotFound(name)) if name == "Nope"));
+
+		// several items of the name
+		let files = [("src/lib.rs", "mod a;\nmod b;\n"), ("src/a.rs", "pub struct X;\n"), ("src/b.rs", "pub struct X;\n")];
+		let dir = TempDir::with_files("import-names-ambiguous", &files);
+		let ws = load(&dir);
+
+		match import(&ws, "crate", &["X"]) {
+			Err(Error::Ambiguous { path, candidates }) => {
+				assert_eq!(path, "X");
+				assert_eq!(candidates.len(), 2, "{candidates:?}");
+			}
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[test]
+	fn refuses_collisions_and_what_is_not_an_import() {
+		let dir = TempDir::with_files("import-refusals", ITEMS);
+		let ws = load(&dir);
+
+		match import(&ws, "crate", &["other::B"]) {
+			Err(Error::Collision { name, collisions }) => {
+				assert_eq!(name, "B");
+				assert!(collisions[0].starts_with("`B`: the import of `fixture::a::B` at src/lib.rs:5:"), "{collisions:?}");
+			}
+			other => panic!("{other:?}"),
+		}
+
+		// glob imports are shadowed, and forcing imports anyway
+		assert!(import(&ws, "crate", &["other::*"]).is_ok());
+
+		let options = ImportOptions { force: true };
+		let forced = rscode::edit::add_imports(&Resolver::new(&ws), &path("crate"), &["other::B".to_owned()], &options);
+
+		assert!(forced.is_ok());
+
+		for invalid in ["not a path!", "#[cfg(test)] use a::b", "", "self"] {
+			assert!(matches!(import(&ws, "crate", &[invalid]), Err(Error::InvalidSource(_))), "{invalid:?}");
+		}
+
+		let lib = "pub struct S;\n\nimpl S {}\n";
+		let dir = TempDir::with_files("import-impl", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+
+		match import(&ws, "<crate::S>", &["std::fmt"]) {
+			Err(Error::Unsupported(message)) => assert!(message.starts_with("cannot import into"), "{message}"),
+			other => panic!("{other:?}"),
+		}
+	}
+
+	#[test]
+	fn merges_into_use_items_of_their_module() {
+		let lib = "\
+use crate::a::{B, C};
+use std::collections::{BTreeMap, HashMap};
+use std::{fmt, io};
+#[allow(unused_imports)]
+use std::{fs, path};
+
+mod a;
+";
+		let files = [("src/lib.rs", lib), ("src/a.rs", "pub struct B;\npub struct C;\npub struct D;\n")];
+		let dir = TempDir::with_files("import-module", &files);
+		let ws = load(&dir);
+		let cases: &[(&[&str], &str, &str)] = &[
+			(&["std::env"], "use std::{fmt, io};", "use std::{env, fmt, io};"),
+			(&["std::collections::BTreeSet"], "{BTreeMap, HashMap}", "{BTreeMap, BTreeSet, HashMap}"),
+			(&["crate::a::D"], "use crate::a::{B, C};", "use crate::a::{B, C, D};"),
+			(&["std::env", "std::process"], "use std::{fmt, io};", "use std::{env, fmt, io, process};"),
+			(&["std::time::Duration"], "use std::{fmt, io};", "use std::time::Duration;\nuse std::{fmt, io};"),
+		];
+
+		for &(imports, old, new) in cases {
+			let addition = import(&ws, "crate", imports).unwrap();
+
+			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace(old, new), "{imports:?}");
+		}
+
+		let addition = import(&ws, "crate", &["std::env"]).unwrap();
+
+		assert_eq!(outcomes(&addition), ["> std::env 3"]);
+		assert_eq!(addition.imports[0].outcome, ImportOutcome::Merged("use std::{env, fmt, io};".to_owned()));
+	}
+
+	#[test]
+	fn merges_into_use_items_of_several_modules() {
+		let lib = "\
+use crate::{a::B, c::D};
+use std::fs;
+use std::{
+	fmt,
+	io::{self, Read},
+};
+
+mod a;
+mod c;
+";
+		let files = [("src/lib.rs", lib), ("src/a.rs", "pub struct B;\n"), ("src/c.rs", "pub struct D;\npub struct E;\n")];
+		let dir = TempDir::with_files("import-crate", &files);
+		let ws = load(&dir);
+		let cases: &[(&[&str], &str, &str)] = &[
+			(&["std::io::Write"], "{self, Read}", "{self, Read, Write}"),
+			(&["std::env"], "\tfmt,\n", "\tenv,\n\tfmt,\n"),
+			(&["std::path::Path"], "Read},\n", "Read},\n\tpath::Path,\n"),
+			(&["crate::c::E"], "c::D}", "c::{D, E}}"),
+			(&["crate::e::F"], "c::D}", "c::D, e::F}"),
+			(&["std::fmt::Write"], "\tfmt,\n", "\tfmt::{self, Write},\n"),
+		];
+
+		for &(imports, old, new) in cases {
+			let addition = import(&ws, "crate", imports).unwrap();
+
+			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace(old, new), "{imports:?}");
+		}
+
+		// a path that diverges from the item's becomes a group
+		let lib = "use crate::{a::B, c::D};\nuse std::fs;\n\nmod a;\nmod c;\n";
+		let files = [("src/lib.rs", lib), ("src/a.rs", "pub struct B;\n"), ("src/c.rs", "pub struct D;\n")];
+		let dir = TempDir::with_files("import-diverge", &files);
+		let ws = load(&dir);
+
+		for (imports, new) in [(&["std::io"], "use std::{fs, io};"), (&["std::fs::File"], "use std::fs::{self, File};")] {
+			let addition = import(&ws, "crate", imports).unwrap();
+
+			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace("use std::fs;", new), "{imports:?}");
+		}
+	}
+
+	#[test]
+	fn applies_imports_and_still_compiles() {
+		let dir = TempDir::fixture("import-apply");
+		let ws = load_fixture(&dir, false);
+		let addition = import(&ws, "crate::nested", &["std::fmt::Write as _", "crate::shapes::Circle"]).unwrap();
+
+		addition.edits.apply().unwrap();
+		assert!(
+			dir.read("src/nested/mod.rs")
+				.contains("pub mod deep;\n\nuse crate::shapes::Circle;\nuse std::fmt::Write as _;\n\n/// Something")
+		);
+		cargo_check(&dir);
+	}
+}
+
 mod real {
 	use super::*;
 	use rscode::View;
@@ -3135,7 +3758,8 @@ pub fn total() -> f64 {
 
 		let text = edited(&dir, &insertion.edits, "src/lib.rs");
 
-		assert!(text.contains("use shapes::Circle;\n\nuse shapes::Shape;\n\nuse shapes::{Shape as _"), "{text}");
+		// (joining the `use` items around it, which are on consecutive lines)
+		assert!(text.contains("use shapes::Circle;\nuse shapes::Shape;\nuse shapes::{Shape as _"), "{text}");
 
 		// formatting an import formats its `use` item
 		let options =

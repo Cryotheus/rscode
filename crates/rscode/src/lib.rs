@@ -12,9 +12,9 @@
 //! - Resolve: [`Resolver`] resolves `use` imports, paths, `impl` targets, visibility, and usable paths.
 //! - Search: [`Find`] with glob-like [`pattern`]s (no regex).
 //! - View: [`View`] shows full source or outlines (bodies elided).
-//! - Edit: [`edit::remove`], [`edit::rename`], [`edit::replace`], [`edit::edit_item`], [`edit::insert`], and
-//!   [`edit::format`] plan changes as an [`EditSet`], which is previewed or applied atomically. Comments and formatting
-//!   outside of the edited ranges are always preserved.
+//! - Edit: [`edit::remove`], [`edit::rename`], [`edit::replace`], [`edit::edit_item`], [`edit::insert`],
+//!   [`edit::create_module`], [`edit::add_imports`], and [`edit::format`] plan changes as an [`EditSet`], which is
+//!   previewed or applied atomically. Comments and formatting outside of the edited ranges are always preserved.
 //! - Serve: the `mcp` feature exposes all of this as a Model Context Protocol server ([`mcp`]).
 //!
 //! Item paths are written like Rust paths: `crate::module::Item`, `::other_crate::Item`, `Type::method`,

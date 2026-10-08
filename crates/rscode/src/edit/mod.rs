@@ -1,8 +1,8 @@
 //! Modifying operations: removing, renaming, replacing, editing, inserting, and formatting items.
 //!
 //! Operations produce an [`EditSet`] describing every change, which can be previewed (as new file contents or a
-//! diff) or applied. Applying is all-or-nothing: every edited file must still parse before anything is written, and
-//! when writing fails partway, what was changed before is undone.
+//! diff) or applied. Applying is all-or-nothing: every edited (or created) file must still parse before anything is
+//! written, and when writing fails partway, what was changed before is undone.
 
 mod format;
 mod remove;
@@ -21,6 +21,7 @@ use crate::source::SourceFile;
 use crate::source::TextRange;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::btree_map::Entry;
 use std::ffi::OsStr;
 use std::fs;
@@ -43,12 +44,20 @@ pub use rename::Collision;
 pub use rename::Rename;
 pub use rename::RenameOptions;
 pub use rename::rename;
+pub use replace::AddedImport;
+pub use replace::CreateModuleOptions;
+pub use replace::ImportAddition;
+pub use replace::ImportOptions;
+pub use replace::ImportOutcome;
 pub use replace::InsertOptions;
 pub use replace::InsertPosition;
 pub use replace::Insertion;
 pub use replace::ItemSpan;
+pub use replace::ModuleCreation;
 pub use replace::ReplaceOptions;
 pub use replace::Replacement;
+pub use replace::add_imports;
+pub use replace::create_module;
 pub use replace::insert;
 pub use replace::item::EditItemOptions;
 pub use replace::item::ItemEdit;
@@ -63,6 +72,9 @@ pub use rscode_fmt::emit::FileChange;
 pub struct Applied {
 	/// Files whose contents were written (unchanged files are skipped).
 	pub written: Vec<PathBuf>,
+
+	/// Files that were created.
+	pub created: Vec<PathBuf>,
 
 	/// Paths that were moved, in order.
 	pub moved: Vec<(PathBuf, PathBuf)>,
@@ -85,6 +97,9 @@ pub struct EditSet {
 
 	/// Files or directories to delete.
 	pub(crate) deletions: Vec<PathBuf>,
+
+	/// Files to create. Each is in [`EditSet::files`] too, with an empty original text and its text as the only edit.
+	pub(crate) created: BTreeSet<PathBuf>,
 }
 
 impl EditSet {
@@ -93,25 +108,32 @@ impl EditSet {
 		Self::default()
 	}
 
-	/// Validates everything (like [`EditSet::preview`]), then writes files, then performs moves and deletions.
+	/// Validates everything (like [`EditSet::preview`]), then writes and creates files, then performs moves and
+	/// deletions.
 	///
 	/// Before anything is written, this also checks that every edited file still has the contents its edits were
-	/// computed from (so changes made after loading are not overwritten), that moved and deleted paths exist, and
-	/// that no move would overwrite an existing path. (A move to the path of the moved file or directory in another
-	/// case, which names it already on file systems that ignore case, as on Windows and macOS, changes the case of its
-	/// name.)
+	/// computed from (so changes made after loading are not overwritten), that no file to create exists, that moved and
+	/// deleted paths exist, and that no move would overwrite an existing path (or a created file). (A move to the path
+	/// of the moved file or directory in another case, which names it already on file systems that ignore case, as on
+	/// Windows and macOS, changes the case of its name.)
 	///
 	/// Applying is all-or-nothing: new contents are written to temporary files next to their files first, and deleted
 	/// paths are moved to temporary names, to be removed once everything else succeeded. When a step fails (such as on
 	/// Windows, on a file that another process has open, or on a directory with such a file), the steps before it are
-	/// undone, and [`Error::Apply`] tells what failed (and what could not be undone, if anything). Symbolic links are
-	/// written through, and permissions are preserved.
+	/// undone (a created file is removed, unless it changed since), and [`Error::Apply`] tells what failed (and what
+	/// could not be undone, if anything). Symbolic links are written through, and permissions are preserved.
 	pub fn apply(&self) -> Result<Applied, Error> {
 		let changes = self.preview()?;
-		let to_write: Vec<&FileChange> = changes.iter().filter(|change| change.is_changed()).collect();
+		let (to_create, edited): (Vec<&FileChange>, Vec<&FileChange>) =
+			changes.iter().partition(|change| self.created.contains(&change.path));
+		let to_write: Vec<&FileChange> = edited.into_iter().filter(|change| change.is_changed()).collect();
 
 		for change in &to_write {
 			check_unmodified(change)?;
+		}
+
+		for change in &to_create {
+			check_absent(&change.path)?;
 		}
 
 		let deletions = self.effective_deletions();
@@ -120,7 +142,7 @@ impl EditSet {
 
 		let mut transaction = Transaction::default();
 
-		if let Err(Failure { path, source }) = transaction.perform(&to_write, &self.moves, &deletions) {
+		if let Err(Failure { path, source }) = transaction.perform(&to_write, &to_create, &self.moves, &deletions) {
 			return Err(Error::Apply {
 				path,
 				source,
@@ -130,16 +152,18 @@ impl EditSet {
 
 		Ok(Applied {
 			written: to_write.iter().map(|change| change.path.clone()).collect(),
+			created: to_create.iter().map(|change| change.path.clone()).collect(),
 			moved: self.moves.clone(),
 			deleted: deletions.iter().map(|path| path.to_path_buf()).collect(),
 			warnings: transaction.commit(),
 		})
 	}
 
-	/// Checks that moves and deletions can be performed in order, tracking which paths they create and remove.
+	/// Checks that moves and deletions can be performed in order (after the files are created), tracking which paths
+	/// they create and remove.
 	fn check_moves_and_deletions(&self, deletions: &[&Path]) -> Result<(), Error> {
 		// later events win: (path, whether it exists afterwards, with everything below it)
-		let mut events: Vec<(&Path, bool)> = Vec::new();
+		let mut events: Vec<(&Path, bool)> = self.created.iter().map(|path| (path.as_path(), true)).collect();
 		let exists = |events: &[(&Path, bool)], path: &Path| {
 			events
 				.iter()
@@ -190,6 +214,28 @@ impl EditSet {
 		Ok(())
 	}
 
+	/// Creates a file with `text`, and the directories it is in that do not exist. Applying fails if the path exists by
+	/// then, and undoing the creation removes the file again (unless it changed since). Creating a file again replaces
+	/// its text.
+	pub fn create_file(&mut self, path: impl Into<PathBuf>, text: impl Into<String>) {
+		let path = path.into();
+		let creation = TextEdit {
+			range: TextRange::new(0, 0),
+			replacement: text.into(),
+		};
+
+		self.files.insert(path.clone(), FileEdits {
+			original: Arc::from(""),
+			edits: vec![creation],
+		});
+		self.created.insert(path);
+	}
+
+	/// The files to create (see [`EditSet::create_file`]), sorted.
+	pub fn created(&self) -> impl Iterator<Item = &Path> {
+		self.created.iter().map(PathBuf::as_path)
+	}
+
 	/// Deletes a file or directory (recursively). Duplicate deletions are ignored.
 	pub fn delete_path(&mut self, path: impl Into<PathBuf>) {
 		let path = path.into();
@@ -204,9 +250,9 @@ impl EditSet {
 		&self.deletions
 	}
 
-	/// A unified diff of all text edits, followed by lines describing moves (`rename <from> -> <to>`) and deletions
-	/// (`delete <path>`). Paths are shown as stored (absolute when loaded from a workspace); see
-	/// [`EditSet::diff_relative_to`].
+	/// A unified diff of all text edits (created files are diffed from `/dev/null`), followed by lines describing
+	/// created files (`create <path>`), moves (`rename <from> -> <to>`), and deletions (`delete <path>`). Paths are
+	/// shown as stored (absolute when loaded from a workspace); see [`EditSet::diff_relative_to`].
 	pub fn diff(&self) -> Result<String, Error> {
 		self.render_diff(Path::to_path_buf)
 	}
@@ -217,7 +263,7 @@ impl EditSet {
 		self.render_diff(|path| path.strip_prefix(base).unwrap_or(path).to_path_buf())
 	}
 
-	/// Paths of the files with text edits.
+	/// Paths of the files with text edits, and of the files to create.
 	pub fn edited_files(&self) -> impl Iterator<Item = &Path> {
 		self.files.keys().map(PathBuf::as_path)
 	}
@@ -262,6 +308,8 @@ impl EditSet {
 		for path in other.deletions {
 			self.delete_path(path);
 		}
+
+		self.created.extend(other.created);
 	}
 
 	/// Whether there is nothing to do.
@@ -295,6 +343,11 @@ impl EditSet {
 			let mut changes = Vec::with_capacity(self.files.len());
 
 			for (path, file) in &self.files {
+				// a file has one text (identical creations are merged)
+				if self.created.contains(path) && file.edits.len() > 1 {
+					return Err(overlap(path, TextRange::new(0, 0), TextRange::new(0, 0)));
+				}
+
 				let formatted = file.apply(path)?;
 
 				if formatted != *file.original && is_rust_file(path) {
@@ -319,10 +372,15 @@ impl EditSet {
 			change.path = display(&change.path);
 		}
 
-		let mut diff = rscode_fmt::emit::unified_diff(&changes, 3);
+		let created: Vec<PathBuf> = self.created().map(&display).collect();
+		let mut diff = unified_diff(&changes, &created, 3);
 
 		if !(diff.is_empty() || diff.ends_with('\n')) {
 			diff.push('\n');
+		}
+
+		for path in &created {
+			diff.push_str(&format!("create {}\n", path.display()));
 		}
 
 		for (from, to) in &self.moves {
@@ -481,8 +539,11 @@ enum Step<'a> {
 	/// undone by writing its original contents back, unless it changed since.
 	Written { path: &'a Path, original: &'a str, written: &'a str },
 
-	/// A directory was created to move a path into; undone by removing it (if it is empty).
+	/// A directory was created to move a path (or create a file) into; undone by removing it (if it is empty).
 	Created(PathBuf),
+
+	/// A file was created with `contents`; undone by removing it, unless it changed since.
+	CreatedFile { path: &'a Path, contents: &'a str },
 
 	/// A file or directory was moved, maybe through a temporary name (to change the case of its name); undone by moving
 	/// it back (through that name again).
@@ -504,6 +565,9 @@ impl Step<'_> {
 			Step::Created(directory) => {
 				fs::remove_dir(directory).map_err(|error| format!("the new directory `{}` stays ({error})", directory.display()))
 			}
+
+			Step::CreatedFile { path, contents } => remove_created(path, contents)
+				.map_err(|error| format!("the new file `{}` stays ({error})", path.display())),
 
 			Step::Moved { from, to, through } => match through {
 				None => move_back(to, from).map_err(|error| stays_moved(from, to, error)),
@@ -554,6 +618,27 @@ impl<'a> Transaction<'a> {
 		}
 
 		warnings
+	}
+
+	/// Creates a file that does not exist with `contents`, and the directories it is in.
+	fn create(&mut self, path: &'a Path, contents: &'a str) -> Result<(), Failure> {
+		self.create_parents(path)?;
+
+		let failure = |source| Failure::at(path, source);
+		let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(failure)?;
+		let written = file.write_all(contents.as_bytes()).and_then(|()| file.sync_all());
+
+		drop(file);
+
+		if let Err(error) = written {
+			// best effort: the error that matters is the write error
+			let _ = fs::remove_file(path);
+
+			return Err(failure(error));
+		}
+
+		self.steps.push(Step::CreatedFile { path, contents });
+		Ok(())
 	}
 
 	/// Creates the missing directories a path is in.
@@ -617,9 +702,20 @@ impl<'a> Transaction<'a> {
 		moved.map_err(|source| Failure::at(from, source))
 	}
 
-	/// Writes files, then moves paths, then moves the paths to delete to temporary names, until a step fails.
-	fn perform(&mut self, changes: &[&'a FileChange], moves: &[(PathBuf, PathBuf)], deletions: &[&'a Path]) -> Result<(), Failure> {
+	/// Writes files, then creates files, then moves paths, then moves the paths to delete to temporary names, until a
+	/// step fails.
+	fn perform(
+		&mut self,
+		changes: &[&'a FileChange],
+		created: &[&'a FileChange],
+		moves: &[(PathBuf, PathBuf)],
+		deletions: &[&'a Path],
+	) -> Result<(), Failure> {
 		self.write(changes)?;
+
+		for change in created {
+			self.create(&change.path, &change.formatted)?;
+		}
 
 		for (from, to) in moves {
 			self.move_path(from, to)?;
@@ -686,6 +782,20 @@ impl<'a> Transaction<'a> {
 /// A file name in upper case (as Windows compares names), to compare names ignoring case.
 fn case_key(name: &OsStr) -> Option<String> {
 	name.to_str().map(str::to_uppercase)
+}
+
+/// Checks that a file to create does not exist (yet).
+fn check_absent(path: &Path) -> Result<(), Error> {
+	match fs::symlink_metadata(path) {
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(Error::io(path, error)),
+
+		Ok(_) => {
+			let message = "cannot create a file that exists";
+
+			Err(Error::io(path, io::Error::new(io::ErrorKind::AlreadyExists, message)))
+		}
+	}
 }
 
 /// Refuses a plain path whose last segment names `items` (what it resolves to) only through private imports of its
@@ -868,6 +978,17 @@ fn overlap(path: &Path, first: TextRange, second: TextRange) -> Error {
 	}
 }
 
+/// Removes a file that an edit created, unless it does not have the contents written to it anymore: someone else's
+/// changes are not undone. A file that is gone already is fine.
+fn remove_created(path: &Path, contents: &str) -> io::Result<()> {
+	match fs::read(path) {
+		Ok(current) if current != contents.as_bytes() => Err(io::Error::other("it changed after the edit wrote it")),
+		Ok(_) => fs::remove_file(path),
+		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+		Err(error) => Err(error),
+	}
+}
+
 fn remove_temporaries(staged: &[Staged<'_>]) {
 	for file in staged {
 		// best effort: the temporary file may not exist anymore
@@ -949,6 +1070,28 @@ fn temporary_path(path: &Path) -> PathBuf {
 	let name = path.file_name().map_or_else(|| "file".into(), |name| name.to_string_lossy());
 
 	path.with_file_name(format!(".{name}.rscode-{}-{count}.tmp", std::process::id()))
+}
+
+/// A unified diff of file changes with `context` lines of context (see [`rscode_fmt::emit::unified_diff`]), in which
+/// the files at the paths in `created` (as the changes have them) are new files, diffed from `/dev/null`.
+pub fn unified_diff(changes: &[FileChange], created: &[PathBuf], context: usize) -> String {
+	let mut diff = String::new();
+
+	for change in changes.iter().filter(|change| change.is_changed()) {
+		let file = rscode_fmt::emit::unified_diff(std::slice::from_ref(change), context);
+
+		match created.contains(&change.path) {
+			// instead of the `--- a/path` line
+			true => {
+				diff.push_str("--- /dev/null\n");
+				diff.push_str(file.split_once('\n').map_or("", |(_, rest)| rest));
+			}
+
+			false => diff.push_str(&file),
+		}
+	}
+
+	diff
 }
 
 /// A temporary path next to `path` (see [`temporary_path`]) that names nothing yet.
@@ -1374,6 +1517,10 @@ mod tests {
 
 		let changes = [change(&lib, "mod a;\nmod gone;\n", "mod b;\n"), change(&a, "struct A;\n", "struct B;\n")];
 		let changes: Vec<&FileChange> = changes.iter().collect();
+
+		// (in a directory that does not exist yet)
+		let created = [change(&dir.path("src/fresh/new.rs"), "", "struct New;\n")];
+		let created: Vec<&FileChange> = created.iter().collect();
 		let moves = [
 			(a.clone(), dir.path("src/b.rs")),
 			// (only the case changes, on file systems that ignore case)
@@ -1385,7 +1532,7 @@ mod tests {
 		let deletions: Vec<&Path> = deletions.iter().map(PathBuf::as_path).collect();
 		let before = dir.snapshot();
 
-		// undone after writing, after each move, and after each deletion
+		// undone after writing and creating, after each move, and after each deletion
 		let prefixes = (0..=moves.len())
 			.map(|moved| (moved, 0))
 			.chain((1..=deletions.len()).map(|deleted| (moves.len(), deleted)));
@@ -1393,7 +1540,7 @@ mod tests {
 		for (moved, deleted) in prefixes {
 			let mut transaction = Transaction::default();
 
-			transaction.perform(&changes, &moves[..moved], &deletions[..deleted]).unwrap();
+			transaction.perform(&changes, &created, &moves[..moved], &deletions[..deleted]).unwrap();
 
 			assert_ne!(dir.snapshot(), before);
 			assert!(transaction.undo().is_empty());
@@ -1403,7 +1550,7 @@ mod tests {
 		// committed, the deleted paths are removed from their temporary names
 		let mut transaction = Transaction::default();
 
-		transaction.perform(&changes, &moves, &deletions).unwrap();
+		transaction.perform(&changes, &created, &moves, &deletions).unwrap();
 
 		assert!(transaction.commit().is_empty());
 
@@ -1420,6 +1567,8 @@ mod tests {
 				directory("src/deep/er"),
 				directory("src/deep/er/moved"),
 				file("src/deep/er/moved/x.rs", "struct X;\n"),
+				directory("src/fresh"),
+				file("src/fresh/new.rs", "struct New;\n"),
 				file("src/lib.rs", "mod b;\n"),
 			]
 		);
@@ -1432,14 +1581,18 @@ mod tests {
 		let c = dir.write("c.rs", "struct C;\n");
 		let changes = [change(&a, "struct A;\n", "struct B;\n"), change(&c, "struct C;\n", "struct D;\n")];
 		let changes: Vec<&FileChange> = changes.iter().collect();
+		let new = dir.path("new.rs");
+		let created = [change(&new, "", "struct New;\n")];
+		let created: Vec<&FileChange> = created.iter().collect();
 		let mut transaction = Transaction::default();
 
-		transaction.perform(&changes, &[(a.clone(), dir.path("b.rs"))], &[]).unwrap();
+		transaction.perform(&changes, &created, &[(a.clone(), dir.path("b.rs"))], &[]).unwrap();
 
-		// someone else creates `a.rs` again, and changes `c.rs`: moving `b.rs` back, or writing `c.rs` back, would
-		// overwrite what they wrote
+		// someone else creates `a.rs` again, and changes `c.rs` and `new.rs`: moving `b.rs` back, or writing `c.rs`
+		// back, or removing `new.rs`, would overwrite what they wrote
 		dir.write("a.rs", "struct Other;\n");
 		dir.write("c.rs", "struct Changed;\n");
+		dir.write("new.rs", "struct Mine;\n");
 
 		let stays_moved = format!(
 			"`{}` stays moved to `{}` (something else is there now)",
@@ -1452,7 +1605,10 @@ mod tests {
 			format!("`{}` was not restored to its original contents ({reason})", path.display())
 		};
 
-		assert_eq!(transaction.undo(), [stays_moved, not_restored(&c), not_restored(&a)]);
+		let stays = format!("the new file `{}` stays (it changed after the edit wrote it)", new.display());
+
+		assert_eq!(transaction.undo(), [stays_moved, stays, not_restored(&c), not_restored(&a)]);
+		assert_eq!(fs::read_to_string(&new).unwrap(), "struct Mine;\n");
 		assert_eq!(fs::read_to_string(&a).unwrap(), "struct Other;\n");
 		assert_eq!(fs::read_to_string(dir.path("b.rs")).unwrap(), "struct B;\n");
 		assert_eq!(fs::read_to_string(&c).unwrap(), "struct Changed;\n");

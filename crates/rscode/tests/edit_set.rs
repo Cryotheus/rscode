@@ -404,10 +404,145 @@ fn deletes_files_and_directories() {
 }
 
 #[test]
+fn creates_files_and_their_directories() {
+	let dir = TempDir::new("creates");
+	let lib = dir.file("src/lib.rs", "mod a;\n");
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(6, 6), "\nmod b;\nmod c;");
+	edits.create_file(dir.path("src/b/deep/mod.rs"), "struct B;\n");
+	edits.create_file(dir.path("src/c.rs"), "");
+	dir.file("src/a.rs", "struct A;\n");
+
+	assert_eq!(edits.created().collect::<Vec<_>>(), [dir.path("src/b/deep/mod.rs"), dir.path("src/c.rs")]);
+	assert!(edits.edited_files().any(|path| path == dir.path("src/c.rs")));
+
+	let applied = edits.apply().unwrap();
+
+	assert_eq!(dir.listing(), ["src/a.rs", "src/b/deep/mod.rs", "src/c.rs", "src/lib.rs"]);
+	assert_eq!(dir.read("src/b/deep/mod.rs"), "struct B;\n");
+	assert_eq!(dir.read("src/c.rs"), "");
+	assert_eq!(dir.read("src/lib.rs"), "mod a;\nmod b;\nmod c;\n");
+	assert_eq!(applied.written, [dir.path("src/lib.rs")]);
+	assert_eq!(applied.created, [dir.path("src/b/deep/mod.rs"), dir.path("src/c.rs")]);
+
+	// a file is created once, with one text
+	let mut edits = EditSet::new();
+	let mut again = EditSet::new();
+
+	edits.create_file(dir.path("src/d.rs"), "struct D;\n");
+	again.create_file(dir.path("src/d.rs"), "struct D;\n");
+	edits.extend(again.clone());
+	assert_eq!(edits.preview().unwrap().len(), 1);
+
+	again.create_file(dir.path("src/d.rs"), "struct E;\n");
+	edits.extend(again);
+	assert!(matches!(edits.preview(), Err(Error::OverlappingEdits { .. })));
+}
+
+#[test]
+fn refuses_to_create_what_exists() {
+	let dir = TempDir::new("create-existing");
+	let lib = dir.file("src/lib.rs", "mod a;\n");
+
+	dir.file("src/a.rs", "struct A;\n");
+	dir.file("src/b/x.rs", "struct X;\n");
+
+	for existing in ["src/a.rs", "src/b"] {
+		let mut edits = EditSet::new();
+
+		edits.replace(&lib, range(4, 5), "b");
+		edits.create_file(dir.path(existing), "struct New;\n");
+
+		match edits.apply() {
+			Err(Error::Io { path, source }) => {
+				assert_eq!(path, dir.path(existing));
+				assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+			}
+			other => panic!("expected an I/O error, got {other:?}"),
+		}
+	}
+
+	// nor does a move go where a file is created
+	let mut edits = EditSet::new();
+
+	edits.create_file(dir.path("src/c.rs"), "struct C;\n");
+	edits.move_path(dir.path("src/a.rs"), dir.path("src/c.rs"));
+
+	match edits.apply() {
+		Err(Error::Io { path, source }) => {
+			assert_eq!(path, dir.path("src/c.rs"));
+			assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+		}
+		other => panic!("expected an I/O error, got {other:?}"),
+	}
+
+	// a created file can move, or be deleted, afterwards
+	let mut edits = EditSet::new();
+
+	edits.create_file(dir.path("src/d.rs"), "struct D;\n");
+	edits.move_path(dir.path("src/d.rs"), dir.path("src/e.rs"));
+	edits.create_file(dir.path("src/f.rs"), "struct F;\n");
+	edits.delete_path(dir.path("src/f.rs"));
+	edits.apply().unwrap();
+
+	assert_eq!(dir.read("src/lib.rs"), "mod a;\n");
+	assert_eq!(dir.listing(), ["src/a.rs", "src/b/x.rs", "src/e.rs", "src/lib.rs"]);
+}
+
+#[test]
+fn creates_nothing_when_a_created_file_does_not_parse() {
+	let dir = TempDir::new("create-syntax");
+	let lib = dir.file("src/lib.rs", "mod a;\n");
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(4, 5), "b");
+	edits.create_file(dir.path("src/b.rs"), "fn b( {}\n");
+
+	match edits.apply() {
+		Err(Error::EditBreaksSyntax { path, location, .. }) => {
+			assert_eq!(path, dir.path("src/b.rs"));
+			assert_eq!(location.line, 1);
+		}
+		other => panic!("expected a syntax error, got {other:?}"),
+	}
+
+	assert_eq!(dir.listing(), ["src/lib.rs"]);
+	assert_eq!(dir.read("src/lib.rs"), "mod a;\n");
+}
+
+#[test]
+fn undoes_created_files_when_a_step_fails() {
+	let dir = TempDir::new("create-undo");
+	let lib = dir.file("src/lib.rs", "mod a;\n");
+
+	dir.file("src/a.rs", "struct A;\n");
+	dir.file("blocker", "a file where a directory is needed\n");
+
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(6, 6), "\nmod b;");
+	edits.create_file(dir.path("src/b/c/mod.rs"), "struct B;\n");
+	edits.move_path(dir.path("src/a.rs"), dir.path("blocker/a.rs"));
+
+	// the file and its directories are created, and then the move fails: all of it is undone
+	let error = edits.apply().unwrap_err();
+
+	assert!(
+		matches!(&error, Error::Apply { path, kept, .. } if *path == dir.path("src/a.rs") && kept.is_empty()),
+		"{error:?}"
+	);
+	assert_eq!(dir.listing(), ["blocker", "src/a.rs", "src/lib.rs"]);
+	assert!(!dir.path("src/b").exists());
+	assert_eq!(dir.read("src/lib.rs"), "mod a;\n");
+}
+
+#[test]
 fn applying_an_empty_edit_set_does_nothing() {
 	let applied = EditSet::new().apply().unwrap();
 
-	assert!(applied.written.is_empty() && applied.moved.is_empty() && applied.deleted.is_empty());
+	assert!(applied.written.is_empty() && applied.created.is_empty());
+	assert!(applied.moved.is_empty() && applied.deleted.is_empty());
 }
 
 #[cfg(unix)]
@@ -471,6 +606,24 @@ fn diffs_edits_moves_and_deletions() {
 		dir.path("src/a.rs").display(),
 		dir.path("src/b.rs").display()
 	)));
+}
+
+#[test]
+fn diffs_created_files_from_nothing() {
+	let dir = TempDir::new("diff-created");
+	let lib = dir.file("src/lib.rs", "mod a;\n");
+	let mut edits = EditSet::new();
+
+	edits.replace(&lib, range(6, 6), "mod b;\nmod c;\n");
+	edits.create_file(dir.path("src/b.rs"), "struct B;\n\nstruct C;\n");
+	edits.create_file(dir.path("src/c.rs"), "");
+
+	let diff = edits.diff_relative_to(&dir.0).unwrap();
+
+	assert!(diff.contains("--- a/src/lib.rs\n+++ b/src/lib.rs\n"), "{diff}");
+	assert!(diff.contains("--- /dev/null\n+++ b/src/b.rs\n@@ -0,0 +1,3 @@\n+struct B;\n+\n+struct C;\n"), "{diff}");
+	assert!(!diff.contains("c.rs\n@@"), "{diff}");
+	assert!(diff.ends_with("create src/b.rs\ncreate src/c.rs\n"), "{diff}");
 }
 
 #[test]

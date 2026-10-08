@@ -1,10 +1,14 @@
-//! Replacing the source of items and inserting new items.
+//! Replacing the source of items and inserting new items: any items ([`insert`]), new modules ([`create_module`]),
+//! and imports ([`add_imports`]), where `cargo rscode sort` would put them ([`order`]).
 //!
 //! The new source is parsed as items of the container it goes into (see [`parse`]) before anything is planned, so
 //! errors point into the source as given. It is re-indented to its place, with the indentation style and line breaks
 //! of the file.
 
+mod create;
+mod import;
 pub(super) mod item;
+mod order;
 mod parse;
 
 use crate::Error;
@@ -39,6 +43,15 @@ use serde::Serialize;
 use smol_str::SmolStr;
 use std::collections::HashSet;
 use std::path::PathBuf;
+
+pub use create::CreateModuleOptions;
+pub use create::ModuleCreation;
+pub use create::create_module;
+pub use import::AddedImport;
+pub use import::ImportAddition;
+pub use import::ImportOptions;
+pub use import::ImportOutcome;
+pub use import::add_imports;
 
 /// The items to replace, and the imports named by the path by the `use` items replaced for them.
 type UseItems = (Vec<ItemId>, Vec<(ItemId, ItemId)>);
@@ -426,10 +439,13 @@ fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 /// The sibling of [`InsertPosition::Before`] and [`InsertPosition::After`] is a path resolved like `parent`, or the
 /// name of an item of the container. Without a `parent`, the position must be before or after a sibling, whose path
 /// must name items of one container: that container is the parent (an `impl` block or trait for an associated item,
-/// the module for other items). New items are separated from their neighbors by blank lines and indented like the
-/// container's items. Fails with [`Error::Collision`] when a new name is already bound in the container (in a module:
-/// by an item or a named import in the same namespace; in an `impl` block: by an associated item), unless
-/// [`InsertOptions::force`].
+/// the module for other items). New items are indented like the container's items, and separated from their
+/// neighbors by blank lines, except where `cargo rscode sort` puts items on consecutive lines: one-line items without
+/// attributes or doc comments (such as `use` items, `mod foo;` declarations, and constants) join one-line siblings of
+/// their group directly, unless blank lines separate those siblings already.
+///
+/// Fails with [`Error::Collision`] when a new name is already bound in the container (in a module: by an item or a
+/// named import in the same namespace; in an `impl` block: by an associated item), unless [`InsertOptions::force`].
 pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, options: &InsertOptions) -> Result<Insertion, Error> {
 	let anchor = match &options.position {
 		InsertPosition::Before(anchor) | InsertPosition::After(anchor) => Some(ItemPath::parse(anchor)?),
@@ -475,7 +491,8 @@ pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, 
 	let placement = placement(resolver, &target, &parent, &options.position, anchor.as_ref())?;
 	let text = target.file.text();
 	let indent = trivia::body_indent(text, target.body);
-	let edit = trivia::insertion(text, placement, &parsed.text, &indent);
+	let spacing = order::spacing(resolver.workspace(), &target, placement, &parsed.text);
+	let edit = trivia::insertion(text, placement, &parsed.text, &indent, spacing);
 	let mut edits = EditSet::new();
 
 	edits.replace(target.file, edit.range, edit.replacement);

@@ -16,6 +16,8 @@
 //! - `cargo rscode remove <PATH>...` removes items, and the files of out-of-line modules.
 //! - `cargo rscode replace <PATH> [SOURCE]` replaces the source of an item, and
 //!   `cargo rscode insert <PARENT> [SOURCE]` adds items to a module, `impl` block, or trait.
+//! - `cargo rscode create-module <PARENT> <NAME> [SOURCE]` creates a module's file and declares it in its parent,
+//!   and `cargo rscode import <MODULE> <PATH>...` adds imports to a module, where sorting puts them.
 //! - `cargo rscode mcp` serves all of this to AI assistants over the Model Context Protocol.
 //!
 //! Edits are validated to still parse before anything is written (all or nothing), and `--dry-run` prints them as

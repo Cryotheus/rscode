@@ -158,6 +158,18 @@ pub(crate) fn diagnostic(diagnostic: &Diagnostic, paths: &PathDisplay) -> String
 	}
 }
 
+/// File changes with the paths of [`PathDisplay::diff_path`].
+fn diff_changes(changes: &[FileChange], paths: &PathDisplay) -> Vec<FileChange> {
+	changes
+		.iter()
+		.map(|change| FileChange {
+			path: paths.diff_path(&change.path),
+			original: change.original.clone(),
+			formatted: change.formatted.clone(),
+		})
+		.collect()
+}
+
 /// File changes with display paths (for rscode_fmt's emitters).
 pub(crate) fn display_changes(changes: &[FileChange], paths: &PathDisplay) -> Vec<FileChange> {
 	changes
@@ -170,11 +182,13 @@ pub(crate) fn display_changes(changes: &[FileChange], paths: &PathDisplay) -> Ve
 		.collect()
 }
 
-/// A unified diff of an edit set's text edits, followed by its moves and deletions.
+/// A unified diff of an edit set's text edits (created files diffed from `/dev/null`), followed by the files it
+/// creates, moves, and deletes.
 pub(crate) fn edit_diff(edits: &EditSet, paths: &PathDisplay) -> Result<String, rscode::Error> {
-	let mut diff = unified_diff(&edits.preview()?, paths);
+	let created: Vec<PathBuf> = edits.created().map(|path| paths.diff_path(path)).collect();
+	let mut diff = rscode::edit::unified_diff(&diff_changes(&edits.preview()?, paths), &created, 3);
 
-	diff.push_str(&file_operations(edits.moves(), edits.deletions(), paths));
+	diff.push_str(&file_operations(edits, paths));
 	Ok(diff)
 }
 
@@ -197,15 +211,19 @@ pub(crate) fn file_lines(rows: &[MatchRow]) -> serde_json::Result<String> {
 	json_line(&entries)
 }
 
-/// `rename <from> -> <to>` and `delete <path>` lines.
-pub(crate) fn file_operations(moves: &[(PathBuf, PathBuf)], deletions: &[PathBuf], paths: &PathDisplay) -> String {
+/// `create <path>`, `rename <from> -> <to>`, and `delete <path>` lines.
+pub(crate) fn file_operations(edits: &EditSet, paths: &PathDisplay) -> String {
 	let mut out = String::new();
 
-	for (from, to) in moves {
+	for path in edits.created() {
+		out.push_str(&format!("create {}\n", paths.display(path)));
+	}
+
+	for (from, to) in edits.moves() {
 		out.push_str(&format!("rename {} -> {}\n", paths.display(from), paths.display(to)));
 	}
 
-	for path in deletions {
+	for path in edits.deletions() {
 		out.push_str(&format!("delete {}\n", paths.display(path)));
 	}
 
@@ -304,16 +322,7 @@ pub(crate) fn last_line(start: LineCol, end: LineCol) -> usize {
 
 /// A unified diff of file changes, with the paths of [`PathDisplay::diff_path`].
 pub(crate) fn unified_diff(changes: &[FileChange], paths: &PathDisplay) -> String {
-	let changes: Vec<FileChange> = changes
-		.iter()
-		.map(|change| FileChange {
-			path: paths.diff_path(&change.path),
-			original: change.original.clone(),
-			formatted: change.formatted.clone(),
-		})
-		.collect();
-
-	rscode::rscode_fmt::emit::unified_diff(&changes, 3)
+	rscode::rscode_fmt::emit::unified_diff(&diff_changes(changes, paths), 3)
 }
 
 /// For each item (and then each of its `impl` blocks) a `// path (kind) file:line-line` header line followed by its
@@ -492,14 +501,26 @@ mod tests {
 
 	#[test]
 	fn renders_file_operations() {
-		let moves = [(PathBuf::from("/ws/src/old.rs"), PathBuf::from("/ws/src/new.rs"))];
-		let deletions = [PathBuf::from("/ws/src/gone"), PathBuf::from("/tmp/x.rs")];
+		let mut edits = EditSet::new();
+
+		edits.create_file("/ws/src/created.rs", "");
+		edits.move_path("/ws/src/old.rs", "/ws/src/new.rs");
+		edits.delete_path("/ws/src/gone");
+		edits.delete_path("/tmp/x.rs");
 
 		assert_eq!(
-			file_operations(&moves, &deletions, &paths()),
-			"rename src/old.rs -> src/new.rs\ndelete src/gone\ndelete /tmp/x.rs\n"
+			file_operations(&edits, &paths()),
+			"create src/created.rs\nrename src/old.rs -> src/new.rs\ndelete src/gone\ndelete /tmp/x.rs\n"
 		);
-		assert_eq!(file_operations(&[], &[], &paths()), "");
+		assert_eq!(file_operations(&EditSet::new(), &paths()), "");
+
+		// a created file is diffed from nothing
+		edits.create_file("/ws/src/created.rs", "struct C;\n");
+
+		let diff = edit_diff(&edits, &paths()).unwrap();
+
+		assert!(diff.starts_with("--- /dev/null\n+++ b/src/created.rs\n@@ -0,0 +1 @@\n+struct C;\n"), "{diff}");
+		assert!(diff.contains("\ncreate src/created.rs\n"), "{diff}");
 	}
 
 	#[test]

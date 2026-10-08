@@ -15,7 +15,17 @@ use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::task::JoinHandle;
 
-const EDIT_TOOLS: [&str; 6] = ["edit_item", "format_items", "insert_items", "remove_items", "rename_item", "replace_item"];
+const EDIT_TOOLS: [&str; 8] = [
+	"add_import",
+	"create_module",
+	"edit_item",
+	"format_items",
+	"insert_items",
+	"remove_items",
+	"rename_item",
+	"replace_item",
+];
+
 const QUERY_TOOLS: [&str; 3] = ["find_items", "view_items", "workspace_info"];
 
 /// Parameters every tool accepts.
@@ -145,6 +155,17 @@ fn annotations() {
 		match tool.name.as_ref() {
 			"remove_items" | "replace_item" | "edit_item" => assert_eq!(annotations.destructive_hint, Some(true)),
 			"rename_item" | "insert_items" | "format_items" => assert_eq!(annotations.destructive_hint, Some(false)),
+
+			"add_import" => {
+				assert_eq!(annotations.destructive_hint, Some(false));
+				assert_eq!(annotations.idempotent_hint, Some(true));
+			}
+
+			"create_module" => {
+				assert_eq!(annotations.destructive_hint, Some(false));
+				assert_eq!(annotations.idempotent_hint, Some(false));
+			}
+
 			_ => assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name),
 		}
 	}
@@ -426,6 +447,8 @@ async fn read_only_servers_refuse_edits() {
 #[test]
 fn required_parameters() {
 	let expected = [
+		("add_import", vec!["module", "paths"]),
+		("create_module", vec!["name", "parent"]),
 		("edit_item", vec!["path"]),
 		("find_items", vec!["pattern"]),
 		("format_items", vec![]),
@@ -690,10 +713,117 @@ mod end_to_end {
 		}
 	}
 
+	#[tokio::test]
+	async fn adds_imports() {
+		let lib = "use std::fmt;\nuse std::io;\n\npub fn f() {}\n";
+		let fixture = Fixture::with_files(
+			"add-import",
+			&[
+				("Cargo.toml", "[package]\nname = \"imports\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
+				("src/lib.rs", lib),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let arguments = json!({ "module": "crate", "paths": "std::env", "dry_run": true });
+		let (failed, text) = client.call("add_import", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&["would import `std::env` (src/lib.rs:1)\n", "nothing was written", "+use std::env;\n use std::fmt;"],
+		);
+		assert_eq!(fixture.read("src/lib.rs"), lib);
+
+		let arguments = json!({ "module": "crate", "paths": ["use std::{env, fmt};", "std::path::Path"] });
+		let (failed, text) = client.call("add_import", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(
+			text,
+			"imported `std::env` (src/lib.rs:1)\n`std::fmt` is already imported (src/lib.rs:2)\nimported `std::path::Path` \
+			 (src/lib.rs:4)\n"
+		);
+		assert_eq!(
+			fixture.read("src/lib.rs"),
+			"use std::env;\nuse std::fmt;\nuse std::io;\nuse std::path::Path;\n\npub fn f() {}\n"
+		);
+
+		// refusals name the parameter to change
+		for (arguments, needle) in [
+			(json!({ "module": "crate", "paths": "other::fmt" }), "hint: import it under another name"),
+			(json!({ "module": "crate", "paths": "not a path" }), "hint: each of `paths` is a `use` tree"),
+			(json!({ "module": "crate", "paths": [] }), "`paths` is empty"),
+		] {
+			let (failed, text) = client.call("add_import", arguments).await;
+
+			assert!(failed && text.contains(needle), "{text}");
+		}
+
+		client.close().await.unwrap();
+	}
+
 	fn assert_contains(text: &str, needles: &[&str]) {
 		for needle in needles {
 			assert!(text.contains(needle), "{needle:?} is not in:\n{text}");
 		}
+	}
+
+	#[tokio::test]
+	async fn creates_modules() {
+		let fixture = Fixture::new("create-module");
+		let mut client = Client::connect(fixture.options()).await;
+		let original = fixture.read("src/lib.rs");
+		let arguments = json!({ "parent": "crate", "name": "render", "source": "pub fn draw() {}", "dry_run": true });
+
+		// a dry run writes nothing
+		let (failed, text) = client.call("create_module", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"would create src/render.rs; would insert `mod render;` into `crate` (src/lib.rs:3)\n",
+				"nothing was written",
+				"--- /dev/null\n+++ b/src/render.rs\n",
+				"+pub fn draw() {}\n",
+				"+mod render;\n pub mod shapes;\n",
+				"create src/render.rs\n",
+			],
+		);
+		assert_eq!(fixture.read("src/lib.rs"), original);
+		assert!(!fixture.root.join("src/render.rs").exists());
+
+		let arguments = json!({ "parent": "crate", "name": "render", "source": "pub fn draw() {}", "vis": "pub" });
+		let (failed, text) = client.call("create_module", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(text, "created src/render.rs; inserted `pub mod render;` into `crate` (src/lib.rs:3)\n");
+		assert_eq!(fixture.read("src/render.rs"), "pub fn draw() {}\n");
+		assert_eq!(fixture.read("src/lib.rs"), original.replace("pub mod shapes;", "pub mod render;\npub mod shapes;"));
+
+		// refusals name the parameter to change, and write nothing
+		let refusals = [
+			(json!({ "parent": "crate", "name": "render" }), "hint: choose another `name`"),
+			(json!({ "parent": "crate", "name": "crate::x" }), "hint: `name` is the new module's identifier"),
+			(json!({ "parent": "crate", "name": "x", "vis": "public" }), "hint: `vis` is `pub`"),
+			(json!({ "parent": "crate", "name": "x", "source": "fn (" }), "hint: `source` is the whole file"),
+			(json!({ "parent": "crate", "name": " " }), "`name` is empty"),
+		];
+
+		for (arguments, needle) in refusals {
+			let (failed, text) = client.call("create_module", arguments).await;
+
+			assert!(failed && text.contains(needle), "{text}");
+		}
+
+		std::fs::write(fixture.root.join("src/stray.rs"), "").unwrap();
+
+		let (failed, text) = client.call("create_module", json!({ "parent": "crate", "name": "stray" })).await;
+
+		assert!(failed && text.contains("hint: declare the existing file with `insert_items`"), "{text}");
+		assert_eq!(fixture.read("src/lib.rs"), original.replace("pub mod shapes;", "pub mod render;\npub mod shapes;"));
+
+		client.close().await.unwrap();
 	}
 
 	#[tokio::test]

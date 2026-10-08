@@ -13,6 +13,7 @@ use clap::parser::ValueSource;
 use rscode::Edition;
 use rscode::ItemKind;
 use rscode::LoadOptions;
+use rscode::edit::CreateModuleOptions;
 use rscode::edit::EditItemOptions;
 use rscode::edit::FmtOptions;
 use rscode::edit::InsertOptions;
@@ -85,6 +86,33 @@ impl ConfigValues {
 		}
 
 		Ok(split)
+	}
+}
+
+/// `create-module`
+#[derive(Debug, Clone)]
+pub(crate) struct CreateModuleArgs {
+	pub(crate) parent: String,
+	pub(crate) name: String,
+
+	/// Where the contents of the module's file come from (`None` for an empty file).
+	pub(crate) source: Option<SourceArg>,
+
+	pub(crate) options: CreateModuleOptions,
+	pub(crate) dry_run: bool,
+}
+
+impl CreateModuleArgs {
+	pub(crate) fn from_matches(matches: &ArgMatches) -> Self {
+		Self {
+			parent: matches._value_of("parent").unwrap_or_default().to_owned(),
+			name: matches._value_of("name").unwrap_or_default().to_owned(),
+			source: matches._value_of("source").is_some().then(|| SourceArg::from_matches(matches)),
+			options: CreateModuleOptions {
+				vis: matches._value_of("vis").unwrap_or_default().trim().to_owned(),
+			},
+			dry_run: matches.flag("dry-run"),
+		}
 	}
 }
 
@@ -368,6 +396,24 @@ impl FromArg {
 			"crate" => Self::CrateRoot,
 			"::" => Self::Foreign,
 			path => Self::Module(path.to_owned()),
+		}
+	}
+}
+
+/// `import`
+#[derive(Debug, Clone)]
+pub(crate) struct ImportArgs {
+	pub(crate) module: String,
+	pub(crate) paths: Vec<String>,
+	pub(crate) dry_run: bool,
+}
+
+impl ImportArgs {
+	pub(crate) fn from_matches(matches: &ArgMatches) -> Self {
+		Self {
+			module: matches._value_of("module").unwrap_or_default().to_owned(),
+			paths: matches._values_of("paths"),
+			dry_run: matches.flag("dry-run"),
 		}
 	}
 }
@@ -849,6 +895,27 @@ mod tests {
 	}
 
 	#[test]
+	fn create_module_arguments() {
+		let args = CreateModuleArgs::from_matches(&parse(&["cargo-rscode", "create-module", "crate::m", "render"]));
+
+		assert_eq!((args.parent.as_str(), args.name.as_str()), ("crate::m", "render"));
+		assert_eq!(args.source, None);
+		assert_eq!(args.options.vis, "");
+		assert!(!args.dry_run);
+
+		let words = ["cargo-rscode", "create-module", "crate", "x", "-", "--vis", " pub(crate) ", "-n"];
+		let args = CreateModuleArgs::from_matches(&parse(&words));
+
+		assert_eq!(args.source, Some(SourceArg::Stdin));
+		assert_eq!(args.options.vis, "pub(crate)");
+		assert!(args.dry_run);
+
+		let args = CreateModuleArgs::from_matches(&parse(&["cargo-rscode", "create-module", "crate", "x", "x.rs"]));
+
+		assert_eq!(args.source, Some(SourceArg::File(PathBuf::from("x.rs"))));
+	}
+
+	#[test]
 	fn default_load_options() {
 		let options = load_options(&parse(&["cargo-rscode", "view", "x"])).unwrap();
 
@@ -1110,6 +1177,16 @@ mod tests {
 
 		assert_eq!(sort.cargo_config, ["a=b"]);
 		assert!(sort.options.format.rustfmt.config.is_empty());
+	}
+
+	#[test]
+	fn import_arguments() {
+		let words = ["cargo-rscode", "import", "crate::m", "std::fs", "crate::a::{B, C}", "-n"];
+		let args = ImportArgs::from_matches(&parse(&words));
+
+		assert_eq!(args.module, "crate::m");
+		assert_eq!(args.paths, ["std::fs", "crate::a::{B, C}"]);
+		assert!(args.dry_run);
 	}
 
 	#[test]

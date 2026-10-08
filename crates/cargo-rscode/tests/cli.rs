@@ -263,7 +263,9 @@ fn prints_help_and_version() {
 
 	assert!(help.stdout.contains("Usage: cargo-rscode <COMMAND>"), "{}", help.stdout);
 
-	for subcommand in ["find", "view", "fmt", "sort", "rename", "remove", "replace", "edit", "insert"] {
+	let subcommands = ["find", "view", "fmt", "sort", "rename", "remove", "replace", "edit", "insert", "create-module", "import"];
+
+	for subcommand in subcommands {
 		assert!(help.stdout.contains(&format!("\n  {subcommand} ")), "{subcommand}: {}", help.stdout);
 	}
 
@@ -1071,6 +1073,71 @@ fn inserts_items() {
 
 	assert_eq!(taken.code, Some(1));
 	assert!(taken.stderr.contains("collides"), "{}", taken.stderr);
+}
+
+#[test]
+fn creates_modules() {
+	let copy = TempCopy::new("create-module");
+	let lib = copy.read("src/lib.rs");
+	let args = ["create-module", "crate", "render", "-", "--lib", "--dry-run"];
+	let dry = run_with_stdin(copy.path(), &args, "pub fn draw() {}\n").success();
+
+	let new_file = "--- /dev/null\n+++ b/src/render.rs\n@@ -0,0 +1 @@\n+pub fn draw() {}\n";
+
+	assert!(dry.stdout.contains(new_file), "{}", dry.stdout);
+	assert!(dry.stdout.contains("\n+mod render;\n pub mod shapes;\n"), "{}", dry.stdout);
+	assert!(dry.stdout.ends_with("create src/render.rs\n"), "{}", dry.stdout);
+	assert_eq!(dry.stderr, native("would create src/render.rs; would insert `mod render;` into crate (src/lib.rs:3)\n"));
+	assert!(!copy.path().join("src/render.rs").exists());
+
+	let args = ["create-module", "crate", "render", "-", "--lib", "--vis", "pub"];
+	let created = run_with_stdin(copy.path(), &args, "pub fn draw() {}\n").success();
+
+	assert_eq!(created.stdout, native("created src/render.rs; inserted `pub mod render;` into crate (src/lib.rs:3)\n"));
+	assert_eq!(copy.read("src/render.rs"), "pub fn draw() {}\n");
+	assert_eq!(copy.read("src/lib.rs"), lib.replace("pub mod shapes;\n", "pub mod render;\npub mod shapes;\n"));
+
+	// without a source, the file is empty
+	let args = ["create-module", "crate::shapes", "round", "--lib", "--message-format", "json"];
+	let report: Value = serde_json::from_str(&run(copy.path(), &args).success().stdout).unwrap();
+
+	assert_eq!(report["created"], native("src/shapes/round.rs"));
+	assert_eq!(report["declaration"], "mod round;");
+	assert_eq!(copy.read("src/shapes/round.rs"), "");
+	assert!(copy.read("src/shapes.rs").starts_with("//! Shapes.\n\nmod round;\n\n/// A circle."));
+	cargo_check(copy.path());
+
+	let taken = run(copy.path(), &["create-module", "crate", "util", "--lib"]);
+
+	assert_eq!(taken.code, Some(1));
+	assert!(taken.stderr.contains("collides with existing names"), "{}", taken.stderr);
+	assert!(taken.stderr.contains("hint: choose another NAME"), "{}", taken.stderr);
+}
+
+#[test]
+fn imports() {
+	let copy = TempCopy::new("import");
+	let lib = copy.read("src/lib.rs");
+	let dry = run(copy.path(), &["import", "crate", "std::fmt", "--lib", "-n"]).success();
+
+	assert!(dry.stdout.contains("+use std::fmt;\n"), "{}", dry.stdout);
+	assert_eq!(dry.stderr, native("would import `std::fmt` (src/lib.rs:6)\n"));
+	assert_eq!(copy.read("src/lib.rs"), lib);
+
+	let imported = run(copy.path(), &["import", "crate", "std::{fmt, io}", "--lib"]).success();
+
+	assert_eq!(imported.stdout, native("imported `std::fmt` (src/lib.rs:6)\nimported `std::io` (src/lib.rs:7)\n"));
+	assert_eq!(copy.read("src/lib.rs"), lib.replace("mod util;\n", "mod util;\n\nuse std::fmt;\nuse std::io;\n"));
+
+	let again = run(copy.path(), &["import", "crate", "use std::fmt;", "--lib"]).success();
+
+	assert_eq!(again.stdout, native("`std::fmt` is already imported (src/lib.rs:6)\n"));
+	cargo_check(copy.path());
+
+	let taken = run(copy.path(), &["import", "crate", "other::add", "--lib"]);
+
+	assert_eq!(taken.code, Some(1));
+	assert!(taken.stderr.contains("hint: import it under another name"), "{}", taken.stderr);
 }
 
 #[test]

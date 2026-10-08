@@ -2,8 +2,12 @@
 //! root, and locations as `file:line:column`.
 
 use crate::Tristate;
+use crate::edit::EditSet;
 use crate::edit::FileChange;
+use crate::edit::ImportAddition;
+use crate::edit::ImportOutcome;
 use crate::edit::Insertion;
+use crate::edit::ModuleCreation;
 use crate::edit::Removal;
 use crate::edit::Rename;
 use crate::edit::Replacement;
@@ -72,9 +76,10 @@ fn diagnostics(workspace: &Workspace) -> Vec<String> {
 	problems.into_iter().map(|(_, problem)| problem).collect()
 }
 
-/// A unified diff of the changed files, followed by `rename <from> -> <to>` and `delete <path>` lines, with paths
-/// relative to the workspace root.
-pub(crate) fn diff(root: &Path, changes: &[FileChange], moves: &[(PathBuf, PathBuf)], deletions: &[PathBuf]) -> String {
+/// A unified diff of the changed files (created files diffed from `/dev/null`), followed by the files `edits` creates,
+/// moves, and deletes (`create <path>`, `rename <from> -> <to>`, and `delete <path>` lines), with paths relative to
+/// the workspace root.
+pub(crate) fn diff(root: &Path, changes: &[FileChange], edits: &EditSet) -> String {
 	let changes: Vec<FileChange> = changes
 		.iter()
 		.filter(|change| change.is_changed())
@@ -84,20 +89,22 @@ pub(crate) fn diff(root: &Path, changes: &[FileChange], moves: &[(PathBuf, PathB
 			formatted: change.formatted.clone(),
 		})
 		.collect();
-	let mut out = match changes.is_empty() {
-		true => String::new(),
-		false => crate::rscode_fmt::emit::unified_diff(&changes, 3),
-	};
+	let created: Vec<PathBuf> = edits.created().map(|path| relative(root, path)).collect();
+	let mut out = crate::edit::unified_diff(&changes, &created, 3);
 
 	if !out.is_empty() && !out.ends_with('\n') {
 		out.push('\n');
 	}
 
-	for (from, to) in moves {
+	for path in &created {
+		writeln!(out, "create {}", path.display()).unwrap();
+	}
+
+	for (from, to) in edits.moves() {
 		writeln!(out, "rename {} -> {}", display(root, from), display(root, to)).unwrap();
 	}
 
-	for path in deletions {
+	for path in edits.deletions() {
 		writeln!(out, "delete {}", display(root, path)).unwrap();
 	}
 
@@ -270,6 +277,36 @@ pub(crate) fn format_written(root: &Path, processed: usize, written: &[PathBuf],
 	out
 }
 
+/// What adding imports did (or would do), one line each: `imported `std::fs` (src/x.rs:7)`, `merged `std::fs` into
+/// `use std::{fs, io};` (src/x.rs:5)`, or `` `std::fs` is already imported (src/x.rs:5)``.
+pub(crate) fn import_addition(root: &Path, plan: &ImportAddition, dry_run: bool) -> String {
+	let mut out = String::new();
+	let file = display(root, &plan.file);
+
+	for import in &plan.imports {
+		let path = &import.path;
+		let line = import.line;
+
+		match &import.outcome {
+			ImportOutcome::Added => writeln!(out, "{} `{path}` ({file}:{line})", done(dry_run, "imported", "import")),
+
+			ImportOutcome::Merged(item) if !item.contains('\n') => {
+				writeln!(out, "{} `{path}` into `{item}` ({file}:{line})", done(dry_run, "merged", "merge"))
+			}
+
+			ImportOutcome::Merged(_) => {
+				writeln!(out, "{} `{path}` into the `use` item at {file}:{line}", done(dry_run, "merged", "merge"))
+			}
+
+			ImportOutcome::Present => writeln!(out, "`{path}` is already imported ({file}:{line})"),
+		}
+		.unwrap();
+	}
+
+	warnings(&mut out, &plan.warnings);
+	out
+}
+
 /// What an insertion did (or would do).
 pub(crate) fn insertion(root: &Path, plan: &Insertion, parent: &str, dry_run: bool) -> String {
 	let mut out = String::new();
@@ -367,6 +404,26 @@ pub(crate) fn load_errors_note(workspace: &Workspace) -> String {
 /// `file:line:column`
 fn location(root: &Path, file: &Path, at: LineCol) -> String {
 	format!("{}:{at}", display(root, file))
+}
+
+/// What creating a module did (or would do): `created src/x.rs; inserted `mod x;` into `crate` (src/lib.rs:4)`.
+pub(crate) fn module_creation(root: &Path, plan: &ModuleCreation, parent: &str, dry_run: bool) -> String {
+	let mut out = String::new();
+
+	writeln!(
+		out,
+		"{} {}; {} `{}` into `{parent}` ({}:{})",
+		done(dry_run, "created", "create"),
+		display(root, &plan.file),
+		done(dry_run, "inserted", "insert"),
+		plan.declaration,
+		display(root, &plan.declared_in),
+		plan.line
+	)
+	.unwrap();
+
+	warnings(&mut out, &plan.warnings);
+	out
 }
 
 fn reference(root: &Path, reference: &Reference) -> String {
@@ -755,8 +812,8 @@ mod tests {
 	use super::*;
 	use crate::CfgContext;
 	use crate::ItemKind;
+	use crate::edit::AddedImport;
 	use crate::edit::Collision;
-	use crate::edit::EditSet;
 	use crate::edit::ItemSpan;
 	use crate::edit::RemovedItem;
 	use crate::model::CrateId;
@@ -786,14 +843,25 @@ mod tests {
 	#[test]
 	fn diffs_of_file_operations() {
 		let unchanged = [change("/ws/src/lib.rs", "x", "x")];
-		let moves = [(PathBuf::from("/ws/src/a.rs"), PathBuf::from("/ws/src/b.rs"))];
-		let deletions = [PathBuf::from("/ws/src/c")];
+		let mut edits = EditSet::new();
+
+		edits.move_path("/ws/src/a.rs", "/ws/src/b.rs");
+		edits.delete_path("/ws/src/c");
+
+		assert_eq!(diff(root(), &unchanged, &edits), "rename src/a.rs -> src/b.rs\ndelete src/c\n");
+		assert_eq!(diff(root(), &[], &EditSet::new()), "");
+
+		// created files
+		edits.create_file("/ws/src/d.rs", "struct D;\n");
+		edits.create_file("/ws/src/e.rs", "");
+
+		let created = [change("/ws/src/d.rs", "", "struct D;\n"), change("/ws/src/e.rs", "", "")];
 
 		assert_eq!(
-			diff(root(), &unchanged, &moves, &deletions),
-			"rename src/a.rs -> src/b.rs\ndelete src/c\n"
+			diff(root(), &created, &edits),
+			"--- /dev/null\n+++ b/src/d.rs\n@@ -0,0 +1 @@\n+struct D;\ncreate src/d.rs\ncreate src/e.rs\n\
+			 rename src/a.rs -> src/b.rs\ndelete src/c\n"
 		);
-		assert_eq!(diff(root(), &[], &[], &[]), "");
 	}
 
 	#[test]
@@ -922,6 +990,47 @@ mod tests {
 			thread_local: false,
 			entry_macro: None,
 		}
+	}
+
+	#[test]
+	fn import_and_module_reports() {
+		let import = |path: &str, outcome: ImportOutcome, line: usize| AddedImport {
+			path: path.to_owned(),
+			outcome,
+			line,
+		};
+		let plan = ImportAddition {
+			edits: EditSet::new(),
+			imports: vec![
+				import("std::env", ImportOutcome::Added, 7),
+				import("std::fs", ImportOutcome::Merged("use std::{fs, io};".to_owned()), 5),
+				import("std::io::Write", ImportOutcome::Merged("use std::{\n\tio::Write,\n};".to_owned()), 3),
+				import("pub use a::B", ImportOutcome::Present, 9),
+			],
+			file: PathBuf::from("/ws/src/lib.rs"),
+			warnings: Vec::new(),
+		};
+
+		assert_eq!(
+			import_addition(root(), &plan, false),
+			"imported `std::env` (src/lib.rs:7)\nmerged `std::fs` into `use std::{fs, io};` (src/lib.rs:5)\nmerged \
+			 `std::io::Write` into the `use` item at src/lib.rs:3\n`pub use a::B` is already imported (src/lib.rs:9)\n"
+		);
+		assert!(import_addition(root(), &plan, true).starts_with("would import `std::env` (src/lib.rs:7)\nwould merge"));
+
+		let module = ModuleCreation {
+			edits: EditSet::new(),
+			file: PathBuf::from("/ws/src/a/b.rs"),
+			declaration: "pub(crate) mod b;".to_owned(),
+			declared_in: PathBuf::from("/ws/src/a.rs"),
+			line: 4,
+			warnings: vec!["something".to_owned()],
+		};
+
+		assert_eq!(
+			module_creation(root(), &module, "crate::a", true),
+			"would create src/a/b.rs; would insert `pub(crate) mod b;` into `crate::a` (src/a.rs:4)\nwarning: something\n"
+		);
 	}
 
 	#[test]

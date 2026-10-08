@@ -9,6 +9,9 @@
 //!   preserved.
 //! - [`Sorter::sort_tokens`] operates on a [`proc_macro2::TokenStream`], such as generated `bindgen` output.
 //!
+//! Editors that add items can put them where sorting would: [`ItemOrder`] tells the group of an item and how it
+//! compares with the items of its group, and [`insertion_point`] where a new item goes among the items of a container.
+//!
 //! Contents of expressions, function bodies, and macro invocations are never sorted, nor are enum variants, struct
 //! fields, or items inside function bodies.
 //!
@@ -159,6 +162,10 @@ use proc_macro2::TokenStream;
 use serde::Deserialize;
 use serde::Serialize;
 
+pub use cryotheum::InsertionPoint;
+pub use cryotheum::ItemOrder;
+pub use cryotheum::insertion_point;
+pub use imports::use_tree_cmp;
 pub use version::version_cmp;
 
 /// A scheme for ordering items.
