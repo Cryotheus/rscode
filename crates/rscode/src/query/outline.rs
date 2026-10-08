@@ -49,8 +49,9 @@ impl<'ws> Source<'ws> {
 	}
 }
 
-/// Replaces each run of several private `use` items of a module (with the lines between them) with `use ...;`.
-fn collapse_imports(workspace: &Workspace, module: ItemId, edits: &mut Vec<Edit>) {
+/// Replaces each run of several private `use` items of a module (with the lines between them) with `use ...;`, and
+/// returns the ranges of the runs.
+fn collapse_imports(workspace: &Workspace, module: ItemId, edits: &mut Vec<Edit>) -> Vec<TextRange> {
 	let mut runs: Vec<(TextRange, usize)> = Vec::new();
 	let mut extends = false;
 
@@ -71,7 +72,10 @@ fn collapse_imports(workspace: &Workspace, module: ItemId, edits: &mut Vec<Edit>
 		extends = private_use;
 	}
 
-	edits.extend((runs.into_iter()).filter(|(_, count)| *count > 1).map(|(range, _)| Edit::Replace(range, "use ...;")));
+	let runs: Vec<TextRange> = runs.into_iter().filter(|(_, count)| *count > 1).map(|(range, _)| range).collect();
+
+	edits.extend(runs.iter().map(|&range| Edit::Replace(range, "use ...;")));
+	runs
 }
 
 /// Collects the elisions of an item and the items inside of it: bodies of functions and macros (but not of
@@ -143,12 +147,13 @@ pub(super) fn item_snippet(
 	imports: bool,
 ) -> Snippet {
 	let mut edits = Vec::new();
+	let mut collapsed = Vec::new();
 
 	if outline {
 		collect_elisions(workspace, item, true, source.file.text(), &mut edits);
 
 		if !imports {
-			collapse_imports(workspace, item, &mut edits);
+			collapsed = collapse_imports(workspace, item, &mut edits);
 		}
 
 		let text = source.file.text();
@@ -162,7 +167,10 @@ pub(super) fn item_snippet(
 	}
 
 	if !docs {
-		edits.extend(within(&syntax.docs, source.region).iter().map(|&range| Edit::Delete(range)));
+		// (the docs of collapsed `use` items go with them)
+		let docs = within(&syntax.docs, source.region).iter().filter(|&&range| !collapsed.iter().any(|run| run.contains_range(range)));
+
+		edits.extend(docs.map(|&range| Edit::Delete(range)));
 	}
 
 	let mut snippet = Snippet::new(source.file, source.region, &edits, within(&syntax.strings, source.region));

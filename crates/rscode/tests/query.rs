@@ -718,7 +718,47 @@ fn views_with_line_numbers() {
 	assert!(text(&resolver, "crate::add", auto.clone()).starts_with("/// Adds two numbers.\n"));
 	assert!(text(&resolver, "crate::add", ViewOptions { docs: false, ..auto.clone() }).starts_with("  14 │ pub fn add("));
 	assert!(text(&resolver, "crate::impls", auto.clone()).contains("\n   9 │ \tpub fn new(radius: f64) -> Self { ... }\n"));
-	assert!(text(&resolver, "crate::shapes", ViewOptions { mode: ViewMode::Full, ..auto }).contains("\n//! Shapes.\n"));
+
+	// (the header of a module with a file gives the line of its declaration)
+	let full = text(&resolver, "crate::shapes", ViewOptions { mode: ViewMode::Full, ..auto });
+
+	assert!(full.contains("\n   1 │ //! Shapes.\n"), "{full}");
+
+	// options written before `auto` had `true` and `false`
+	let options = |json: &str| serde_json::from_str::<ViewOptions>(json).unwrap().line_numbers;
+
+	assert_eq!(options(r#"{ "line-numbers": true }"#), LineNumbers::Always);
+	assert_eq!(options(r#"{ "line-numbers": false }"#), LineNumbers::Never);
+	assert_eq!(options(r#"{ "line-numbers": "auto" }"#), LineNumbers::Auto);
+	assert!(serde_json::from_str::<ViewOptions>(r#"{ "line-numbers": "often" }"#).is_err());
+}
+
+#[test]
+fn outlines_collapse_imports_with_their_docs_and_attributes() {
+	let dir = std::env::temp_dir().join(format!("rscode-query-imports-{}", std::process::id()));
+	let root = dir.join("lib.rs");
+
+	std::fs::create_dir_all(&dir).unwrap();
+	std::fs::write(
+		&root,
+		"/// The map.\nuse std::collections::HashMap;\n#[cfg(unix)]\nuse std::fs;\n\npub use std::io;\n\npub fn f() {}\n",
+	)
+	.unwrap();
+
+	let mut workspace = Workspace::new(&dir);
+
+	workspace.load_crate(CrateSpec::new("imports", root));
+
+	let resolver = Resolver::new(&workspace);
+
+	for docs in [true, false] {
+		let outline = text(&resolver, "::imports", ViewOptions { imports: false, docs, ..ViewOptions::default() });
+
+		assert!(outline.ends_with("\nuse ...;\n\npub use std::io;\n\npub fn f() {}"), "{outline}");
+		assert!(!outline.contains("HashMap") && !outline.contains("unix"), "{outline}");
+	}
+
+	std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

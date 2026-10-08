@@ -768,7 +768,7 @@ pub(crate) struct ViewParams {
 	#[serde(default)]
 	pub(crate) line_numbers: Option<bool>,
 
-	/// In outlines, list a module's `use` items (by default, each run of them is one `use ...;` line).
+	/// In outlines, list a module's `use` items (by default, each run of private ones is one `use ...;` line).
 	#[serde(default)]
 	pub(crate) imports: bool,
 

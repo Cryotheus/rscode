@@ -523,7 +523,8 @@ fn is_plain(path: &ItemPath) -> bool {
 }
 
 /// Whether a line is the header line of a view of an item (`// path (kind) file:line-endline`, maybe followed by
-/// `[cfg: …]` and `[inactive]`), which text copied from a view may start with.
+/// `[cfg: …]` and `[inactive]`), which text copied from a view has above each item: the path must parse, and the kind
+/// be one (with the label of statics of macro invocations: `static (thread_local!)`).
 fn is_view_header(line: &str) -> bool {
 	let Some(mut rest) = line.trim().strip_prefix("// ") else {
 		return false;
@@ -540,8 +541,17 @@ fn is_view_header(line: &str) -> bool {
 		return false;
 	};
 	let is_lines = lines.split('-').all(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
+	let Some(path_kind) = (path_kind_file.rsplit_once(' ')).and_then(|(path_kind, _)| path_kind.strip_suffix(')')) else {
+		return false;
+	};
 
-	is_lines && path_kind_file.rsplit_once(' ').is_some_and(|(path_kind, _)| path_kind.ends_with(')') && path_kind.contains(" ("))
+	// (the path may contain ` (`, as in `impl Fn(u8) for T`: try each)
+	is_lines
+		&& path_kind.match_indices(" (").any(|(at, _)| {
+			let kind = path_kind[at + 2..].split(") (").next().unwrap_or_default();
+
+			kind.parse::<ItemKind>().is_ok_and(|parsed| parsed.name() == kind) && ItemPath::parse(&path_kind[..at]).is_ok()
+		})
 }
 
 /// The item an anchor stands for among the items of its container: the item, or for an import its `use` item, and for
@@ -614,20 +624,28 @@ fn module_namespaces(resolver: &Resolver<'_>, module: ItemId, binding: &NewBindi
 	if resolved.is_empty() { binding.namespaces.to_vec() } else { resolved }
 }
 
-/// Source as it may be pasted from a view: without the view's header line and without line-number gutters
-/// (`  12 │ `), which are no part of the items.
+/// Source as it may be pasted from a view: without the views' header lines (one above each item) and without
+/// line-number gutters (`  12 │ `), which are no part of the items.
 fn pasted(source: &str) -> Cow<'_, str> {
-	let source = match source.split_once('\n') {
-		Some((first, rest)) if is_view_header(first) => rest,
-		_ => source,
-	};
-	let lines: Vec<&str> = source.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect();
+	let lines: Vec<&str> = (source.split('\n'))
+		.map(|line| line.strip_suffix('\r').unwrap_or(line))
+		.filter(|line| !is_view_header(line))
+		.collect();
+	let headers = lines.len() < source.split('\n').count();
 	let numbered = lines.iter().any(|line| item::gutter_len(line).is_some())
 		&& lines.iter().all(|line| line.trim().is_empty() || item::gutter_len(line).is_some());
 
-	match numbered {
-		true => Cow::Owned(lines.iter().map(|line| &line[item::gutter_len(line).unwrap_or(0)..]).collect::<Vec<_>>().join("\n")),
-		false => Cow::Borrowed(source),
+	match (headers, numbered) {
+		(_, true) => Cow::Owned(lines.iter().map(|line| &line[item::gutter_len(line).unwrap_or(0)..]).collect::<Vec<_>>().join("\n")),
+
+		// (keeping the line endings)
+		(true, false) => Cow::Owned(
+			(source.split_inclusive('\n'))
+				.filter(|line| !is_view_header(line.trim_end_matches(['\n', '\r'])))
+				.collect(),
+		),
+
+		(false, false) => Cow::Borrowed(source),
 	}
 }
 

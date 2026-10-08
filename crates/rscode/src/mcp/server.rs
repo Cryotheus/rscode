@@ -66,7 +66,7 @@ const HIDDEN_PARAMETERS: [&str; 6] = ["all_features", "all_targets", "bin", "fea
 const INSTRUCTIONS: &str = "\
 rscode reads, searches, and edits the Rust crates of a cargo workspace by item path, without compiling anything. \
 Items that macros generate are invisible, except the statics of `thread_local!` and the `static NAME = value;` \
-entries of item-position macro invocations (statics of their module, whose uses are not tracked).
+entries of item-position macro invocations (statics of their module; uses of entries are not tracked).
 
 Paths are written like Rust paths: `crate::m::Item` (from the root of every selected crate), `::crate_name::Item`, \
 or `m::Item` (tried from every crate root). Also `Type::method`, `<Type as Trait>::method`, `impl Trait for Type`, \
@@ -76,17 +76,17 @@ Generic arguments pick impl blocks (`impl From<u8> for W`), and a selector picks
 header: `impl Tools[add_bots]` (with that item), `impl Tools[#tool_router]` (with that attribute), `<Tools>[2]::new` \
 (the second); printed paths carry one when needed. A path names every cfg variant of an item (disabled ones are \
 marked inactive) and goes through imports and re-exports. A path that names nothing in the selected packages is \
-looked up in the other workspace members, with a note.
+looked up in the other workspace members.
 
 Every tool takes `packages` (cargo package specs; by default the server's selection, see workspace_info). Also \
 accepted, rarely needed: `workspace` (every member), `features`, `all_features`, `all_targets` (tests, examples, \
-benches too), and `lib` or `bin` (names) to pick the library or binaries of a package that has both, whose roots \
-are both `crate`.
+benches too), and `lib` (true) or `bin` (binary names) to pick the library or binaries of a package that has both, \
+whose roots are both `crate`.
 
 Edits are all-or-nothing: every changed file must still parse, or nothing is written. With `dry_run` they return \
-their summary and a diff and write nothing; with `format`, rustfmt formats what they wrote. Code outside of the \
-edited items is kept as it is. For small changes use edit_item (exact `old`/`new` text, visibility, docs, \
-attributes) rather than replace_item.
+their summary and a diff and write nothing; replace_item, edit_item, and insert_items take `format` to have rustfmt \
+format what they wrote. Code outside of the edited items is kept as it is. For small changes use edit_item (exact \
+`old`/`new` text, visibility, docs, attributes) rather than replace_item.
 
 Every call reads the files again, so other tools' changes are seen. Lines are 1-based. Typically: workspace_info, \
 find_items, view_items, then edit.";
@@ -266,8 +266,8 @@ impl Server {
 		self.query("find_references", target, move |target| tools::references(&target.load, &params)).await
 	}
 
-	/// Show items by path, in full or outlined (the default for modules: bodies elided, and runs of `use` items
-	/// shown as `use ...;` unless `imports`). Each starts with a header `// path (kind) file:line-endline`; lines are
+	/// Show items by path, in full or outlined (the default for modules: bodies elided, and runs of private `use`
+	/// items shown as `use ...;` unless `imports`). Each starts with a header `// path (kind) file:line-endline`; lines are
 	/// numbered when they are not consecutive.
 	#[tool(annotations(title = "View items", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
 	async fn view_items(&self, Parameters(params): Parameters<ViewParams>) -> CallToolResult {

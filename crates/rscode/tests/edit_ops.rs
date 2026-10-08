@@ -967,11 +967,21 @@ pub mod out;
 			assert_eq!(edited.replace("\t\n", "\n").replace("right + left\n\n}", "right + left\n}"), expected, "{source}");
 		}
 
-		// a comment that merely looks like one stays
-		let source = "// add (fn)\n/// Adds.\npub fn add(left: i32, right: i32) -> i32 {\n\tright + left\n}\n";
-		let replacement = replace(&ws, "crate::add", source, &ReplaceOptions::default()).unwrap();
+		// comments that merely look like one stay
+		for comment in ["// add (fn)", "// Adapted from serde (MIT) src/de.rs:120-140", "// see a::b (fnord) x.rs:1"] {
+			let source = format!("{comment}\n/// Adds.\npub fn add(left: i32, right: i32) -> i32 {{\n\tright + left\n}}\n");
+			let replacement = replace(&ws, "crate::add", &source, &ReplaceOptions::default()).unwrap();
 
-		assert!(edited(&dir, &replacement.edits, "src/lib.rs").contains("// add (fn)\n/// Adds."));
+			assert!(edited(&dir, &replacement.edits, "src/lib.rs").contains(&format!("{comment}\n/// Adds.")), "{comment}");
+		}
+
+		// a view of several items has a header above each
+		let source = "// fixture::S (struct) src/lib.rs:9\npub struct S;\n\n// <fixture::S>::m (assoc-fn) src/lib.rs:12-15\n\
+		              pub struct T;\n";
+		let options = InsertOptions::default();
+		let insertion = rscode::edit::insert(&Resolver::new(&ws), Some(&path("crate::out")), source, &options).unwrap();
+
+		assert_eq!(edited(&dir, &insertion.edits, "src/out.rs"), "pub fn o() {}\n\npub struct S;\n\npub struct T;\n");
 	}
 
 	#[test]

@@ -66,8 +66,9 @@ pub struct ItemView {
 	pub impls: Vec<ItemView>,
 }
 
-/// When views prefix their lines with line numbers.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+/// When views prefix their lines with line numbers. Deserialized from its name, or from `true` and `false` (for
+/// [`Always`](Self::Always) and [`Never`](Self::Never)), as [`ViewOptions::line_numbers`] was a `bool` before.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LineNumbers {
 	/// Never.
@@ -77,9 +78,39 @@ pub enum LineNumbers {
 	/// Always.
 	Always,
 
-	/// Only when the lines shown are not the consecutive lines of the item (or file) from its first line on, as when
-	/// bodies are elided or doc comments left out: otherwise the first line's number tells every line's.
+	/// Only when the lines shown are not the consecutive lines of the item from its first line on, as when bodies are
+	/// elided or doc comments left out, and for the files of modules: otherwise the first line's number tells every
+	/// line's.
 	Auto,
+}
+
+impl<'de> Deserialize<'de> for LineNumbers {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		struct Visitor;
+
+		impl serde::de::Visitor<'_> for Visitor {
+			type Value = LineNumbers;
+
+			fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				formatter.write_str("`never`, `always`, `auto`, or a bool")
+			}
+
+			fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<LineNumbers, E> {
+				Ok(value.into())
+			}
+
+			fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<LineNumbers, E> {
+				match value {
+					"never" => Ok(LineNumbers::Never),
+					"always" => Ok(LineNumbers::Always),
+					"auto" => Ok(LineNumbers::Auto),
+					_ => Err(E::unknown_variant(value, &["never", "always", "auto"])),
+				}
+			}
+		}
+
+		deserializer.deserialize_any(Visitor)
+	}
 }
 
 impl From<bool> for LineNumbers {
@@ -143,7 +174,8 @@ impl Renderer<'_, '_> {
 		let line_numbers = match self.options.line_numbers {
 			LineNumbers::Never => false,
 			LineNumbers::Always => true,
-			LineNumbers::Auto => !snippet.is_consecutive_from(first_line),
+			// (the header of a module with a file gives the line of its declaration)
+			LineNumbers::Auto => source.module_file || !snippet.is_consecutive_from(first_line),
 		};
 
 		snippet.dedent();

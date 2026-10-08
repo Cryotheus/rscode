@@ -1514,6 +1514,11 @@ mod end_to_end {
 		assert_contains(&text, &["pub fn assist() {}", "pub fn add() {}"]);
 		assert!(!text.contains("note"), "{text}");
 
+		let edit = json!({ "path": "::helper::assist", "vis": "pub(crate)", "dry_run": true });
+		let (failed, text) = client.call("edit_item", edit).await;
+
+		assert!(!failed && text.starts_with("would edit `helper::assist`"), "{text}");
+
 		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist"], "packages": "demo" })).await;
 
 		assert!(failed);
