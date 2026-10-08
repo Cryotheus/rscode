@@ -5,12 +5,15 @@
 //! of strings is expected.
 
 use crate::ItemKind;
+use crate::edit::EditItemOptions;
 use crate::edit::FmtOptions;
 use crate::edit::InsertOptions;
 use crate::edit::InsertPosition;
+use crate::edit::ItemEdit;
 use crate::edit::RemoveOptions;
 use crate::edit::RenameOptions;
 use crate::edit::ReplaceOptions;
+use crate::edit::TextReplacement;
 use crate::query::ViewMode;
 use crate::query::ViewOptions;
 use crate::resolve::ReferenceOptions;
@@ -55,6 +58,105 @@ pub(crate) struct AttachParams {
 pub(crate) struct DetachParams {
 	/// The name the source was attached as.
 	pub(crate) name: String,
+}
+
+/// Parameters of `edit_item`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct EditItemParams {
+	/// Path of the item to edit; `use crate::a::Name` edits an import's `use` item.
+	pub(crate) path: String,
+
+	/// Exact text to replace, copied from the item as view_items prints it (with or without line numbers); it must
+	/// occur once in the item.
+	#[serde(default)]
+	pub(crate) old: Option<String>,
+
+	/// The text to put in place of `old`, indented as in the view (an empty string deletes `old`).
+	#[serde(default)]
+	pub(crate) new: Option<String>,
+
+	/// More replacements (`{"old": ..., "new": ...}`), applied in order after `old` and `new`.
+	#[serde(default)]
+	pub(crate) edits: Vec<TextEdit>,
+
+	/// New visibility: `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`, or `private`.
+	#[serde(default, alias = "visibility")]
+	pub(crate) vis: Option<String>,
+
+	/// New doc comment text, without `///`; an empty string removes the doc comment.
+	#[serde(default)]
+	pub(crate) doc: Option<String>,
+
+	/// Attributes to add, like `derive(Debug)` or `#[must_use]`.
+	#[serde(default, deserialize_with = "string_list")]
+	pub(crate) add_attributes: Vec<String>,
+
+	/// Attributes to remove: a path like `derive` (of exactly one attribute), or exact text like
+	/// `#[allow(dead_code)]`.
+	#[serde(default, deserialize_with = "string_list")]
+	pub(crate) remove_attributes: Vec<String>,
+
+	/// Edit every cfg variant that the path names (otherwise only the one that has the `old` texts).
+	#[serde(default)]
+	pub(crate) all_variants: bool,
+
+	/// Write nothing: return the summary and a unified diff of the changes.
+	#[serde(default, alias = "dryRun", alias = "dry-run", alias = "check")]
+	pub(crate) dry_run: bool,
+
+	/// Format the edited item with rustfmt after writing it.
+	#[serde(default)]
+	pub(crate) format: bool,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
+}
+
+impl EditItemParams {
+	/// The edit, checked before anything is loaded.
+	pub(crate) fn edit(&self) -> Result<ItemEdit, String> {
+		let first = match (&self.old, &self.new) {
+			(Some(old), Some(new)) => Some(TextReplacement {
+				old: old.clone(),
+				new: new.clone(),
+			}),
+
+			(Some(_), None) => return Err("`old` needs `new`, the text to put in its place (an empty string deletes it)".to_owned()),
+			(None, Some(_)) => return Err("`new` needs `old`, the exact text that it replaces".to_owned()),
+			(None, None) => None,
+		};
+
+		let edit = ItemEdit {
+			replacements: (first.into_iter())
+				.chain(self.edits.iter().map(|edit| TextReplacement {
+					old: edit.old.clone(),
+					new: edit.new.clone(),
+				}))
+				.collect(),
+			remove_attributes: self.remove_attributes.clone(),
+			add_attributes: self.add_attributes.clone(),
+			doc: self.doc.clone(),
+			visibility: self.vis.clone(),
+		};
+
+		if edit.is_empty() {
+			return Err(
+				"nothing to change: give `old` and `new` (or `edits`), `vis`, `doc`, `add_attributes`, or `remove_attributes`"
+					.to_owned(),
+			);
+		}
+
+		edit.check().map_err(|error| error.to_string())?;
+		Ok(edit)
+	}
+
+	pub(crate) fn options(&self) -> EditItemOptions {
+		EditItemOptions {
+			all_variants: self.all_variants,
+			allow_kind_change: false,
+		}
+	}
 }
 
 /// Parameters of `find_items`.
@@ -526,6 +628,17 @@ impl<'de> Visitor<'de> for StringList {
 	}
 }
 
+/// An `edit_item` replacement.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+pub(crate) struct TextEdit {
+	/// Exact text to replace, like `old`.
+	pub(crate) old: String,
+
+	/// The text to put in its place, like `new`.
+	pub(crate) new: String,
+}
+
 /// Parameters of `view_items`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -680,14 +793,42 @@ mod tests {
 			let rename: RenameParams = parse(with(json!({ "path": "a", "new_name": "b" }), flag));
 			let remove: RemoveParams = parse(with(json!({ "paths": ["a"] }), flag));
 			let replace: ReplaceParams = parse(with(json!({ "path": "a", "source": "" }), flag));
+			let edit: EditItemParams = parse(with(json!({ "path": "a", "vis": "pub" }), flag));
 			let insert: InsertParams = parse(with(json!({ "parent": "crate", "source": "" }), flag));
 			let format: FormatParams = parse(with(json!({}), flag));
 
 			assert!(
-				rename.dry_run && remove.dry_run && replace.dry_run && insert.dry_run && format.check,
+				rename.dry_run && remove.dry_run && replace.dry_run && edit.dry_run && insert.dry_run && format.check,
 				"{flag}"
 			);
 		}
+	}
+
+	#[test]
+	fn edit_item_edits() {
+		let edit: EditItemParams = parse(json!({
+			"path": "crate::f",
+			"old": "a",
+			"new": "b",
+			"edits": [{ "old": "c", "new": "d" }],
+			"visibility": "pub(crate)",
+			"add_attributes": "must_use",
+			"all_variants": true,
+		}));
+		let item_edit = edit.edit().unwrap();
+
+		assert_eq!(item_edit.replacements.iter().map(|edit| (&*edit.old, &*edit.new)).collect::<Vec<_>>(), [("a", "b"), ("c", "d")]);
+		assert_eq!(item_edit.visibility.as_deref(), Some("pub(crate)"));
+		assert_eq!(item_edit.add_attributes, ["must_use"]);
+		assert!(edit.options().all_variants && !edit.options().allow_kind_change);
+
+		let error = |arguments: serde_json::Value| parse::<EditItemParams>(arguments).edit().unwrap_err();
+
+		assert!(error(json!({ "path": "f" })).starts_with("nothing to change: give `old` and `new`"));
+		assert!(error(json!({ "path": "f", "old": "a" })).starts_with("`old` needs `new`"));
+		assert!(error(json!({ "path": "f", "new": "a" })).starts_with("`new` needs `old`"));
+		assert!(error(json!({ "path": "f", "vis": "public" })).starts_with("`public` is not a visibility"));
+		assert!(error(json!({ "path": "f", "add_attributes": ["#[a] #[b]"] })).contains("expected one attribute"));
 	}
 
 	#[test]

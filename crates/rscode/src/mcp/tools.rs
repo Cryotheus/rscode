@@ -3,6 +3,7 @@
 //! Each call loads the workspace from disk, so changes made by anything else are always seen. Failures become
 //! messages for the client (tool errors), with hints for the common mistakes.
 
+use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
@@ -140,6 +141,51 @@ fn describe_in(error: &Error, resolver: &Resolver<'_>) -> String {
 			None => describe(error),
 		},
 	}
+}
+
+/// `edit_item`
+pub(crate) fn edit_item(load: &LoadOptions, params: &EditItemParams, permit: &Permit<'_>) -> Output {
+	let edit = params.edit()?;
+	let path = parse_path(&params.path)?;
+	let workspace = self::load(load)?;
+	let resolver = Resolver::new(&workspace);
+	let plan = edit::edit_item(&resolver, &path, &edit, &params.options()).map_err(|error| {
+		let all_variants = matches!(error, Error::Ambiguous { .. }) && edit::replaces_all_variants(&resolver, &path);
+
+		match error {
+			Error::Ambiguous { .. } if all_variants && in_several_crates(&resolver, &path) => {
+				format!("{error}\nhint: {SELECT_ONE_CRATE}, or set `all_variants` to edit every one of them")
+			}
+
+			Error::Ambiguous { .. } if all_variants => {
+				format!("{error}\nhint: give `old` text that only one of them has, or set `all_variants` to edit every one of them")
+			}
+
+			Error::TextMismatch { ref lines, .. } if lines.is_empty() => {
+				format!("{error}\nhint: copy `old` exactly from the output of `view_items` (with or without its line numbers)")
+			}
+
+			Error::TextMismatch { .. } => {
+				format!("{error}\nhint: include more of the surrounding text in `old`, so that it occurs once")
+			}
+
+			error => describe_in(&error, &resolver),
+		}
+	})?;
+	let root = workspace.root();
+	let mut text = render::item_edit(root, &plan, params.dry_run);
+
+	if params.format && params.dry_run {
+		text.push_str(UNFORMATTED_DIFF);
+	}
+
+	finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
+
+	if params.format && !params.dry_run && !plan.spans.is_empty() {
+		text.push_str(&format_written(load, permit, &[(params.path.clone(), path)]));
+	}
+
+	Ok(text)
 }
 
 /// Fails when a file no longer has the contents the edits were planned on.
@@ -721,7 +767,10 @@ mod tests {
 			serde_json::from_value(serde_json::json!({ "parent": "crate", "source": "fn f() {}", "position": "after" })).unwrap();
 		let format: FormatParams = serde_json::from_value(serde_json::json!({ "formatter": "none", "sort": false })).unwrap();
 
+		let edit: EditItemParams = serde_json::from_value(serde_json::json!({ "path": "crate::f", "old": "a" })).unwrap();
+
 		assert!(self::find(&load, &find).unwrap_err().starts_with("unknown item kind `nope`"));
+		assert!(self::edit_item(&load, &edit, &PERMIT).unwrap_err().starts_with("`old` needs `new`"));
 		assert!(self::insert(&load, &insert, &PERMIT).unwrap_err().starts_with("`anchor`"));
 		assert!(self::format(&load, &format, &PERMIT).unwrap_err().starts_with("nothing to do"));
 	}

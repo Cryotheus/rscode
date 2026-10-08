@@ -6,6 +6,7 @@ use crate::ui::Level;
 use rscode::ItemKind;
 use rscode::edit::Collision;
 use rscode::edit::Insertion;
+use rscode::edit::ItemSpan;
 use rscode::edit::Removal;
 use rscode::edit::Rename;
 use rscode::edit::Replacement;
@@ -48,6 +49,32 @@ pub(crate) trait EditReport: Serialize {
 
 	/// What was (or would be) done, one line each.
 	fn summary(&self) -> String;
+}
+
+/// An item that `edit` edited, with its lines after the edit.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub(crate) struct EditedRow {
+	/// The canonical path of the item.
+	pub(crate) path: String,
+
+	pub(crate) file: String,
+
+	/// The first line of the item after the edit.
+	pub(crate) start: usize,
+
+	/// The last line of the item after the edit.
+	pub(crate) end: usize,
+}
+
+impl EditedRow {
+	fn new(span: &ItemSpan, paths: &PathDisplay) -> Self {
+		Self {
+			path: span.path.clone(),
+			file: paths.display(&span.file),
+			start: span.start,
+			end: span.end,
+		}
+	}
 }
 
 /// `fmt`/`sort` writing files.
@@ -137,6 +164,81 @@ impl EditReport for InsertionReport {
 			let name = item.name.as_ref().map(|name| format!(" {name}")).unwrap_or_default();
 
 			out.push_str(&format!("{verb} {}{name} into {} ({})\n", item.kind, self.parent, self.file));
+		}
+
+		for file in &self.formatted {
+			out.push_str(&format!("formatted {file}\n"));
+		}
+
+		out
+	}
+}
+
+/// `edit`
+#[derive(Debug, Default, Serialize)]
+pub(crate) struct ItemEditReport {
+	/// The edited items.
+	pub(crate) edited: Vec<EditedRow>,
+
+	pub(crate) files: Vec<String>,
+
+	/// Files formatted afterwards (`--fmt`).
+	pub(crate) formatted: Vec<String>,
+
+	pub(crate) warnings: Vec<String>,
+
+	/// Parts of the edit that changed nothing.
+	pub(crate) notes: Vec<String>,
+
+	pub(crate) dry_run: bool,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) diff: Option<String>,
+}
+
+impl ItemEditReport {
+	pub(crate) fn new(plan: &Replacement, dry_run: bool, paths: &PathDisplay) -> Self {
+		Self {
+			edited: plan.spans.iter().map(|span| EditedRow::new(span, paths)).collect(),
+			files: plan.files.iter().map(|file| paths.display(file)).collect(),
+			formatted: Vec::new(),
+			warnings: plan.warnings.clone(),
+			notes: plan.notes.clone(),
+			dry_run,
+			diff: None,
+		}
+	}
+}
+
+impl EditReport for ItemEditReport {
+	fn diff(&self) -> Option<&str> {
+		self.diff.as_deref()
+	}
+
+	fn dry_run(&self) -> bool {
+		self.dry_run
+	}
+
+	fn messages(&self) -> Vec<(Level, String)> {
+		(self.warnings.iter().map(|warning| (Level::Warning, warning.clone())))
+			.chain(self.notes.iter().map(|note| (Level::Note, note.clone())))
+			.collect()
+	}
+
+	fn summary(&self) -> String {
+		let mut out = String::new();
+
+		if self.edited.is_empty() {
+			out.push_str(if self.dry_run { "nothing would change\n" } else { "nothing changed\n" });
+		}
+
+		for row in &self.edited {
+			let lines = match row.end > row.start {
+				true => format!("{}-{}", row.start, row.end),
+				false => row.start.to_string(),
+			};
+
+			out.push_str(&format!("{} {} ({}:{lines})\n", done(self.dry_run, "edit", "edited"), row.path, row.file));
 		}
 
 		for file in &self.formatted {
@@ -500,6 +602,45 @@ mod tests {
 	}
 
 	#[test]
+	fn builds_item_edit_reports() {
+		let plan = Replacement {
+			edits: EditSet::new(),
+			replaced: vec!["demo::add".to_owned()],
+			files: vec![PathBuf::from("/ws/src/lib.rs")],
+			spans: vec![ItemSpan {
+				path: "demo::add".to_owned(),
+				file: PathBuf::from("/ws/src/lib.rs"),
+				start: 3,
+				end: 5,
+			}],
+			warnings: vec!["w".to_owned()],
+			notes: vec!["n".to_owned()],
+		};
+		let report = ItemEditReport::new(&plan, false, &paths());
+
+		assert_eq!(report.summary(), "edited demo::add (src/lib.rs:3-5)\n");
+		assert_eq!(report.messages(), [(Level::Warning, "w".to_owned()), (Level::Note, "n".to_owned())]);
+		assert_eq!(
+			serde_json::to_value(&report).unwrap(),
+			serde_json::json!({
+				"edited": [{ "path": "demo::add", "file": "src/lib.rs", "start": 3, "end": 5 }],
+				"files": ["src/lib.rs"],
+				"formatted": [],
+				"warnings": ["w"],
+				"notes": ["n"],
+				"dry_run": false,
+			})
+		);
+
+		let unchanged = Replacement {
+			spans: Vec::new(),
+			..plan
+		};
+
+		assert_eq!(ItemEditReport::new(&unchanged, true, &paths()).summary(), "nothing would change\n");
+	}
+
+	#[test]
 	fn builds_removal_reports() {
 		let mut edits = EditSet::new();
 
@@ -580,7 +721,9 @@ mod tests {
 			edits: EditSet::new(),
 			replaced: vec!["demo::add".to_owned()],
 			files: vec![PathBuf::from("/ws/src/lib.rs")],
+			spans: Vec::new(),
 			warnings: vec!["w".to_owned()],
+			notes: Vec::new(),
 		};
 		let mut report = ReplacementReport::new(&plan, false, &paths());
 

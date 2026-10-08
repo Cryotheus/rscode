@@ -1,4 +1,4 @@
-//! Planning and applying `remove`, `replace`, `insert`, and `format` on crates on disk.
+//! Planning and applying `remove`, `replace`, `edit_item`, `insert`, and `format` on crates on disk.
 //!
 //! Tests copy the `edit_ops` fixture (or write small crates) to a temporary directory, load the crates from there,
 //! and check the planned edits with [`EditSet::preview`], or apply them and check the files (and that the fixture
@@ -1157,6 +1157,569 @@ pub mod out;
 	}
 }
 
+mod edit_item {
+	use super::*;
+	use rscode::View;
+	use rscode::ViewMode;
+	use rscode::edit::EditItemOptions;
+	use rscode::edit::ItemEdit;
+	use rscode::edit::ItemSpan;
+	use rscode::edit::Replacement;
+	use rscode::edit::TextReplacement;
+
+	const INNER: &str = "//! Inner docs.\n\npub fn f() {}\n";
+
+	const LIB: &str = "\
+//! The fixture.
+
+use std::fmt;
+
+/// Shapes.
+#[derive(Debug, Clone)]
+pub struct Shape {
+	/// The sides.
+	pub sides: u8,
+}
+
+impl Shape {
+	/// A triangle.
+	pub fn triangle() -> Self {
+		let sides = 3;
+
+		Self { sides }
+	}
+
+	#[allow(dead_code)] #[allow(unused)]
+	fn name(&self) -> &'static str {
+		\"a shape
+  with sides\"
+	}
+}
+
+impl fmt::Display for Shape {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, \"{}\", self.name())
+	}
+}
+
+#[cfg(feature = \"a\")]
+pub fn variant() -> u8 {
+	1
+}
+
+#[cfg(not(feature = \"a\"))]
+pub fn variant() -> u8 {
+	2
+}
+
+pub enum Kind {
+	A,
+	B,
+}
+
+mod inner;
+";
+
+	/// A crate with [`LIB`] as `lib` and [`INNER`] as its module `inner`.
+	fn crate_dir(name: &str, lib: &str) -> TempDir {
+		TempDir::with_files(name, &[("src/lib.rs", lib), ("src/inner.rs", INNER)])
+	}
+
+	fn edit(ws: &Workspace, target: &str, edit: ItemEdit) -> Result<Replacement, Error> {
+		edit_with(ws, target, edit, &EditItemOptions::default())
+	}
+
+	fn edit_with(ws: &Workspace, target: &str, edit: ItemEdit, options: &EditItemOptions) -> Result<Replacement, Error> {
+		rscode::edit::edit_item(&Resolver::new(ws), &path(target), &edit, options)
+	}
+
+	/// The message of an error that only says something.
+	fn message(result: Result<Replacement, Error>) -> String {
+		match result {
+			Err(Error::InvalidSource(message) | Error::Unsupported(message) | Error::TextMismatch { message, .. }) => message,
+			other => panic!("{other:?}"),
+		}
+	}
+
+	/// An edit that replaces `old` with `new`.
+	fn text(old: &str, new: &str) -> ItemEdit {
+		texts(&[(old, new)])
+	}
+
+	/// An edit that replaces texts, in order.
+	fn texts(replacements: &[(&str, &str)]) -> ItemEdit {
+		ItemEdit {
+			replacements: (replacements.iter())
+				.map(|(old, new)| TextReplacement {
+					old: (*old).to_owned(),
+					new: (*new).to_owned(),
+				})
+				.collect(),
+			..ItemEdit::default()
+		}
+	}
+
+	/// The text of an item as views show it in full.
+	fn view(ws: &Workspace, target: &str, line_numbers: bool) -> String {
+		let views = View::new().mode(ViewMode::Full).line_numbers(line_numbers).item_path(path(target)).run(ws).unwrap();
+
+		views[0].text.clone()
+	}
+
+	#[test]
+	fn applies_item_edits_and_still_compiles() {
+		let dir = TempDir::fixture("edit-item-apply");
+		let ws = load_fixture(&dir, true);
+		let resolver = Resolver::new(&ws);
+		let options = EditItemOptions::default();
+		let mut edits = EditSet::new();
+		let mut plan = |target: &str, edit: ItemEdit| {
+			edits.extend(rscode::edit::edit_item(&resolver, &path(target), &edit, &options).unwrap().edits);
+		};
+
+		plan(
+			"crate::shapes::Circle::new",
+			text("let radius = Radius(radius);\n\n\tSelf { radius }", "Self {\n\t\tradius: Radius(radius.abs()),\n\t}"),
+		);
+		plan(
+			"crate::shapes::Circle",
+			ItemEdit {
+				add_attributes: vec!["must_use".to_owned()],
+				doc: Some("A circle,\nround.".to_owned()),
+				..ItemEdit::default()
+			},
+		);
+		plan("crate::extra", text("\"plain\"", "\"simple\""));
+		plan(
+			"crate::unit",
+			ItemEdit {
+				visibility: Some("pub(crate)".to_owned()),
+				remove_attributes: vec![],
+				..ItemEdit::default()
+			},
+		);
+		plan(
+			"crate::shapes",
+			ItemEdit {
+				doc: Some("Shapes, round ones.".to_owned()),
+				..ItemEdit::default()
+			},
+		);
+
+		let applied = edits.apply().unwrap();
+		let shapes = dir.read("src/shapes.rs");
+
+		assert_eq!(dir.relative(&applied.written), ["src/lib.rs", "src/shapes.rs"]);
+		assert!(shapes.starts_with("//! Shapes, round ones.\n\npub mod round;"), "{shapes}");
+		assert!(shapes.contains("\t\tSelf {\n\t\t\tradius: Radius(radius.abs()),\n\t\t}\n\t}"), "{shapes}");
+		assert!(shapes.contains("/// A circle,\n/// round.\n#[derive(Debug, Clone, Copy)]\n#[must_use]\npub struct"), "{shapes}");
+		assert!(dir.read("src/lib.rs").contains("\"simple\"") && dir.read("src/lib.rs").contains("pub(crate) fn unit()"));
+		cargo_check(&dir);
+	}
+
+	#[test]
+	fn changes_attributes() {
+		let dir = crate_dir("edit-attributes", LIB);
+		let ws = load(&dir);
+		let attributes = |target: &str, add: &[&str], remove: &[&str]| {
+			edit(
+				&ws,
+				target,
+				ItemEdit {
+					add_attributes: add.iter().map(|text| (*text).to_owned()).collect(),
+					remove_attributes: remove.iter().map(|text| (*text).to_owned()).collect(),
+					..ItemEdit::default()
+				},
+			)
+		};
+		let edited = |result: Result<Replacement, Error>, file: &str| edited(&dir, &result.unwrap().edits, file);
+
+		// removed by path or by exact text, with their line when nothing else is on it
+		assert_eq!(edited(attributes("crate::Shape", &[], &["derive"]), "src/lib.rs"), LIB.replace("#[derive(Debug, Clone)]\n", ""));
+		assert_eq!(
+			edited(attributes("crate::Shape::name", &[], &["#[allow( unused )]"]), "src/lib.rs"),
+			LIB.replace(" #[allow(unused)]", "")
+		);
+		assert_eq!(
+			edited(attributes("crate::Shape::name", &[], &["allow(dead_code)"]), "src/lib.rs"),
+			LIB.replace("#[allow(dead_code)] ", "")
+		);
+		assert_eq!(
+			message(attributes("crate::Shape::name", &[], &["allow"])),
+			"`allow` is the path of 2 attributes of `fixture::Shape::name` (`#[allow(dead_code)]`, `#[allow(unused)]`): \
+			 give the exact text of the one to remove"
+		);
+		assert_eq!(
+			message(attributes("crate::Shape", &[], &["inline"])),
+			"`fixture::Shape` has no attribute `inline` (it has `#[derive(Debug, Clone)]`)"
+		);
+
+		// added after the others, on a line of their own (removing first)
+		assert_eq!(
+			edited(attributes("crate::Shape", &["derive(PartialEq)"], &["derive"]), "src/lib.rs"),
+			LIB.replace("#[derive(Debug, Clone)]\n", "#[derive(PartialEq)]\n")
+		);
+		assert_eq!(
+			edited(attributes("crate::Shape::triangle", &["#[must_use]"], &[]), "src/lib.rs"),
+			LIB.replace("\t/// A triangle.\n", "\t/// A triangle.\n\t#[must_use]\n")
+		);
+		assert_eq!(
+			edited(attributes("crate::Shape::name", &["inline"], &[]), "src/lib.rs"),
+			LIB.replace("#[allow(unused)]\n", "#[allow(unused)]\n\t#[inline]\n")
+		);
+		assert_eq!(
+			message(attributes("crate::Shape::name", &["allow(unused)"], &[])),
+			"`fixture::Shape::name` already has the attribute `#[allow(unused)]`"
+		);
+
+		// inner attributes of crate roots and module files
+		assert_eq!(
+			edited(attributes("crate", &["allow(dead_code)"], &[]), "src/lib.rs"),
+			LIB.replace("//! The fixture.\n", "//! The fixture.\n#![allow(dead_code)]\n")
+		);
+		assert_eq!(
+			edited(attributes("crate::inner", &["#![allow(dead_code)]", "cfg(test)"], &[]), "src/inner.rs"),
+			"//! Inner docs.\n#![allow(dead_code)]\n\npub fn f() {}\n"
+		);
+		assert!(message(attributes("crate::Shape", &["#![allow(dead_code)]"], &[])).contains("is an inner attribute"));
+
+		// removing the inner attributes between blank lines removes a blank line with them
+		let lib = LIB.replace("//! The fixture.\n", "//! The fixture.\n\n#![allow(dead_code)]\n");
+		let dir = crate_dir("edit-inner-attributes", &lib);
+		let ws = load(&dir);
+		let plan = edit(
+			&ws,
+			"crate",
+			ItemEdit {
+				remove_attributes: vec!["allow".to_owned()],
+				..ItemEdit::default()
+			},
+		)
+		.unwrap();
+
+		assert_eq!(super::edited(&dir, &plan.edits, "src/lib.rs"), LIB);
+	}
+
+	#[test]
+	fn changes_doc_comments() {
+		let dir = crate_dir("edit-docs", LIB);
+		let ws = load(&dir);
+		let doc = |target: &str, doc: &str| {
+			edit(
+				&ws,
+				target,
+				ItemEdit {
+					doc: Some(doc.to_owned()),
+					..ItemEdit::default()
+				},
+			)
+			.unwrap()
+		};
+		let edited = |plan: Replacement, file: &str| edited(&dir, &plan.edits, file);
+
+		assert_eq!(
+			edited(doc("crate::Shape", "A shape.\n\nWith sides."), "src/lib.rs"),
+			LIB.replace("/// Shapes.\n", "/// A shape.\n///\n/// With sides.\n")
+		);
+		assert_eq!(edited(doc("crate::Shape", ""), "src/lib.rs"), LIB.replace("/// Shapes.\n", ""));
+		assert_eq!(edited(doc("crate::Kind", "/// Kinds."), "src/lib.rs"), LIB.replace("pub enum Kind", "/// Kinds.\npub enum Kind"));
+		assert_eq!(edited(doc("crate::Kind::A", "The first."), "src/lib.rs"), LIB.replace("\tA,", "\t/// The first.\n\tA,"));
+
+		// the docs of a module with a file are its inner docs
+		assert_eq!(edited(doc("crate::inner", "Inner, changed."), "src/inner.rs"), INNER.replace("Inner docs.", "Inner, changed."));
+		assert_eq!(edited(doc("crate::inner", ""), "src/inner.rs"), "pub fn f() {}\n");
+		assert_eq!(edited(doc("crate", "The crate."), "src/lib.rs"), LIB.replace("The fixture.", "The crate."));
+
+		// the same docs again change nothing
+		let plan = doc("crate::Shape", "Shapes.");
+
+		assert!(plan.replaced.is_empty() && plan.spans.is_empty());
+		assert_eq!(plan.notes, ["`fixture::Shape` already has this doc comment"]);
+		assert!(changes(&dir, &plan.edits).is_empty());
+	}
+
+	#[test]
+	fn changes_visibilities() {
+		let dir = crate_dir("edit-visibility", LIB);
+		let ws = load(&dir);
+		let visibility = |target: &str, visibility: &str| {
+			edit(
+				&ws,
+				target,
+				ItemEdit {
+					visibility: Some(visibility.to_owned()),
+					..ItemEdit::default()
+				},
+			)
+		};
+		let edited = |result: Result<Replacement, Error>, file: &str| edited(&dir, &result.unwrap().edits, file);
+
+		assert_eq!(
+			edited(visibility("crate::Shape::triangle", "pub(crate)"), "src/lib.rs"),
+			LIB.replace("pub fn triangle", "pub(crate) fn triangle")
+		);
+		assert_eq!(edited(visibility("crate::Shape::name", "pub"), "src/lib.rs"), LIB.replace("\tfn name", "\tpub fn name"));
+		assert_eq!(edited(visibility("crate::Shape", "private"), "src/lib.rs"), LIB.replace("pub struct Shape", "struct Shape"));
+		assert_eq!(edited(visibility("crate::inner", "crate"), "src/lib.rs"), LIB.replace("mod inner;", "pub(crate) mod inner;"));
+		assert_eq!(edited(visibility("use crate::fmt", "pub"), "src/lib.rs"), LIB.replace("use std::fmt;", "pub use std::fmt;"));
+
+		let unchanged = visibility("crate::Shape", " pub ").unwrap();
+
+		assert_eq!(unchanged.notes, ["`fixture::Shape` is pub already"]);
+		assert!(changes(&dir, &unchanged.edits).is_empty());
+
+		assert_eq!(
+			message(visibility("crate::Kind::A", "pub")),
+			"cannot change the visibility of `fixture::Kind::A`: it is a variant, which has the visibility of its parent"
+		);
+		assert!(message(visibility("<crate::Shape as std::fmt::Display>::fmt", "pub")).contains("visibility of its parent"));
+		assert!(message(visibility("impl crate::Shape", "pub")).ends_with("it is an impl, which has no visibility"));
+		assert!(message(visibility("crate", "pub")).ends_with("it is a crate root, which has no visibility"));
+		assert!(message(visibility("crate::Shape", "public")).starts_with("`public` is not a visibility"));
+	}
+
+	#[test]
+	fn edits_the_files_of_modules_and_crates_and_imports() {
+		let dir = crate_dir("edit-files", LIB);
+		let ws = load(&dir);
+		let plan = edit(&ws, "crate::inner", text("pub fn f() {}", "pub fn g() {}")).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/inner.rs"), INNER.replace("fn f", "fn g"));
+		assert_eq!(
+			plan.spans,
+			[ItemSpan {
+				path: "fixture::inner".to_owned(),
+				file: dir.path("src/inner.rs"),
+				start: 1,
+				end: 3,
+			}]
+		);
+
+		let plan = edit(&ws, "crate", text("mod inner;", "pub mod inner;")).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("mod inner;", "pub mod inner;"));
+
+		// an import's `use` item
+		let plan = edit(&ws, "use crate::fmt", text("std::fmt", "core::fmt")).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("std::fmt", "core::fmt"));
+		assert_eq!(plan.replaced, ["use fixture::fmt"]);
+	}
+
+	#[test]
+	fn edits_files_with_crlf_line_breaks() {
+		let lib = LIB.replace('\n', "\r\n");
+		let dir = crate_dir("edit-crlf", &lib);
+		let ws = load(&dir);
+		let viewed = view(&ws, "crate::Shape::triangle", false);
+		let new = viewed.replace("let sides = 3;\n", "let sides = 3;\n\tlet more = sides;\n");
+		let plan = edit(&ws, "crate::Shape::triangle", text(&viewed, &new)).unwrap();
+
+		assert_eq!(
+			edited(&dir, &plan.edits, "src/lib.rs"),
+			lib.replace("let sides = 3;\r\n", "let sides = 3;\r\n\t\tlet more = sides;\r\n")
+		);
+
+		let plan = edit(
+			&ws,
+			"crate::Kind",
+			ItemEdit {
+				doc: Some("Kinds\nof shapes.".to_owned()),
+				add_attributes: vec!["derive(Debug)".to_owned()],
+				..ItemEdit::default()
+			},
+		)
+		.unwrap();
+
+		assert_eq!(
+			edited(&dir, &plan.edits, "src/lib.rs"),
+			lib.replace("pub enum Kind", "/// Kinds\r\n/// of shapes.\r\n#[derive(Debug)]\r\npub enum Kind")
+		);
+	}
+
+	#[test]
+	fn picks_the_cfg_variant_with_the_text() {
+		let dir = crate_dir("edit-variants", LIB);
+		let ws = load(&dir);
+		let plan = edit(&ws, "crate::variant", text("2", "20")).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("\t2\n", "\t20\n"));
+		assert_eq!(
+			plan.notes,
+			[native(
+				"of the 2 items that `crate::variant` names, only `fixture::variant` (fn) at src/lib.rs:38:1 with \
+				 #[cfg(not(feature = \"a\"))] has the text to replace"
+			)]
+		);
+		assert!(matches!(edit(&ws, "crate::variant", text("-> u8", "-> u16")), Err(Error::Ambiguous { .. })));
+		assert_eq!(
+			message(edit(&ws, "crate::variant", text("3", "30"))),
+			"`old` not found in any of the 2 items that `crate::variant` names"
+		);
+		assert_eq!(
+			message(edit(&ws, "crate::variant", text("pub fn variant() -> u16 {", ""))),
+			native(
+				"`old` not found in any of the 2 items that `crate::variant` names; the closest is in `fixture::variant` \
+				 (src/lib.rs:33-36); the closest line is 34: `pub fn variant() -> u8 {`"
+			)
+		);
+
+		let all = EditItemOptions {
+			all_variants: true,
+			..EditItemOptions::default()
+		};
+		let plan = edit_with(&ws, "crate::variant", text("-> u8", "-> u16"), &all).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("-> u8", "-> u16"));
+		assert_eq!(plan.warnings, ["edited 2 `cfg` variants of `crate::variant`"]);
+		assert_eq!(plan.spans.len(), 2);
+
+		let visibility = ItemEdit {
+			visibility: Some("pub(crate)".to_owned()),
+			..ItemEdit::default()
+		};
+
+		assert!(matches!(edit(&ws, "crate::variant", visibility.clone()), Err(Error::Ambiguous { .. })));
+		assert!(edit_with(&ws, "crate::variant", visibility, &all).is_ok());
+	}
+
+	#[test]
+	fn refuses_edits_that_change_the_item() {
+		let dir = crate_dir("edit-refusals", LIB);
+		let ws = load(&dir);
+		let method = "pub fn triangle() -> Self {\n\tlet sides = 3;\n\n\tSelf { sides }\n}";
+
+		assert_eq!(
+			message(edit(&ws, "crate::Shape::triangle", text(method, "pub const TRIANGLE: u8 = 3;"))),
+			native(
+				"after the edit, `fixture::Shape::triangle` (at line 13 of src/lib.rs) is an assoc-const rather than an \
+				 assoc-fn (allow a kind change to change it)"
+			)
+		);
+		assert_eq!(
+			message(edit(&ws, "crate::Shape::triangle", text(method, "fn a() {}\n\nfn b() {}"))),
+			native(
+				"after the edit, `fixture::Shape::triangle` (at line 13 of src/lib.rs) is 2 items (allow a kind change to \
+				 split it)"
+			)
+		);
+		assert!(
+			message(edit(&ws, "crate::Shape::triangle", text("{ sides }", "{ sides"))).starts_with(&native(
+				"after the edit, `fixture::Shape::triangle` (at line 13 of src/lib.rs) does not parse as associated items \
+				 of an `impl` block at "
+			))
+		);
+
+		let kind_change = EditItemOptions {
+			allow_kind_change: true,
+			..EditItemOptions::default()
+		};
+
+		assert!(edit_with(&ws, "crate::Shape::triangle", text(method, "pub const TRIANGLE: u8 = 3;"), &kind_change).is_ok());
+
+		// a new name is only a warning
+		let plan = edit(&ws, "crate::Shape::triangle", text("fn triangle", "fn trigon")).unwrap();
+
+		assert_eq!(
+			plan.warnings,
+			["the replacement of `fixture::Shape::triangle` does not define `triangle`; references to it are not updated"]
+		);
+		assert!(message(edit(&ws, "crate::Shape", ItemEdit::default())).starts_with("nothing to change"));
+		assert!(matches!(edit(&ws, "crate::nope", text("a", "b")), Err(Error::NotFound(_))));
+	}
+
+	#[test]
+	fn replaces_text_as_written_or_as_views_print_it() {
+		let dir = crate_dir("edit-text", LIB);
+		let ws = load(&dir);
+		let triangle = "crate::Shape::triangle";
+
+		// as written
+		let plan = edit(&ws, triangle, text("let sides = 3;", "let sides = 4;")).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("= 3;", "= 4;"));
+		assert_eq!(plan.replaced, ["fixture::Shape::triangle"]);
+		assert_eq!(
+			plan.spans,
+			[ItemSpan {
+				path: "fixture::Shape::triangle".to_owned(),
+				file: dir.path("src/lib.rs"),
+				start: 13,
+				end: 18,
+			}]
+		);
+
+		// as views print it: dedented
+		let viewed = view(&ws, triangle, false);
+
+		assert!(viewed.contains("\tlet sides = 3;\n\n\tSelf { sides }\n}"), "{viewed}");
+
+		let plan = edit(&ws, triangle, text("\tlet sides = 3;\n\n\tSelf { sides }", "\tSelf {\n\t\tsides: 3,\n\t}")).unwrap();
+
+		assert_eq!(
+			edited(&dir, &plan.edits, "src/lib.rs"),
+			LIB.replace("\t\tlet sides = 3;\n\n\t\tSelf { sides }", "\t\tSelf {\n\t\t\tsides: 3,\n\t\t}")
+		);
+		assert_eq!((plan.spans[0].start, plan.spans[0].end), (13, 18));
+
+		// with the line numbers of numbered views
+		let numbered = view(&ws, triangle, true);
+		let old = numbered.lines().skip(2).take(3).collect::<Vec<_>>().join("\n");
+
+		assert!(old.contains(" │ \tlet sides = 3;"), "{old}");
+
+		let plan = edit(&ws, triangle, text(&old, &old.replace("= 3", "= 4"))).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("= 3;", "= 4;"));
+
+		// which of several occurrences, by the line numbers
+		let plan = edit(&ws, triangle, text("  18 │ }", "  18 │ } // triangle")).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("{ sides }\n\t}", "{ sides }\n\t} // triangle"));
+		assert!(matches!(edit(&ws, triangle, text("}", "")), Err(Error::TextMismatch { lines, .. }) if lines == [17, 18]));
+
+		// a whole view (with a line break after it), whose string keeps its continuation line
+		let viewed = view(&ws, "crate::Shape::name", false) + "\n";
+		let plan = edit(&ws, "crate::Shape::name", text(&viewed, &viewed.replace("with sides", "with corners"))).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("with sides", "with corners"));
+
+		// replacements in order, each in the text the ones before left
+		let plan = edit(&ws, triangle, texts(&[("3", "4"), ("4;", "5;")])).unwrap();
+
+		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("= 3;", "= 5;"));
+	}
+
+	#[test]
+	fn tells_where_text_occurs_or_what_comes_closest() {
+		let dir = crate_dir("edit-mismatch", LIB);
+		let ws = load(&dir);
+		let mismatch = |old: &str| match edit(&ws, "crate::Shape::triangle", text(old, "x")) {
+			Err(Error::TextMismatch { message, lines }) => (message, lines),
+			other => panic!("{other:?}"),
+		};
+		let triangle = native("`fixture::Shape::triangle` (src/lib.rs:13-18)");
+
+		assert_eq!(mismatch("sides"), (format!("`old` occurs 2 times in {triangle}, at lines 15, 17"), vec![15, 17]));
+		assert_eq!(
+			mismatch("let sides = 3;\n\n    Self { sides }").0,
+			format!(
+				"`old` not found in {triangle}; it matches at line 15 if indentation is ignored (the file indents with \
+				 tabs, `old` with spaces)"
+			)
+		);
+		assert_eq!(mismatch("let sides = 6;").0, format!("`old` not found in {triangle}; the closest line is 15: `let sides = 3;`"));
+		assert_eq!(
+			mismatch("let sides = 3;\nSelf").0,
+			format!("`old` not found in {triangle}; its first line is at line 15, but what follows differs")
+		);
+		assert_eq!(
+			message(edit(&ws, "crate::Shape::triangle", texts(&[("3", "4"), ("3", "5")]))),
+			format!("`old` number 2 (`3`) not found in {triangle}")
+		);
+	}
+}
+
 mod insert {
 	use super::*;
 
@@ -1993,6 +2556,11 @@ mod format {
 /// Planning edits of every kind on this crate's own source (never applied): the plans preview as parsable files.
 mod real {
 	use super::*;
+	use rscode::View;
+	use rscode::ViewMode;
+	use rscode::edit::EditItemOptions;
+	use rscode::edit::ItemEdit;
+	use rscode::edit::TextReplacement;
 	use rscode::path::CanonicalPath;
 
 	fn load_self() -> Workspace {
@@ -2018,7 +2586,7 @@ mod real {
 		let ws = load_self();
 		let resolver = Resolver::new(&ws);
 		let krate = &ws.crates()[0];
-		let (mut removed, mut replaced, mut inserted) = (0, 0, 0);
+		let (mut removed, mut replaced, mut inserted, mut edited_items) = (0, 0, 0, 0);
 
 		for (index, (item, data)) in krate.items().enumerate() {
 			let named = data.name.is_some() && data.kind != ItemKind::Import && !item.is_crate_root();
@@ -2059,6 +2627,39 @@ mod real {
 				replaced += 1;
 			}
 
+			// its whole view (with line numbers or not) is found, and changes nothing; a smaller sample, since views of
+			// modules parse their files
+			if let [target] = targets.as_slice()
+				&& (index % 18 == 0 || container)
+			{
+				let view = View::new().mode(ViewMode::Full).line_numbers(true).items(&resolver, &[*target]).unwrap();
+
+				// (without the line that names the file of a module)
+				let skipped = usize::from(view[0].text.lines().next().is_some_and(|line| line.contains("// file: ")));
+				let numbered: Vec<&str> = view[0].text.lines().skip(skipped).collect();
+				let plain: Vec<&str> = (numbered.iter())
+					.map(|line| line.split_once(" │").map_or(*line, |(_, text)| text.strip_prefix(' ').unwrap_or(text)))
+					.collect();
+
+				for text in [plain.join("\n"), numbered.join("\n")] {
+					let edit = ItemEdit {
+						replacements: vec![TextReplacement {
+							old: text.clone(),
+							new: text,
+						}],
+						..ItemEdit::default()
+					};
+					let plan = rscode::edit::edit_item(&resolver, &item_path, &edit, &EditItemOptions::default())
+						.unwrap_or_else(|error| panic!("editing `{item_path}`: {error}"));
+
+					let changes = plan.edits.preview().unwrap();
+
+					assert!(changes.iter().all(|change| !change.is_changed()), "editing `{item_path}` changes it");
+				}
+
+				edited_items += 1;
+			}
+
 			// inserting into it (when it holds items) leaves parsable files
 			if container {
 				for position in [InsertPosition::Start, InsertPosition::End] {
@@ -2073,7 +2674,10 @@ mod real {
 			}
 		}
 
-		assert!(removed > 50 && replaced > 100 && inserted > 10, "{removed} {replaced} {inserted}");
+		assert!(
+			removed > 50 && replaced > 100 && inserted > 10 && edited_items > 50,
+			"{removed} {replaced} {inserted} {edited_items}"
+		);
 	}
 }
 

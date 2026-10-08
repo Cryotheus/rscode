@@ -15,7 +15,7 @@ use tokio::io::ReadHalf;
 use tokio::io::WriteHalf;
 use tokio::task::JoinHandle;
 
-const EDIT_TOOLS: [&str; 5] = ["format_items", "insert_items", "remove_items", "rename_item", "replace_item"];
+const EDIT_TOOLS: [&str; 6] = ["edit_item", "format_items", "insert_items", "remove_items", "rename_item", "replace_item"];
 const QUERY_TOOLS: [&str; 3] = ["find_items", "view_items", "workspace_info"];
 
 /// Parameters every tool accepts.
@@ -143,7 +143,7 @@ fn annotations() {
 		assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
 
 		match tool.name.as_ref() {
-			"remove_items" | "replace_item" => assert_eq!(annotations.destructive_hint, Some(true)),
+			"remove_items" | "replace_item" | "edit_item" => assert_eq!(annotations.destructive_hint, Some(true)),
 			"rename_item" | "insert_items" | "format_items" => assert_eq!(annotations.destructive_hint, Some(false)),
 			_ => assert_eq!(annotations.idempotent_hint, Some(true), "{}", tool.name),
 		}
@@ -426,6 +426,7 @@ async fn read_only_servers_refuse_edits() {
 #[test]
 fn required_parameters() {
 	let expected = [
+		("edit_item", vec!["path"]),
 		("find_items", vec!["pattern"]),
 		("format_items", vec![]),
 		("insert_items", vec!["source"]),
@@ -764,6 +765,74 @@ mod end_to_end {
 		let (failed, text) = client.call("format_items", json!({ "check": true })).await;
 
 		assert!(!failed, "{text}");
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn edits_items_in_place() {
+		let fixture = Fixture::new("edit-item");
+		let mut client = Client::connect(fixture.options()).await;
+		let shapes = fixture.read("src/shapes.rs");
+
+		// a line copied from a numbered view of a method
+		let (failed, view) = client.call("view_items", json!({ "paths": ["crate::shapes::Circle::area"] })).await;
+
+		assert!(!failed, "{view}");
+
+		let old = view.lines().find(|line| line.contains("3.0 *")).unwrap();
+		let arguments = json!({ "path": "crate::shapes::Circle::area", "old": old, "new": old.replace("3.0", "3.14") });
+		let mut dry_run = arguments.clone();
+
+		dry_run["dry_run"] = json!(true);
+
+		let (failed, text) = client.call("edit_item", dry_run).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"would edit `demo::shapes::Circle::area` (src/shapes.rs:11-13)\n",
+				"nothing was written",
+				"-\t\t3.0 * self.radius",
+				"+\t\t3.14 * self.radius",
+			],
+		);
+		assert_eq!(fixture.read("src/shapes.rs"), shapes);
+
+		let (failed, text) = client.call("edit_item", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(text, "edited `demo::shapes::Circle::area` (src/shapes.rs:11-13)\n");
+		assert_eq!(fixture.read("src/shapes.rs"), shapes.replace("3.0", "3.14"));
+
+		// the visibility, doc comment, and attributes
+		let arguments = json!({ "path": "crate::three", "vis": "pub(crate)", "doc": "Three.", "add_attributes": "must_use" });
+		let (failed, text) = client.call("edit_item", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&fixture.read("src/lib.rs"), &["\n/// Three.\n#[must_use]\npub(crate) fn three() -> i32 {\n"]);
+
+		// text that does not occur once writes nothing, and tells what to do
+		let lib = fixture.read("src/lib.rs");
+		let (failed, text) = client.call("edit_item", json!({ "path": "crate::add", "old": "a - b", "new": "a * b" })).await;
+
+		assert!(failed);
+		assert_eq!(
+			text,
+			"`old` not found in `demo::add` (src/lib.rs:7-10); the closest line is 9: `a + b`\nhint: copy `old` exactly \
+			 from the output of `view_items` (with or without its line numbers)"
+				.replace('/', std::path::MAIN_SEPARATOR_STR)
+		);
+
+		let (failed, text) = client.call("edit_item", json!({ "path": "crate::add", "old": "b", "new": "c" })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["`old` occurs 4 times", "hint: include more of the surrounding text in `old`"]);
+		assert_eq!(fixture.read("src/lib.rs"), lib);
+
+		let (failed, text) = client.call("edit_item", json!({ "path": "crate::add" })).await;
+
+		assert!(failed && text.starts_with("nothing to change"), "{text}");
 		client.close().await.unwrap();
 	}
 

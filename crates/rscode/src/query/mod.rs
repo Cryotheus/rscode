@@ -9,6 +9,8 @@ pub use find::Find;
 pub use find::FindMatch;
 pub use find::FindOptions;
 pub use outline::outline_text;
+pub(crate) use snippet::PrintedText;
+pub(crate) use snippet::multiline_strings;
 pub use view::ItemView;
 pub use view::View;
 pub use view::ViewMode;

@@ -13,6 +13,7 @@ use clap::parser::ValueSource;
 use rscode::Edition;
 use rscode::ItemKind;
 use rscode::LoadOptions;
+use rscode::edit::EditItemOptions;
 use rscode::edit::FmtOptions;
 use rscode::edit::InsertOptions;
 use rscode::edit::InsertPosition;
@@ -84,6 +85,80 @@ impl ConfigValues {
 		}
 
 		Ok(split)
+	}
+}
+
+/// `edit`
+#[derive(Debug, Clone)]
+pub(crate) struct EditArgs {
+	pub(crate) path: String,
+
+	/// `--old` and `--new` (or `--old-file` and `--new-file`), in pairs.
+	pub(crate) replacements: Vec<(TextArg, TextArg)>,
+
+	/// `--doc` or `--doc-file`.
+	pub(crate) doc: Option<TextArg>,
+
+	/// `--vis`
+	pub(crate) visibility: Option<String>,
+
+	/// `--add-attr`
+	pub(crate) add_attributes: Vec<String>,
+
+	/// `--remove-attr`
+	pub(crate) remove_attributes: Vec<String>,
+
+	pub(crate) options: EditItemOptions,
+	pub(crate) dry_run: bool,
+
+	/// `--fmt`
+	pub(crate) format: bool,
+}
+
+impl EditArgs {
+	pub(crate) fn from_matches(matches: &ArgMatches) -> anyhow::Result<Self> {
+		let olds = matches._values_of("old");
+		let news = matches._values_of("new");
+		let file = |id: &str| matches._value_of(id).map(|path| TextArg::Read(SourceArg::from_path(path)));
+
+		if olds.len() != news.len() {
+			anyhow::bail!(
+				"`--old` and `--new` come in pairs, but there are {} `--old` and {} `--new`",
+				olds.len(),
+				news.len()
+			);
+		}
+
+		let mut replacements: Vec<(TextArg, TextArg)> =
+			(olds.into_iter().map(TextArg::Inline)).zip(news.into_iter().map(TextArg::Inline)).collect();
+
+		if let (Some(old), Some(new)) = (file("old-file"), file("new-file")) {
+			replacements.push((old, new));
+		}
+
+		let doc = matches._value_of("doc").map(|doc| TextArg::Inline(doc.to_owned())).or_else(|| file("doc-file"));
+		let stdin = (replacements.iter().flat_map(|(old, new)| [old, new]).chain(&doc))
+			.filter(|text| **text == TextArg::Read(SourceArg::Stdin))
+			.count();
+
+		if stdin > 1 {
+			anyhow::bail!("only one of `--old-file`, `--new-file`, and `--doc-file` can read stdin (`-`)");
+		}
+
+		Ok(Self {
+			path: matches._value_of("path").unwrap_or_default().to_owned(),
+			replacements,
+			doc,
+			visibility: matches._value_of("vis").map(str::to_owned),
+			add_attributes: matches._values_of("add-attr"),
+			remove_attributes: matches._values_of("remove-attr"),
+			options: EditItemOptions {
+				all_variants: matches.flag("all-variants"),
+				allow_kind_change: matches.flag("allow-kind-change"),
+			},
+			dry_run: matches.flag("dry-run"),
+			format: matches.flag("fmt"),
+		})
 	}
 }
 
@@ -526,9 +601,14 @@ impl SourceArg {
 
 	/// The source a `SOURCE` value names (`-` and none for stdin).
 	fn from_value(value: Option<&str>) -> Self {
-		match value {
-			None | Some("-") => Self::Stdin,
-			Some(path) => Self::File(PathBuf::from(path)),
+		value.map_or(Self::Stdin, Self::from_path)
+	}
+
+	/// A file, or stdin for `-`.
+	fn from_path(path: &str) -> Self {
+		match path {
+			"-" => Self::Stdin,
+			path => Self::File(PathBuf::from(path)),
 		}
 	}
 }
@@ -538,6 +618,13 @@ struct TargetOption {
 	id: &'static str,
 	plural: &'static str,
 	is_kind: fn(&Target) -> bool,
+}
+
+/// Text given on the command line, or read from a file or stdin.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum TextArg {
+	Inline(String),
+	Read(SourceArg),
 }
 
 /// `view`
@@ -767,6 +854,54 @@ mod tests {
 
 		assert_eq!(options, LoadOptions::default());
 		assert!(options.targets.is_default());
+	}
+
+	#[test]
+	fn edit_arguments() {
+		let args = EditArgs::from_matches(&parse(&[
+			"cargo-rscode",
+			"edit",
+			"crate::f",
+			"--old",
+			"a",
+			"--new",
+			"-b",
+			"--old",
+			"c",
+			"--new",
+			"",
+			"--vis",
+			"pub(crate)",
+			"--doc-file",
+			"-",
+			"--add-attr",
+			"must_use",
+			"--remove-attr",
+			"derive",
+			"--all-variants",
+			"-n",
+		]))
+		.unwrap();
+		let inline = |text: &str| TextArg::Inline(text.to_owned());
+
+		assert_eq!(args.path, "crate::f");
+		assert_eq!(args.replacements, [(inline("a"), inline("-b")), (inline("c"), inline(""))]);
+		assert_eq!(args.doc, Some(TextArg::Read(SourceArg::Stdin)));
+		assert_eq!(args.visibility.as_deref(), Some("pub(crate)"));
+		assert_eq!((args.add_attributes, args.remove_attributes), (vec!["must_use".to_owned()], vec!["derive".to_owned()]));
+		assert!(args.options.all_variants && !args.options.allow_kind_change && args.dry_run && !args.format);
+
+		let args = EditArgs::from_matches(&parse(&["cargo-rscode", "edit", "f", "--old-file", "old.rs", "--new-file", "-"])).unwrap();
+
+		assert_eq!(
+			args.replacements,
+			[(TextArg::Read(SourceArg::File(PathBuf::from("old.rs"))), TextArg::Read(SourceArg::Stdin))]
+		);
+
+		let error = |words: &[&str]| EditArgs::from_matches(&parse(words)).unwrap_err().to_string();
+
+		assert!(error(&["cargo-rscode", "edit", "f", "--old", "a"]).starts_with("`--old` and `--new` come in pairs"));
+		assert!(error(&["cargo-rscode", "edit", "f", "--old-file", "-", "--new-file", "-"]).starts_with("only one of"));
 	}
 
 	#[test]

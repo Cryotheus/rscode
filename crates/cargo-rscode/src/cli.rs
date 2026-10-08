@@ -243,7 +243,7 @@ pub(crate) fn cli() -> Command {
 		.styles(STYLES)
 		.subcommand_required(true)
 		.arg_required_else_help(true)
-		.subcommands([find(), view(), fmt(), sort(), rename(), remove(), replace(), insert()]);
+		.subcommands([find(), view(), fmt(), sort(), rename(), remove(), replace(), edit(), insert()]);
 
 	#[cfg(feature = "mcp")]
 	let command = command.subcommand(mcp());
@@ -278,6 +278,61 @@ pub(crate) fn color_choice(args: &[OsString]) -> ColorChoice {
 
 fn dry_run() -> Arg {
 	flag("dry-run", "Print the changes as a diff instead of writing them").short('n')
+}
+
+fn edit() -> Command {
+	let command = Command::new("edit")
+		.about("Edit an item in place: text inside it, its attributes, doc comment, or visibility")
+		.long_about(
+			"Edit an item in place, giving only the change: exact text to replace inside it (`--old` must occur once in \
+			 the item, as written in the file or as `view` prints it, even with `-n` line numbers), attributes to add \
+			 or remove, a new doc comment, or a new visibility. The new text gets the indentation of the item's lines; \
+			 nothing else is re-indented. Out-of-line modules and crate roots are edited in their own files.",
+		)
+		.arg(item_path("path", "PATH", "The item to edit"))
+		.arg(
+			multi_opt("old", "TEXT", "Exact text to replace (repeatable, each paired with a --new, applied in order)")
+				.allow_hyphen_values(true),
+		)
+		.arg(multi_opt("new", "TEXT", "The text to put in place of the --old of the same position").allow_hyphen_values(true))
+		.arg(
+			opt("old-file", "Read the text to replace from a file (`-` for stdin)")
+				.value_name("FILE")
+				.value_hint(ValueHint::FilePath)
+				.conflicts_with("old")
+				.requires("new-file"),
+		)
+		.arg(
+			opt("new-file", "Read the new text from a file (`-` for stdin)")
+				.value_name("FILE")
+				.value_hint(ValueHint::FilePath)
+				.conflicts_with("new")
+				.requires("old-file"),
+		)
+		.arg(opt("vis", "Set the visibility: pub, pub(crate), pub(super), pub(in PATH), or private").value_name("VIS"))
+		.arg(
+			opt("doc", "Set the doc comment, without `///` (an empty text removes it)")
+				.value_name("TEXT")
+				.allow_hyphen_values(true),
+		)
+		.arg(
+			opt("doc-file", "Read the doc comment from a file (`-` for stdin)")
+				.value_name("FILE")
+				.value_hint(ValueHint::FilePath)
+				.conflicts_with("doc"),
+		)
+		.arg(multi_opt("add-attr", "ATTR", "Add an attribute, like `derive(Debug)` or `#[must_use]` (repeatable)"))
+		.arg(multi_opt(
+			"remove-attr",
+			"ATTR",
+			"Remove an attribute by its path (`derive`) or exact text (`#[allow(dead_code)]`) (repeatable)",
+		))
+		.arg(flag("all-variants", "Edit every `cfg` variant instead of failing when there are several"))
+		.arg(flag("allow-kind-change", "Allow the item to become another kind of item, or several items"))
+		.arg(dry_run())
+		.arg(flag("fmt", "Format the edited item with rustfmt afterwards"));
+
+	output_args(load_args(command), FORMATS)
 }
 
 fn find() -> Command {

@@ -11,6 +11,7 @@
 //! | `rename_item` | renames an item and updates the references to it across the workspace |
 //! | `remove_items` | removes items with their attached comments (and out-of-line module files) |
 //! | `replace_item` | replaces the source of an item |
+//! | `edit_item` | replaces exact text inside an item, and sets its visibility, doc comment, or attributes |
 //! | `insert_items` | inserts items into a module, `impl` block, or trait |
 //! | `format_items` | sorts and formats items with rustfmt or prettyplease |
 //! | `attach_source` | attaches another workspace or package under a name (with [`ServerOptions::exposed`]) |

@@ -1,5 +1,6 @@
 //! The subcommands.
 
+mod edit;
 mod find;
 mod fmt;
 mod format_edited;
@@ -173,6 +174,7 @@ pub(crate) fn run(name: &str, matches: &ArgMatches, ui: &Ui) -> anyhow::Result<E
 		"rename" => rename::run(matches, ui),
 		"remove" => remove::run(matches, ui),
 		"replace" => replace::run(matches, ui),
+		"edit" => edit::run(matches, ui),
 		"insert" => insert::run(matches, ui),
 
 		#[cfg(feature = "mcp")]

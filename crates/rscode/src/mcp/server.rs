@@ -3,6 +3,7 @@
 use super::ServerOptions;
 use super::params::AttachParams;
 use super::params::DetachParams;
+use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
@@ -85,8 +86,8 @@ find_items takes glob patterns: `*` matches within one path segment (`parse_*`, 
 segments (`crate::config::**`, `**::tests::*`). A pattern that does not start with `crate::` or `::` matches anywhere: \
 `Config::load` finds `my_crate::config::Config::load`.
 
-Edits (rename_item, remove_items, replace_item, insert_items, format_items) are all-or-nothing: every changed file \
-must still parse, or nothing is written. Set `dry_run` (`check` for format_items) to get a unified diff without \
+Edits (rename_item, remove_items, replace_item, edit_item, insert_items, format_items) are all-or-nothing: every \
+changed file must still parse, or nothing is written. Set `dry_run` (`check` for format_items) to get a unified diff without \
 writing anything. Comments and formatting outside of the edited items are preserved.
 
 The workspace is loaded from disk again for every call, so changes made by other tools are always seen. Lines and \
@@ -120,6 +121,20 @@ pub(crate) struct Server {
 
 #[tool_router(router = edit_tools)]
 impl Server {
+	/// Edit one item in place, sending only the change: replace exact text inside it (`old` must occur once in the
+	/// item; copy it from view_items), and/or set its visibility, doc comment, or attributes. Cheaper than replace_item
+	/// for small changes.
+	#[tool(annotations(title = "Edit an item", read_only_hint = false, destructive_hint = true, open_world_hint = false))]
+	async fn edit_item(&self, Parameters(params): Parameters<EditItemParams>, context: RequestContext<RoleServer>) -> CallToolResult {
+		let target = self.target(&params.selection, false);
+		let dry_run = params.dry_run;
+
+		self.edit("edit_item", context, target, dry_run, move |load, permit| {
+			tools::edit_item(load, &params, permit)
+		})
+		.await
+	}
+
 	/// Sort items (Cryotheum ordering) and format them with rustfmt or prettyplease. A module target formats its
 	/// whole file, and its child modules' files unless `skip_children`; other targets are formatted in place without
 	/// touching the rest of the file. Set `check` to get the diff without writing.
@@ -190,9 +205,9 @@ impl Server {
 	}
 
 	/// Replace the whole source of an item, including its doc comments and attributes, with `source`: one item of the
-	/// same kind (unless `allow_kind_change`), re-indented to fit. Get the current source first with `view_items`
-	/// (`mode` `full`, `line_numbers` false). An import (`use crate::a::Name`) is replaced as its `use` item, which
-	/// must import nothing else. Set `dry_run` to review the diff first.
+	/// same kind (unless `allow_kind_change`), re-indented to fit. For small changes, edit_item is cheaper. Get the
+	/// current source first with `view_items` (`mode` `full`, `line_numbers` false). An import (`use crate::a::Name`)
+	/// is replaced as its `use` item, which must import nothing else. Set `dry_run` to review the diff first.
 	#[tool(annotations(title = "Replace an item", read_only_hint = false, destructive_hint = true, open_world_hint = false))]
 	async fn replace_item(&self, Parameters(params): Parameters<ReplaceParams>, context: RequestContext<RoleServer>) -> CallToolResult {
 		let target = self.target(&params.selection, false);

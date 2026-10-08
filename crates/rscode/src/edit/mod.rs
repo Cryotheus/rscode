@@ -1,4 +1,4 @@
-//! Modifying operations: removing, renaming, replacing, inserting, and formatting items.
+//! Modifying operations: removing, renaming, replacing, editing, inserting, and formatting items.
 //!
 //! Operations produce an [`EditSet`] describing every change, which can be previewed (as new file contents or a
 //! diff) or applied. Applying is all-or-nothing: every edited file must still parse before anything is written, and
@@ -46,9 +46,14 @@ pub use rename::rename;
 pub use replace::InsertOptions;
 pub use replace::InsertPosition;
 pub use replace::Insertion;
+pub use replace::ItemSpan;
 pub use replace::ReplaceOptions;
 pub use replace::Replacement;
 pub use replace::insert;
+pub use replace::item::EditItemOptions;
+pub use replace::item::ItemEdit;
+pub use replace::item::TextReplacement;
+pub use replace::item::edit_item;
 pub use replace::replace;
 pub use replace::replaces_all_variants;
 pub use rscode_fmt::emit::FileChange;

@@ -12,9 +12,9 @@
 //! - Resolve: [`Resolver`] resolves `use` imports, paths, `impl` targets, visibility, and usable paths.
 //! - Search: [`Find`] with glob-like [`pattern`]s (no regex).
 //! - View: [`View`] shows full source or outlines (bodies elided).
-//! - Edit: [`edit::remove`], [`edit::rename`], [`edit::replace`], [`edit::insert`], and [`edit::format`] plan
-//!   changes as an [`EditSet`], which is previewed or applied atomically. Comments and formatting outside of the
-//!   edited ranges are always preserved.
+//! - Edit: [`edit::remove`], [`edit::rename`], [`edit::replace`], [`edit::edit_item`], [`edit::insert`], and
+//!   [`edit::format`] plan changes as an [`EditSet`], which is previewed or applied atomically. Comments and formatting
+//!   outside of the edited ranges are always preserved.
 //! - Serve: the `mcp` feature exposes all of this as a Model Context Protocol server ([`mcp`]).
 //!
 //! Item paths are written like Rust paths: `crate::module::Item`, `::other_crate::Item`, `Type::method`,
@@ -30,9 +30,10 @@
 //! map that only grows until the thread exits, and parsing recurses as deeply as the code is nested. So rscode parses
 //! on short-lived threads of its own, with large stacks: loading ([`Workspace::load_crate`], [`load_workspace`]),
 //! viewing ([`View`]), finding references (renames and removals), checking edits ([`EditSet::preview`] and
-//! [`EditSet::apply`]), parsing new source ([`edit::replace`], [`edit::insert`]), and formatting ([`edit::format`])
-//! neither grow the calling thread's source map nor need a large stack on it. Only parsing a [`CfgExpr`] from text
-//! (as [`CfgContext::enable`] does) happens on the calling thread, which keeps that (short) text.
+//! [`EditSet::apply`]), parsing new source ([`edit::replace`], [`edit::edit_item`], [`edit::insert`]), and
+//! formatting ([`edit::format`]) neither grow the calling thread's source map nor need a large stack on it. Only
+//! parsing a [`CfgExpr`] from text (as [`CfgContext::enable`] does) happens on the calling thread, which keeps that
+//! (short) text.
 
 #![warn(missing_docs)]
 

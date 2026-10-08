@@ -110,6 +110,16 @@ pub enum Error {
 	#[error("{0}")]
 	InvalidSource(String),
 
+	/// Text to replace inside of an item (see [`edit_item`](crate::edit::edit_item)) does not occur in it exactly once.
+	#[error("{message}")]
+	TextMismatch {
+		/// Where the text was looked for, and where it occurs, or what comes closest.
+		message: String,
+
+		/// The (1-based) lines of the file where it occurs: none when it does not occur.
+		lines: Vec<usize>,
+	},
+
 	/// The operation does not support what it was given.
 	#[error("{0}")]
 	Unsupported(String),

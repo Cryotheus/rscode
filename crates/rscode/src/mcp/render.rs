@@ -294,6 +294,38 @@ pub(crate) fn insertion(root: &Path, plan: &Insertion, parent: &str, dry_run: bo
 	out
 }
 
+/// What an item edit did (or would do): the edited items with their lines after the edit, notes, and warnings.
+pub(crate) fn item_edit(root: &Path, plan: &Replacement, dry_run: bool) -> String {
+	let mut out = String::new();
+
+	if plan.spans.is_empty() {
+		out.push_str(if dry_run { "nothing would change\n" } else { "nothing changed\n" });
+	}
+
+	for span in &plan.spans {
+		let lines = match span.end > span.start {
+			true => format!("{}-{}", span.start, span.end),
+			false => span.start.to_string(),
+		};
+
+		writeln!(
+			out,
+			"{} `{}` ({}:{lines})",
+			done(dry_run, "edited", "edit"),
+			span.path,
+			display(root, &span.file)
+		)
+		.unwrap();
+	}
+
+	for note in &plan.notes {
+		writeln!(out, "note: {note}").unwrap();
+	}
+
+	warnings(&mut out, &plan.warnings);
+	out
+}
+
 /// The name of a kind, marking statics declared by `thread_local!` and by entries of other macro invocations.
 fn kind_label(kind: ItemKind, thread_local: bool, entry_macro: Option<&str>) -> String {
 	match (thread_local, entry_macro) {
@@ -725,6 +757,7 @@ mod tests {
 	use crate::ItemKind;
 	use crate::edit::Collision;
 	use crate::edit::EditSet;
+	use crate::edit::ItemSpan;
 	use crate::edit::RemovedItem;
 	use crate::model::CrateId;
 	use crate::model::CrateSpec;
@@ -891,6 +924,34 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn item_edit_reports() {
+		let span = |path: &str, file: &str, start: usize, end: usize| ItemSpan {
+			path: path.to_owned(),
+			file: PathBuf::from(file),
+			start,
+			end,
+		};
+		let mut plan = Replacement {
+			edits: EditSet::new(),
+			replaced: vec!["demo::f".to_owned(), "demo::g".to_owned()],
+			files: vec![PathBuf::from("/ws/src/lib.rs")],
+			spans: vec![span("demo::f", "/ws/src/lib.rs", 3, 9), span("demo::g", "/ws/src/lib.rs", 12, 12)],
+			warnings: vec!["w".to_owned()],
+			notes: vec!["n".to_owned()],
+		};
+
+		assert_eq!(
+			item_edit(root(), &plan, false),
+			"edited `demo::f` (src/lib.rs:3-9)\nedited `demo::g` (src/lib.rs:12)\nnote: n\nwarning: w\n"
+		);
+
+		plan.spans.clear();
+		plan.warnings.clear();
+
+		assert_eq!(item_edit(root(), &plan, true), "nothing would change\nnote: n\n");
+	}
+
 	fn krate(workspace: &Workspace, name: &str, kind: TargetKind, package: u32, selected: bool) -> Crate {
 		let id = CrateId(workspace.crates.len() as u32);
 		let root = PathBuf::from(format!("/ws/{name}/src/lib.rs"));
@@ -1024,7 +1085,9 @@ mod tests {
 			edits: EditSet::new(),
 			replaced: vec!["demo::f".to_owned(), "demo::f".to_owned()],
 			files: vec![PathBuf::from("/ws/src/unix.rs"), PathBuf::from("/ws/src/windows.rs")],
+			spans: Vec::new(),
 			warnings: vec!["the new item is named `g`".to_owned()],
+			notes: Vec::new(),
 		};
 
 		assert_eq!(

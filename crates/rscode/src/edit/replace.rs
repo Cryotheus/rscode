@@ -4,6 +4,7 @@
 //! errors point into the source as given. It is re-indented to its place, with the indentation style and line breaks
 //! of the file.
 
+pub(super) mod item;
 mod parse;
 
 use crate::Error;
@@ -95,6 +96,22 @@ pub struct Insertion {
 	pub warnings: Vec<String>,
 }
 
+/// Where an edited item is after an edit (see [`Replacement::spans`]).
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ItemSpan {
+	/// The canonical path of the item.
+	pub path: String,
+
+	/// The file with the item's text (a module's own file for out-of-line modules whose file was edited).
+	pub file: PathBuf,
+
+	/// The first line of the item (1-based).
+	pub start: usize,
+
+	/// The last line of the item.
+	pub end: usize,
+}
+
 /// Options for [`replace`].
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -120,8 +137,17 @@ pub struct Replacement {
 	/// The edited files.
 	pub files: Vec<PathBuf>,
 
+	/// Where the edited items are after the edit, in the order of [`Replacement::replaced`]
+	/// ([`edit_item`](crate::edit::edit_item) tells; [`replace`] does not).
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub spans: Vec<ItemSpan>,
+
 	/// Things to know about the replacement.
 	pub warnings: Vec<String>,
+
+	/// What needs no attention, such as parts of an edit that change nothing.
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	pub notes: Vec<String>,
 }
 
 /// A container to insert items into.
@@ -631,7 +657,9 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 		edits: EditSet::new(),
 		replaced: Vec::new(),
 		files: Vec::new(),
+		spans: Vec::new(),
 		warnings: Vec::new(),
+		notes: Vec::new(),
 	};
 
 	// parsed once per container kind (`cfg` variants may be in different containers)

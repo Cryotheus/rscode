@@ -263,7 +263,7 @@ fn prints_help_and_version() {
 
 	assert!(help.stdout.contains("Usage: cargo-rscode <COMMAND>"), "{}", help.stdout);
 
-	for subcommand in ["find", "view", "fmt", "sort", "rename", "remove", "replace", "insert"] {
+	for subcommand in ["find", "view", "fmt", "sort", "rename", "remove", "replace", "edit", "insert"] {
 		assert!(help.stdout.contains(&format!("\n  {subcommand} ")), "{subcommand}: {}", help.stdout);
 	}
 
@@ -300,6 +300,7 @@ fn usage_errors_exit_with_2() {
 		&["view", "x", "-v", "-q"],
 		&["view", "x", "-s"],
 		&["insert", "crate", "--position", "before"],
+		&["edit", "x", "--old", "a", "--old-file", "b", "--new-file", "c"],
 		&["find", "x", "--kind", "strukt"],
 	] {
 		assert_eq!(run(&fixture(), args).code, Some(2), "{args:?}");
@@ -987,6 +988,53 @@ fn replaces_items() {
 }
 
 #[test]
+fn edits_items() {
+	let dry = run(&fixture(), &["edit", "crate::add", "--old", "left + right", "--new", "right + left", "--dry-run"]).success();
+
+	assert!(dry.stdout.contains("-\tleft + right\n+\tright + left\n"), "{}", dry.stdout);
+	assert_eq!(dry.stderr, native("would edit demo::add (src/lib.rs:8-11)\n"));
+
+	let copy = TempCopy::new("edit");
+	let edited = run(copy.path(), &["edit", "crate::add", "--old", "left + right", "--new", "right + left"]).success();
+
+	assert_eq!(edited.stdout, native("edited demo::add (src/lib.rs:8-11)\n"));
+	assert!(copy.read("src/lib.rs").contains("\tright + left\n"));
+
+	// the doc comment, attributes, and visibility
+	let json = run(
+		copy.path(),
+		&["edit", "crate::twice", "--doc", "Twice.", "--add-attr", "must_use", "--message-format", "json"],
+	)
+	.success();
+
+	assert!(json.stdout.starts_with(r#"{"edited":[{"path":"demo::twice","file":"#), "{}", json.stdout);
+	assert!(copy.read("src/lib.rs").contains("/// Twice.\n#[must_use]\npub fn twice"));
+	run(copy.path(), &["edit", "crate::util::double", "--vis", "pub(super)"]).success();
+	assert!(copy.read("src/util.rs").contains("pub(super) fn double"));
+
+	// text from files, which only one `cfg` variant has
+	std::fs::write(copy.path().join("old.txt"), "\"plain\"").unwrap();
+	std::fs::write(copy.path().join("new.txt"), "\"simple\"").unwrap();
+
+	let variant = run(copy.path(), &["edit", "crate::extra", "--old-file", "old.txt", "--new-file", "new.txt"]).success();
+
+	assert!(variant.stderr.contains("note: of the 2 items that `crate::extra` names, only"), "{}", variant.stderr);
+	assert!(copy.read("src/lib.rs").contains("\t\"simple\"\n"));
+	cargo_check(copy.path());
+
+	let missing = run(copy.path(), &["edit", "crate::add", "--old", "left - right", "--new", "x"]);
+
+	assert_eq!(missing.code, Some(1));
+	assert!(missing.stderr.contains("the closest line is 10: `right + left`"), "{}", missing.stderr);
+	assert!(missing.stderr.contains("hint: copy `--old` exactly from the output of `cargo rscode view`"), "{}", missing.stderr);
+
+	let nothing = run(copy.path(), &["edit", "crate::add"]);
+
+	assert_eq!(nothing.code, Some(1));
+	assert!(nothing.stderr.starts_with("error: nothing to change"), "{}", nothing.stderr);
+}
+
+#[test]
 fn inserts_items() {
 	let copy = TempCopy::new("insert");
 	let first =
@@ -1198,6 +1246,7 @@ mod mcp {
 			"rename_item",
 			"remove_items",
 			"replace_item",
+			"edit_item",
 			"insert_items",
 			"format_items",
 		] {
@@ -1207,6 +1256,6 @@ mod mcp {
 		let read_only = tools(&["--read-only"]);
 
 		assert!(read_only.contains("find_items") && read_only.contains("view_items"), "{read_only:?}");
-		assert!(!read_only.contains("rename_item") && !read_only.contains("remove_items"), "{read_only:?}");
+		assert!(!read_only.contains("rename_item") && !read_only.contains("edit_item"), "{read_only:?}");
 	}
 }

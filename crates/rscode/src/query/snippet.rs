@@ -140,7 +140,112 @@ impl Line {
 	}
 
 	fn is_blank(&self) -> bool {
-		!self.verbatim && self.text.trim().is_empty()
+		is_blank(&self.text, self.verbatim)
+	}
+}
+
+/// Where a line of a [`PrintedText`] comes from.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct PrintedLine {
+	/// Where the line starts in the printed text.
+	printed: usize,
+
+	/// Where its printed text starts in the text given to [`PrintedText::new`], counting the prefix: after the
+	/// indentation removed from it (after all of the whitespace of a blank line).
+	source: usize,
+
+	/// The length of the printed line.
+	len: usize,
+}
+
+/// A text as views print it in full: like a [`Snippet`] of it without edits, dedented ([`Snippet::dedent`]), without
+/// line numbers. It remembers where each printed line comes from, so that text copied from a view can be found in
+/// the source (see [`edit_item`](crate::edit::edit_item)); views and edits share these rules.
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub(crate) struct PrintedText {
+	/// The printed text: the lines, joined with `\n`.
+	pub(crate) text: String,
+
+	/// The indentation removed from every line, except from blank lines (which are emptied) and from lines that start
+	/// inside of string literals (which are kept as they are).
+	pub(crate) indentation: String,
+
+	/// The printed lines, in order.
+	lines: Vec<PrintedLine>,
+
+	/// The length of the indentation put before the text, which is not in it.
+	prefix: usize,
+}
+
+impl PrintedText {
+	/// How views print `text`: a region of a file that starts at the start of a line, or after `prefix`, the
+	/// indentation of its line, when code precedes it on that line (as [`Snippet::new`] puts it before the region).
+	/// `strings`: the string literals of `text` that span lines, sorted (see [`multiline_strings`]).
+	pub(crate) fn new(prefix: &str, text: &str, strings: &[TextRange]) -> Self {
+		let working = format!("{prefix}{text}");
+
+		// (start, text without the line break, verbatim) of every line of the working text
+		let mut lines: Vec<(usize, &str, bool)> = Vec::new();
+		let mut start = 0;
+
+		for line in working.split('\n') {
+			// (the first line starts the region, so it does not start inside of a string)
+			let verbatim = start > prefix.len() && is_inside(strings, start - prefix.len());
+
+			lines.push((start, line.strip_suffix('\r').unwrap_or(line), verbatim));
+			start += line.len() + 1;
+		}
+
+		let is_shown = |&(_, text, verbatim): &(usize, &str, bool)| !is_blank(text, verbatim);
+		let (Some(first), Some(last)) = (lines.iter().position(is_shown), lines.iter().rposition(is_shown)) else {
+			return Self::default();
+		};
+		let lines = &lines[first..=last];
+		let indentation = common_indentation(lines.iter().map(|&(_, text, verbatim)| (text, verbatim)));
+		let mut printed = Self {
+			text: String::with_capacity(working.len()),
+			indentation: indentation.to_owned(),
+			lines: Vec::with_capacity(lines.len()),
+			prefix: prefix.len(),
+		};
+
+		for &(start, text, verbatim) in lines {
+			let removed = match (is_blank(text, verbatim), verbatim) {
+				(true, _) => text.len(),
+				(false, true) => 0,
+				(false, false) => indentation.len(),
+			};
+
+			if !printed.lines.is_empty() {
+				printed.text.push('\n');
+			}
+
+			printed.lines.push(PrintedLine {
+				printed: printed.text.len(),
+				source: start + removed,
+				len: text.len() - removed,
+			});
+			printed.text.push_str(&text[removed..]);
+		}
+
+		printed
+	}
+
+	/// The printed lines, each with where it starts in the text (for the first line, where the text starts).
+	pub(crate) fn lines(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+		(self.lines.iter()).map(|line| (&self.text[line.printed..line.printed + line.len], line.source.saturating_sub(self.prefix)))
+	}
+
+	/// The offset in the text (given to [`PrintedText::new`]) of an offset in the printed text: printed text copied
+	/// from there starts (or ends) there in the text. The printed line break between two lines stands for the line
+	/// break (`\n` or `\r\n`) and the indentation removed from the second line.
+	pub(crate) fn source_offset(&self, offset: usize) -> usize {
+		let index = self.lines.partition_point(|line| line.printed <= offset).saturating_sub(1);
+
+		match self.lines.get(index) {
+			Some(line) => (line.source + offset.saturating_sub(line.printed).min(line.len)).saturating_sub(self.prefix),
+			None => 0,
+		}
 	}
 }
 
@@ -203,11 +308,7 @@ impl Snippet {
 	/// Removes the indentation common to all lines (but those starting inside of string literals), and empties blank
 	/// lines.
 	pub(super) fn dedent(&mut self) {
-		let common = (self.lines.iter())
-			.filter(|line| !line.is_blank() && !line.verbatim)
-			.map(|line| indentation(&line.text))
-			.reduce(common_prefix)
-			.map_or(0, str::len);
+		let common = common_indentation(self.lines.iter().map(|line| (line.text.as_str(), line.verbatim))).len();
 
 		for line in &mut self.lines {
 			if line.is_blank() {
@@ -371,9 +472,8 @@ impl Syntax {
 
 				TokenTree::Literal(literal) => {
 					let range = parsed.range(literal.span());
-					let text = parsed.text.get(range.as_range()).unwrap_or_default();
 
-					if is_string_literal(text) && text.contains('\n') {
+					if parsed.text.get(range.as_range()).is_some_and(is_multiline_string) {
 						self.strings.push(range);
 					}
 				}
@@ -398,6 +498,35 @@ fn clamp(text: &str, range: TextRange) -> TextRange {
 	let start = floor(range.start);
 
 	TextRange::new(start, floor(range.end).max(start))
+}
+
+/// Adds the string literals among `tokens` (lexed from `text`) that span lines.
+fn collect_strings(text: &str, tokens: TokenStream, strings: &mut Vec<TextRange>) {
+	for token in tokens {
+		match token {
+			TokenTree::Group(group) => collect_strings(text, group.stream(), strings),
+
+			TokenTree::Literal(literal) => {
+				let range = TextRange::from(literal.span().byte_range());
+
+				if text.get(range.as_range()).is_some_and(is_multiline_string) {
+					strings.push(range);
+				}
+			}
+
+			TokenTree::Ident(_) | TokenTree::Punct(_) => {}
+		}
+	}
+}
+
+/// The indentation that views remove from the lines of an item, given as `(text, verbatim)`: the indentation common
+/// to all lines but blank lines and lines that start inside of string literals (`verbatim`).
+fn common_indentation<'a>(lines: impl Iterator<Item = (&'a str, bool)>) -> &'a str {
+	lines
+		.filter(|&(text, verbatim)| !is_blank(text, verbatim) && !verbatim)
+		.map(|(text, _)| indentation(text))
+		.reduce(common_prefix)
+		.unwrap_or_default()
 }
 
 fn common_prefix<'a>(a: &'a str, b: &str) -> &'a str {
@@ -461,11 +590,21 @@ fn indentation(line: &str) -> &str {
 	&line[..line.len() - line.trim_start_matches([' ', '\t']).len()]
 }
 
+/// Whether a line is blank (only whitespace, and not inside of a string literal), so views empty it.
+fn is_blank(text: &str, verbatim: bool) -> bool {
+	!verbatim && text.trim().is_empty()
+}
+
 /// Whether `offset` is strictly inside of one of the (sorted, disjoint) `ranges`.
 fn is_inside(ranges: &[TextRange], offset: usize) -> bool {
 	let index = ranges.partition_point(|range| range.start < offset);
 
 	index > 0 && offset < ranges[index - 1].end
+}
+
+/// Whether the source text of a literal is a string spanning lines, whose continuation lines views keep as they are.
+fn is_multiline_string(text: &str) -> bool {
+	is_string_literal(text) && text.contains('\n')
 }
 
 fn is_punct(token: &TokenTree, char: char) -> bool {
@@ -482,6 +621,21 @@ fn is_string_literal(text: &str) -> bool {
 	let rest = rest.strip_prefix('r').unwrap_or(rest);
 
 	rest.trim_start_matches('#').starts_with('"')
+}
+
+/// The string literals of a text that span lines (like [`Syntax::strings`] for files), found by lexing it on a thread
+/// of its own (see [`isolated`]): none when it does not lex.
+pub(crate) fn multiline_strings(text: &str) -> Vec<TextRange> {
+	isolated(|| {
+		let Ok(tokens) = text.parse::<TokenStream>() else {
+			return Vec::new();
+		};
+		let mut strings = Vec::new();
+
+		collect_strings(text, tokens, &mut strings);
+		strings.sort();
+		strings
+	})
 }
 
 /// Sorts edits and resolves overlaps: deletions separated by nothing but spaces are merged and then extended to their
@@ -835,6 +989,60 @@ mod tests {
 				Edit::Delete(TextRange::new(8, 9))
 			]
 		);
+	}
+
+	#[test]
+	fn prints_text_like_views_and_maps_it_back() {
+		let text = concat!(
+			"impl A {\r\n\tfn a() {\r\n\t\tlet s = \"x\r\n  y\";\r\n\t\t\r\n\t\tb();\r\n\t}\r\n}",
+			"  struct B {\n    b: u8,\n  }\n"
+		);
+		let source = file(text);
+		let strings = Syntax::of(text).strings;
+
+		for (from, to) in [("fn a", "\t}"), ("struct B", "  }"), ("impl", "struct B {\n    b: u8,\n  }")] {
+			let region = region(text, from, to);
+			let mut snippet = Snippet::new(&source, region, &[], &strings);
+
+			snippet.dedent();
+
+			// (the text starts at the start of its line, unless code precedes it there)
+			let line_start = text[..region.start].rfind('\n').map_or(0, |index| index + 1);
+			let (start, prefix) = match text[line_start..region.start].trim().is_empty() {
+				true => (line_start, ""),
+				false => (region.start, line_indent(text, region.start)),
+			};
+			let region_text = &text[start..region.end];
+			let local: Vec<TextRange> = (strings.iter())
+				.filter(|string| string.start >= start)
+				.map(|string| TextRange::new(string.start - start, string.end - start))
+				.collect();
+			let printed = PrintedText::new(prefix, region_text, &local);
+
+			assert_eq!(printed.text, snippet.render(false), "{from}");
+		}
+
+		let printed = PrintedText::new("", &text[..text.find("  struct").unwrap()], &strings);
+
+		assert_eq!(printed.text, "impl A {\n\tfn a() {\n\t\tlet s = \"x\n  y\";\n\n\t\tb();\n\t}\n}");
+		assert_eq!(printed.indentation, "");
+
+		// a printed line break stands for the line break and the indentation of the next line
+		let offset = |needle: &str| printed.text.find(needle).unwrap();
+
+		assert_eq!(printed.source_offset(offset("\n\tfn")), text.find("\r\n\tfn").unwrap());
+		assert_eq!(printed.source_offset(offset("\tfn") + 1), text.find("fn a").unwrap());
+		assert_eq!(printed.source_offset(offset("  y")), text.find("  y").unwrap());
+		assert_eq!(printed.source_offset(offset("\n\n") + 1), text.find("\t\t\r\n\t\tb").unwrap() + 2);
+		assert_eq!(printed.lines().nth(4), Some(("", text.find("\t\t\r\n\t\tb").unwrap() + 2)));
+
+		let printed = PrintedText::new("  ", "struct B {\n    b: u8,\n  }", &[]);
+
+		assert_eq!(printed.text, "struct B {\n  b: u8,\n}");
+		assert_eq!(printed.source_offset(0), 0);
+		assert_eq!(printed.source_offset(printed.text.find("b:").unwrap()), "struct B {\n    ".len());
+		assert_eq!(multiline_strings("fn a() { \"x\ny\"; \"z\"; r#\"\n\"# }"), [TextRange::new(9, 14), TextRange::new(21, 27)]);
+		assert!(multiline_strings("fn a() {").is_empty());
 	}
 
 	fn range_of(text: &str, needle: &str) -> TextRange {
