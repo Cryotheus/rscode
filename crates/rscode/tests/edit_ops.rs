@@ -4534,6 +4534,12 @@ pub fn first() -> u8 {
 			["fixture", "fixture::commands", "fixture::SAY", "fixture::HELP", "fixture::QUIT", "fixture::first"]
 		);
 
+		// a path with `!` that names nothing suggests the invocations, not the macro's definition
+		let suggestions = rscode::query::suggest(&resolver, &path("crate::m::commands!"));
+
+		assert_eq!((suggestions.similar, suggestions.named), (both.map(str::to_owned).to_vec(), 2));
+		assert_eq!(rscode::query::suggest(&resolver, &path("crate::m::commands")).similar, ["fixture::commands"]);
+
 		let views = rscode::View::new().path("crate::commands![2]").unwrap().run_with(&resolver).unwrap();
 
 		assert_eq!((views[0].kind, views[0].text.as_str()), (ItemKind::MacroCall, "commands! {\n\tstatic QUIT = 3;\n}"));

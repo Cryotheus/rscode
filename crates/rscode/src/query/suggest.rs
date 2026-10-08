@@ -1,8 +1,10 @@
 //! What a path that names no item may have meant: the one item whose path ends like it, and items named like its
 //! last segment.
 
+use crate::model::ItemData;
 use crate::model::ItemId;
 use crate::model::ItemKind;
+use crate::model::Workspace;
 use crate::path::Anchor;
 use crate::path::ItemPath;
 use crate::resolve::Resolver;
@@ -29,9 +31,19 @@ pub struct Suggestions {
 	pub named: usize,
 }
 
+/// The name of an item that the last segment of a path is compared with: its name, or for a path with `!`
+/// (`macro_call`), the name of the macro of an invocation in a module (not that of a `macro_rules!` definition).
+fn compared_name<'ws>(ws: &Workspace, item: ItemId, data: &'ws ItemData, macro_call: bool) -> Option<&'ws str> {
+	match macro_call {
+		true => ws.parent(item).filter(|&parent| ws.item(parent).kind == ItemKind::Module).and_then(|_| data.macro_name()),
+		false => data.name.as_deref().filter(|_| data.kind.is_nameable() && data.kind != ItemKind::Import),
+	}
+}
+
 /// What `path`, which names no item, may have meant: items of every loaded crate (selected or not) named like its
-/// last segment, and, for a plain path without an anchor, the only item whose path ends like it. Nothing is
-/// suggested for `use` paths, `impl` blocks, and fields.
+/// last segment, and, for a plain path without an anchor, the only item whose path ends like it. For a path with `!`,
+/// the items are the invocations of macros of that name in modules (`m::name![2]`), not the macros' definitions.
+/// Nothing is suggested for `use` paths, `impl` blocks, and fields.
 pub fn suggest(resolver: &Resolver<'_>, path: &ItemPath) -> Suggestions {
 	let Some(last) = path.segments.last().filter(|_| !path.import && path.field.is_none()) else {
 		return Suggestions::default();
@@ -41,9 +53,8 @@ pub fn suggest(resolver: &Resolver<'_>, path: &ItemPath) -> Suggestions {
 	let named = |exact: bool| -> Vec<ItemId> {
 		(ws.crates().iter())
 			.flat_map(|krate| krate.items())
-			.filter(|(_, data)| data.kind.is_nameable() && data.kind != ItemKind::Import)
-			.filter(|(_, data)| {
-				data.name.as_deref().is_some_and(|name| match exact {
+			.filter(|&(item, data)| {
+				compared_name(ws, item, data, path.macro_call).is_some_and(|name| match exact {
 					true => name == last.as_str(),
 					false => name.eq_ignore_ascii_case(last.as_str()),
 				})
