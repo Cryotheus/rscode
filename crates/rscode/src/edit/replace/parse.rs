@@ -213,9 +213,12 @@ impl NewItem {
 pub(super) struct ParsedSource {
 	pub(super) items: Vec<NewItem>,
 
-	/// The text of the items: the source without a byte order mark and, for enum variants, without a trailing comma
-	/// (the variant being replaced keeps the comma after it).
+	/// The text of the items: the source without a byte order mark and, for enum variants and fields, without a
+	/// trailing comma (the variant or field being replaced keeps the comma after it).
 	pub(super) text: String,
+
+	/// Where the code ends in [`ParsedSource::text`]: a trailing comment follows, if any.
+	pub(super) code_end: usize,
 
 	/// Whether a comment follows the last token (it would comment out code following the text on its line).
 	pub(super) trailing_comment: bool,
@@ -535,13 +538,15 @@ fn parse_source_here(source: &str, container: Container) -> Result<ParsedSource,
 		text.replace_range(comma, "");
 	}
 
-	let trailing_comment = !text.get(end.min(text.len())..).unwrap_or_default().trim().is_empty();
-	let ends_with_semicolon = text.get(..end.min(text.len())).is_some_and(|code| code.ends_with(';'));
+	let code_end = end.min(text.len());
+	let trailing_comment = !text.get(code_end..).unwrap_or_default().trim().is_empty();
+	let ends_with_semicolon = text.get(..code_end).is_some_and(|code| code.ends_with(';'));
 	let has_cfg = has_cfg_attributes(&text);
 
 	Ok(ParsedSource {
 		items,
 		text,
+		code_end,
 		trailing_comment,
 		ends_with_semicolon,
 		has_cfg,

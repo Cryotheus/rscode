@@ -4427,11 +4427,33 @@ impl Point {
 			LIB.replace("radius: f64", "radius: f32")
 		);
 
-		// only a field replaces a field
-		let resolver = Resolver::new(&ws);
-		let function = rscode::edit::replace(&resolver, &path("crate::Point.x"), "fn x() {}", &ReplaceOptions::default());
+		// a comment after the source's comma goes after the file's
+		assert_eq!(
+			replaced(&dir, &ws, "crate::Point.x", "pub x: i64, // note"),
+			LIB.replace("\t/// The x coordinate.\n\tpub x: i32,", "\tpub x: i64, // note")
+		);
+		assert_eq!(
+			replaced(&dir, &ws, "crate::Pair.0", "pub u32, /* c */"),
+			LIB.replace("pub u8, pub u16", "pub u32, /* c */\npub u16")
+		);
+		assert_eq!(
+			replaced(&dir, &ws, "crate::Shape::Square", "Square(f32), // note"),
+			LIB.replace("\tSquare(f64),", "\tSquare(f32), // note")
+		);
 
-		assert!(matches!(function, Err(Error::InvalidSource(_))), "{function:?}");
+		// only a field replaces a field, of the same form
+		let resolver = Resolver::new(&ws);
+		let replace = |path: &str, source: &str| match rscode::edit::replace(&resolver, &super::path(path), source, &ReplaceOptions::default()) {
+			Err(Error::InvalidSource(message)) => message,
+			other => panic!("{other:?}"),
+		};
+
+		replace("crate::Point.x", "fn x() {}");
+		assert_eq!(replace("crate::Point.x", "u8"), "`fixture::Point.x` is a named field: write it as `name: Type`");
+		assert_eq!(
+			replace("crate::Pair.0", "a: u8"),
+			"`fixture::Pair.0` is a field of a tuple struct or variant: write it as a type alone (`pub u8`), without a name"
+		);
 	}
 
 	#[test]

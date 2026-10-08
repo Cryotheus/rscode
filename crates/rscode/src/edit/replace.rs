@@ -17,6 +17,7 @@ use crate::edit::describe;
 use crate::edit::trivia;
 use crate::edit::trivia::Placement;
 use crate::model::ImportInfo;
+use crate::model::ItemData;
 use crate::model::ItemDetail;
 use crate::model::ItemId;
 use crate::model::ItemKind;
@@ -383,6 +384,25 @@ fn check_entry_anchor(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &Ite
 	}
 }
 
+/// Fails unless new fields have the form of the field they replace: `name: Type` for a named field, a type alone for a
+/// field of a tuple struct or variant (whose name is its index).
+fn check_field_form(data: &ItemData, path: &str, items: &[NewItem]) -> Result<(), Error> {
+	if data.kind != ItemKind::Field {
+		return Ok(());
+	}
+
+	let named = data.name.as_deref().is_some_and(|name| !name.starts_with(|char: char| char.is_ascii_digit()));
+
+	match items.iter().any(|item| item.name.is_some() != named) {
+		false => Ok(()),
+		true if named => Err(Error::InvalidSource(format!("`{path}` is a named field: write it as `name: Type`"))),
+
+		true => Err(Error::InvalidSource(format!(
+			"`{path}` is a field of a tuple struct or variant: write it as a type alone (`pub u8`), without a name"
+		))),
+	}
+}
+
 /// Whether code (not just a line comment) follows `offset` on its line.
 fn code_follows(text: &str, offset: usize) -> bool {
 	let rest = text.get(offset..).unwrap_or_default();
@@ -467,6 +487,14 @@ fn entry_anchor(resolver: &Resolver<'_>, anchor: &ItemPath, entry: ItemId) -> Er
 		"`{anchor}` is an entry of the macro invocation `{call}`, which items cannot be inserted into: to add entries, \
 		 replace the invocation, or replace the entry with itself and the new entries (allowing a kind change)"
 	))
+}
+
+/// The offset after a `,` that follows `offset` (after spaces and tabs), if one does.
+fn following_comma(text: &str, offset: usize) -> Option<usize> {
+	let rest = text.get(offset..)?;
+	let spaces = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+
+	rest[spaces..].starts_with(',').then_some(offset + spaces + 1)
 }
 
 /// The item that replacing `item` replaces for the path: the import, when `item` is its `use` item.
@@ -806,12 +834,29 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 		};
 
 		check_kinds(data.kind, &canonical, &source.items, container, options.allow_kind_change)?;
+		check_field_form(data, &canonical, &source.items)?;
 
 		let file = ws.file_of(item);
 		let text = file.text();
 		let indent = trivia::line_indent(text, data.range.start);
-		let mut replacement = trivia::reindent(&source.text, indent, text);
 		let mut range = data.range;
+
+		// a comment after a variant or field goes after the comma that follows it in the file (rather than before it,
+		// which would leave the comma on a line of its own)
+		let comma = (source.trailing_comment && matches!(container, Container::Enum | Container::Fields))
+			.then(|| following_comma(text, range.end))
+			.flatten();
+		let mut replacement = match comma {
+			Some(end) => {
+				range.end = end;
+
+				let (code, comment) = source.text.split_at(source.code_end);
+
+				trivia::reindent(&format!("{code},{comment}"), indent, text)
+			}
+
+			None => trivia::reindent(&source.text, indent, text),
+		};
 
 		// every variant keeps its own `cfg`, unless the source has one (so they do not all become unconditional)
 		if items.len() > 1 && !source.has_cfg {
