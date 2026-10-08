@@ -4651,6 +4651,19 @@ m! { static B = 3; }
 		assert_eq!(replaced("crate::QUIT", "static QUIT = 4"), LIB.replace("QUIT = 3", "QUIT = 4"));
 		assert_eq!(replaced("crate::HELP", "/// Help.\nstatic HELP = 5;"), LIB.replace("static HELP = 2", "/// Help.\n\tstatic HELP = 5"));
 
+		// not anchors: new items would go after the invocation, not into it
+		for (parent, anchor) in [(None, "crate::SAY"), (Some(path("crate")), "SAY")] {
+			let options = InsertOptions { position: InsertPosition::After(anchor.to_owned()), force: false };
+
+			match rscode::edit::insert(&resolver, parent.as_ref(), "static NEW = 5;", &options) {
+				Err(Error::Unsupported(message)) => assert!(
+					message.starts_with(&format!("`{anchor}` is an entry of the macro invocation `fixture::commands![1]`")),
+					"{message}"
+				),
+				other => panic!("{other:?}"),
+			}
+		}
+
 		let function = rscode::edit::replace(&resolver, &path("crate::SAY"), "fn say() {}", &ReplaceOptions::default());
 
 		assert!(matches!(function, Err(Error::InvalidSource(_))), "{function:?}");

@@ -252,6 +252,10 @@ fn anchor_target<'ws>(resolver: &Resolver<'ws>, anchor: Option<&ItemPath>) -> Re
 		});
 	}
 
+	if let Some(&entry) = items.iter().find(|&&item| ws.entry_macro(item).is_some()) {
+		return Err(entry_anchor(resolver, anchor, entry));
+	}
+
 	let mut targets: Vec<Target<'ws>> = Vec::new();
 	let mut unsupported = None;
 
@@ -358,6 +362,27 @@ fn check_kinds(kind: ItemKind, path: &str, items: &[NewItem], container: Contain
 	}
 }
 
+/// Refuses an anchor that names statics declared by entries of a macro invocation (other than `thread_local!`, see
+/// [`Workspace::entry_macro`]): the new items would go into the container after the invocation, not into it. A single
+/// name names the entries of the container's invocations too, like in [`siblings`].
+fn check_entry_anchor(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &ItemPath) -> Result<(), Error> {
+	let ws = resolver.workspace();
+	let mut named = resolver.resolve_item_path(anchor);
+
+	if let (Anchor::None, None, false, [name]) = (anchor.anchor, &anchor.qualifier, anchor.import, anchor.segments.as_slice())
+		&& is_plain(anchor)
+	{
+		let calls = ws.children(target.item).filter(|&child| ws.item(child).kind == ItemKind::MacroCall);
+
+		named.extend(calls.flat_map(|call| ws.children(call)).filter(|&entry| ws.item(entry).name.as_ref() == Some(name)));
+	}
+
+	match named.into_iter().find(|&item| ws.entry_macro(item).is_some()) {
+		Some(entry) => Err(entry_anchor(resolver, anchor, entry)),
+		None => Ok(()),
+	}
+}
+
 /// Whether code (not just a line comment) follows `offset` on its line.
 fn code_follows(text: &str, offset: usize) -> bool {
 	let rest = text.get(offset..).unwrap_or_default();
@@ -433,6 +458,17 @@ fn distinct_places(ws: &Workspace, items: Vec<ItemId>) -> Vec<ItemId> {
 		.collect()
 }
 
+/// The refusal of an anchor that is an entry of a macro invocation (see [`check_entry_anchor`]).
+fn entry_anchor(resolver: &Resolver<'_>, anchor: &ItemPath, entry: ItemId) -> Error {
+	let ws = resolver.workspace();
+	let call = ws.parent(entry).map(|call| resolver.canonical_path(call).to_string()).unwrap_or_default();
+
+	Error::Unsupported(format!(
+		"`{anchor}` is an entry of the macro invocation `{call}`, which items cannot be inserted into: to add entries, \
+		 replace the invocation, or replace the entry with itself and the new entries (allowing a kind change)"
+	))
+}
+
 /// The item that replacing `item` replaces for the path: the import, when `item` is its `use` item.
 fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 	imports.iter().find(|(use_item, _)| *use_item == item).map_or(item, |&(_, import)| import)
@@ -451,7 +487,9 @@ fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 /// their group directly, unless blank lines separate those siblings already.
 ///
 /// Fails with [`Error::Collision`] when a new name is already bound in the container (in a module: by an item or a
-/// named import in the same namespace; in an `impl` block: by an associated item), unless [`InsertOptions::force`].
+/// named import in the same namespace; in an `impl` block: by an associated item), unless [`InsertOptions::force`],
+/// and with [`Error::Unsupported`] when the sibling is an entry of a macro invocation (`static SAY = 1;` of
+/// `commands! { ... }`), which items cannot be inserted into.
 pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, options: &InsertOptions) -> Result<Insertion, Error> {
 	let source = &*pasted(source);
 	let anchor = match &options.position {
@@ -684,6 +722,8 @@ fn placement(
 
 		(_, Some(anchor)) => anchor,
 	};
+
+	check_entry_anchor(resolver, target, anchor)?;
 
 	let siblings = siblings(resolver, target, anchor);
 
