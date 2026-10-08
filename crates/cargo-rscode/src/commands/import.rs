@@ -19,7 +19,9 @@ use std::process::ExitCode;
 /// An error of [`rscode::edit::add_imports`], with a hint naming the argument that gets past it.
 fn hinted(error: Error, resolver: &Resolver<'_>) -> anyhow::Error {
 	let hint = match &error {
-		Error::Collision { .. } => "import it under another name ('x::Y as Z'), or remove what has the name",
+		Error::Collision { .. } => {
+			"import it under another name ('x::Y as Z'), or remove what has the name (it names something else)"
+		}
 		Error::InvalidSource(_) => "each PATH is a `use` tree, such as `std::fs`, 'crate::a::{B, C}', or 'x::Y as Z'",
 		_ => return super::hinted(error, resolver),
 	};

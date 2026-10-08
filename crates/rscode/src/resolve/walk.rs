@@ -140,6 +140,15 @@ impl<'a> Walker<'a> {
 		}
 	}
 
+	/// A walker for paths written in `module` after imports are resolved that finds only the bindings visible from
+	/// `module`, as rustc does for the paths of imports.
+	pub(super) fn visible(ws: &'a Workspace, tables: &'a Tables, module: ItemId, kind: PathKind) -> Self {
+		Self {
+			enforce_vis: true,
+			..Self::new(ws, tables, module, kind)
+		}
+	}
+
 	fn assoc_items(&self, owner: ItemId, name: &str, want: Want, out: &mut Vec<Found>) {
 		let Some(items) = self.tables.assoc.get(&owner) else {
 			return;

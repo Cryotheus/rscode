@@ -388,20 +388,23 @@ impl<'ws> Resolver<'ws> {
 	/// looked up in the type namespace, except for the last segment, which is looked up in `namespace` (every
 	/// namespace for `None`, like a `use` does). The result has one element per segment.
 	pub fn resolve_prefixes(&self, module: ItemId, path: &PathRef, namespace: Option<Namespace>, kind: PathKind) -> Vec<Vec<Res>> {
-		let want = namespace.map_or(Want::All, Want::One);
-		let mut walker = Walker::new(self.ws, &self.tables, self.ws.module_of(module), kind);
+		let walker = Walker::new(self.ws, &self.tables, self.ws.module_of(module), kind);
 
-		walker
-			.prefixes(path, want)
-			.into_iter()
-			.map(|found| {
-				let mut res: Vec<Res> = found.into_iter().map(|found| found.res).collect();
+		prefixes(walker, path, namespace)
+	}
 
-				res.sort();
-				res.dedup();
-				res
-			})
-			.collect()
+	/// Resolves every prefix of a `use` path written inside of `module`, like [`Resolver::resolve_prefixes`] with
+	/// [`PathKind::Use`], but finds only the bindings visible from `module`, as rustc does: what another module binds
+	/// privately (or with a visibility that does not reach `module`) is not found.
+	pub(crate) fn resolve_visible_prefixes(
+		&self,
+		module: ItemId,
+		path: &PathRef,
+		namespace: Option<Namespace>,
+	) -> Vec<Vec<Res>> {
+		let walker = Walker::visible(self.ws, &self.tables, self.ws.module_of(module), PathKind::Use);
+
+		prefixes(walker, path, namespace)
 	}
 
 	/// For a path with a selector that names nothing, a hint for messages: the paths of the `impl` blocks (or macro
@@ -497,4 +500,21 @@ pub enum Viewpoint {
 
 	/// From another crate (`--from ::`): only public items through public modules and re-exports.
 	Foreign,
+}
+
+/// What every prefix of `path` resolves to with `walker` (see [`Resolver::resolve_prefixes`]).
+fn prefixes(mut walker: Walker<'_>, path: &PathRef, namespace: Option<Namespace>) -> Vec<Vec<Res>> {
+	let want = namespace.map_or(Want::All, Want::One);
+
+	walker
+		.prefixes(path, want)
+		.into_iter()
+		.map(|found| {
+			let mut res: Vec<Res> = found.into_iter().map(|found| found.res).collect();
+
+			res.sort();
+			res.dedup();
+			res
+		})
+		.collect()
 }

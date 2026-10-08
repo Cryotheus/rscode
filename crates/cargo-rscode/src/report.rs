@@ -125,6 +125,7 @@ impl ImportReport {
 						ImportOutcome::Added => "added",
 						ImportOutcome::Merged(_) => "merged",
 						ImportOutcome::Present => "present",
+						ImportOutcome::InScope => "in-scope",
 					},
 					item: match &import.outcome {
 						ImportOutcome::Merged(item) => Some(item.clone()),
@@ -171,6 +172,8 @@ impl EditReport for ImportReport {
 					format!("{} `{path}` into the `use` item at {file}:{line}\n", done(self.dry_run, "merge", "merged"))
 				}
 
+				("in-scope", _) if line == 0 => format!("`{path}` is already in scope (by a prelude)\n"),
+				("in-scope", _) => format!("`{path}` is already in scope ({file}:{line})\n"),
 				_ => format!("`{path}` is already imported ({file}:{line})\n"),
 			});
 		}
@@ -184,7 +187,7 @@ impl EditReport for ImportReport {
 pub(crate) struct ImportRow {
 	pub(crate) path: String,
 
-	/// `added`, `merged`, or `present`.
+	/// `added`, `merged`, `present`, or `in-scope`.
 	pub(crate) outcome: &'static str,
 
 	/// The new text of the `use` item it was merged into.
@@ -750,6 +753,8 @@ mod tests {
 				import("std::env", ImportOutcome::Added, 2),
 				import("std::fs", ImportOutcome::Merged("use std::{fs, io};".to_owned()), 1),
 				import("std::fmt", ImportOutcome::Present, 3),
+				import("Circle", ImportOutcome::InScope, 5),
+				import("Vec", ImportOutcome::InScope, 0),
 			],
 			file: PathBuf::from("/ws/src/lib.rs"),
 			warnings: Vec::new(),
@@ -759,7 +764,8 @@ mod tests {
 		assert_eq!(
 			report.summary(),
 			"imported `std::env` (src/lib.rs:2)\nmerged `std::fs` into `use std::{fs, io};` (src/lib.rs:1)\n\
-			 `std::fmt` is already imported (src/lib.rs:3)\n"
+			 `std::fmt` is already imported (src/lib.rs:3)\n`Circle` is already in scope (src/lib.rs:5)\n`Vec` is \
+			 already in scope (by a prelude)\n"
 		);
 		assert_eq!(
 			serde_json::to_value(&report).unwrap()["imports"],
@@ -767,6 +773,8 @@ mod tests {
 				{"path": "std::env", "outcome": "added", "line": 2},
 				{"path": "std::fs", "outcome": "merged", "item": "use std::{fs, io};", "line": 1},
 				{"path": "std::fmt", "outcome": "present", "line": 3},
+				{"path": "Circle", "outcome": "in-scope", "line": 5},
+				{"path": "Vec", "outcome": "in-scope", "line": 0},
 			])
 		);
 		assert!(ImportReport::new(&plan, "crate", true, &paths()).summary().starts_with("would import `std::env`"));

@@ -3135,13 +3135,14 @@ mod add_imports {
 		rscode::edit::add_imports(&Resolver::new(ws), &path(module), &imports, &ImportOptions::default())
 	}
 
-	/// The imports' paths, outcomes (`+` added, `=` present, `>` merged), and lines.
+	/// The imports' paths, outcomes (`+` added, `=` present, `~` in scope, `>` merged), and lines.
 	fn outcomes(addition: &ImportAddition) -> Vec<String> {
 		(addition.imports.iter())
 			.map(|import| {
 				let outcome = match import.outcome {
 					ImportOutcome::Added => "+",
 					ImportOutcome::Present => "=",
+					ImportOutcome::InScope => "~",
 					ImportOutcome::Merged(_) => ">",
 				};
 
@@ -3179,7 +3180,7 @@ mod inline {
 }
 ",
 		),
-		("src/a.rs", "pub struct A;\n\npub struct B;\n\npub struct C;\n\nfn g() {}\n"),
+		("src/a.rs", "pub struct A;\n\npub struct B;\n\npub struct C;\n\npub struct Z;\n\nfn g() {}\n"),
 	];
 
 	#[test]
@@ -3320,7 +3321,14 @@ mod a;
 		let text = edited(&dir, &addition.edits, "src/lib.rs");
 
 		assert!(text.ends_with("\tuse crate::a::C;\n\tuse std::fmt;\n\n\tpub(crate) use crate::a::C as See;\n}\n"), "{text}");
-		assert!(matches!(import(&ws, "crate", &["Nope"]), Err(Error::NotFound(name)) if name == "Nope"));
+
+		// (names of other crates need their paths)
+		match import(&ws, "crate", &["Nope"]) {
+			Err(Error::Unsupported(message)) => {
+				assert!(message.starts_with("no item of the workspace is named `Nope`: name an item"), "{message}");
+			}
+			other => panic!("{other:?}"),
+		}
 
 		// several items of the name
 		let files = [("src/lib.rs", "mod a;\nmod b;\n"), ("src/a.rs", "pub struct X;\n"), ("src/b.rs", "pub struct X;\n")];
@@ -3334,6 +3342,136 @@ mod a;
 			}
 			other => panic!("{other:?}"),
 		}
+	}
+
+	/// What the module binds already, by another path, a `self` import, a glob import, or as an item of its own, is
+	/// left as it is: importing it again changes nothing.
+	#[test]
+	fn leaves_what_the_module_binds_already() {
+		let files = [
+			(
+				"src/lib.rs",
+				"mod globbed;\nmod other;\nmod reverse;\nmod shapes;\nmod util;\n\n\
+				 use std::{\n\tcollections::{HashMap, HashSet},\n\tio,\n};\n",
+			),
+			("src/globbed.rs", "use crate::shapes::*;\n"),
+			("src/other.rs", "pub struct Circle;\n"),
+			("src/reverse.rs", "use std::fs;\nuse std::io::{self, Read};\n"),
+			("src/shapes.rs", "pub struct Circle;\n"),
+			("src/util.rs", "use crate::shapes::Circle;\n\npub fn helper() {}\n"),
+		];
+		let dir = TempDir::with_files("import-bound", &files);
+		let ws = load(&dir);
+		let cases: &[(&str, &[&str], &[&str])] = &[
+			(
+				"crate::util",
+				&["Circle", "super::shapes::Circle", "self::Circle"],
+				&["= Circle 1", "= super::shapes::Circle 1", "= self::Circle 1"],
+			),
+			("crate::reverse", &["std::io", "std::io::{self}"], &["= std::io 2", "= std::io::{self} 2"]),
+			("crate::globbed", &["Circle"], &["= Circle 1"]),
+			(
+				"crate::shapes",
+				&["Circle", "crate::shapes::Circle", "Vec"],
+				&["~ Circle 1", "~ crate::shapes::Circle 1", "~ Vec 0"],
+			),
+		];
+
+		for &(module, imports, expected) in cases {
+			let addition = import(&ws, module, imports).unwrap();
+
+			assert!(addition.edits.is_empty(), "{module} {imports:?}");
+			assert_eq!(outcomes(&addition), expected, "{module} {imports:?}");
+		}
+
+		// `io` is imported, and `Write` joins it
+		let addition = import(&ws, "crate", &["std::io::{self, Write}"]).unwrap();
+
+		assert_eq!(outcomes(&addition), ["= std::io::{self} 7", "> std::io::Write 7"]);
+		assert_eq!(
+			edited(&dir, &addition.edits, "src/lib.rs"),
+			files[0].1.replace("\tio,\n", "\tio::{self, Write},\n")
+		);
+
+		// a name bound to something else collides
+		match import(&ws, "crate::util", &["crate::other::Circle"]) {
+			Err(Error::Collision { name, collisions }) => {
+				assert_eq!(name, "Circle");
+				let expected = "`Circle`: the import of `fixture::shapes::Circle` at src/util.rs:1:";
+
+				assert!(collisions[0].starts_with(expected), "{collisions:?}");
+			}
+			other => panic!("{other:?}"),
+		}
+	}
+
+	/// Paths into the crate, and bare names, must name what the module can import.
+	#[test]
+	fn refuses_what_the_module_cannot_import() {
+		let shapes = "\
+pub struct Circle;
+
+pub struct Square;
+
+pub enum Kind {
+	Round,
+	Flat,
+}
+
+pub(crate) fn area() {}
+
+pub mod made {
+	make!();
+}
+
+mod private {
+	pub struct Hidden;
+}
+";
+		let files = [
+			("src/lib.rs", "pub mod shapes;\nmod util;\n\npub use shapes::Square;\n"),
+			("src/shapes.rs", shapes),
+			("src/util.rs", "pub fn helper() {}\n"),
+		];
+		let dir = TempDir::with_files("import-unnameable", &files);
+		let ws = load(&dir);
+
+		match import(&ws, "crate::util", &["crate::shapes::Circel"]) {
+			Err(Error::NotFound(path)) => assert_eq!(path, "crate::shapes::Circel"),
+			other => panic!("{other:?}"),
+		}
+
+		let refusals: &[(&str, &str)] = &[
+			(
+				"Hidden",
+				"`Hidden` names `fixture::shapes::private::Hidden`, which is not visible from `crate::util`: make it \
+				 visible there, or re-export it",
+			),
+			(
+				"crate::shapes::private::Hidden",
+				"`crate::shapes::private::Hidden` is not visible from `crate::util` (`crate::shapes::private` is not): \
+				 make it visible there, or import it by the path of a re-export",
+			),
+			("super::shapes::private", "`super::shapes::private` is not visible from `crate::util`: make it"),
+			(
+				"crate::shapes::Circle::new",
+				"cannot import `crate::shapes::Circle::new`: `crate::shapes::Circle` is a struct",
+			),
+		];
+
+		for &(refused, message) in refusals {
+			match import(&ws, "crate::util", &[refused]) {
+				Err(Error::Unsupported(text)) => assert!(text.starts_with(message), "{text}"),
+				other => panic!("{refused}: {other:?}"),
+			}
+		}
+
+		// what it can import, paths that macros may make name something, and paths into other crates
+		let imports = ["super::shapes::{Kind::Round, area}", "crate::Square", "crate::shapes::made::T", "std::fs", "x::Y"];
+		let addition = import(&ws, "crate::util", &imports).unwrap();
+		let added = addition.imports.iter().filter(|import| import.outcome == ImportOutcome::Added);
+
+		assert_eq!(added.count(), 6, "{:?}", outcomes(&addition));
 	}
 
 	#[test]
@@ -3417,8 +3555,14 @@ use std::{
 
 mod a;
 mod c;
+mod e;
 ";
-		let files = [("src/lib.rs", lib), ("src/a.rs", "pub struct B;\n"), ("src/c.rs", "pub struct D;\npub struct E;\n")];
+		let files = [
+			("src/lib.rs", lib),
+			("src/a.rs", "pub struct B;\n"),
+			("src/c.rs", "pub struct D;\npub struct E;\n"),
+			("src/e.rs", "pub struct F;\n"),
+		];
 		let dir = TempDir::with_files("import-crate", &files);
 		let ws = load(&dir);
 		let cases: &[(&[&str], &str, &str)] = &[

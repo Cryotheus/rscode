@@ -264,7 +264,8 @@ pub(crate) fn format_written(root: &Path, processed: usize, written: &[PathBuf],
 }
 
 /// What adding imports did (or would do), one line each: `imported `std::fs` (src/x.rs:7)`, `merged `std::fs` into
-/// `use std::{fs, io};` (src/x.rs:5)`, or `` `std::fs` is already imported (src/x.rs:5)``.
+/// `use std::{fs, io};` (src/x.rs:5)`, `` `std::fs` is already imported (src/x.rs:5)``, or `` `Circle` is already in
+/// scope (src/x.rs:3)``.
 pub(crate) fn import_addition(root: &Path, plan: &ImportAddition, dry_run: bool) -> String {
 	let mut out = String::new();
 	let file = display(root, &plan.file);
@@ -285,6 +286,8 @@ pub(crate) fn import_addition(root: &Path, plan: &ImportAddition, dry_run: bool)
 			}
 
 			ImportOutcome::Present => writeln!(out, "`{path}` is already imported ({file}:{line})"),
+			ImportOutcome::InScope if line == 0 => writeln!(out, "`{path}` is already in scope (by a prelude)"),
+			ImportOutcome::InScope => writeln!(out, "`{path}` is already in scope ({file}:{line})"),
 		}
 		.unwrap();
 	}
@@ -1135,6 +1138,8 @@ mod tests {
 				import("std::fs", ImportOutcome::Merged("use std::{fs, io};".to_owned()), 5),
 				import("std::io::Write", ImportOutcome::Merged("use std::{\n\tio::Write,\n};".to_owned()), 3),
 				import("pub use a::B", ImportOutcome::Present, 9),
+				import("Circle", ImportOutcome::InScope, 11),
+				import("Vec", ImportOutcome::InScope, 0),
 			],
 			file: PathBuf::from("/ws/src/lib.rs"),
 			warnings: Vec::new(),
@@ -1143,7 +1148,8 @@ mod tests {
 		assert_eq!(
 			import_addition(root(), &plan, false),
 			"imported `std::env` (src/lib.rs:7)\nmerged `std::fs` into `use std::{fs, io};` (src/lib.rs:5)\nmerged \
-			 `std::io::Write` into the `use` item at src/lib.rs:3\n`pub use a::B` is already imported (src/lib.rs:9)\n"
+			 `std::io::Write` into the `use` item at src/lib.rs:3\n`pub use a::B` is already imported (src/lib.rs:9)\n\
+			 `Circle` is already in scope (src/lib.rs:11)\n`Vec` is already in scope (by a prelude)\n"
 		);
 		assert!(import_addition(root(), &plan, true).starts_with("would import `std::env` (src/lib.rs:7)\nwould merge"));
 

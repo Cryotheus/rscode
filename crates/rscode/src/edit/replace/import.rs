@@ -23,7 +23,10 @@ use crate::model::PathSegmentRef;
 use crate::model::Visibility;
 use crate::model::Workspace;
 use crate::path::ItemPath;
+use crate::resolve::Binding;
+use crate::resolve::Namespace;
 use crate::resolve::PathKind;
+use crate::resolve::Res;
 use crate::resolve::Resolver;
 use crate::resolve::Viewpoint;
 use crate::source::SourceFile;
@@ -49,8 +52,22 @@ pub struct AddedImport {
 	/// How it was added.
 	pub outcome: ImportOutcome,
 
-	/// The line of the `use` item that imports it, once the edits are applied (1-based).
+	/// The line of the `use` item that imports it (for [`ImportOutcome::InScope`], of the item that has its name, or 0
+	/// for a prelude), once the edits are applied (1-based).
 	pub line: usize,
+}
+
+/// What a module binds already of what an import imports, under the name the import binds (see [`bound_already`]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Bound {
+	/// An import of this `use` item.
+	Import(ItemId),
+
+	/// This item of the module (or `extern crate` item).
+	Item(ItemId),
+
+	/// A prelude.
+	Prelude,
 }
 
 /// What the edits of [`add_imports`] are planned with.
@@ -113,6 +130,10 @@ pub enum ImportOutcome {
 
 	/// The module imports it already: nothing changes.
 	Present,
+
+	/// The module has it in scope already, other than by an import: a bare name (or a path) that names an item of the
+	/// module, or of a prelude. Nothing changes; the line is the item's (0 for a prelude).
+	InScope,
 }
 
 /// The last part of a [`Leaf`].
@@ -143,12 +164,28 @@ struct Leaf {
 }
 
 impl Leaf {
-	/// Whether `info` (an import of a `use` item with the visibility `vis`) imports the same.
+	/// The name the import binds: its alias, or the last segment of its path (`None` for globs and `_` imports).
+	fn binding_name(&self) -> Option<&str> {
+		match &self.last {
+			Last::Name(_, Some(alias)) | Last::SelfModule(Some(alias)) if unraw(alias) == "_" => None,
+			Last::Name(_, Some(alias)) | Last::SelfModule(Some(alias)) => Some(unraw(alias)),
+			Last::Name(name, None) => Some(unraw(name)),
+			Last::SelfModule(None) => self.segments.last().map(|segment| unraw(segment)),
+			Last::Glob => None,
+		}
+	}
+
+	/// Whether the import is a name without a path (like `Circle`, or `Circle as C`).
+	fn is_bare(&self) -> bool {
+		self.segments.is_empty() && !self.leading_colon && matches!(self.last, Last::Name(..))
+	}
+
+	/// Whether `info` (an import of a `use` item with the visibility `vis`) imports the same: by the same path, name,
+	/// and visibility (`a::b` imports the module `b` like `a::b::{self}` does).
 	fn is_imported_by(&self, info: &ImportInfo, vis: &Visibility) -> bool {
 		let same_alias = |alias: &Option<String>| alias.as_deref().map(unraw) == info.alias.as_deref();
 		let last_matches = match &self.last {
-			Last::Name(_, alias) => !info.glob && !info.is_self && same_alias(alias),
-			Last::SelfModule(alias) => info.is_self && same_alias(alias),
+			Last::Name(_, alias) | Last::SelfModule(alias) => !info.glob && same_alias(alias),
 			Last::Glob => info.glob,
 		};
 
@@ -187,11 +224,46 @@ impl Leaf {
 		matches!(&self.last, Last::Name(last, None) if name.unraw() == unraw(last))
 	}
 
+	/// The namespace the path of the import is looked up in: the type namespace for modules (`self`) and the modules
+	/// of globs, every namespace (`None`) otherwise.
+	fn namespace(&self) -> Option<Namespace> {
+		match self.last {
+			Last::Name(..) => None,
+			Last::SelfModule(_) | Last::Glob => Some(Namespace::Type),
+		}
+	}
+
 	/// The path of the import (with `::` in front when written so).
 	fn path(&self) -> String {
 		let colon = if self.leading_colon { "::" } else { "" };
 
 		format!("{colon}{}", self.tree(0))
+	}
+
+	/// The path that the import names (for a glob, the module it imports from), to resolve.
+	fn path_ref(&self) -> PathRef {
+		PathRef {
+			leading_colon: self.leading_colon,
+			segments: (self.names().into_iter())
+				.map(|name| PathSegmentRef {
+					name: name.into(),
+					range: TextRange::default(),
+					has_arguments: false,
+				})
+				.collect(),
+		}
+	}
+
+	/// The first `count` segments of its path (with the imported name), as written: `crate::a`.
+	fn prefix(&self, count: usize) -> String {
+		let colon = if self.leading_colon { "::" } else { "" };
+		let mut segments: Vec<&str> = self.segments.iter().map(String::as_str).collect();
+
+		if let Last::Name(name, _) = &self.last {
+			segments.push(name);
+		}
+
+		format!("{colon}{}", segments[..count.min(segments.len())].join("::"))
 	}
 
 	/// The leaf as a `use` tree after its first `skip` segments: `io::Write`, `Write as W`, `*`, or `self`.
@@ -362,13 +434,14 @@ enum Origin {
 	Local,
 }
 
-/// Where an import is: in a `use` item at an offset of the original text, in the text inserted by an edit (by its
-/// index in the edits) at an offset of that text, or where an earlier leaf is.
+/// Where an import is: in a `use` item (or item) at an offset of the original text, in the text inserted by an edit
+/// (by its index in the edits) at an offset of that text, where an earlier leaf is, or in no line of the file.
 #[derive(Debug, Clone, Copy)]
 enum Place {
 	Original(usize),
 	Inserted(usize, usize),
 	Same,
+	Nowhere,
 }
 
 /// A `use` item of the module, as a target to merge imports into.
@@ -392,9 +465,10 @@ struct UseItem {
 /// tree as written in a `use` item, with or without `use` (and a visibility before it, for re-exports) and `;`:
 /// `std::fs`, `crate::a::{B, C}`, `x::Y as Z`, `m::*`, `pub use a::B`. Every leaf of the trees is one import.
 ///
-/// What the module imports already (by the same path and name, with the same visibility) is left as it is
-/// ([`ImportOutcome::Present`]). The other imports follow the module's import granularity, as its `use` items of the
-/// import's visibility show it:
+/// What the module imports already is left as it is ([`ImportOutcome::Present`]): by the same path and name, with the
+/// same visibility, or by another path to the same item under the same name (`super::a::B` for `use crate::a::B;`),
+/// and so is what it has in scope otherwise ([`ImportOutcome::InScope`]). The other imports follow the module's
+/// import granularity, as its `use` items of the import's visibility show it:
 /// - with one import per `use` item (or no `use` items), each gets a `use` item of its own, where `cargo rscode sort`
 ///   puts it: among the `use` items (or re-exports) in order, on consecutive lines like theirs (see [`super::insert`]),
 ///   or, when blank lines group them by where their paths are from (the standard library, other crates, the crate
@@ -407,7 +481,8 @@ struct UseItem {
 ///   prefix with it.
 ///
 /// A bare name that names nothing in the module (like `Circle`) imports the item of the workspace of that name, by
-/// the shortest path to it usable from the module (`crate::shapes::Circle`).
+/// the shortest path to it usable from the module (`crate::shapes::Circle`). A path into the loaded crates (starting
+/// with `crate`, `self`, `super`, or a name of the module's scope) must name something visible from the module.
 ///
 /// `use` items with attributes (or `cfg`s) and of other visibilities take no imports. Merged imports go into the
 /// `{}` groups in the order rustfmt sorts them, and an import that diverges from a path of the item turns it into a
@@ -416,8 +491,10 @@ struct UseItem {
 ///
 /// Fails with [`Error::InvalidSource`] for an import that is not a `use` tree (or has attributes), with
 /// [`Error::Collision`] when a new import binds a name the module binds otherwise (unless [`ImportOptions::force`];
-/// glob imports never collide), with [`Error::NotFound`] or [`Error::Ambiguous`] for a bare name that names no item
-/// or several, and with [`Error::Unsupported`] when `module` is not a module.
+/// glob imports never collide), with [`Error::NotFound`] for a path into the loaded crates that names nothing, with
+/// [`Error::Ambiguous`] for a bare name that names several items, and with [`Error::Unsupported`] when `module` is not
+/// a module, for a bare name that names no item of the workspace, and for what the module cannot import (an item that
+/// is not visible from it, or an associated item).
 pub fn add_imports(
 	resolver: &Resolver<'_>,
 	module: &ItemPath,
@@ -449,17 +526,14 @@ pub fn add_imports(
 	let file = target.file;
 	let uses = use_items(ws, target.item, file)?;
 
-	for leaf in &mut leaves {
-		if let Some(path) = path_of_bare_name(resolver, target.item, leaf)? {
-			*leaf = path;
-		}
-	}
-
-	// what is imported already (also by an earlier leaf), and what is new
-	let mut present: Vec<(usize, Option<ItemId>)> = Vec::new();
+	// where each import ends up: (leaf, outcome, the original offset of its `use` item (or item), or its insertion and
+	// the offset of the item in its text); and the leaves to import, which the module does not bind already (nor an
+	// earlier leaf)
+	let mut placed: Vec<(usize, ImportOutcome, Place)> = Vec::new();
 	let mut new: Vec<usize> = Vec::new();
 
-	for (index, leaf) in leaves.iter().enumerate() {
+	for index in 0..leaves.len() {
+		let leaf = &leaves[index];
 		let imports = |use_item: &UseItem| {
 			let vis = &ws.item(use_item.item).vis;
 
@@ -469,11 +543,32 @@ pub fn add_imports(
 		let existing = (uses.iter())
 			.filter(|use_item| ws.item(use_item.item).cfg.is_none())
 			.find(|use_item| imports(use_item));
+		let place_of = |item: ItemId| match ws.file_of(item).path() == file.path() {
+			true => Place::Original(ws.item(item).attrs.after_attrs),
+			false => Place::Nowhere,
+		};
 
-		match (existing, new.iter().find(|&&earlier| leaves[earlier] == *leaf)) {
-			(Some(use_item), _) => present.push((index, Some(use_item.item))),
-			(None, Some(_)) => present.push((index, None)),
-			(None, None) => new.push(index),
+		let bound = match existing {
+			Some(use_item) => Some(Bound::Import(use_item.item)),
+			None => bound_already(resolver, target.item, leaf),
+		};
+
+		match bound {
+			Some(Bound::Import(use_item)) => placed.push((index, ImportOutcome::Present, place_of(use_item))),
+			Some(Bound::Item(item)) => placed.push((index, ImportOutcome::InScope, place_of(item))),
+			Some(Bound::Prelude) => placed.push((index, ImportOutcome::InScope, Place::Nowhere)),
+
+			None => {
+				match path_of_bare_name(resolver, target.item, module, leaf)? {
+					Some(path) => leaves[index] = path,
+					None => check_path(resolver, target.item, module, leaf)?,
+				}
+
+				match new.iter().any(|&earlier| leaves[earlier] == leaves[index]) {
+					true => placed.push((index, ImportOutcome::Present, Place::Same)),
+					false => new.push(index),
+				}
+			}
 		}
 	}
 
@@ -495,10 +590,6 @@ pub fn add_imports(
 	}
 
 	let mut edits: Vec<TextEdit> = Vec::new();
-
-	// where each import ends up: (leaf, outcome, the original offset of its `use` item, or its insertion and the
-	// offset of the item in its text)
-	let mut placed: Vec<(usize, ImportOutcome, Place)> = Vec::new();
 
 	for (use_index, indices) in &merged {
 		let use_item = &uses[*use_index];
@@ -543,13 +634,6 @@ pub fn add_imports(
 		insert_lines(&cx, &lines, &mut edits, &mut placed)?;
 	}
 
-	for (index, item) in present {
-		let use_item = item.and_then(|item| uses.iter().find(|use_item| use_item.item == item));
-		let offset = use_item.map(|use_item| use_item.range.start);
-
-		placed.push((index, ImportOutcome::Present, offset.map_or(Place::Same, Place::Original)));
-	}
-
 	placed.sort_by_key(|(index, ..)| *index);
 
 	let mut plan = ImportAddition {
@@ -570,6 +654,8 @@ pub fn add_imports(
 			Place::Same => (plan.imports.iter())
 				.find(|import| import.path == display(&leaves[index]))
 				.map_or(0, |import| import.line),
+
+			Place::Nowhere => 0,
 		};
 
 		plan.imports.push(AddedImport {
@@ -584,6 +670,73 @@ pub fn add_imports(
 	}
 
 	Ok(plan)
+}
+
+/// What `module` binds already of what `leaf` imports, under the name the leaf binds: for a bare name (without an
+/// alias), whatever it names in the module (by any binding, or a prelude); for a path, what it names in every
+/// namespace where it names a loaded item (or where the module binds the name), when the module binds the name to
+/// that, other than by a glob import (as `use super::a::B;` binds what `crate::a::B` names).
+fn bound_already(resolver: &Resolver<'_>, module: ItemId, leaf: &Leaf) -> Option<Bound> {
+	let ws = resolver.workspace();
+	let name = leaf.binding_name()?;
+	let bare = leaf.is_bare() && matches!(leaf.last, Last::Name(_, None));
+	let path = leaf.path_ref();
+	let namespaces = match leaf.namespace() {
+		Some(namespace) => vec![namespace],
+		None => Namespace::ALL.to_vec(),
+	};
+	let mut bindings: Vec<Binding> = Vec::new();
+	let mut matched = false;
+
+	// (a bare name is looked up in the module's scope)
+	let kind = if bare { PathKind::Code } else { PathKind::Use };
+
+	for namespace in namespaces {
+		let targets = resolver.resolve_prefixes(module, &path, Some(namespace), kind).pop().unwrap_or_default();
+		let bound: Vec<Binding> = (resolver.bindings(module, name, namespace).into_iter())
+			.filter(|binding| bare || !binding.glob)
+			.collect();
+
+		// (a path outside of the loaded crates names something in every namespace, as a guess)
+		let guessed = targets.iter().all(|target| matches!(target, Res::External(_)));
+
+		if targets.is_empty() || (bound.is_empty() && guessed && !bare) {
+			continue;
+		}
+
+		let mut bound_to: Vec<Res> = bound.iter().map(|binding| binding.res.clone()).collect();
+
+		bound_to.sort();
+		bound_to.dedup();
+
+		if !bare && bound_to != targets {
+			return None;
+		}
+
+		matched = true;
+		bindings.extend(bound);
+	}
+
+	if !matched {
+		return None;
+	}
+
+	// the import that binds it, else the item
+	let import = (bindings.iter())
+		.filter_map(|binding| binding.import)
+		.find(|&import| ws.item(import).kind == ItemKind::Import);
+
+	if let Some(use_item) = import.and_then(|import| ws.parent(import)) {
+		return Some(Bound::Import(use_item));
+	}
+
+	let item = bindings.iter().find_map(|binding| match (binding.import, &binding.res) {
+		(Some(extern_crate), _) => Some(extern_crate),
+		(None, Res::Item(item)) => Some(*item),
+		_ => None,
+	});
+
+	Some(item.map_or(Bound::Prelude, Bound::Item))
 }
 
 /// Fails with [`Error::Collision`] when the new imports bind names that the module binds otherwise (unless forced).
@@ -613,6 +766,75 @@ fn check_collisions(
 		name: names.join("`, `"),
 		collisions: collisions.iter().map(|(name, existing)| format!("`{name}`: {existing}")).collect(),
 	})
+}
+
+/// Checks that the path of `leaf` names something that `module` (named `module_path`) can import, when the path goes
+/// into the loaded crates: when it starts with `crate`, `self`, `super`, or a name of a loaded item in the module's
+/// scope. Fails with [`Error::NotFound`] when it names nothing, and with [`Error::Unsupported`] when what it names is
+/// not visible from `module`, or is in something other than a module or an enum (such as an associated item). Paths
+/// into other crates, and through modules where macros or unresolved imports may bind more names, are not checked.
+fn check_path(resolver: &Resolver<'_>, module: ItemId, module_path: &ItemPath, leaf: &Leaf) -> Result<(), Error> {
+	let ws = resolver.workspace();
+	let path = leaf.path_ref();
+	let prefixes = resolver.resolve_prefixes(module, &path, leaf.namespace(), PathKind::Use);
+	let items = |found: &[Res]| -> Option<Vec<ItemId>> {
+		(found.iter())
+			.map(|res| match res {
+				Res::Item(item) => Some(*item),
+				_ => None,
+			})
+			.collect()
+	};
+
+	if !prefixes.first().and_then(|first| items(first)).is_some_and(|first| !first.is_empty()) {
+		return Ok(());
+	}
+
+	if let Some(missing) = prefixes.iter().position(Vec::is_empty) {
+		// (what the segment before names: the first one names loaded items)
+		let Some(containers) = items(&prefixes[missing - 1]) else {
+			return Ok(());
+		};
+
+		let name = &path.segments[missing].name;
+		let unseen = |item: &ItemId| ws.item(*item).kind == ItemKind::Module && resolver.may_bind_unseen(*item, name);
+
+		if containers.iter().any(unseen) {
+			return Ok(());
+		}
+
+		let has_members = |item: &ItemId| matches!(ws.item(*item).kind, ItemKind::Module | ItemKind::Enum);
+
+		return match containers.iter().find(|item| !has_members(item)) {
+			Some(&container) if !containers.iter().any(has_members) => Err(Error::Unsupported(format!(
+				"cannot import `{}`: `{}` is {}, and imports name items of modules and variants of enums",
+				leaf.path(),
+				leaf.prefix(missing),
+				article(ws.item(container).kind)
+			))),
+
+			_ => Err(Error::NotFound(leaf.path())),
+		};
+	}
+
+	let visible = resolver.resolve_visible_prefixes(module, &path, leaf.namespace());
+
+	match visible.iter().position(Vec::is_empty) {
+		None => Ok(()),
+
+		Some(hidden) => {
+			let through = match hidden + 1 == path.segments.len() {
+				true => String::new(),
+				false => format!(" (`{}` is not)", leaf.prefix(hidden + 1)),
+			};
+
+			Err(Error::Unsupported(format!(
+				"`{}` is not visible from `{module_path}`{through}: make it visible there, or import it by the path of \
+				 a re-export",
+				leaf.path()
+			)))
+		}
+	}
 }
 
 /// Whitespace removed, to compare token text.
@@ -972,9 +1194,15 @@ fn parse_leaves(text: &str) -> Result<Vec<Leaf>, Error> {
 
 /// The import of the item that a bare name (an import without a path, like `Circle`) means, when the name names
 /// nothing in `module` (no crate and no item in scope): the shortest path to the item of the workspace of that name
-/// usable from `module` (like `crate::shapes::Circle`). Fails with [`Error::NotFound`] when no item has the name, and
-/// with [`Error::Ambiguous`] when several do.
-fn path_of_bare_name(resolver: &Resolver<'_>, module: ItemId, leaf: &Leaf) -> Result<Option<Leaf>, Error> {
+/// usable from `module` (named `module_path`, like `crate::shapes::Circle`). Fails with [`Error::Unsupported`] when no
+/// item of the workspace has the name, or the one that has it cannot be named from `module`, and with
+/// [`Error::Ambiguous`] when several items have it.
+fn path_of_bare_name(
+	resolver: &Resolver<'_>,
+	module: ItemId,
+	module_path: &ItemPath,
+	leaf: &Leaf,
+) -> Result<Option<Leaf>, Error> {
 	let Last::Name(name, alias) = &leaf.last else {
 		return Ok(None);
 	};
@@ -1013,7 +1241,13 @@ fn path_of_bare_name(resolver: &Resolver<'_>, module: ItemId, leaf: &Leaf) -> Re
 	found.dedup_by(|a, b| a.0 == b.0);
 
 	let item = match found.as_slice() {
-		[] => return Err(Error::NotFound(name.clone())),
+		[] => {
+			return Err(Error::Unsupported(format!(
+				"no item of the workspace is named `{name}`: name an item of another crate by its path (like \
+				 `std::collections::HashSet`)"
+			)));
+		}
+
 		[(_, item)] => *item,
 
 		found => {
@@ -1025,7 +1259,18 @@ fn path_of_bare_name(resolver: &Resolver<'_>, module: ItemId, leaf: &Leaf) -> Re
 	};
 
 	let Some(path) = resolver.usable_paths(item, Viewpoint::Module(module)).into_iter().next() else {
-		return Ok(None);
+		let item_path = resolver.canonical_path(item);
+
+		return Err(Error::Unsupported(match item.krate() == module.krate() {
+			true => format!(
+				"`{name}` names `{item_path}`, which is not visible from `{module_path}`: make it visible there, or \
+				 re-export it"
+			),
+			false => format!(
+				"`{name}` names `{item_path}`, which `{module_path}` cannot name: it is not public, or its crate is \
+				 not a dependency"
+			),
+		}));
 	};
 	let leading_colon = path.starts_with("::");
 	let mut segments: Vec<String> = path.trim_start_matches("::").split("::").map(str::to_owned).collect();

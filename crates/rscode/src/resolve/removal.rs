@@ -260,6 +260,12 @@ impl Resolver<'_> {
 		macro_calls || unresolved || self.globs_may_bind(module, name, dead, visited)
 	}
 
+	/// Whether a module might bind `name` to items that are not loaded (see [`Resolver::may_bind_unloaded`]), so that
+	/// a path naming nothing in it may still name something.
+	pub(crate) fn may_bind_unseen(&self, module: ItemId, name: &str) -> bool {
+		self.may_bind_unloaded(module, name, &[], &mut Vec::new())
+	}
+
 	/// Whether the path of an import fails to resolve at a segment that names one of `dead` in its module.
 	fn path_through(&self, import: ItemId, dead: &[DeadName]) -> bool {
 		let Some(info) = self.ws.item(import).import_info() else {

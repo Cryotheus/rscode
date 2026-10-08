@@ -116,7 +116,9 @@ pub(crate) fn add_import(load: &LoadOptions, params: &AddImportParams, permit: &
 		let plan = edit::add_imports(resolver, &module, &imports, &ImportOptions::default()).map_err(|error| {
 			let hint = match &error {
 				Error::Ambiguous { .. } if in_several_crates(resolver, &module) => SELECT_ONE_CRATE,
-				Error::Collision { .. } => "import it under another name (`x::Y as Z`), or remove what has the name",
+				Error::Collision { .. } => {
+					"import it under another name (`x::Y as Z`), or remove what has the name (it names something else)"
+				}
 				Error::InvalidSource(_) => "each of `paths` is a `use` tree: `std::fs`, `crate::a::{B, C}`, or `x::Y as Z`",
 				_ => return retry::fail(error, resolver),
 			};

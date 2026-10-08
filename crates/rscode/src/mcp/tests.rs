@@ -782,6 +782,23 @@ mod end_to_end {
 			"use std::env;\nuse std::fmt;\nuse std::io;\nuse std::path::Path;\n\npub fn f() {}\n"
 		);
 
+		// importing again changes nothing, by any path or name
+		let arguments = json!({ "module": "crate", "paths": ["std::env", "fmt", "std::io::{self}", "Vec"] });
+		let (failed, text) = client.call("add_import", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(
+			text,
+			"`std::env` is already imported (src/lib.rs:1)\n`fmt` is already imported (src/lib.rs:2)\n\
+			 `std::io::{self}` is already imported (src/lib.rs:3)\n`Vec` is already in scope (by a prelude)\n"
+		);
+
+		// a bare name of another crate needs its path
+		let (failed, text) = client.call("add_import", json!({ "module": "crate", "paths": "HashSet" })).await;
+
+		assert!(failed && text.starts_with("no item of the workspace is named `HashSet`: name an item"), "{text}");
+		assert!(!text.contains("find_items"), "{text}");
+
 		// refusals name the parameter to change
 		for (arguments, needle) in [
 			(json!({ "module": "crate", "paths": "other::fmt" }), "hint: import it under another name"),

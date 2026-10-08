@@ -1268,7 +1268,24 @@ fn imports() {
 	let again = run(copy.path(), &["import", "crate", "use std::fmt;", "--lib"]).success();
 
 	assert_eq!(again.stdout, native("`std::fmt` is already imported (src/lib.rs:6)\n"));
+
+	// by another name or spelling too, and what is in scope otherwise
+	let again = run(copy.path(), &["import", "crate", "fmt", "std::io::{self}", "Vec", "--lib"]).success();
+
+	assert_eq!(
+		again.stdout,
+		native(
+			"`fmt` is already imported (src/lib.rs:6)\n`std::io::{self}` is already imported (src/lib.rs:7)\n`Vec` is \
+			 already in scope (by a prelude)\n"
+		)
+	);
 	cargo_check(copy.path());
+
+	// bare names of other crates need their paths
+	let unknown = run(copy.path(), &["import", "crate", "HashSet", "--lib"]);
+
+	assert_eq!(unknown.code, Some(1));
+	assert!(unknown.stderr.starts_with("error: no item of the workspace is named `HashSet`"), "{}", unknown.stderr);
 
 	let taken = run(copy.path(), &["import", "crate", "other::add", "--lib"]);
 
