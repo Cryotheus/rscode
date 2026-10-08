@@ -48,7 +48,12 @@ use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 
 /// How [`closest`] tells what comes closest to a text that was not found, from the closest.
-const CLOSEST: [&str; 3] = ["if indentation is ignored", "its first line is at line", "the closest line is"];
+const CLOSEST: [&str; 4] = [
+	"if whitespace at the ends of lines is ignored",
+	"if indentation is ignored",
+	"its first line is at line",
+	"the closest line is",
+];
 
 /// An attribute of an item (doc comments included), as a range of the text of its [`Region`].
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -720,6 +725,24 @@ fn check_item(ws: &Workspace, item: ItemId, path: &str, region: &Region<'_>, all
 fn closest(region: &Region<'_>, printed: &PrintedText, old: &str) -> String {
 	let lines: Vec<(&str, usize)> = printed.lines().collect();
 	let line_number = |index: usize| region.line_of(lines[index].1);
+
+	// without whitespace at the ends of lines, which views do not show
+	let ended_text = trim_line_ends(lines.iter().map(|(line, _)| *line));
+
+	if let [at] = occurrences(&ended_text, &trim_line_ends(old.split('\n')))[..] {
+		let index = ended_text[..at].matches('\n').count();
+		let ending = (index..index + old.split('\n').count())
+			.find(|&index| lines.get(index).is_some_and(|(line, _)| line.ends_with([' ', '\t'])));
+
+		return format!(
+			"; it matches at line {} if whitespace at the ends of lines is ignored ({})",
+			line_number(index),
+			match ending {
+				Some(ending) => format!("line {} ends with whitespace that `old` lacks", line_number(ending)),
+				None => "`old` has whitespace at the end of a line, which the file lacks".to_owned(),
+			}
+		);
+	}
 
 	// without indentation (and trailing spaces)
 	let flat_text = flatten(lines.iter().map(|(line, _)| *line));
@@ -1396,6 +1419,21 @@ fn replace_text(region: &mut Region<'_>, replacement: &TextReplacement, name: &s
 		attempts.push((trim(old), trim(new), *line));
 	}
 
+	// first without the `// file:` line that views of modules (and crate roots) start with, which is not in the file
+	if region.module_file {
+		let headerless: Vec<(String, String, Option<usize>)> = (attempts.iter())
+			.filter_map(|(old, new, line)| {
+				let (first, rest) = old.split_once('\n')?;
+				let path = first.trim_end().strip_prefix("// file: ")?;
+				let new = new.strip_prefix(first).and_then(|new| new.strip_prefix('\n')).unwrap_or(new);
+
+				(!path.is_empty() && region.file.path().ends_with(path)).then(|| (rest.to_owned(), new.to_owned(), *line))
+			})
+			.collect();
+
+		attempts.splice(0..0, headerless);
+	}
+
 	let mut failure = None;
 
 	for (old, new, line) in &attempts {
@@ -1618,37 +1656,45 @@ fn spaces(text: &str) -> usize {
 }
 
 /// `old` and `new` without the line-number gutters of a numbered view, when every line of `old` (but empty ones) has
-/// one, and the line of the file where `old` starts, by its line numbers.
+/// one, and the line of the file where `old` starts, by its line numbers. Lines whose gutter has no number are not
+/// from the file, and are left out.
 fn strip_gutters(old: &str, new: &str) -> Option<(String, String, Option<usize>)> {
 	/// The lines of a text, without their line breaks.
 	fn lines(text: &str) -> Vec<&str> {
 		text.split('\n').map(|line| line.strip_suffix('\r').unwrap_or(line)).collect()
 	}
 
+	// (lines of views that are not from the file, such as the `// file:` line of a module, have no number)
+	let synthetic = |line: &&str| gutter_len(line).is_some() && line.split_once('│').is_some_and(|(number, _)| number.trim().is_empty());
+	let has_text = |line: &&str| !synthetic(line) && gutter_len(line).is_some_and(|gutter| !line[gutter..].trim().is_empty());
 	let old_lines = lines(old);
 
 	// (lines with nothing but a gutter are no text to look for)
-	if !old_lines.iter().any(|line| gutter_len(line).is_some_and(|gutter| !line[gutter..].trim().is_empty()))
-		|| !old_lines.iter().all(|line| line.is_empty() || gutter_len(line).is_some())
-	{
+	if !old_lines.iter().any(has_text) || !old_lines.iter().all(|line| line.is_empty() || gutter_len(line).is_some()) {
 		return None;
 	}
 
 	let strip = |text: &str| {
 		(lines(text).into_iter())
+			.filter(|line| !synthetic(line))
 			.map(|line| &line[gutter_len(line).unwrap_or(0)..])
 			.collect::<Vec<_>>()
 			.join("\n")
 	};
 
 	// the line of the first line, from the first line number
-	let line = (old_lines.iter().enumerate()).find_map(|(index, line)| {
+	let line = (old_lines.iter().filter(|line| !synthetic(line)).enumerate()).find_map(|(index, line)| {
 		let number = line.split_once(" │")?.0.trim();
 
 		number.parse::<usize>().ok()?.checked_sub(index)
 	});
 
 	Some((strip(old), strip(new), line))
+}
+
+/// Lines without their trailing whitespace, joined with `\n`.
+fn trim_line_ends<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+	lines.map(str::trim_end).collect::<Vec<_>>().join("\n")
 }
 
 /// Replaces `old` with `new` in a region, where `old` occurs exactly once, as views print the region or as written in
@@ -2081,9 +2127,16 @@ mod tests {
 			strip_gutters("  12 │ a\n\n  14 │ \tb", "  12 │ a\n\tc"),
 			Some(("a\n\n\tb".to_owned(), "a\n\tc".to_owned(), Some(12)))
 		);
-		assert_eq!(strip_gutters("\n     │ x\n  14 │ b", "").unwrap().2, Some(12));
 		assert_eq!(strip_gutters("a\n  14 │ b", ""), None);
 		assert_eq!(strip_gutters("  14 │\n  15 │", ""), None);
+
+		// lines without a number are not from the file
+		assert_eq!(strip_gutters("\n     │ x\n  14 │ b", ""), Some(("\nb".to_owned(), String::new(), Some(13))));
+		assert_eq!(
+			strip_gutters("     │ // file: src/a.rs\n   1 │ //! A.", "     │ // file: src/a.rs\n   1 │ //! B."),
+			Some(("//! A.".to_owned(), "//! B.".to_owned(), Some(1)))
+		);
+		assert_eq!(strip_gutters("     │ // file: src/a.rs", ""), None);
 	}
 
 	#[test]

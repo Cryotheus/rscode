@@ -1601,6 +1601,15 @@ mod inner;
 		let plan = edit(&ws, "crate::inner", text("pub fn f() {}", "pub fn g() {}")).unwrap();
 
 		assert_eq!(edited(&dir, &plan.edits, "src/inner.rs"), INNER.replace("fn f", "fn g"));
+
+		// text copied from the start of its view, with the `// file:` line that is not in the file
+		for line_numbers in [false, true] {
+			let old = view(&ws, "crate::inner", line_numbers).lines().take(2).collect::<Vec<_>>().join("\n");
+			let plan = edit(&ws, "crate::inner", text(&old, &old.replace("Inner docs.", "Better docs."))).unwrap();
+
+			assert!(old.contains("// file: src"), "{old}");
+			assert_eq!(edited(&dir, &plan.edits, "src/inner.rs"), INNER.replace("Inner docs.", "Better docs."));
+		}
 		assert_eq!(
 			plan.spans,
 			[ItemSpan {
@@ -1859,6 +1868,18 @@ mod inner;
 		assert_eq!(
 			message(edit(&ws, "crate::Shape::triangle", texts(&[("3", "4"), ("3", "5")]))),
 			format!("`old` number 2 (`3`) not found in {triangle}")
+		);
+
+		// whitespace at the end of a line, which views do not show
+		let dir = crate_dir("edit-mismatch-ends", &LIB.replace("let sides = 3;\n", "let sides = 3; \n"));
+		let ws = load(&dir);
+
+		assert_eq!(
+			message(edit(&ws, "crate::Shape::triangle", text("let sides = 3;\n\n\tSelf { sides }", "x"))),
+			format!(
+				"`old` not found in {triangle}; it matches at line 15 if whitespace at the ends of lines is ignored (line \
+				 15 ends with whitespace that `old` lacks)"
+			)
 		);
 	}
 }
