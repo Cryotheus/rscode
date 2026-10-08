@@ -294,10 +294,12 @@ struct Occurrence {
 	printed: Option<(usize, usize)>,
 }
 
-/// Why [`plan_item`] failed for an item: the error, and the index of the text replacement that failed, if one did.
+/// Why [`plan_item`] failed for an item.
 #[derive(Debug)]
 struct PlanFailure {
 	error: Error,
+
+	/// The index of the text replacement that failed, if one did.
 	replacement: Option<usize>,
 }
 
