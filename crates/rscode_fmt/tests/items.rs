@@ -688,16 +688,27 @@ fn formats_many_imports_in_linear_time() {
 #[cfg(unix)]
 mod fake_rustfmt {
 	use super::*;
-	use std::os::unix::fs::PermissionsExt;
+	use std::io::Write as _;
 	use std::path::PathBuf;
+	use std::process::Command;
+	use std::process::Stdio;
 
 	/// A "rustfmt" that ignores its input and prints `output`.
+	///
+	/// The script is written by a `sh` of its own: had this process the file open for writing, a process that another
+	/// test forks meanwhile would inherit that until it execs, and running the script would fail with "Text file busy".
 	fn fake(name: &str, output: &str) -> FormatOptions {
 		let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("fake-rustfmt-{name}"));
 		let script = format!("#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{output}\nEOF\n");
+		let mut writer = Command::new("sh")
+			.args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+			.arg(&path)
+			.stdin(Stdio::piped())
+			.spawn()
+			.unwrap();
 
-		std::fs::write(&path, script).unwrap();
-		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+		writer.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+		assert!(writer.wait().unwrap().success());
 
 		let mut options = rustfmt();
 
