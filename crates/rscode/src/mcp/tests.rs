@@ -1501,12 +1501,18 @@ mod end_to_end {
 		);
 
 		// paths that name nothing in the selection are searched in the other members, unless the call names packages
-		let note = "note: found in workspace member `helper`, which is not selected by default (pass `packages` to skip \
-		            this search)";
-		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist", "crate::add"] })).await;
+		let note = "note: found in unselected workspace member `helper`";
+		let (failed, text) = client.call("view_items", json!({ "paths": ["crate::assist", "crate::add"] })).await;
 
 		assert!(!failed, "{text}");
 		assert_contains(&text, &[&format!("// {note}"), "pub fn assist() {}", "pub fn add() {}"]);
+
+		// (a path that names the member's crate asks for it: no note)
+		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist", "crate::add"] })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["pub fn assist() {}", "pub fn add() {}"]);
+		assert!(!text.contains("note"), "{text}");
 
 		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist"], "packages": "demo" })).await;
 
@@ -1528,7 +1534,7 @@ mod end_to_end {
 
 		let (_, text) = client.call("find_items", json!({ "pattern": "nothing" })).await;
 
-		assert!(text.starts_with("note: also searched workspace member `helper`"), "{text}");
+		assert!(text.starts_with("note: also searched unselected workspace member `helper`\n"), "{text}");
 		assert_contains(&text, &["no items match `nothing`"]);
 		assert!(!text.contains("hint"), "{text}");
 
@@ -1808,7 +1814,7 @@ mod end_to_end {
 		assert_contains(
 			&text,
 			&[
-				"// note: found in workspace members `left`, `right`, which are not selected by default",
+				"// note: found in unselected workspace members `left`, `right`\n",
 				"// left::shared (fn) ",
 				"// right::shared (fn) ",
 			],
@@ -1833,7 +1839,7 @@ mod end_to_end {
 		let (failed, text) = client.call("rename_item", rename).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &["note: found in workspace member `left`", "+pub fn only() {}"]);
+		assert_contains(&text, &["note: found in unselected workspace member `left`\n", "+pub fn only() {}"]);
 
 		// several paths of a removal are only searched in the selection
 		let remove = json!({ "paths": ["crate::own", "crate::left_only"], "dry_run": true });

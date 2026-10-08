@@ -131,13 +131,13 @@ fn not_found_path(error: &Error) -> Option<ItemPath> {
 /// searched too.
 pub(crate) fn note(members: &[SmolStr], found: bool) -> String {
 	let names: Vec<String> = members.iter().map(|member| format!("`{member}`")).collect();
-	let (members, are) = match names.as_slice() {
-		[name] => (format!("member {name}"), "is"),
-		_ => (format!("members {}", names.join(", ")), "are"),
+	let members = match names.as_slice() {
+		[name] => format!("member {name}"),
+		_ => format!("members {}", names.join(", ")),
 	};
 	let what = if found { "found in" } else { "also searched" };
 
-	format!("{what} workspace {members}, which {are} not selected by default (pass `packages` to skip this search)")
+	format!("{what} unselected workspace {members}")
 }
 
 /// Runs `op` on the workspace loaded with `load`. When it fails because a path names nothing, and the call named no
@@ -160,6 +160,8 @@ pub(crate) fn run(
 	};
 
 	let path = not_found_path(&error);
+	// (a path that starts with the crate of a member asks for that member: finding it there is no news)
+	let asked = path.as_ref().is_some_and(|path| workspace.unloaded_member_of(path).is_some());
 	let widening = match (search, selection.names_packages()) {
 		(Search::Selected, _) | (_, true) => None,
 		_ => load.widened(&workspace, path.as_ref()),
@@ -186,6 +188,7 @@ pub(crate) fn run(
 	let members = members_of(&wider, found, &widening.members);
 	let note = match members.is_empty() {
 		true => format!("note: {}\n", self::note(&widening.members, false)),
+		false if asked => String::new(),
 		false => format!("note: {}\n", self::note(&members, true)),
 	};
 

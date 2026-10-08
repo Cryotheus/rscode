@@ -309,12 +309,15 @@ pub(crate) fn find(load: &LoadOptions, params: &FindParams) -> Output {
 	let resolver = Resolver::new(&wider);
 	let found = search(&resolver, &find, params)?;
 	let members = retry::members_of(&wider, found.0.iter().map(|found| found.item), &widening.members);
+	// (a pattern that starts with the crate of a member asks for that member: finding it there is no news)
+	let asked = path.as_ref().is_some_and(|path| workspace.unloaded_member_of(path).is_some());
 	let note = match members.is_empty() {
-		true => retry::note(&widening.members, false),
-		false => retry::note(&members, true),
+		true => format!("note: {}\n", retry::note(&widening.members, false)),
+		false if asked => String::new(),
+		false => format!("note: {}\n", retry::note(&members, true)),
 	};
 
-	Ok(format!("note: {note}\n") + &found_text(&wider, &resolver, params, found))
+	Ok(note + &found_text(&wider, &resolver, params, found))
 }
 
 /// Appends the diff for a dry run, or writes the edits.
@@ -893,7 +896,8 @@ pub(crate) fn view(load: &LoadOptions, params: &ViewParams) -> Output {
 
 			let members = retry::members_of(&wider, found, &widening.members);
 
-			if !members.is_empty() {
+			// (paths that start with the crate of a member ask for that member: finding them there is no news)
+			if !members.is_empty() && member_path.is_none() {
 				notes.insert(0, retry::note(&members, true));
 			}
 		}
