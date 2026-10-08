@@ -220,17 +220,20 @@ fn broken_imports(resolver: &Resolver<'_>, removed: &HashSet<ItemId>) -> BTreeMa
 	broken
 }
 
-/// Refuses a path naming `impl` blocks (or items of them) that are not `cfg` variants of each other: blocks whose
-/// headers differ, such as `impl From<u8> for X` and `impl From<u16> for X` for `impl From for X` (generic arguments
-/// in the path tell them apart), and blocks of one crate with the same `cfg`s, such as two `impl X` blocks (a selector
-/// tells them apart).
-fn check_impl_headers(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
+/// Refuses a path naming `impl` blocks (or items of them), or macro invocations, that are not `cfg` variants of each
+/// other: blocks whose headers differ, such as `impl From<u8> for X` and `impl From<u16> for X` for `impl From for X`
+/// (generic arguments in the path tell them apart), and blocks or invocations of one crate that are compiled together
+/// (see [`coexisting_items`](super::coexisting_items)), such as two `impl X` blocks, or two `lazy! { ... }` of a module
+/// (a selector tells them apart: `impl X[2]`, `m::lazy![2]`).
+fn check_variants(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
 	let ws = resolver.workspace();
-	let in_impls: Vec<ItemId> = (items.iter().copied())
-		.filter(|&item| (ws.parent(item).into_iter().chain([item])).any(|item| ws.item(item).kind == ItemKind::Impl))
+	let selectable: Vec<ItemId> = (items.iter().copied())
+		.filter(|&item| {
+			(ws.parent(item).into_iter().chain([item])).any(|item| matches!(ws.item(item).kind, ItemKind::Impl | ItemKind::MacroCall))
+		})
 		.collect();
 
-	if !super::impl_headers_differ(ws, items) && !super::same_cfg_items(ws, &in_impls) {
+	if !super::impl_headers_differ(ws, items) && !super::coexisting_items(ws, &selectable) {
 		return Ok(());
 	}
 
@@ -517,7 +520,8 @@ fn push_removed(removed: &mut Vec<RemovedItem>, item: RemovedItem) {
 /// [`Removal::removed`] lists the removed items (items inside of other removed items are not listed), followed by
 /// the pruned imports ([`ItemKind::Import`]). Fails with [`Error::NotFound`] when a path names nothing, with
 /// [`Error::Ambiguous`] when it names `impl` blocks (or their items) with different headers (see
-/// [`ItemPath`]'s generic arguments) or several blocks of one crate with the same header and `cfg`s, and with
+/// [`ItemPath`]'s generic arguments), several blocks of one crate with the same header that are compiled together, or
+/// several invocations of a macro in a module that are (`m::name!` for `m::name![1]` and `m::name![2]`), and with
 /// [`Error::Unsupported`] for crate roots.
 pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptions) -> Result<Removal, Error> {
 	let ws = resolver.workspace();
@@ -768,7 +772,7 @@ fn targets(resolver: &Resolver<'_>, paths: &[ItemPath], active_only: bool) -> Re
 			}
 		}
 
-		check_impl_headers(resolver, path, &items)?;
+		check_variants(resolver, path, &items)?;
 
 		for item in items {
 			if item.is_crate_root() {

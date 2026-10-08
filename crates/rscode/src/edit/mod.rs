@@ -1009,15 +1009,19 @@ fn restore(path: &Path, original: &str, written: &str) -> io::Result<()> {
 	fs::rename(&file.temporary, &file.target).inspect_err(|_| remove_temporaries(std::slice::from_ref(&file)))
 }
 
-/// Whether two of `items` at distinct places are in the same crate and have the same effective `cfg`: such items are
-/// not `cfg` variants of each other (like two `impl Tools` blocks with the same header, or two `use a::Trait as _;` of
-/// one module), so they neither get the same text nor go away together.
-pub(crate) fn same_cfg_items(ws: &Workspace, items: &[ItemId]) -> bool {
+/// Whether two of `items` at distinct places are in the same crate and are compiled together whenever one of them is:
+/// they have the same effective `cfg`, or one of them has none. Such items are not `cfg` variants of each other (like
+/// two `impl Tools` blocks with the same header, an `impl Config` block and a `#[cfg(test)] impl Config` block, or two
+/// `use a::Trait as _;` of one module), so they neither get the same text nor go away together.
+pub(crate) fn coexisting_items(ws: &Workspace, items: &[ItemId]) -> bool {
 	let place = |item: ItemId| (ws.file_of(item).path(), ws.item(item).range);
+	let coexist = |a: ItemId, b: ItemId| match (ws.effective_cfg(a), ws.effective_cfg(b)) {
+		(Some(a), Some(b)) => a == b,
+		_ => true,
+	};
 
 	items.iter().enumerate().any(|(index, &a)| {
-		(items[index + 1..].iter())
-			.any(|&b| a.krate() == b.krate() && place(a) != place(b) && ws.effective_cfg(a) == ws.effective_cfg(b))
+		(items[index + 1..].iter()).any(|&b| a.krate() == b.krate() && place(a) != place(b) && coexist(a, b))
 	})
 }
 

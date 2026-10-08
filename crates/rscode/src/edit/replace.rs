@@ -708,8 +708,8 @@ fn push_unique<T: PartialEq>(list: &mut Vec<T>, value: T) {
 /// Comments attached above the item stay, and the replacement gets the line breaks of the file. Fails with
 /// [`Error::NotFound`] when `path` names nothing, [`Error::Ambiguous`] when it names several items (`cfg` variants,
 /// see [`ReplaceOptions::all_variants`]; items of `impl` blocks whose headers differ, which generic arguments in the
-/// path tell apart; or items of one crate with the same `cfg`s, like `impl` blocks with the same header, which a
-/// selector tells apart), and [`Error::InvalidSource`] when `source` is not a valid replacement.
+/// path tell apart; or items of one crate that are compiled together, like `impl` blocks with the same header, which
+/// a selector tells apart), and [`Error::InvalidSource`] when `source` is not a valid replacement.
 pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: &ReplaceOptions) -> Result<Replacement, Error> {
 	let source = &*pasted(source);
 	let ws = resolver.workspace();
@@ -724,9 +724,9 @@ pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: 
 		return Err(Error::NotFound(path.to_string()));
 	}
 
-	// (`impl` blocks whose headers differ are not `cfg` variants of each other, and neither are items of one crate with
-	// the same `cfg`s, such as two `impl` blocks with the same header)
-	if items.len() > 1 && (!options.all_variants || super::impl_headers_differ(ws, &items) || super::same_cfg_items(ws, &items)) {
+	// (`impl` blocks whose headers differ are not `cfg` variants of each other, and neither are items of one crate that
+	// are compiled together, such as two `impl` blocks with the same header)
+	if items.len() > 1 && (!options.all_variants || super::impl_headers_differ(ws, &items) || super::coexisting_items(ws, &items)) {
 		return Err(ambiguous(resolver, path, &items, &imports));
 	}
 
@@ -883,8 +883,9 @@ fn replacement_warnings(ws: &Workspace, item: ItemId, path: &str, items: &[NewIt
 
 /// Whether [`ReplaceOptions::all_variants`] lets [`replace`] replace the several items that `path` names, rather than
 /// fail: whether they are `cfg` variants (or items of several crates). Items of `impl` blocks whose headers differ
-/// (which generic arguments in the path tell apart) are not, and neither are two items of one crate with the same
-/// `cfg`s (such as two `impl` blocks with the same header, which a selector tells apart).
+/// (which generic arguments in the path tell apart) are not, and neither are two items of one crate that are compiled
+/// together (see [`coexisting_items`](super::coexisting_items)), such as two `impl` blocks with the same header, or one
+/// without a `cfg` and one with `#[cfg(test)]` (a selector tells them apart).
 pub fn replaces_all_variants(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 	let ws = resolver.workspace();
 	let mut resolved = resolver.resolve_item_path(path);
@@ -898,7 +899,7 @@ pub fn replaces_all_variants(resolver: &Resolver<'_>, path: &ItemPath) -> bool {
 	};
 	let items = distinct_places(ws, items);
 
-	items.len() > 1 && !super::impl_headers_differ(ws, &items) && !super::same_cfg_items(ws, &items)
+	items.len() > 1 && !super::impl_headers_differ(ws, &items) && !super::coexisting_items(ws, &items)
 }
 
 /// Whether two items are the same text (of a file loaded by several crates).

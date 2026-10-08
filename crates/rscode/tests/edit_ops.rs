@@ -479,6 +479,72 @@ impl Tools {
 		assert!(!edited(&dir, &removal.edits, "src/lib.rs").contains("fn os"));
 	}
 
+	/// An `impl` block without a `cfg` is compiled with every other block of its crate, so it is no `cfg` variant of a
+	/// `#[cfg(test)]` block with the same header: a path naming both is ambiguous, rather than removing the test helpers
+	/// with the other block, or replacing both by the same text (which defines its items twice).
+	#[test]
+	fn does_not_take_an_unconditional_impl_block_for_a_cfg_variant() {
+		let lib = "\
+pub struct Config;
+
+impl Config {
+	pub fn new() -> Self {
+		Self
+	}
+}
+
+#[cfg(test)]
+impl Config {
+	fn for_tests() -> Self {
+		Self
+	}
+}
+
+#[cfg(unix)]
+impl Config {
+	pub fn os() {}
+}
+
+#[cfg(not(unix))]
+impl Config {
+	pub fn os() {}
+}
+";
+		let dir = TempDir::with_files("remove-unconditional-impl", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let all_variants = ReplaceOptions { all_variants: true, ..ReplaceOptions::default() };
+
+		match rscode::edit::remove(&resolver, &paths(&["impl crate::Config"]), &RemoveOptions::default()) {
+			Err(Error::Ambiguous { candidates, .. }) => assert_eq!(
+				candidates,
+				[
+					"`impl fixture::Config[new]` at src/lib.rs:3:1",
+					"`impl fixture::Config[for_tests]` at src/lib.rs:9:1",
+					"`impl fixture::Config[3]` at src/lib.rs:16:1",
+					"`impl fixture::Config[4]` at src/lib.rs:21:1",
+				]
+				.map(native)
+			),
+			other => panic!("{other:?}"),
+		}
+
+		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("impl crate::Config")));
+
+		let replaced = rscode::edit::replace(&resolver, &path("impl crate::Config"), "impl Config {}", &all_variants);
+
+		assert!(matches!(replaced, Err(Error::Ambiguous { .. })), "{replaced:?}");
+
+		// a selector names one of them
+		let removal = rscode::edit::remove(&resolver, &paths(&["impl crate::Config[for_tests]"]), &RemoveOptions::default());
+
+		assert_eq!(removal.unwrap().removed.len(), 1);
+
+		// `cfg` variants still go together
+		assert!(rscode::edit::replaces_all_variants(&resolver, &path("crate::Config::os")));
+		assert_eq!(remove(&ws, &["crate::Config::os"], &RemoveOptions::default()).removed.len(), 2);
+	}
+
 	#[test]
 	fn removes_items_with_attached_comments() {
 		let dir = TempDir::with_files("remove-comments", &[("src/lib.rs", COMMENTS)]);
@@ -4462,6 +4528,15 @@ pub fn first() -> u8 {
 			other => panic!("{other:?}"),
 		}
 
+		// and so is removing them (rather than removing every one)
+		match rscode::edit::remove(&resolver, &paths(&["crate::commands!"]), &RemoveOptions::default()) {
+			Err(Error::Ambiguous { candidates, .. }) => assert_eq!(
+				candidates,
+				["`fixture::commands![1]` at src/lib.rs:5:1", "`fixture::commands![2]` at src/lib.rs:10:1"].map(native)
+			),
+			other => panic!("{other:?}"),
+		}
+
 		let replacement = rscode::edit::replace(&resolver, &path("crate::commands![2]"), source, &ReplaceOptions::default()).unwrap();
 
 		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs"), LIB.replace("QUIT = 3", "QUIT = 4"));
@@ -4482,6 +4557,37 @@ pub fn first() -> u8 {
 			edited(&dir, &insertion.edits, "src/lib.rs"),
 			LIB.replace("QUIT = 3;\n}\n", "QUIT = 3;\n}\n\npub fn second() {}\n")
 		);
+	}
+
+	/// Invocations that are `cfg` variants of each other go together, unlike those compiled together.
+	#[test]
+	fn cfg_variants_are_removed_together() {
+		let lib = "\
+macro_rules! m {
+	($($t:tt)*) => {};
+}
+
+#[cfg(unix)]
+m! { static A = 1; }
+
+#[cfg(not(unix))]
+m! { static A = 2; }
+
+m! { static B = 3; }
+";
+		let dir = TempDir::with_files("macro-calls-cfg", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+
+		assert!(rscode::edit::remove(&resolver, &paths(&["crate::m!"]), &RemoveOptions::default()).is_err());
+
+		let remove = |paths: &[&str]| rscode::edit::remove(&resolver, &super::paths(paths), &RemoveOptions::default()).unwrap();
+
+		assert_eq!(
+			edited(&dir, &remove(&["crate::m![1]", "crate::m![2]"]).edits, "src/lib.rs"),
+			"macro_rules! m {\n\t($($t:tt)*) => {};\n}\n\nm! { static B = 3; }\n"
+		);
+		assert_eq!(remove(&["crate::A"]).removed.len(), 2);
 	}
 
 	/// The `static` entries of an invocation are statics of the invocation, named like items of its module when it
