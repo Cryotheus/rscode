@@ -2,8 +2,11 @@
 //! selector that the canonical path of such a block (or invocation) shows.
 
 use super::Resolver;
+use super::fxhash::FxHashMap;
+use super::fxhash::FxHashSet;
 use super::impls::named_assoc_items;
 use super::text::attribute_paths;
+use super::vis::home_module;
 use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::Workspace;
@@ -12,81 +15,139 @@ use crate::path::ItemPath;
 use crate::path::Selector;
 use crate::pattern::PathPattern;
 use crate::source::TextRange;
+use smol_str::SmolStr;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+
+/// The selectors that the canonical paths of `impl` blocks and macro invocations show, by block or invocation (see
+/// [`Resolver::impl_selector`]).
+pub(super) type SelectorCache = Mutex<FxHashMap<ItemId, Option<Selector>>>;
 
 /// Where an item is: its file and range. Items of a file that several crates load are at the same place.
 type Place<'ws> = (&'ws Path, TextRange);
 
 impl Resolver<'_> {
+	/// The selector of an `impl` block or macro invocation that the cache has, else the one among those that `compute`
+	/// gives (which the cache keeps).
+	fn cached_selector(&self, item: ItemId, compute: impl FnOnce() -> Vec<(ItemId, Option<Selector>)>) -> Option<Selector> {
+		if let Some(selector) = self.selectors.lock().unwrap_or_else(PoisonError::into_inner).get(&item) {
+			return selector.clone();
+		}
+
+		// (not locked while computing, which resolves paths)
+		let computed = compute();
+		let mut cache = self.selectors.lock().unwrap_or_else(PoisonError::into_inner);
+
+		cache.extend(computed);
+		cache.entry(item).or_default().clone()
+	}
+
 	/// The selector that the canonical path of an `impl` block shows (`base` is that path without it), when the path
 	/// names other blocks too: the first associated item name that no other block has, else the first attribute path
 	/// that no other block has, else its index (see [`Selector`]). `None` when the path names the block alone (or does
 	/// not name it, or cannot be written as a user path).
+	///
+	/// (The selectors of the blocks with the same header are computed together, once: computing each on its own would
+	/// take time quadratic in the number of blocks.)
 	pub(super) fn impl_selector(&self, impl_block: ItemId, base: &CanonicalPath) -> Option<Selector> {
-		if !self.may_share_header(impl_block) {
-			return None;
-		}
-
-		let named = self.header_blocks(impl_block, base)?;
-		let places = places(self.ws, &named);
-		let own = place(self.ws, impl_block);
-
-		if places.len() < 2 {
-			return None;
-		}
-
-		let others: Vec<ItemId> = named.iter().copied().filter(|&item| place(self.ws, item) != own).collect();
-		let has_item = |block: ItemId, name: &str| named_assoc_items(self.ws, block).any(|item| self.ws.item(item).name() == Some(name));
-
-		if let Some(name) = named_assoc_items(self.ws, impl_block)
-			.filter_map(|item| self.ws.item(item).name.clone())
-			.find(|name| !others.iter().any(|&other| has_item(other, name)))
-		{
-			return Some(Selector::Item(name));
-		}
-
-		if let Some(attribute) = attribute_paths(self.ws.item_text(impl_block))
-			.into_iter()
-			.find(|attribute| !others.iter().any(|&other| has_attribute(self.ws, other, attribute)))
-		{
-			return Some(Selector::Attribute(attribute));
-		}
-
-		let index = places.iter().position(|&known| known == own)?;
-
-		Some(Selector::Index(u32::try_from(index + 1).ok()?))
+		self.cached_selector(impl_block, || self.header_selectors(impl_block, base))
 	}
 
-	/// The `impl` blocks that the header of `impl_block` names (`base` is the block's canonical path without a
-	/// selector), the block among them. `None` when the header cannot be written as a user path, or does not name the
-	/// block.
-	fn header_blocks(&self, impl_block: ItemId, base: &CanonicalPath) -> Option<Vec<ItemId>> {
-		let info = self.ws.item(impl_block).impl_info()?;
-		let text = match &base.unresolved_self_ty {
-			None => base.to_string(),
-			Some(self_ty) => match &info.trait_text {
-				Some(trait_text) => format!("impl {trait_text} for {self_ty}"),
-				None => format!("impl {self_ty}"),
-			},
-		};
-		let named = self.compute_item_path(&ItemPath::parse(&text).ok()?);
+	/// The `impl` blocks that `header` (the header of `impl_block` as a user path, see [`header_text`]) names, the block
+	/// among them. `None` when the header does not parse, or does not name the block.
+	fn header_blocks(&self, impl_block: ItemId, header: &str) -> Option<Vec<ItemId>> {
+		let named = self.compute_item_path(&ItemPath::parse(header).ok()?);
 
 		named.contains(&impl_block).then_some(named)
 	}
 
-	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
-	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
-	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
-		let named = self.macro_calls(call, base)?;
-		let places = places(self.ws, &named);
+	/// The selectors that the canonical paths of the `impl` blocks with the header of `impl_block` show (`base` is its
+	/// canonical path without a selector), `impl_block` among them (see [`Resolver::impl_selector`]).
+	fn header_selectors(&self, impl_block: ItemId, base: &CanonicalPath) -> Vec<(ItemId, Option<Selector>)> {
+		let ws = self.ws;
+		let Some(header) = self.may_share_header(impl_block).then(|| header_text(ws, impl_block, base)).flatten() else {
+			return vec![(impl_block, None)];
+		};
+		let Some(named) = self.header_blocks(impl_block, &header) else {
+			return vec![(impl_block, None)];
+		};
+
+		// the blocks with the same header text name the same blocks, so their selectors are told apart from the same ones
+		let same: Vec<ItemId> = (named.iter().copied())
+			.filter(|&block| block == impl_block || header_text(ws, block, &self.impl_base(block)).as_ref() == Some(&header))
+			.collect();
+		let places = places(ws, &named);
 
 		if places.len() < 2 {
-			return None;
+			return same.into_iter().map(|block| (block, None)).collect();
 		}
 
-		let index = places.iter().position(|&known| known == place(self.ws, call))?;
+		// the places with an associated item of each name, and with an attribute of each path (or ending with it)
+		let at: FxHashMap<Place<'_>, usize> = places.iter().enumerate().map(|(index, &place)| (place, index)).collect();
+		let mut names: FxHashMap<SmolStr, FxHashSet<usize>> = FxHashMap::default();
+		let mut attributes: FxHashMap<String, FxHashSet<usize>> = FxHashMap::default();
 
-		Some(Selector::Index(u32::try_from(index + 1).ok()?))
+		for &block in &named {
+			let index = at[&place(ws, block)];
+
+			for name in named_assoc_items(ws, block).filter_map(|item| ws.item(item).name.clone()) {
+				names.entry(name).or_default().insert(index);
+			}
+
+			for attribute in attribute_paths(ws.item_text(block)) {
+				for path in path_suffixes(&attribute) {
+					attributes.entry(path.to_owned()).or_default().insert(index);
+				}
+			}
+		}
+
+		let only_at = |places: Option<&FxHashSet<usize>>, index: usize| places.is_some_and(|places| places.len() == 1 && places.contains(&index));
+
+		(same.into_iter())
+			.map(|block| {
+				let index = at[&place(ws, block)];
+				let item = (named_assoc_items(ws, block).filter_map(|item| ws.item(item).name.clone()))
+					.find(|name| only_at(names.get(name), index))
+					.map(Selector::Item);
+				let attribute = || {
+					(attribute_paths(ws.item_text(block)).into_iter())
+						.find(|attribute| only_at(attributes.get(attribute), index))
+						.map(Selector::Attribute)
+				};
+
+				(block, item.or_else(attribute).or_else(|| u32::try_from(index + 1).ok().map(Selector::Index)))
+			})
+			.collect()
+	}
+
+	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
+	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
+	///
+	/// (Like [`Resolver::impl_selector`], the indexes of the invocations with the same path are computed together, once.)
+	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
+		self.cached_selector(call, || self.call_selectors(call, base))
+	}
+
+	/// The indexes that the canonical paths of the invocations with the path of `call` show (`base` is its canonical path
+	/// without a selector), `call` among them (see [`Resolver::macro_selector`]).
+	fn call_selectors(&self, call: ItemId, base: &CanonicalPath) -> Vec<(ItemId, Option<Selector>)> {
+		let ws = self.ws;
+		let Some(named) = self.macro_calls(call, base) else {
+			return vec![(call, None)];
+		};
+		let places = places(ws, &named);
+		let at: FxHashMap<Place<'_>, usize> = places.iter().enumerate().map(|(index, &place)| (place, index)).collect();
+
+		// (those in modules with the same path have the same path)
+		(named.into_iter())
+			.filter(|&other| other == call || self.module_segments(home_module(ws, other)) == base.segments)
+			.map(|other| {
+				let index = (places.len() > 1).then(|| u32::try_from(at[&place(ws, other)] + 1).ok()).flatten();
+
+				(other, index.map(Selector::Index))
+			})
+			.collect()
 	}
 
 	/// The invocations that the path of a macro invocation names (`base` is its canonical path without a selector): those
@@ -159,14 +220,17 @@ impl Resolver<'_> {
 				_ => return false,
 			},
 		};
-		let base = CanonicalPath {
-			selector: None,
-			..self.compute_canonical_path(target)
-		};
 		let named = match ws.item(target).kind {
-			ItemKind::Impl if self.may_share_header(target) => self.header_blocks(target, &base),
+			ItemKind::Impl if self.may_share_header(target) => {
+				header_text(ws, target, &self.impl_base(target)).and_then(|header| self.header_blocks(target, &header))
+			}
+
 			ItemKind::Impl => None,
-			_ => self.macro_calls(target, &base),
+
+			_ => self.macro_calls(target, &CanonicalPath {
+				selector: None,
+				..self.compute_canonical_path(target)
+			}),
 		};
 
 		self.select(named.unwrap_or_else(|| vec![target]), selector).contains(&target)
@@ -178,6 +242,26 @@ fn has_attribute(ws: &Workspace, item: ItemId, path: &str) -> bool {
 	attribute_paths(ws.item_text(item))
 		.iter()
 		.any(|attribute| attribute == path || attribute.strip_suffix(path).is_some_and(|prefix| prefix.ends_with("::")))
+}
+
+/// The header of an `impl` block as a user path (`base` is its canonical path without a selector): `impl a::Foo`,
+/// `impl Tr for a::Foo<T>`, or for a self type that is not loaded, `impl Tr for Vec<u8>`.
+fn header_text(ws: &Workspace, impl_block: ItemId, base: &CanonicalPath) -> Option<String> {
+	let info = ws.item(impl_block).impl_info()?;
+
+	Some(match &base.unresolved_self_ty {
+		None => base.to_string(),
+
+		Some(self_ty) => match &info.trait_text {
+			Some(trait_text) => format!("impl {trait_text} for {self_ty}"),
+			None => format!("impl {self_ty}"),
+		},
+	})
+}
+
+/// An attribute path and its ends after each `::` (`a::b`, `b`): the paths that [`has_attribute`] finds it by.
+fn path_suffixes(path: &str) -> impl Iterator<Item = &str> {
+	std::iter::once(path).chain(path.match_indices("::").map(move |(at, _)| &path[at + 2..]))
 }
 
 /// The place of an item.

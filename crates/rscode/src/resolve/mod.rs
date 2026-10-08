@@ -54,6 +54,7 @@ use build::ImportIndex;
 use fxhash::FxHashSet;
 use impls::ImplIndex;
 use scope::Tables;
+use selector::SelectorCache;
 use serde::Serialize;
 use smol_str::SmolStr;
 use usable::UsableCache;
@@ -142,6 +143,9 @@ pub struct Resolver<'ws> {
 
 	/// Usable paths, computed on demand per viewpoint.
 	usable: UsableCache,
+
+	/// The selectors of the canonical paths of `impl` blocks and macro invocations, computed on demand.
+	selectors: SelectorCache,
 }
 
 impl<'ws> Resolver<'ws> {
@@ -162,6 +166,7 @@ impl<'ws> Resolver<'ws> {
 			impls,
 			imports,
 			usable: UsableCache::default(),
+			selectors: SelectorCache::default(),
 		}
 	}
 

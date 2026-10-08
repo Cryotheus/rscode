@@ -40,9 +40,7 @@ impl Resolver<'_> {
 			}
 
 			(ItemKind::Impl, _) => {
-				self.set_impl_owner(item, &mut path);
-				path.is_impl = true;
-				path.name = None;
+				path = self.impl_base(item);
 				path.selector = self.impl_selector(item, &path);
 			}
 
@@ -88,6 +86,25 @@ impl Resolver<'_> {
 
 		segments.extend(path.name);
 		segments
+	}
+
+	/// The canonical path of an `impl` block without its selector.
+	pub(super) fn impl_base(&self, impl_block: ItemId) -> CanonicalPath {
+		let mut path = CanonicalPath {
+			segments: Vec::new(),
+			impl_trait: None,
+			self_ty_arguments: None,
+			unresolved_self_ty: None,
+			is_impl: true,
+			is_import: false,
+			name: None,
+			selector: None,
+			is_field: false,
+			is_macro_call: false,
+		};
+
+		self.set_impl_owner(impl_block, &mut path);
+		path
 	}
 
 	/// The crate name followed by the names of the modules down to `module`.
