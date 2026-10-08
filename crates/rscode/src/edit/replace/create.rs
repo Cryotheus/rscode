@@ -68,9 +68,10 @@ pub struct ModuleCreation {
 /// consecutive lines, like theirs), or else where `mod` declarations go (after `extern crate` items, before `use`
 /// items).
 ///
-/// Fails with [`Error::InvalidIdent`] for a name that is not an identifier, [`Error::Collision`] when the parent binds
-/// the name already, [`Error::Io`] when a file of the module exists already (`name.rs` or `name/mod.rs`), and
-/// [`Error::InvalidSource`] when the source does not parse as a file or `vis` is not a visibility.
+/// Fails with [`Error::InvalidIdent`] for a name that is not an identifier, [`Error::Unsupported`] for a name that is
+/// not ASCII, [`Error::Collision`] when the parent binds the name already, [`Error::Io`] when a file of the module
+/// exists already (`name.rs` or `name/mod.rs`), and [`Error::InvalidSource`] when the source does not parse as a file
+/// or `vis` is not a visibility.
 pub fn create_module(
 	resolver: &Resolver<'_>,
 	parent: &ItemPath,
@@ -80,6 +81,15 @@ pub fn create_module(
 ) -> Result<ModuleCreation, Error> {
 	let ws = resolver.workspace();
 	let name = NewName::parse(name.trim())?;
+
+	// (rustc looks for the files of modules with other names only by `#[path]`)
+	if !name.bare.is_ascii() {
+		return Err(Error::Unsupported(format!(
+			"`{}` is not an ASCII name, and rustc loads the file of a module only by an ASCII name: choose one",
+			name.written
+		)));
+	}
+
 	let declaration = declaration(&name, options.vis.trim())?;
 	let target = target(resolver, parent, None)?;
 

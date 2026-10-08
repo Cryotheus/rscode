@@ -3066,6 +3066,14 @@ mod create_module {
 			assert!(matches!(create(&ws, "crate", name, ""), Err(Error::InvalidIdent(_))), "{name}");
 		}
 
+		// (rustc loads no file for a module with a non-ASCII name)
+		match create(&ws, "crate", "café", "") {
+			Err(Error::Unsupported(message)) => {
+				assert!(message.starts_with("`café` is not an ASCII name"), "{message}");
+			}
+			other => panic!("{other:?}"),
+		}
+
 		match create(&ws, "crate", "x", "fn x( {}") {
 			Err(Error::InvalidSource(message)) => {
 				assert!(message.starts_with("the source does not parse as the file of a module at 1:"), "{message}")
