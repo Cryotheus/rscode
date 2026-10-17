@@ -8,6 +8,7 @@ use crate::edit::ImportAddition;
 use crate::edit::ImportOutcome;
 use crate::edit::Insertion;
 use crate::edit::ModuleCreation;
+use crate::edit::Movement;
 use crate::edit::Removal;
 use crate::edit::Rename;
 use crate::edit::Replacement;
@@ -582,6 +583,34 @@ pub(crate) fn relative(root: &Path, path: &Path) -> PathBuf {
 		Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
 		_ => path.to_path_buf(),
 	}
+}
+
+/// What moving an item within its container did (or would do).
+pub(crate) fn movement(root: &Path, plan: &Movement, dry_run: bool) -> String {
+	if plan.edits.is_empty() {
+		return match dry_run {
+			true => "nothing would change\n".to_owned(),
+			false => "nothing changed\n".to_owned(),
+		};
+	}
+
+	let mut out = String::new();
+
+	writeln!(
+		out,
+		"{} {} within `{}` ({}):",
+		done(dry_run, "moved", "move"),
+		count(plan.moved.len(), "item", "items"),
+		plan.parent,
+		display(root, &plan.file)
+	)
+	.unwrap();
+
+	for path in &plan.moved {
+		writeln!(out, "  {path}").unwrap();
+	}
+
+	out
 }
 
 /// What a removal did (or would do): removed items, deleted files, dangling references, and warnings.

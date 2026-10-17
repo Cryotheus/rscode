@@ -471,7 +471,7 @@ fn fmt() -> Command {
 		.about("Sort and format items")
 		.long_about(
 			"Sort (with the Cryotheum ordering schema) and format items. A module target formats its file(s), including \
-			 child modules unless --skip-children; other items are formatted in place, leaving the rest of their file \
+			 out-of-line child module files unless --skip-children; inline modules remain part of the selected file. Other items are formatted in place, leaving the rest of their file \
 			 untouched. After formatting, `match` arms spanning several lines are separated from their neighbours by a \
 			 blank line, and one-line arms follow each other directly.",
 		)
@@ -897,8 +897,8 @@ fn sort() -> Command {
 		.about("Sort items (like `fmt --formatter none`)")
 		.long_about(
 			"Sort items with the Cryotheum ordering schema without formatting them: the items of module targets, and \
-			 of the `impl` blocks, traits, and `extern` blocks among them (and in child modules, unless \
-			 --skip-children).",
+			 of the `impl` blocks, traits, and `extern` blocks among them (including inline modules; out-of-line child \
+			 module files are skipped with --skip-children).",
 		)
 		.arg(targets());
 
@@ -923,7 +923,7 @@ fn sort_args(command: Command) -> Command {
         ))
         .arg(flag(
             "skip-children",
-            "Do not process child modules of module targets",
+            "Do not process out-of-line child module files of module targets",
         ))
 }
 

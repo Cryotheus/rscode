@@ -376,7 +376,6 @@ impl FmtArgs {
                         .unwrap_or_default(),
                 )
                 .merge_extern_blocks(!matches.flag("no-merge-extern-blocks"))
-                .recursive(!skip_children)
         });
         let formatter = match sort_only {
             true => RsFormatter::None,
@@ -1285,11 +1284,7 @@ mod tests {
                         ("edition".to_owned(), "2018".to_owned()),
                     ],
                 },
-                sort: Some(
-                    SortOptions::new()
-                        .merge_extern_blocks(false)
-                        .recursive(false)
-                ),
+                sort: Some(SortOptions::new().merge_extern_blocks(false)),
                 allow_comment_loss: true,
             }
         );
@@ -2007,11 +2002,9 @@ mod tests {
         assert_eq!(args.emit, Emit::Stdout);
         assert_eq!(
             args.options.format,
-            FormatOptions::new().formatter(RsFormatter::None).sort(Some(
-                SortOptions::new()
-                    .schema(OrderingSchema::Cryotheum)
-                    .recursive(false)
-            ))
+            FormatOptions::new()
+                .formatter(RsFormatter::None)
+                .sort(Some(SortOptions::new().schema(OrderingSchema::Cryotheum)))
         );
     }
 

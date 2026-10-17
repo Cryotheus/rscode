@@ -637,17 +637,45 @@ pub(crate) fn insertion(text: &str, placement: Placement, source: &str, indent: 
 	let lexed = Lexed::new(text);
 	let line_ending = line_ending(text);
 	let item = format!("{indent}{}", reindent_with(source, indent, line_ending, &indent_unit_in(&lexed)));
+
+	laid_out_insertion(&lexed, placement, &item, indent, line_ending, spacing)
+}
+
+/// Inserts source taken from another place in `text` without changing its internal bytes or line endings.
+///
+/// `source` normally already includes its first line's indentation. When `starts_line` is false, it came from the
+/// middle of a line and the container's `indent` is added to that first line; later lines retain the indentation they
+/// had in the same container.
+pub(crate) fn verbatim_insertion(
+	text: &str,
+	placement: Placement,
+	source: &str,
+	starts_line: bool,
+	indent: &str,
+	line_ending: &str,
+	spacing: Spacing,
+) -> TextEdit {
+	let lexed = Lexed::new(text);
+	let item = match starts_line || indent.is_empty() {
+		true => Cow::Borrowed(source),
+		false => Cow::Owned(format!("{indent}{source}")),
+	};
+
+	laid_out_insertion(&lexed, placement, &item, indent, line_ending, spacing)
+}
+
+fn laid_out_insertion(lexed: &Lexed<'_>, placement: Placement, item: &str, indent: &str, line_ending: &str, spacing: Spacing) -> TextEdit {
 	let new = Inserted {
-		items: &item,
+		items: item,
 		indent,
 		line_ending,
 		spacing,
 	};
 
 	let (range, replacement) = match placement {
-		Placement::Before(sibling) => insert_before(&lexed, clamp(text, sibling), new),
-		Placement::After(sibling) => insert_after(&lexed, clamp(text, sibling), new),
-		Placement::End(body) => insert_at_end(&lexed, clamp(text, body), &item, line_ending),
+		Placement::Before(sibling) => insert_before(lexed, clamp(lexed.text, sibling), new),
+		Placement::After(sibling) => insert_after(lexed, clamp(lexed.text, sibling), new),
+		Placement::End(body) => insert_at_end(lexed, clamp(lexed.text, body), item, line_ending),
 	};
 
 	TextEdit { range, replacement }
@@ -1051,6 +1079,56 @@ pub(crate) fn removal_ranges(text: &str, items: &[TextRange]) -> Vec<TextRange> 
 	}
 
 	blocks.into_iter().map(|block| removal_range_in(&lexed, block)).collect()
+}
+
+/// Like [`removal_ranges`], but preserves the trivia that belongs to a moved item when it shares a line with other
+/// code: attached comments above move even when code follows the item, while the line's indentation stays behind for
+/// that code; a trailing comment moves when it ends the line, while the line break stays behind for preceding code.
+pub(crate) fn movement_ranges(text: &str, items: &[TextRange]) -> Vec<TextRange> {
+	let lexed = Lexed::new(text);
+	let mut items: Vec<TextRange> = items.iter().map(|&item| clamp(text, item)).collect();
+
+	items.sort_by_key(|item| (item.start, std::cmp::Reverse(item.end)));
+
+	let mut blocks: Vec<TextRange> = Vec::with_capacity(items.len());
+
+	for item in items {
+		match blocks.last_mut() {
+			Some(block) if item.end <= block.end => {}
+			Some(block) if item.start <= block.end || lexed.after(block.end).ceiling >= item.start => block.end = item.end,
+			_ => blocks.push(item),
+		}
+	}
+
+	blocks
+		.into_iter()
+		.map(|block| {
+			let leading = leading(&lexed, block.start);
+			let trailing = trailing(&lexed, block.end);
+			let comments_above = leading.starts_line && !text[leading.block_start..block.start].trim().is_empty();
+
+			if comments_above && !trailing.ends_line {
+				let indent = line_indent(text, block.start);
+				let after_indent = leading.block_start.saturating_add(indent.len());
+				let start = match text.get(leading.block_start..after_indent) == Some(indent) {
+					true => after_indent,
+					false => leading.block_start,
+				};
+
+				return TextRange::new(start, trailing.space_end);
+			}
+
+			let comment = lexed
+				.pieces_in(TextRange::new(block.end, trailing.break_start))
+				.iter()
+				.any(|piece| piece.kind == Kind::Comment);
+
+			match !leading.starts_line && trailing.ends_line && comment {
+				true => TextRange::new(leading.space_start, trailing.break_start),
+				false => removal_range_in(&lexed, block),
+			}
+		})
+		.collect()
 }
 
 /// Lexes a whole text (after a byte order mark), calling `visit` with every piece in order until it returns `false`.

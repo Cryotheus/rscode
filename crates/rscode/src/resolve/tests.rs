@@ -85,7 +85,7 @@ fn canonical_path_round_trip_failures(ws: &Workspace, resolver: &Resolver<'_>) -
 				arguments: None,
 				import: path.is_import,
 				field,
-				selector: None,
+				selector: path.selector,
 				macro_call: false,
 			};
 
@@ -162,6 +162,31 @@ fn canonical_paths_of_every_kind() {
 	assert_eq!(path.impl_trait.as_deref(), Some("Tr"));
 	assert_eq!(path.name.as_deref(), Some("required"));
 	assert!(!path.is_impl);
+}
+
+#[test]
+fn import_indexes_select_one_of_several_same_named_imports() {
+	let ws = single(
+		r#"
+		pub struct A;
+		pub struct B;
+
+		pub mod m {
+			use crate::A as Same;
+			use crate::B as Same;
+		}
+		"#,
+	);
+	let resolver = Resolver::new(&ws);
+	let both = resolver.resolve_item_path(&ItemPath::parse("use crate::m::Same").unwrap());
+
+	assert_eq!(both.len(), 2);
+	assert_eq!(resolver.canonical_path(both[0]).to_string(), "use t::m::Same[1]");
+	assert_eq!(resolver.canonical_path(both[1]).to_string(), "use t::m::Same[2]");
+	assert_eq!(resolver.resolve_item_path(&ItemPath::parse("use crate::m::Same[2]").unwrap()), [both[1]]);
+	assert!(resolver.selects(&Selector::Index(1), both[0]));
+	assert!(!resolver.selects(&Selector::Index(2), both[0]));
+	assert!(resolver.selects(&Selector::Index(2), both[1]));
 }
 
 #[test]

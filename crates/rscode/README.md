@@ -15,9 +15,10 @@ configuration, and marked inactive where it disables them.
 - **Find:** `Find` searches with glob-like patterns (no regex): `*Error`, `crate::shapes::*`, `**::Circle`,
   `<Circle as Shape>::*`.
 - **View:** `View` shows exact source, or outlines with bodies elided.
-- **Edit:** `edit::rename`, `edit::remove`, `edit::replace`, `edit::insert`, and `edit::format` plan changes as an
-  `EditSet`. It can be previewed as new file contents or a diff, or applied all at once. Every edited file must still
-  parse before anything is written, and text outside of the edits, comments included, is never touched.
+- **Edit:** `edit::rename`, `edit::remove`, `edit::move_item`, `edit::replace`, `edit::insert`, and `edit::format`
+  plan changes as an `EditSet`. It can be previewed as new file contents or a diff, or applied all at once. Every
+  edited file must still parse before anything is written, and text outside of the edits, comments included, is
+  never touched.
 - **Serve:** the `mcp` feature serves all of this over the Model Context Protocol (`mcp::serve_stdio`), for the
   server's own workspace and for the workspaces and packages that clients attach from exposed directories
   (`mcp::ServerOptions::exposed`).

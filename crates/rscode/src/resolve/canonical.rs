@@ -58,6 +58,7 @@ impl Resolver<'_> {
 				path.segments = self.module_segments(home_module(self.ws, item));
 				path.name = data.import_info().map(ImportInfo::path_name);
 				path.is_import = true;
+				path.selector = self.import_selector(item, &path);
 			}
 
 			// invocations of a macro are named by its name and a `!` (and an index, when the path names others too)

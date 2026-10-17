@@ -5,6 +5,7 @@
 //! written, and when writing fails partway, what was changed before is undone.
 
 mod format;
+mod move_item;
 mod remove;
 mod rename;
 mod replace;
@@ -36,6 +37,8 @@ use std::sync::atomic::Ordering;
 pub use format::FmtOptions;
 pub use format::Formatting;
 pub use format::format;
+pub use move_item::Movement;
+pub use move_item::move_item;
 pub use remove::Removal;
 pub use remove::RemoveOptions;
 pub use remove::RemovedItem;

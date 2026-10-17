@@ -9,6 +9,7 @@ use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
+use super::params::MoveParams;
 use super::params::ReferencesParams;
 use super::params::RemoveParams;
 use super::params::RenameParams;
@@ -49,6 +50,7 @@ use rmcp::tool;
 use rmcp::tool_handler;
 use rmcp::tool_router;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::convert::identity;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -57,10 +59,6 @@ use std::sync::Arc;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use tokio::sync::Mutex;
-
-/// The parameters of [`Selection`] that tool schemas leave out (see [`slim`]): rarely needed, and described once in
-/// [`INSTRUCTIONS`].
-const HIDDEN_PARAMETERS: [&str; 6] = ["all_features", "all_targets", "bin", "features", "lib", "workspace"];
 
 /// Guidance for the client (and its model), sent when connecting.
 const INSTRUCTIONS: &str = "\
@@ -71,7 +69,8 @@ entries of item-position macro invocations (statics of their module; uses of ent
 Paths are written like Rust paths: `crate::m::Item` (from the root of every selected crate), `::crate_name::Item`, \
 or `m::Item` (tried from every crate root). Also `Type::method`, `<Type as Trait>::method`, `impl Trait for Type`, \
 `impl Type`, `Enum::Variant`, fields (`Type.field`, `Tuple.0`, `Enum::Variant.field`), macro invocations \
-(`m::name!`, `name![2]` for the second), and imports (`use m::Name`: a leaf of a `use` item; `use m::*` for globs). \
+(`m::name!`, `name![2]` for the second), and imports (`use m::Name`: a leaf of a `use` item; `use m::Name[2]` for \
+the second matching import; `use m::*` for globs). \
 Generic arguments pick impl blocks (`impl From<u8> for W`), and a selector picks one of several blocks with the same \
 header: `impl Tools[add_bots]` (with that item), `impl Tools[#tool_router]` (with that attribute), `<Tools>[2]::new` \
 (the second); printed paths carry one when needed. A path names every cfg variant of an item (disabled ones are \
@@ -86,7 +85,7 @@ whose roots are both `crate`.
 Edits are all-or-nothing: every changed file must still parse, or nothing is written. With `dry_run` they return \
 their summary and a diff and write nothing; replace_item, edit_item, and insert_items take `format` to have rustfmt \
 format what they wrote. Code outside of the edited items is kept as it is. For small changes use edit_item (exact \
-`old`/`new` text, visibility, docs, attributes) rather than replace_item.
+`old`/`new` text, visibility, docs, attributes) rather than replace_item. JSON strings must escape hard tabs as `\t`.
 
 Every call reads the files again, so other tools' changes are seen. Lines are 1-based. Typically: workspace_info, \
 find_items, view_items, then edit.";
@@ -122,7 +121,8 @@ pub(crate) struct Server {
 #[tool_router(router = edit_tools)]
 impl Server {
 	/// Import into a module: each leaf of the `use` trees in `paths` becomes a `use` item where `cargo rscode sort`
-	/// puts it, or joins the module's grouped `use` items. What the module imports already is left alone.
+	/// puts it. When the module already groups imports, it joins its grouped `use` items; otherwise it preserves the
+	/// existing one-import-per-line style. What the module imports already is left alone.
 	#[tool(annotations(
 		title = "Add imports",
 		read_only_hint = false,
@@ -171,9 +171,9 @@ impl Server {
 		.await
 	}
 
-	/// Sort items (Cryotheum order) and format them with rustfmt or prettyplease: a module target formats its files
-	/// (and its child modules' unless `skip_children`), other targets only themselves. `check` shows the diff without
-	/// writing.
+	/// Format items with rustfmt or prettyplease; `sort: true` first applies Cryotheum ordering. A module target also
+	/// formats its out-of-line child modules' files unless `skip_children`; inline children in its file are always
+	/// formatted. Other targets format only themselves. `check` shows the diff without writing.
 	#[tool(annotations(
 		title = "Format items",
 		read_only_hint = false,
@@ -205,6 +205,28 @@ impl Server {
 		.await
 	}
 
+	/// Reorder an item, with directly complementary `cfg` variants and attached comments, within its existing
+	/// container. `start` and `end` need no `anchor`; `before` and `after` take a sibling there. Imports, fields, enum
+	/// variants, macro definitions/invocations and their entries, `#[macro_use]` items, out-of-line module declarations,
+	/// and cross-container moves are not supported. Ordinary items cannot cross a direct-sibling macro definition,
+	/// item-position macro invocation, or `#[macro_use]` item.
+	#[tool(annotations(
+		title = "Move an item",
+		read_only_hint = false,
+		destructive_hint = false,
+		idempotent_hint = true,
+		open_world_hint = false
+	))]
+	async fn move_item(&self, Parameters(params): Parameters<MoveParams>, context: RequestContext<RoleServer>) -> CallToolResult {
+		let target = self.target(&params.selection, false);
+		let dry_run = params.dry_run;
+
+		self.edit("move_item", context, target, dry_run, move |load, permit| {
+			tools::move_item(load, &params, permit)
+		})
+		.await
+	}
+
 	/// Remove items (every cfg variant) with their docs, attributes, and attached comments, and the files of
 	/// out-of-line modules unless `keep_files`. Reports references left dangling.
 	#[tool(annotations(title = "Remove items", read_only_hint = false, destructive_hint = true, open_world_hint = false))]
@@ -232,8 +254,9 @@ impl Server {
 		.await
 	}
 
-	/// Replace an item's whole source (docs and attributes included) with `source`, re-indented to fit; another kind
-	/// needs `allow_kind_change`. For small changes, edit_item is cheaper. An import is replaced as its `use` item.
+	/// Replace one item's whole source (docs and attributes included) with one item of the same kind, re-indented to
+	/// fit. Add adjacent items with insert_items. `allow_kind_change` permits another kind or several items. For small
+	/// changes, edit_item is cheaper. An import is replaced as its `use` item.
 	#[tool(annotations(title = "Replace an item", read_only_hint = false, destructive_hint = true, open_world_hint = false))]
 	async fn replace_item(&self, Parameters(params): Parameters<ReplaceParams>, context: RequestContext<RoleServer>) -> CallToolResult {
 		let target = self.target(&params.selection, false);
@@ -293,7 +316,8 @@ impl Server {
 impl Server {
 	/// Attach a cargo workspace or package (its Cargo.toml must be in a directory the server exposes, see list_sources)
 	/// under a name, to pass as `attached` to the other tools. A name keeps the source it has until detach_source frees
-	/// it; the response says what is attached. Attaching is cheap: every call loads from disk.
+	/// it or this MCP connection ends; reconnecting starts a new attachment session. Attaching is cheap: every call
+	/// loads from disk.
 	#[tool(annotations(
 		title = "Attach a source",
 		read_only_hint = false,
@@ -417,8 +441,9 @@ impl Server {
 		respond("list_sources", Ok(self.describe_sources()))
 	}
 
-	/// Make an attached source the one that calls without `attached` work on, for the rest of the session ("" for the
-	/// server's own workspace).
+	/// Make an attached source the one that calls without `attached` work on, for the rest of this MCP connection (""
+	/// for the server's own workspace). The default is shared by every caller on the connection; concurrent workflows
+	/// should pass `attached` on each call instead.
 	#[tool(annotations(
 		title = "Use a source",
 		read_only_hint = false,
@@ -593,7 +618,7 @@ impl Server {
 
 			if target.by_default {
 				message.push_str(
-					"\nhint: the session uses it by default (see `use_source`): pass `attached` to work on another one",
+					"\nhint: the connection uses it by default (see `use_source`): pass `attached` to work on another one",
 				);
 			}
 
@@ -625,7 +650,7 @@ impl Server {
 	}
 
 	/// The response of `attach_source` for a name that keeps its source (see [`Verdict::Keep`]): with `use_it`, the
-	/// session uses it by default from now on.
+	/// connection uses it by default from now on.
 	fn keep(&self, name: &str, text: String, use_it: bool) -> String {
 		if !use_it {
 			return text;
@@ -670,7 +695,7 @@ impl Server {
 		self.session.lock().unwrap_or_else(PoisonError::into_inner)
 	}
 
-	/// What a call with `selection` works on: the attached source it names, or else the session's default source (see
+	/// What a call with `selection` works on: the attached source it names, or else the connection's default source (see
 	/// `use_source`), or the server's own workspace (also for an empty `attached`). With `everything`, every other
 	/// target of every workspace member is loaded too, so that references everywhere are found.
 	fn target(&self, selection: &Selection, everything: bool) -> Result<Target, String> {
@@ -755,6 +780,12 @@ impl ServerHandler for Server {
 			return Ok(result.into());
 		}
 
+		if let Some(tool) = self.tool_router.get(&request.name)
+			&& let Err(message) = validate_arguments(tool, request.arguments.as_ref())
+		{
+			return Ok(respond(&request.name, Err(message)).into());
+		}
+
 		self.tool_router.call(ToolCallContext::new(self, request, context)).await
 	}
 
@@ -796,7 +827,7 @@ struct Target {
 	/// The attached source, if the call works on one (rather than on the server's own workspace).
 	source: Option<(String, Source)>,
 
-	/// Whether the source is the session's default (see `use_source`), rather than named by the call.
+	/// Whether the source is the connection's default (see `use_source`), rather than named by the call.
 	by_default: bool,
 }
 
@@ -847,18 +878,185 @@ fn respond(tool: &str, result: Result<String, String>) -> CallToolResult {
 	}
 }
 
+/// Alternate spellings accepted by serde for a tool parameter.
+fn parameter_aliases(tool: &str) -> &'static [(&'static str, &'static str)] {
+	const ADD_IMPORT: &[(&str, &str)] = &[
+		("path", "paths"),
+		("imports", "paths"),
+		("dryRun", "dry_run"),
+		("dry-run", "dry_run"),
+		("check", "dry_run"),
+	];
+	const ATTACH: &[(&str, &str)] = &[("manifest", "manifest_path"), ("path", "manifest_path")];
+	const CREATE: &[(&str, &str)] = &[("content", "source"), ("dryRun", "dry_run"), ("dry-run", "dry_run"), ("check", "dry_run")];
+	const EDIT: &[(&str, &str)] = &[("visibility", "vis"), ("dryRun", "dry_run"), ("dry-run", "dry_run"), ("check", "dry_run")];
+	const FORMAT: &[(&str, &str)] = &[("paths", "targets"), ("dry_run", "check"), ("dryRun", "check"), ("dry-run", "check")];
+	const INSERT: &[(&str, &str)] = &[("content", "source"), ("dryRun", "dry_run"), ("dry-run", "dry_run"), ("check", "dry_run")];
+	const DRY_RUN: &[(&str, &str)] = &[("dryRun", "dry_run"), ("dry-run", "dry_run"), ("check", "dry_run")];
+
+	match tool {
+		"add_import" => ADD_IMPORT,
+		"attach_source" => ATTACH,
+		"create_module" => CREATE,
+		"edit_item" => EDIT,
+		"format_items" => FORMAT,
+		"insert_items" => INSERT,
+		"move_item" | "remove_items" | "rename_item" | "replace_item" => DRY_RUN,
+		_ => &[],
+	}
+}
+
+/// Validates names and required parameters together, before serde can ignore an unknown name or stop at the first
+/// missing field. Aliases count as their canonical parameters.
+fn validate_arguments(tool: &Tool, arguments: Option<&serde_json::Map<String, Value>>) -> Result<(), String> {
+	let Some(Value::Object(properties)) = tool.input_schema.get("properties") else {
+		return Ok(());
+	};
+	let aliases = parameter_aliases(&tool.name);
+	let accepts_selection = !SOURCE_TOOLS.contains(&tool.name.as_ref());
+	let contains = |name: &str| arguments.is_some_and(|arguments| arguments.contains_key(name));
+	let provided = |name: &str| contains(name) || aliases.iter().any(|(alias, canonical)| *canonical == name && contains(alias));
+	let mut unknown: Vec<&str> = arguments
+		.into_iter()
+		.flat_map(|arguments| arguments.keys())
+		.filter(|name| {
+			!properties.contains_key(*name) && !aliases.iter().any(|(alias, _)| *alias == name.as_str()) && !(accepts_selection && name.as_str() == "attached")
+		})
+		.map(String::as_str)
+		.collect();
+	let required: Vec<&str> = tool
+		.input_schema
+		.get("required")
+		.and_then(Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(Value::as_str)
+		.collect();
+	let mut missing: Vec<&str> = required.iter().copied().filter(|name| !provided(name)).collect();
+	let position = arguments.and_then(|arguments| arguments.get("position")).and_then(Value::as_str);
+	let relative = matches!(position, Some("before" | "after"));
+	let absolute = position.is_none() || matches!(position, Some("start" | "end"));
+
+	match tool.name.as_ref() {
+		"insert_items" if relative && !provided("anchor") => missing.push("anchor"),
+		"insert_items" if absolute && !provided("parent") => missing.push("parent"),
+		"move_item" if relative && !provided("anchor") => missing.push("anchor"),
+		_ => {}
+	}
+
+	unknown.sort_unstable();
+	missing.sort_unstable();
+
+	if unknown.is_empty() && missing.is_empty() {
+		return Ok(());
+	}
+
+	let mut message = format!("invalid parameters for `{}`:", tool.name);
+
+	if !unknown.is_empty() {
+		write!(message, "\n- unknown: {}", unknown.join(", ")).unwrap();
+	}
+
+	if !missing.is_empty() {
+		write!(message, "\n- missing required: {}", missing.join(", ")).unwrap();
+	}
+
+	let mut accepted: BTreeSet<&str> = properties.keys().map(String::as_str).collect();
+
+	if accepts_selection {
+		accepted.insert("attached");
+	}
+
+	accepted.extend(aliases.iter().map(|(alias, _)| *alias));
+	writeln!(message, "\naccepted parameters: {}", accepted.into_iter().collect::<Vec<_>>().join(", ")).unwrap();
+
+	if !aliases.is_empty() {
+		writeln!(
+			message,
+			"aliases: {}",
+			aliases
+				.iter()
+				.map(|(alias, canonical)| format!("{alias} -> {canonical}"))
+				.collect::<Vec<_>>()
+				.join(", ")
+		)
+		.unwrap();
+	}
+
+	let mut example = serde_json::Map::new();
+
+	for name in required {
+		let value = properties
+			.get(name)
+			.map_or(Value::String("value".to_owned()), |schema| example_value(name, schema));
+
+		example.insert(name.to_owned(), value);
+	}
+
+	// Some constraints span several optional schema fields, so a required-fields-only example would still fail.
+	match tool.name.as_ref() {
+		"edit_item" => {
+			example.insert("old".to_owned(), Value::String("old text".to_owned()));
+			example.insert("new".to_owned(), Value::String("new text".to_owned()));
+		}
+
+		"insert_items" => {
+			example.insert("parent".to_owned(), Value::String("crate".to_owned()));
+		}
+
+		_ => {}
+	}
+
+	write!(message, "example arguments: {}", Value::Object(example)).unwrap();
+	Err(message)
+}
+
+/// A compact, valid-looking value for a required parameter in an error's example call.
+fn example_value(name: &str, schema: &Value) -> Value {
+	if let Some(value) = schema.get("default") {
+		return value.clone();
+	}
+
+	if let Some(value) = schema.get("enum").and_then(Value::as_array).and_then(|values| values.first()) {
+		return value.clone();
+	}
+
+	match schema.get("type").and_then(Value::as_str) {
+		Some("array") => Value::Array(vec![Value::String(
+			match name {
+				"paths" | "targets" => "crate::item",
+				_ => "value",
+			}
+			.to_owned(),
+		)]),
+
+		Some("boolean") => Value::Bool(false),
+		Some("integer" | "number") => Value::from(0),
+
+		_ => Value::String(
+			match name {
+				"manifest_path" => "/path/to/Cargo.toml",
+				"module" | "parent" => "crate",
+				"path" => "crate::item",
+				"pattern" => "*",
+				"source" => "fn example() {}",
+				"new_name" => "new_name",
+				_ => "value",
+			}
+			.to_owned(),
+		),
+	}
+}
+
 /// Slims a tool's input schema to what a model needs to call the tool (the schemas of every tool are sent with every
 /// request): no `$schema`, no defaults that say nothing (`false`, `null`, empty), no `null` types of optional
-/// parameters (leaving a parameter out is the same), no descriptions of [`SHARED_PARAMETERS`], and none of
-/// [`HIDDEN_PARAMETERS`]. [`INSTRUCTIONS`] describes those once; they are still accepted.
+/// parameters (leaving a parameter out is the same), and no descriptions of [`SHARED_PARAMETERS`].
 fn slim(tool: &mut Tool) {
 	let mut schema = (*tool.input_schema).clone();
 
 	schema.remove("$schema");
 
 	if let Some(Value::Object(properties)) = schema.get_mut("properties") {
-		properties.retain(|name, _| !HIDDEN_PARAMETERS.contains(&name.as_str()));
-
 		for (name, property) in properties.iter_mut() {
 			let Value::Object(property) = property else {
 				continue;
@@ -922,8 +1120,8 @@ fn sources_instructions(read_only: bool) -> String {
 
 	format!(
 		"\n\nOther workspaces and packages can be attached with attach_source (the path of their Cargo.toml, and a \
-		 name{write}), then named as any tool's `attached`, or made the default with use_source. Names last for the \
-		 session: list_sources lists them, detach_source frees one. Attachable are the directories that match \
+		 name{write}), then named as any tool's `attached`, or made the connection-wide default with use_source. Names \
+		 last until detach_source or this MCP connection ends: list_sources lists them. Attachable are the directories that match \
 		 (`*` within a path component, `**` across){writing}:"
 	)
 }

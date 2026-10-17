@@ -16,7 +16,7 @@ const KEYWORDS: &[&str] = &[
 
 /// Where a [`Selector`] may be written, for messages.
 const SELECTOR_PLACES: &str = "a selector (`[...]`) can only follow an `impl` header (`impl Foo[new]`), a qualifier \
-	(`<Foo>[2]::new`), or a macro name and `!` (`m::name![2]`)";
+	(`<Foo>[2]::new`), a macro name and `!` (`m::name![2]`), or an import path (`use m::Name[2]`)";
 
 /// Where a path starts.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Hash, Serialize)]
@@ -108,11 +108,40 @@ pub struct CanonicalPath {
 	/// For an `impl` block (and the items of a trait `impl`) whose path names other blocks too (like several `impl Foo`
 	/// blocks): which one, displayed after the `impl` header (`impl my_crate::Foo[new]`,
 	/// `<my_crate::Foo as Tr>[2]::f`), so that the path names it alone. For a macro invocation: its index among those
-	/// of the same macro in its module (`my_crate::a::commands![2]`), when there are several.
+	/// of the same macro in its module (`my_crate::a::commands![2]`), when there are several. For an import: its index
+	/// among imports with the same `use` path (`use my_crate::a::Name[2]`).
 	pub selector: Option<Selector>,
 }
 
 impl CanonicalPath {
+	/// A path accepted by [`ItemPath`] that names this item when one can be written.
+	///
+	/// Most canonical paths already use the input syntax. Items of an `impl` whose self type is not a loaded item
+	/// are displayed with an informative pseudo-segment (`crate::m::<impl Type>::item`); for input, this returns the
+	/// equivalent qualifier (`<Type>::item`) or `impl` header.
+	pub fn input_path(&self) -> String {
+		let Some(self_ty) = &self.unresolved_self_ty else {
+			return self.to_string();
+		};
+		let selector = self.selector.as_ref().map(ToString::to_string).unwrap_or_default();
+
+		if self.is_impl {
+			return match &self.impl_trait {
+				Some(trait_text) => format!("impl {trait_text} for {self_ty}{selector}"),
+				None => format!("impl {self_ty}{selector}"),
+			};
+		}
+
+		let qualifier = match &self.impl_trait {
+			Some(trait_text) => format!("<{self_ty} as {trait_text}>{selector}"),
+			None => format!("<{self_ty}>{selector}"),
+		};
+		let name = self.name.as_deref().unwrap_or_default();
+		let raw = (is_keyword(name) && !is_unrawable(name)).then_some("r#").unwrap_or_default();
+
+		format!("{qualifier}::{raw}{name}")
+	}
+
 	/// The path for messages that list several items: its [`Display`](std::fmt::Display), except that an item of an
 	/// inherent `impl` whose type has generic arguments shows them, as a path naming it (`<my_crate::Wrapper<u8>>::get`):
 	/// the items of `impl Wrapper<u8>` and `impl Wrapper<u16>` have the same path otherwise.
@@ -230,6 +259,8 @@ impl std::fmt::Display for CanonicalPath {
 		if self.is_macro_call {
 			f.write_str("!")?;
 			write_selector(f, self.selector.as_ref())?;
+		} else if self.is_import {
+			write_selector(f, self.selector.as_ref())?;
 		}
 
 		Ok(())
@@ -247,9 +278,9 @@ impl std::fmt::Display for CanonicalPath {
 /// - a [`Selector`] in brackets after an `impl` header or a qualifier (`impl Foo[new]`, `<Foo as Tr>[2]::f`) names
 ///   one of the `impl` blocks it names. `[` never starts or continues a type in these paths (slice and array types
 ///   can only appear inside generic arguments), so the brackets after the header are always a selector;
-/// - `use [::]segment(::segment)*`: the imports (leaves of `use` items) of the module named by all but the last
+/// - `use [::]segment(::segment)*[index]`: the imports (leaves of `use` items) of the module named by all but the last
 ///   segment that bind the last segment, which may be `*` (glob imports) or `_` (underscore imports). Other paths go
-///   through imports to what they import;
+///   through imports to what they import. An index selects one of several matching imports;
 /// - `[::]segment(::segment)*.field`: a field of the structs, unions, or variants the plain path names, by its name
 ///   or, in a tuple struct or variant, its index (`crate::Point.x`, `crate::Pair.0`, `Shape::Circle.radius`). A named
 ///   field may also be written `Type::name` when the type has no associated item (or variant) of that name;
@@ -301,7 +332,8 @@ pub struct ItemPath {
 	#[serde(skip_serializing_if = "std::ops::Not::not")]
 	pub macro_call: bool,
 
-	/// For a macro invocation path: which of the invocations it names ([`Selector::Index`], `m::name![2]`).
+	/// For a macro invocation or import path: which one it names ([`Selector::Index`], `m::name![2]`,
+	/// `use m::Name[2]`).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub selector: Option<Selector>,
 }
@@ -414,6 +446,8 @@ impl std::fmt::Display for ItemPath {
 
 		if self.macro_call {
 			f.write_str("!")?;
+			write_selector(f, self.selector.as_ref())?;
+		} else if self.import {
 			write_selector(f, self.selector.as_ref())?;
 		}
 
@@ -673,7 +707,7 @@ impl<'a> Parser<'a> {
 	/// An identifier that is not an anchor keyword (or `*` or `_` ending a `use` path).
 	fn parse_segment(&mut self, expected: &str) -> Result<SmolStr, String> {
 		let token = self.bump();
-		let last_of_use = self.import_name && self.peek().is_none();
+		let last_of_use = self.import_name && matches!(self.peek(), None | Some(Token::Selector(_)));
 
 		match token {
 			Some(Token::Star) if last_of_use => Ok("*".into()),
@@ -727,6 +761,12 @@ impl<'a> Parser<'a> {
 		}
 
 		path.import = true;
+		path.selector = self.parse_selector()?;
+
+		if path.selector.as_ref().is_some_and(|selector| !matches!(selector, Selector::Index(_))) {
+			return Err("only an index selects one of several imports: `use crate::m::Name[2]`".to_owned());
+		}
+
 		Ok(path)
 	}
 
@@ -760,8 +800,8 @@ pub struct Qualifier {
 }
 
 /// Which one of several `impl` blocks a path names, written in brackets after the `impl` header or qualifier
-/// (`impl Tools[add_bots]`, `impl Tools[#tool_router]`, `<Tools>[2]::new`), or which of several macro invocations
-/// (`m::commands![2]`, only by index). It picks among the blocks (or invocations) that the path names without it.
+/// (`impl Tools[add_bots]`, `impl Tools[#tool_router]`, `<Tools>[2]::new`), or which of several macro invocations or
+/// imports (`m::commands![2]`, `use m::Name[2]`, only by index). It picks among the items the path names without it.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "kind", content = "value")]
 pub enum Selector {
@@ -1290,6 +1330,8 @@ mod tests {
 		};
 
 		assert_eq!(unresolved.to_string(), "my_crate::a::<impl Trait for Vec<u8>>::method");
+		assert_eq!(unresolved.input_path(), "<Vec<u8> as Trait>::method");
+		assert_eq!(ItemPath::parse(&unresolved.input_path()).unwrap().to_string(), "<Vec<u8> as Trait>::method");
 		assert_eq!(
 			CanonicalPath {
 				is_impl: true,
@@ -1306,6 +1348,7 @@ mod tests {
 		};
 
 		assert_eq!(unresolved_inherent.to_string(), "my_crate::a::<impl Vec<u8>>::method");
+		assert_eq!(unresolved_inherent.input_path(), "<Vec<u8>>::method");
 		assert_eq!(
 			CanonicalPath {
 				is_impl: true,
@@ -1595,6 +1638,12 @@ mod tests {
 			(Anchor::Crate, ["a", "B"].map(SmolStr::new).as_slice())
 		);
 		assert_eq!(parse("use a::*").segments.last().unwrap(), "*");
+		assert_eq!(parse("use a::B[2]").selector, Some(Selector::Index(2)));
+		assert_eq!(parse("use a::B[2]").to_string(), "use a::B[2]");
+		assert_eq!(
+			parse_error("use a::B[name]"),
+			"only an index selects one of several imports: `use crate::m::Name[2]`"
+		);
 		assert_eq!(parse("use a::_").segments.last().unwrap(), "_");
 		assert!(!parse("crate::a::B").import);
 	}
@@ -1768,13 +1817,12 @@ mod tests {
 		assert_eq!(parse_error("x![0]"), "selector indexes start at 1");
 
 		// selectors
-		let places = "a selector (`[...]`) can only follow an `impl` header (`impl Foo[new]`), a qualifier (`<Foo>[2]::new`), or a \
-		              macro name and `!` (`m::name![2]`)";
+		let places = "a selector (`[...]`) can only follow an `impl` header (`impl Foo[new]`), a qualifier (`<Foo>[2]::new`), a \
+		              macro name and `!` (`m::name![2]`), or an import path (`use m::Name[2]`)";
 
 		assert_eq!(parse_error("crate::Foo[2]"), places);
 		assert_eq!(parse_error("<Foo>::new[2]"), places);
 		assert_eq!(parse_error("impl Foo[1][2]"), places);
-		assert_eq!(parse_error("use a::b[1]"), places);
 		assert_eq!(parse_error("<Foo[1] as Tr>"), "expected `as` or `>`, found `[1]`");
 		assert_eq!(parse_error("impl Foo[1"), "expected `]` to close the selector");
 		assert_eq!(parse_error("impl Foo[0]"), "selector indexes start at 1");

@@ -103,10 +103,40 @@ fn check(line: &[u8]) -> Option<String> {
 	if quoted.len() < text.len() {
 		quoted.push_str("...");
 	}
+	let tab_hint = has_literal_tab_in_string(line)
+		.then_some("; a tab inside a JSON string must be escaped as `\\t`")
+		.unwrap_or_default();
 
 	Some(format!(
-		"rscode mcp: ignored a line of input that is not JSON ({error}), so nothing answers it: {quoted}"
+		"rscode mcp: ignored a line of input that is not JSON ({error}){tab_hint}, so nothing answers it: {quoted}"
 	))
+}
+
+/// Whether a literal tab occurs between JSON string quotes (rather than as valid whitespace between JSON tokens).
+/// This intentionally only diagnoses the common transport mistake; [`serde_json`] remains the authority on syntax.
+fn has_literal_tab_in_string(line: &[u8]) -> bool {
+	let mut in_string = false;
+	let mut escaped = false;
+
+	for &byte in line {
+		if !in_string {
+			in_string = byte == b'"';
+			continue;
+		}
+
+		if escaped {
+			escaped = false;
+		} else {
+			match byte {
+				b'\\' => escaped = true,
+				b'"' => in_string = false,
+				b'\t' => return true,
+				_ => {}
+			}
+		}
+	}
+
+	false
 }
 
 #[cfg(test)]
@@ -180,5 +210,18 @@ mod tests {
 		assert_eq!(reports.len(), 1, "{reports:?}");
 		assert!(reports[0].starts_with("rscode mcp: ignored a line of input that is not JSON (key must be a string"));
 		assert!(reports[0].ends_with("so nothing answers it: {this is not json"), "{}", reports[0]);
+	}
+
+	#[tokio::test]
+	async fn explains_literal_tabs_in_json_strings() {
+		let (_, reports) = read(&[b"{\"old\":\"a\tb\"}\n"]).await;
+
+		assert_eq!(reports.len(), 1);
+		assert!(reports[0].contains("a tab inside a JSON string must be escaped as `\\t`"), "{}", reports[0]);
+
+		let (_, reports) = read(&[b"{\tbad}\n"]).await;
+
+		assert_eq!(reports.len(), 1);
+		assert!(!reports[0].contains("tab inside a JSON string"), "{}", reports[0]);
 	}
 }

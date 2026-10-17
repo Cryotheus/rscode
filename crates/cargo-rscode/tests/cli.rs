@@ -868,6 +868,29 @@ fn sorts_items() {
 }
 
 #[test]
+fn skip_children_sorts_inline_modules_but_not_child_files() {
+	let copy = TempCopy::with_files(
+		"sort-skip-children",
+		&[
+			("Cargo.toml", "[package]\nname = \"skip-children\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+			(
+				"src/lib.rs",
+				"pub mod m {\n\tpub fn b() {}\n\tpub fn a() {}\n\n\tpub mod inline {\n\t\tpub fn d() {}\n\t\tpub fn c() {}\n\t}\n\n\tpub mod child;\n}\n",
+			),
+			("src/m/child.rs", "pub fn d() {}\npub fn c() {}\n"),
+		],
+	);
+	let sorted = run(copy.path(), &["sort", "--skip-children", "crate::m"]).success();
+	let lib = copy.read("src/lib.rs");
+	let child = copy.read("src/m/child.rs");
+
+	assert_eq!(sorted.stdout, native("sorted src/lib.rs\n"));
+	assert!(lib.find("fn a").unwrap() < lib.find("fn b").unwrap(), "{lib}");
+	assert!(lib.find("fn c").unwrap() < lib.find("fn d").unwrap(), "{lib}");
+	assert!(child.find("fn d").unwrap() < child.find("fn c").unwrap(), "{child}");
+}
+
+#[test]
 fn previews_renames() {
 	let lib = read_fixture("src/lib.rs");
 	let rename = run(&fixture(), &["rename", "crate::add", "sum", "--dry-run"]).success();
@@ -1319,8 +1342,11 @@ fn creates_modules() {
 
 	assert!(dry.stdout.contains(new_file), "{}", dry.stdout);
 	assert!(dry.stdout.contains("\n+mod render;\n pub mod shapes;\n"), "{}", dry.stdout);
-	assert!(dry.stdout.ends_with("create src/render.rs\n"), "{}", dry.stdout);
-	assert_eq!(dry.stderr, native("would create src/render.rs; would insert `mod render;` into crate (src/lib.rs:3)\n"));
+	assert!(dry.stdout.ends_with(&native("create src/render.rs\n")), "{}", dry.stdout);
+	assert_eq!(
+		dry.stderr,
+		native("would create src/render.rs; would insert `mod render;` into crate (src/lib.rs:3)\n")
+	);
 	assert!(!copy.path().join("src/render.rs").exists());
 
 	let args = ["create-module", "crate", "render", "-", "--lib", "--vis", "pub"];

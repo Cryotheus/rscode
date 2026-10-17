@@ -13,7 +13,7 @@ It comes as:
 | crate                                 | what                                                                                                              |
 |---------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | [`cargo-rscode`](crates/cargo-rscode) | the `cargo rscode` command, which also serves the Model Context Protocol (`cargo rscode mcp`) for AI agents       |
-| [`rscode`](crates/rscode)             | the library: loading, name resolution, find, view, rename, remove, replace, insert, format                        |
+| [`rscode`](crates/rscode)             | the library: loading, name resolution, find, view, rename, remove, move, replace, insert, format                  |
 | [`rscode_fmt`](crates/rscode_fmt)     | formatting of whole files or single items with rustfmt or prettyplease                                            |
 | [`rscode_sort`](crates/rscode_sort)   | deterministic sorting of items (the "Cryotheum" ordering), usable on its own, e.g. for generated `bindgen` output |
 
@@ -75,7 +75,7 @@ suggestions. `cargo rscode <subcommand> --help` documents everything.
 | `impl Type[name]`       | one of several `impl` blocks with one header: with item `name`, attribute `[#attr]`, `[2]` |
 | `Type.field`            | a field (`Tuple.0`, `Enum::Variant.field`; `Type::field` when nothing else has that name)  |
 | `m::name!`              | the invocations of the macro `name` in `m` (`name![2]`: the second)                        |
-| `use m::Name`           | the imports of `m` that bind `Name` (`use m::*`: glob imports, `use m::_`: `as _` imports) |
+| `use m::Name`           | imports binding `Name` (`use m::Name[2]`: second match; `use m::*`: glob; `use m::_`: `as _`) |
 
 Paths go through imports and re-exports to what they import. To name an import itself, use its `use` path, quoted as
 one argument (`cargo rscode remove 'use crate::bindings::ItemOrder'`), which is how `find --imports` prints imports.
@@ -123,17 +123,17 @@ is separated from its neighbours by a blank line; code under `#[rustfmt::skip]` 
 ## MCP server (for AI agents)
 
 `cargo rscode mcp` serves the same operations as tools over stdio: `workspace_info`, `find_items`, `view_items`,
-`find_references`, and the editing tools `rename_item`, `remove_items`, `replace_item`, `edit_item`, `insert_items`,
-`create_module`, `add_import`, and `format_items` (`--read-only` leaves them out). The workspace is reloaded for every
-call, so edits made by other tools are always seen, and editing tools support `dry_run` to return a diff instead of
+`find_references`, and the editing tools `rename_item`, `move_item`, `remove_items`, `replace_item`, `edit_item`,
+`insert_items`, `create_module`, `add_import`, and `format_items` (`--read-only` leaves them out). `format_items`
+formats by default and only sorts when `sort: true`; a missing target defaults to `crate`. The workspace is reloaded
+for every call, so edits made by other tools are always seen, and editing tools support `dry_run` to return a diff instead of
 writing. With `--expose`, clients can also attach other workspaces and packages by name (`attach_source`,
 `detach_source`, `list_sources`, `use_source`); see below.
 
 The server is built to cost a model fewer tokens than reading and editing files directly: `edit_item` sends only the
 changed text (or a new visibility, doc comment, or attribute), `add_import` and `insert_items` take only the new
-lines, views number their lines only when they are not consecutive and outline a module's imports as `use ...;`, and
-the tool schemas are kept small (the rarely used selection parameters are described once in the server's
-instructions rather than in every tool).
+lines, and views number their lines only when they are not consecutive and outline a module's imports as `use ...;`.
+Tool schemas expose every accepted selection parameter, and parameter errors list unknown and missing names together.
 
 Claude Code:
 
@@ -195,17 +195,19 @@ their `Cargo.toml` (or its directory) and a name of their choice, and then pass 
   matching a `write` pattern, even when they reach elsewhere (through `#[path]` attributes or other workspace
   members). Sources attached read-only can still be previewed with `dry_run`. Reading is not confined the same way:
   a source is loaded like cargo loads it, including its other workspace members and `#[path]` files.
-- Names are scoped to the client that attached them. Over stdio each client has its own server process, so clients
+- Names are scoped to one live MCP connection. Over stdio each client normally has its own server process, so clients
   never see or break each other's names. Attaching checks that cargo can plan loading the source (so it fails for
   manifests cargo rejects), and then only records the name: every tool call loads its source from disk anyway.
   A name keeps its source until `detach_source` forgets it: attaching under a taken name changes nothing and answers
   with what the name has (a read-only request never replaces a writable attachment, and says that a writable one is
   active), except that attaching the same `Cargo.toml` for writing makes a read-only attachment writable.
-  `list_sources` shows the attached sources and the exposed directories.
+  `list_sources` shows the attached sources and the exposed directories. A reconnect creates a new connection, so its
+  sources must be attached again.
 - The server's own workspace (`--manifest-path`, or the one containing the working directory) remains the default
   when a tool call names no `attached` source, unless `use_source` (or `attach_source` with `use`) makes an attached
-  source the default for the session. `--expose` does not restrict edits of the server's own workspace, like on the
-  command line.
+  source the connection-wide default. That default is shared by every caller using the connection; concurrent agent
+  workflows should pass `attached` explicitly on each call. `--expose` does not restrict edits of the server's own
+  workspace, like on the command line.
 
 ## Shell completion
 

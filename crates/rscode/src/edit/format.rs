@@ -147,8 +147,9 @@ pub struct FmtOptions {
 	/// the sorting options say, so that formatting after sorting (and sorting after formatting) changes nothing.
 	pub format: FormatOptions,
 
-	/// Only process the targeted items themselves: child modules are neither sorted nor (when out-of-line)
-	/// formatted.
+	/// Do not add the files of out-of-line child modules to the formatting plan.
+	///
+	/// Inline child modules remain part of a targeted item or file and follow the formatter's sorting options.
 	pub skip_children: bool,
 
 	/// Only process `cfg` variants that are not definitely disabled.
@@ -273,10 +274,6 @@ fn format_file(file: &FileTargets<'_>, options: &FmtOptions) -> Result<String, F
 	if let Some(sort) = &mut format.sort {
 		// `use` items are sorted like rustfmt sorts them, so that neither undoes what the other did
 		sort.style_edition = format.rustfmt.style_edition_in_effect().into();
-
-		if options.skip_children {
-			sort.recursive = false;
-		}
 	}
 
 	Formatter::new(format).format_items(file.file.text(), &file.targets)

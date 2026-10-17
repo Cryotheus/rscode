@@ -10,13 +10,14 @@
 //! | `view_items` | the source (or an outline) of items by path, numbered where its lines are not consecutive |
 //! | `find_references` | the references to an item, by file, with the item and line of code of each |
 //! | `rename_item` | renames an item and updates the references to it across the workspace |
+//! | `move_item` | moves an item before or after a sibling, or to the start or end of its existing container |
 //! | `remove_items` | removes items with their attached comments (and out-of-line module files) |
 //! | `replace_item` | replaces the source of an item |
 //! | `edit_item` | replaces exact text inside an item, and sets its visibility, doc comment, or attributes |
 //! | `insert_items` | inserts items into a module, `impl` block, or trait |
 //! | `create_module` | creates a module's file and declares it in its parent |
 //! | `add_import` | imports into a module: new `use` items in sorted position, or merged into its `use` items |
-//! | `format_items` | sorts and formats items with rustfmt or prettyplease |
+//! | `format_items` | formats items with rustfmt or prettyplease, optionally sorting first |
 //! | `attach_source` | attaches another workspace or package under a name (with [`ServerOptions::exposed`]) |
 //! | `detach_source` | forgets an attached source |
 //! | `list_sources` | the attached sources, the server's own workspace, and the exposed directories |
@@ -28,9 +29,9 @@
 //! returns a unified diff instead of writing. With [`ServerOptions::read_only`], the editing tools are not offered.
 //!
 //! Every request carries the tool schemas, so they are kept small: they leave out `$schema`, defaults that say nothing
-//! (`false`, empty), and the selection parameters other than `packages`, and the parameters that tools share are
-//! described once in the server's instructions. A path that names nothing in the selected packages is looked up in
-//! the other workspace members when the call names no packages, and suggestions follow when it still names nothing.
+//! (`false`, empty), and descriptions of parameters that the server instructions explain once. A path that names
+//! nothing in the selected packages is looked up in the other workspace members when the call names no packages, and
+//! suggestions follow when it still names nothing.
 //!
 //! # Sources
 //!
@@ -38,8 +39,9 @@
 //! ([`ServerOptions::exposed`]), on the cargo workspaces and packages in them that a client attaches: `attach_source`
 //! takes the path of a `Cargo.toml` whose directory an [`Exposure`] matches, a name, and whether the client needs to
 //! write. The tools then take that name as `attached`; `use_source` (or `attach_source` with `use`) makes a source the
-//! one that calls without `attached` work on, for the rest of the session (an empty `attached` still names the server's
-//! own workspace). A source can only be attached for writing where it is exposed
+//! one that calls without `attached` work on, for the rest of the connection (an empty `attached` still names the
+//! server's own workspace). This default is connection-wide, so concurrent callers should pass `attached` explicitly.
+//! A source can only be attached for writing where it is exposed
 //! for writing, and edits of attached sources are only written below directories exposed for writing, however the
 //! edit reaches them (for example through `#[path]` attributes or other workspace members); edits of the server's own
 //! workspace are not restricted. Sources attached read-only can still be previewed with `dry_run`. Without exposed
@@ -49,9 +51,10 @@
 //! members and the files its `#[path]` attributes name can be read too. With [`LoadOptions::exact_features`], cargo
 //! may update its cache of rustc's output in a source's target directory, like `cargo metadata` does.
 //!
-//! Names belong to a session (a connection): over stdio, a server has exactly one client, and clients do not see
-//! (or break) each other's names. Attaching is cheap, since it only records the name for the canonical path of the
-//! `Cargo.toml` (after checking that cargo can plan loading it); every call loads its source anyway.
+//! Names belong to one live connection: over stdio, a server has exactly one client, and clients do not see (or break)
+//! each other's names. Reconnecting starts with no attachments. Attaching is cheap, since it only records the name for
+//! the canonical path of the `Cargo.toml` (after checking that cargo can plan loading it); every call loads its source
+//! anyway.
 //!
 //! A name keeps its source until `detach_source` forgets it, since clients work on a source by its name. Attaching
 //! under a taken name changes nothing, and the response says what the name has: an ordinary result when it is the same
@@ -86,6 +89,7 @@ use futures::future::Either;
 use input::CheckedInput;
 use rmcp::RoleServer;
 use rmcp::ServiceExt;
+use rmcp::service::QuitReason;
 use rmcp::service::ServerInitializeError;
 use rmcp::transport::IntoTransport;
 use server::Server;
@@ -162,6 +166,17 @@ fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> ErrorKind {
 		.map_or(ErrorKind::Other, std::io::Error::kind)
 }
 
+/// Classifies why a running session stopped. A join failure may be returned either by awaiting the service task or
+/// inside rmcp's [`QuitReason`]; neither is a clean disconnect.
+fn session_stopped(stopped: Result<QuitReason, tokio::task::JoinError>) -> Result<(), Error> {
+	match stopped {
+		Ok(QuitReason::Closed) => Ok(()),
+		Ok(QuitReason::Cancelled) => Ok(()),
+		Ok(QuitReason::JoinError(error)) | Err(error) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {error}"))),
+		Ok(reason) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {reason:?}"))),
+	}
+}
+
 async fn run<T, E, A>(server: Server, transport: T) -> Result<(), Error>
 where
 	T: IntoTransport<RoleServer, E, A>,
@@ -179,10 +194,7 @@ where
 	// an edit may still be writing on its worker thread: let it finish before the process may exit
 	edits_finished(&edits, EDIT_GRACE_PERIOD).await;
 
-	match stopped {
-		Ok(_) => Ok(()),
-		Err(error) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {error}"))),
-	}
+	session_stopped(stopped)
 }
 
 /// Serves MCP over any transport of `rmcp` (for example a `(reader, writer)` pair of `tokio` I/O objects) until the

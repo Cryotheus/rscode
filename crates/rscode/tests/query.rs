@@ -1193,6 +1193,22 @@ fn suggests_what_paths_naming_nothing_meant() {
 	assert_eq!(suggest("crate::HELPER").similar, [helper]);
 	assert_eq!(suggest("crate::nothing"), rscode::query::Suggestions::default());
 	assert_eq!(suggest("use crate::helper"), rscode::query::Suggestions::default());
+
+	// An impl of an unresolved self type is suggested with accepted qualifier syntax, not its display-only
+	// `<impl ...>` pseudo-segment.
+	let mut unresolved = Workspace::new(fixture("resolve_basic"));
+	unresolved.load_crate(CrateSpec::new("resolve_basic", fixture("resolve_basic/src/lib.rs")));
+	unresolved.link();
+	let resolver = Resolver::new(&unresolved);
+	let suggestion = rscode::query::suggest(&resolver, &"Vec::area".parse().unwrap())
+		.similar
+		.into_iter()
+		.find(|path| path.starts_with("<Vec<T> as Shape>"))
+		.expect("the unresolved impl method is suggested");
+	let suggested = suggestion.parse().unwrap();
+
+	assert_eq!(suggestion, "<Vec<T> as Shape>::area");
+	assert!(!resolver.resolve_item_path(&suggested).is_empty());
 }
 
 #[test]

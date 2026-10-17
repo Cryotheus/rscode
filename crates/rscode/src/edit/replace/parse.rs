@@ -4,6 +4,7 @@
 //! [`ItemKind::Fn`] in a module and an [`ItemKind::AssocFn`] in an `impl` block), including syntax that `syn` only
 //! tokenizes (`Verbatim` items such as `fn f();` or `const trait T {}`).
 
+use crate::CfgExpr;
 use crate::Error;
 use crate::load::macro_entries::Entry;
 use crate::load::thread_local;
@@ -173,6 +174,9 @@ pub(super) struct NewBinding {
 pub(super) struct NewItem {
 	pub(super) kind: ItemKind,
 
+	/// The conjunction of the item's `cfg` attributes, when all of their predicates parse.
+	pub(super) cfg: Option<CfgExpr>,
+
 	/// The unraw'd name, `None` for unnamed items (and `_`).
 	pub(super) name: Option<SmolStr>,
 
@@ -189,6 +193,7 @@ impl NewItem {
 	fn unnamed(kind: ItemKind) -> Self {
 		Self {
 			kind,
+			cfg: None,
 			name: None,
 			bindings: Vec::new(),
 		}
@@ -204,7 +209,12 @@ impl NewItem {
 			})
 			.collect();
 
-		Self { kind, name, bindings }
+		Self {
+			kind,
+			cfg: None,
+			name,
+			bindings,
+		}
 	}
 }
 
@@ -317,6 +327,39 @@ fn has_cfg_attributes(text: &str) -> bool {
 	})
 }
 
+/// The conjunction of the outer `cfg` attributes in an item's tokens, when each predicate parses.
+fn cfg_expression(tokens: TokenStream) -> Option<CfgExpr> {
+	let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+	let mut expressions = Vec::new();
+
+	for pair in tokens.windows(2) {
+		let [TokenTree::Punct(pound), TokenTree::Group(attribute)] = pair else {
+			continue;
+		};
+
+		if pound.as_char() != '#' || attribute.delimiter() != Delimiter::Bracket {
+			continue;
+		}
+
+		let contents: Vec<TokenTree> = attribute.stream().into_iter().collect();
+		let [TokenTree::Ident(name), TokenTree::Group(predicate)] = contents.as_slice() else {
+			continue;
+		};
+
+		if name == "cfg" && predicate.delimiter() == Delimiter::Parenthesis {
+			expressions.push(CfgExpr::from_tokens(predicate.stream()).ok()?);
+		}
+	}
+
+	CfgExpr::all(expressions)
+}
+
+/// Adds the item's `cfg` predicate to its classification.
+fn with_cfg(mut item: NewItem, tokens: TokenStream) -> NewItem {
+	item.cfg = cfg_expression(tokens);
+	item
+}
+
 /// The unraw'd name of an identifier, `None` for `_`.
 fn ident_name(ident: &Ident) -> Option<SmolStr> {
 	let name = ident.unraw().to_string();
@@ -373,6 +416,7 @@ fn module_item(item: &Item) -> NewItem {
 
 		Item::ForeignMod(block) => NewItem {
 			kind: ItemKind::ExternBlock,
+			cfg: None,
 			name: None,
 			bindings: block.items.iter().flat_map(|item| foreign_item(item).bindings).collect(),
 		},
@@ -385,6 +429,7 @@ fn module_item(item: &Item) -> NewItem {
 			// the statics of a `thread_local!` are bound in the module, like the items of an `extern` block
 			_ => NewItem {
 				kind: ItemKind::MacroCall,
+				cfg: None,
 				name: None,
 				bindings: (thread_local::declarations(&item.mac).into_iter().flatten())
 					.flat_map(|declaration| NewItem::named(ItemKind::Static, &declaration.ident, VALUE).bindings)
@@ -411,6 +456,7 @@ fn module_item(item: &Item) -> NewItem {
 
 			NewItem {
 				kind: ItemKind::Use,
+				cfg: None,
 				name: None,
 				bindings,
 			}
@@ -471,7 +517,12 @@ fn parse_fields(text: &str) -> syn::Result<Parsed> {
 
 			let items = fields
 				.iter()
-				.map(|field| NewItem::with_name(ItemKind::Field, field.ident.as_ref().and_then(ident_name), &[]))
+				.map(|field| {
+					with_cfg(
+						NewItem::with_name(ItemKind::Field, field.ident.as_ref().and_then(ident_name), &[]),
+						field.to_token_stream(),
+					)
+				})
 				.collect();
 
 			Ok((items, end, trailing_comma))
@@ -481,9 +532,13 @@ fn parse_fields(text: &str) -> syn::Result<Parsed> {
 	parser(true).parse_str(text).or_else(|named| parser(false).parse_str(text).map_err(|_| named))
 }
 
-fn parse_list<T: Parse + ToTokens>(text: &str, classify: impl Fn(&T) -> NewItem) -> syn::Result<Parsed> {
+fn parse_list<T: Parse + ToTokens>(text: &str, classify: impl Fn(&T) -> NewItem, allow_inner_attributes: bool) -> syn::Result<Parsed> {
 	let parser = |input: ParseStream<'_>| {
-		reject_inner_attributes(input)?;
+		if allow_inner_attributes {
+			input.call(Attribute::parse_inner)?;
+		} else {
+			reject_inner_attributes(input)?;
+		}
 
 		let mut items = Vec::new();
 		let mut end = 0;
@@ -492,7 +547,7 @@ fn parse_list<T: Parse + ToTokens>(text: &str, classify: impl Fn(&T) -> NewItem)
 			let item: T = input.parse()?;
 
 			end = end_of(&item, end);
-			items.push(classify(&item));
+			items.push(with_cfg(classify(&item), item.to_token_stream()));
 		}
 
 		Ok((items, end, None))
@@ -506,29 +561,39 @@ fn parse_list<T: Parse + ToTokens>(text: &str, classify: impl Fn(&T) -> NewItem)
 /// Fails with [`Error::InvalidSource`] (with a location relative to `source`) when it does not parse, or when it has
 /// inner attributes (`#![...]`, `//!`), which would apply to the container.
 pub(super) fn parse_source(source: &str, container: Container) -> Result<ParsedSource, Error> {
-	crate::source::isolated(|| parse_source_here(source, container))
+	crate::source::isolated(|| parse_source_here(source, container, false))
+}
+
+/// Parses source inserted before the first item of a module, where leading inner attributes apply to that module.
+/// Other containers remain as strict as [`parse_source`].
+pub(super) fn parse_source_at_start(source: &str, container: Container) -> Result<ParsedSource, Error> {
+	crate::source::isolated(|| parse_source_here(source, container, container == Container::Module))
 }
 
 /// [`parse_source`] on the calling thread.
-fn parse_source_here(source: &str, container: Container) -> Result<ParsedSource, Error> {
+fn parse_source_here(source: &str, container: Container, allow_inner_attributes: bool) -> Result<ParsedSource, Error> {
 	let text = source.strip_prefix('\u{feff}').unwrap_or(source);
 
 	let parsed = match container {
-		Container::Module => parse_list(text, |item: &Item| module_item(item)),
-		Container::Impl => parse_list(text, |item: &ImplItem| impl_item(item)),
-		Container::Trait => parse_list(text, |item: &TraitItem| trait_item(item)),
-		Container::Extern => parse_list(text, |item: &ForeignItem| foreign_item(item)),
+		Container::Module => parse_list(text, |item: &Item| module_item(item), allow_inner_attributes),
+		Container::Impl => parse_list(text, |item: &ImplItem| impl_item(item), allow_inner_attributes),
+		Container::Trait => parse_list(text, |item: &TraitItem| trait_item(item), allow_inner_attributes),
+		Container::Extern => parse_list(text, |item: &ForeignItem| foreign_item(item), allow_inner_attributes),
 		Container::Enum => parse_variants(text),
 		Container::Fields => parse_fields(text),
 
-		Container::ThreadLocal => parse_list(text, |declaration: &Declaration| {
-			NewItem::named(ItemKind::Static, &declaration.ident, VALUE)
-		}),
+		Container::ThreadLocal => parse_list(
+			text,
+			|declaration: &Declaration| NewItem::named(ItemKind::Static, &declaration.ident, VALUE),
+			allow_inner_attributes,
+		),
 
 		// (entries are bound nowhere)
-		Container::Entries => parse_list(text, |entry: &Entry| {
-			NewItem::with_name(ItemKind::Static, ident_name(&entry.ident), &[])
-		}),
+		Container::Entries => parse_list(
+			text,
+			|entry: &Entry| NewItem::with_name(ItemKind::Static, ident_name(&entry.ident), &[]),
+			allow_inner_attributes,
+		),
 	};
 
 	let (items, end, trailing_comma) = parsed.map_err(|error| invalid_source(&error, text, container))?;
@@ -569,7 +634,11 @@ fn parse_variants(text: &str) -> syn::Result<Parsed> {
 			end = comma.start;
 		}
 
-		Ok((variants.iter().map(variant).collect(), end, trailing_comma))
+		Ok((
+			variants.iter().map(|item| with_cfg(variant(item), item.to_token_stream())).collect(),
+			end,
+			trailing_comma,
+		))
 	};
 
 	parser.parse_str(text)
@@ -973,5 +1042,19 @@ mod tests {
 
 		// a byte order mark does not count as a column
 		assert!(error("\u{feff}fn 1() {}", Container::Module).contains("at 1:4:"));
+	}
+
+	#[test]
+	fn allows_inner_attributes_only_at_the_start_of_modules() {
+		let source = "//! docs\n#![allow(dead_code)]\nfn f() {}";
+		let parsed = parse_source_at_start(source, Container::Module).unwrap();
+
+		assert_eq!(parsed.text, source);
+		assert_eq!(parsed.items.len(), 1);
+		assert_eq!(parsed.items[0].kind, ItemKind::Fn);
+		assert_eq!(parsed.items[0].name.as_deref(), Some("f"));
+
+		assert!(matches!(parse_source(source, Container::Module), Err(Error::InvalidSource(_))));
+		assert!(matches!(parse_source_at_start(source, Container::Impl), Err(Error::InvalidSource(_))));
 	}
 }

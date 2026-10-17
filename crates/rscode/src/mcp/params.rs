@@ -1,8 +1,8 @@
 //! Tool parameters: what clients send, their JSON schemas, and their conversion into library options.
 //!
 //! Every field's doc comment becomes its description in the tool's input schema, which is what a model reads to
-//! call the tool. Parameters are lenient: unknown fields are ignored, and a single string is accepted where a list
-//! of strings is expected.
+//! call the tool. The server rejects unknown top-level call parameters before deserializing these types. A single
+//! string is accepted where a list of strings is expected.
 
 use crate::ItemKind;
 use crate::edit::CreateModuleOptions;
@@ -86,7 +86,8 @@ pub(crate) struct CreateModuleParams {
 	pub(crate) name: String,
 
 	/// The file's contents (may be empty, and may start with `//!` docs).
-	#[serde(default)]
+	/// `content` is accepted as an alias.
+	#[serde(default, alias = "content")]
 	pub(crate) source: String,
 
 	/// Its visibility (`pub`, `pub(crate)`, ...); private when empty.
@@ -124,11 +125,12 @@ pub(crate) struct EditItemParams {
 	/// The item; `use crate::a::Name` edits an import's `use` item.
 	pub(crate) path: String,
 
-	/// Exact text to replace, as view_items prints it (line numbers optional); must occur once in the item.
+	/// Exact text to replace, as view_items prints it (line numbers optional); must occur once in the item. In JSON,
+	/// write a hard tab as `\t` rather than as a literal control character.
 	#[serde(default)]
 	pub(crate) old: Option<String>,
 
-	/// What replaces `old` ("" deletes it).
+	/// What replaces `old` ("" deletes it). In JSON, write a hard tab as `\t`.
 	#[serde(default)]
 	pub(crate) new: Option<String>,
 
@@ -278,20 +280,21 @@ impl FindParams {
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct FormatParams {
 	/// Path patterns: `crate` (every loaded crate), modules (their files), or other items (formatted in place). Globs
-	/// work.
-	#[serde(default = "crate_root", deserialize_with = "string_list")]
+	/// work. With no targets the default is `crate`; give item or module paths for a scoped check. `paths` is accepted
+	/// as an alias.
+	#[serde(default = "crate_root", alias = "paths", deserialize_with = "string_list")]
 	pub(crate) targets: Vec<String>,
 
 	/// `rustfmt` (honors rustfmt.toml), `prettyplease` (drops non-doc comments, so refuses unless
-	/// `allow_comment_loss`), or `none` (only sort).
+	/// `allow_comment_loss`), or `none` (skip formatting; then `sort` must be true).
 	#[serde(default)]
 	pub(crate) formatter: Formatter,
 
-	/// Sort items first (Cryotheum order: by kind, then name).
-	#[serde(default = "yes")]
+	/// Also sort items first (Cryotheum order: by kind, then name). Formatting alone is the default.
+	#[serde(default)]
 	pub(crate) sort: bool,
 
-	/// Leave child modules' files alone.
+	/// Leave out-of-line child modules' files alone. Inline child modules in a selected file are still formatted.
 	#[serde(default)]
 	pub(crate) skip_children: bool,
 
@@ -313,7 +316,7 @@ impl FormatParams {
 			return Err("nothing to do: `formatter` is `none` and `sort` is false".to_owned());
 		}
 
-		let sort = self.sort.then(|| SortOptions::new().recursive(!self.skip_children));
+		let sort = self.sort.then(SortOptions::new);
 
 		Ok(FmtOptions {
 			format: FormatOptions::new()
@@ -363,6 +366,7 @@ pub(crate) struct InsertParams {
 	pub(crate) parent: Option<String>,
 
 	/// The items, with their docs and attributes.
+	#[serde(alias = "content")]
 	pub(crate) source: String,
 
 	/// `end`, `start` (after inner attributes and `//!` docs), or `before`/`after` the `anchor`.
@@ -434,7 +438,7 @@ pub(crate) enum Mode {
 	Outline,
 }
 
-/// Where `insert_items` inserts.
+/// Where `insert_items` inserts or `move_item` moves an item.
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "snake_case")]
@@ -444,6 +448,52 @@ pub(crate) enum Position {
 	Start,
 	Before,
 	After,
+}
+
+/// Parameters of `move_item`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct MoveParams {
+	/// The sibling item to reorder, including variants with directly complementary `cfg` predicates such as `X` and
+	/// `not(X)`. Imports, fields, enum variants, macro definitions/invocations and their entries, `#[macro_use]` items,
+	/// out-of-line module declarations, and cross-container moves are not supported. Ordinary items cannot cross a
+	/// direct-sibling macro definition, item-position macro invocation, or `#[macro_use]` item.
+	pub(crate) path: String,
+
+	/// `end` (the default), `start`, or `before`/`after` the sibling `anchor` in the same container.
+	#[serde(default)]
+	pub(crate) position: Position,
+
+	/// The sibling for `before`/`after`; omit it for `start` or `end`.
+	#[serde(default)]
+	pub(crate) anchor: Option<String>,
+
+	/// Write nothing: return the summary and a unified diff of the changes.
+	#[serde(default, alias = "dryRun", alias = "dry-run", alias = "check")]
+	pub(crate) dry_run: bool,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
+}
+
+impl MoveParams {
+	/// The destination, checked before anything is loaded.
+	pub(crate) fn position(&self) -> Result<InsertPosition, String> {
+		let anchor = self.anchor.as_deref().map(str::trim).filter(|anchor| !anchor.is_empty());
+
+		match (self.position, anchor) {
+			(Position::End, None) => Ok(InsertPosition::End),
+			(Position::Start, None) => Ok(InsertPosition::Start),
+			(Position::Before, Some(anchor)) => Ok(InsertPosition::Before(anchor.to_owned())),
+			(Position::After, Some(anchor)) => Ok(InsertPosition::After(anchor.to_owned())),
+
+			(Position::Before | Position::After, None) => {
+				Err("`anchor` (the path of a sibling item) is required with position `before` and `after`".to_owned())
+			}
+
+			(Position::End | Position::Start, Some(_)) => Err("`anchor` is only used with position `before` or `after`".to_owned()),
+		}
+	}
 }
 
 /// Parameters of `find_references`.
@@ -588,7 +638,9 @@ pub(crate) struct ReplaceParams {
 	/// The item; `use crate::a::Name` replaces an import's `use` item.
 	pub(crate) path: String,
 
-	/// The item's complete new source, with its docs and attributes.
+	/// The item's complete new source, including every doc comment and attribute to keep; omissions remove them. When
+	/// `all_variants` replaces several cfg variants and this source has no cfg, each variant keeps its existing
+	/// `cfg`/`cfg_attr` attributes.
 	pub(crate) source: String,
 
 	/// Allow another kind of item, or several items.
@@ -626,7 +678,7 @@ impl ReplaceParams {
 #[schemars(crate = "rmcp::schemars")]
 #[serde(default)]
 pub(crate) struct Selection {
-	/// The attached source to work on (see `attach_source`), instead of the session's default.
+	/// The attached source to work on (see `attach_source`), instead of the connection-wide default.
 	pub(crate) attached: Option<String>,
 
 	/// Packages to load (cargo package specs).
@@ -634,6 +686,7 @@ pub(crate) struct Selection {
 	pub(crate) packages: Vec<String>,
 
 	/// Load every workspace member.
+	#[serde(default, deserialize_with = "string_boolean")]
 	pub(crate) workspace: bool,
 
 	/// Features to enable, in addition to the server's (`feature` or `package/feature`).
@@ -641,13 +694,17 @@ pub(crate) struct Selection {
 	pub(crate) features: Vec<String>,
 
 	/// Enable all features.
+	#[serde(default, deserialize_with = "string_boolean")]
 	pub(crate) all_features: bool,
 
-	/// Also load examples, tests, and benches (not only libraries and binaries).
+	/// Also load separate example, integration-test, and bench targets (not only libraries and binaries). Unit-test
+	/// modules written in a selected library or binary's source are already loaded, even when inactive under cfg(test).
+	#[serde(default, deserialize_with = "string_boolean")]
 	pub(crate) all_targets: bool,
 
 	/// Load the library of each selected package, and no binaries unless named in `bin`. Selects the library when
 	/// a path (like `crate`) names items of both a library and a binary.
+	#[serde(default, deserialize_with = "string_boolean")]
 	pub(crate) lib: bool,
 
 	/// Load these binaries (by name), and no other binaries (nor the library unless `lib`).
@@ -743,7 +800,8 @@ pub(crate) struct TextEdit {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub(crate) struct UseParams {
-	/// The name of an attached source, or "" for the server's own workspace.
+	/// The name of an attached source, or "" for the server's own workspace. This changes the default for the whole
+	/// MCP connection; concurrent callers should pass `attached` explicitly instead.
 	pub(crate) name: String,
 }
 
@@ -843,6 +901,34 @@ fn string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>
 	deserializer.deserialize_any(StringList)
 }
 
+struct StringBoolean;
+
+impl<'de> Visitor<'de> for StringBoolean {
+	type Value = bool;
+
+	fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str("a boolean or the string `true` or `false`")
+	}
+
+	fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+		Ok(value)
+	}
+
+	fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+		match value.trim() {
+			value if value.eq_ignore_ascii_case("true") => Ok(true),
+			value if value.eq_ignore_ascii_case("false") => Ok(false),
+			_ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+		}
+	}
+}
+
+/// Deserializes a boolean, also accepting the strings `true` and `false` for compatibility with clients that
+/// stringify tool arguments.
+fn string_boolean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+	deserializer.deserialize_any(StringBoolean)
+}
+
 /// Lists the kinds that can be found: named items, and `impl` blocks (with qualified patterns).
 fn unknown_kind(kind: &str) -> String {
 	let names: Vec<&str> = ItemKind::ALL
@@ -885,12 +971,17 @@ mod tests {
 
 		assert_eq!(format.targets(), ["crate"]);
 		assert_eq!(format.formatter, Formatter::Rustfmt);
-		assert!(format.sort && !format.skip_children && !format.check && !format.allow_comment_loss);
+		assert!(!format.sort && !format.skip_children && !format.check && !format.allow_comment_loss);
 
 		let insert: InsertParams = parse(json!({ "parent": "crate", "source": "fn f() {}" }));
 
 		assert_eq!(insert.position, Position::End);
 		assert!(insert.anchor.is_none() && !insert.force && !insert.dry_run && !insert.format);
+
+		let movement: MoveParams = parse(json!({ "path": "crate::f" }));
+
+		assert_eq!(movement.position, Position::End);
+		assert!(movement.anchor.is_none() && !movement.dry_run);
 	}
 
 	#[test]
@@ -906,13 +997,28 @@ mod tests {
 			let replace: ReplaceParams = parse(with(json!({ "path": "a", "source": "" }), flag));
 			let edit: EditItemParams = parse(with(json!({ "path": "a", "vis": "pub" }), flag));
 			let insert: InsertParams = parse(with(json!({ "parent": "crate", "source": "" }), flag));
+			let movement: MoveParams = parse(with(json!({ "path": "a" }), flag));
 			let format: FormatParams = parse(with(json!({}), flag));
 
 			assert!(
-				rename.dry_run && remove.dry_run && replace.dry_run && edit.dry_run && insert.dry_run && format.check,
+				rename.dry_run && remove.dry_run && replace.dry_run && edit.dry_run && insert.dry_run && movement.dry_run && format.check,
 				"{flag}"
 			);
 		}
+	}
+
+	#[test]
+	fn move_positions_require_an_anchor_only_when_relative() {
+		let params = |arguments| parse::<MoveParams>(arguments).position();
+
+		assert_eq!(params(json!({ "path": "a" })).unwrap(), InsertPosition::End);
+		assert_eq!(params(json!({ "path": "a", "position": "start" })).unwrap(), InsertPosition::Start);
+		assert_eq!(
+			params(json!({ "path": "a", "position": "before", "anchor": "crate::b" })).unwrap(),
+			InsertPosition::Before("crate::b".to_owned())
+		);
+		assert!(params(json!({ "path": "a", "position": "after" })).unwrap_err().contains("`anchor`"));
+		assert!(params(json!({ "path": "a", "anchor": "crate::b" })).unwrap_err().contains("only used"));
 	}
 
 	#[test]
@@ -974,12 +1080,16 @@ mod tests {
 
 	#[test]
 	fn format_options() {
-		let format: FormatParams = parse(json!({ "targets": ["crate::a", " ", "crate::b::*"], "skip_children": true }));
+		let format: FormatParams = parse(json!({
+			"targets": ["crate::a", " ", "crate::b::*"],
+			"sort": true,
+			"skip_children": true,
+		}));
 		let options = format.options().unwrap();
 
 		assert_eq!(format.targets(), ["crate::a", "crate::b::*"]);
 		assert_eq!(options.format.formatter, RsFormatter::RustFmt);
-		assert_eq!(options.format.sort, Some(SortOptions::new().recursive(false)));
+		assert_eq!(options.format.sort, Some(SortOptions::new()));
 		assert_eq!(options.format.sort.as_ref().unwrap().schema, OrderingSchema::Cryotheum);
 		assert!(options.skip_children && !options.active_only);
 
@@ -991,12 +1101,12 @@ mod tests {
 		assert_eq!(options.format.sort, None);
 		assert!(options.format.allow_comment_loss);
 
-		let sort_only: FormatParams = parse(json!({ "formatter": "none" }));
+		let sort_only: FormatParams = parse(json!({ "formatter": "none", "sort": true }));
 
 		assert_eq!(sort_only.options().unwrap().format.formatter, RsFormatter::None);
 		assert_eq!(sort_only.options().unwrap().format.sort, Some(SortOptions::new()));
 
-		let nothing: FormatParams = parse(json!({ "formatter": "none", "sort": false }));
+		let nothing: FormatParams = parse(json!({ "formatter": "none" }));
 
 		assert!(nothing.options().unwrap_err().starts_with("nothing to do"));
 	}
@@ -1091,6 +1201,33 @@ mod tests {
 		let remove: RemoveParams = parse(json!({ "paths": ["a, b"] }));
 
 		assert_eq!(remove.paths, ["a, b"]);
+	}
+
+	#[test]
+	fn tool_parameter_aliases_are_understood() {
+		let create: CreateModuleParams = parse(json!({ "parent": "crate", "name": "new", "content": "fn f() {}" }));
+		let insert: InsertParams = parse(json!({ "parent": "crate", "content": "fn f() {}" }));
+		let format: FormatParams = parse(json!({ "paths": ["crate::a", "crate::b"] }));
+
+		assert_eq!(create.source, "fn f() {}");
+		assert_eq!(insert.source, "fn f() {}");
+		assert_eq!(format.targets(), ["crate::a", "crate::b"]);
+	}
+
+	#[test]
+	fn selection_booleans_accept_strings() {
+		let selection: Selection = parse(json!({
+			"workspace": "TRUE",
+			"all_features": "false",
+			"all_targets": " true ",
+			"lib": "False",
+		}));
+
+		assert!(selection.workspace);
+		assert!(!selection.all_features);
+		assert!(selection.all_targets);
+		assert!(!selection.lib);
+		assert!(error::<Selection>(json!({ "workspace": "yes" })).contains("a boolean or the string"));
 	}
 
 	#[test]

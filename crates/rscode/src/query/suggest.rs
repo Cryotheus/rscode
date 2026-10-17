@@ -81,7 +81,7 @@ pub fn suggest(resolver: &Resolver<'_>, path: &ItemPath) -> Suggestions {
 			tail.iter().zip(&path.segments).all(|(segment, wanted)| segment == wanted.as_str())
 		};
 
-		*paths.entry(canonical.to_string()).or_default() |= ends_like;
+		*paths.entry(canonical.input_path()).or_default() |= ends_like;
 	}
 
 	let suffixed: Vec<&String> = paths.iter().filter(|(_, ends_like)| **ends_like).map(|(path, _)| path).collect();

@@ -13,6 +13,7 @@ use super::tools;
 use super::tools::Output;
 use crate::Error;
 use crate::ItemId;
+use crate::ItemKind;
 use crate::ItemPath;
 use crate::Resolver;
 use crate::Workspace;
@@ -275,13 +276,14 @@ fn several_crates(resolver: &Resolver<'_>, path: Option<&ItemPath>, items: &[Ite
 /// or else how to search for it.
 fn suggestion(resolver: &Resolver<'_>, path: Option<&ItemPath>) -> String {
 	let suggestions = path.map(|path| query::suggest(resolver, path)).unwrap_or_default();
+	let macro_hint = path.and_then(|path| macro_invocation_hint(resolver, path));
 
 	if let Some(path) = &suggestions.unique_suffix {
 		return format!("did you mean `{path}`?");
 	}
 
 	let mut hint = match suggestions.similar.as_slice() {
-		[] => return tools::SEARCH_HINT.to_owned(),
+		[] => return macro_hint.unwrap_or_else(|| tools::SEARCH_HINT.to_owned()),
 		[path] => format!("did you mean `{path}`?"),
 
 		[paths @ .., last] => {
@@ -295,5 +297,45 @@ fn suggestion(resolver: &Resolver<'_>, path: Option<&ItemPath>) -> String {
 		write!(hint, " ({} items have that name: see `find_items`)", suggestions.named).unwrap();
 	}
 
+	if let Some(macro_hint) = macro_hint {
+		write!(hint, "; {macro_hint}").unwrap();
+	}
+
 	hint
+}
+
+/// A hint for code written inside a module-level macro invocation, which is not loaded as separate items.
+pub(super) fn macro_invocation_hint(resolver: &Resolver<'_>, path: &ItemPath) -> Option<String> {
+	if path.import || path.qualifier.is_some() || path.field.is_some() || path.macro_call {
+		return None;
+	}
+
+	let mut module_path = path.clone();
+	module_path.segments.pop()?;
+	module_path.arguments = None;
+	module_path.selector = None;
+	let ws = resolver.workspace();
+	let mut invocations: Vec<String> = (resolver.resolve_item_path(&module_path).into_iter())
+		.filter(|&item| ws.item(item).kind == ItemKind::Module)
+		.flat_map(|module| ws.children(module))
+		.filter(|&item| ws.item(item).kind == ItemKind::MacroCall)
+		.map(|item| resolver.canonical_path(item).input_path())
+		.collect();
+
+	invocations.sort();
+	invocations.dedup();
+	invocations.truncate(5);
+
+	let paths: Vec<String> = invocations.into_iter().map(|path| format!("`{path}`")).collect();
+	let [first, rest @ ..] = paths.as_slice() else {
+		return None;
+	};
+	let listed = match rest {
+		[] => first.clone(),
+		_ => format!("{} or {}", paths[..paths.len() - 1].join(", "), paths.last().unwrap()),
+	};
+
+	Some(format!(
+		"the name may be code inside a macro invocation, whose contents are not separate items; edit {listed} with exact text"
+	))
 }

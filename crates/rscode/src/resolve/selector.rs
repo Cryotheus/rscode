@@ -161,6 +161,27 @@ impl Resolver<'_> {
 		self.cached_selector(call, || self.call_selectors(call, base))
 	}
 
+	/// The index that the canonical path of an import shows when its `use` path names imports at several places.
+	pub(super) fn import_selector(&self, import: ItemId, base: &CanonicalPath) -> Option<Selector> {
+		let mut unselected = base.clone();
+
+		unselected.selector = None;
+		let path = ItemPath::parse(&unselected.to_string()).ok()?;
+		let imports = self.compute_item_path(&path);
+
+		if !imports.contains(&import) {
+			return None;
+		}
+
+		let places = places(self.ws, &imports);
+
+		(places.len() > 1)
+			.then(|| places.iter().position(|&candidate| candidate == place(self.ws, import)))
+			.flatten()
+			.and_then(|index| u32::try_from(index + 1).ok())
+			.map(Selector::Index)
+	}
+
 	/// Whether an item with this canonical path matches a pattern, with the pattern's selector tested by what it picks
 	/// ([`Resolver::selects`]) rather than compared with the path's (see [`PathPattern::matches_any_selector`]).
 	pub(crate) fn matches_pattern(&self, pattern: &PathPattern, item: ItemId, path: &CanonicalPath, is_selected: bool) -> bool {
@@ -209,11 +230,23 @@ impl Resolver<'_> {
 	}
 
 	/// Whether `selector` picks the `impl` block of an item (the item itself, or the block of an associated item) among
-	/// the blocks with the same header, or a macro invocation among those of the same macro in its module, as a path
-	/// with that selector does (`impl Foo[2]`, `<Foo>[#attr]::name`, `m::name![2]`): any selector that picks a block,
-	/// not only the one its canonical path shows (items of inherent `impl`s show none). Picks no other items.
+	/// the blocks with the same header, a macro invocation among those of the same macro in its module, or an import
+	/// among those with the same `use` path. This follows paths such as `impl Foo[2]`, `<Foo>[#attr]::name`,
+	/// `m::name![2]`, and `use m::Name[2]`: any selector that picks the item, not only the one its canonical path shows.
 	pub fn selects(&self, selector: &Selector, item: ItemId) -> bool {
 		let ws = self.ws;
+
+		if ws.item(item).kind == ItemKind::Import {
+			let mut base = self.canonical_path(item);
+
+			base.selector = None;
+			let Ok(path) = ItemPath::parse(&base.to_string()) else {
+				return false;
+			};
+
+			return self.select(self.compute_item_path(&path), selector).contains(&item);
+		}
+
 		let target = match ws.item(item).kind {
 			ItemKind::Impl | ItemKind::MacroCall => item,
 

@@ -1,4 +1,4 @@
-//! Planning and applying `remove`, `replace`, `edit_item`, `insert`, `create_module`, `add_imports`, and `format` on
+//! Planning and applying `remove`, `move_item`, `replace`, `edit_item`, `insert`, `create_module`, `add_imports`, and `format` on
 //! crates on disk.
 //!
 //! Tests copy the `edit_ops` fixture (or write small crates) to a temporary directory, load the crates from there,
@@ -941,6 +941,330 @@ use self::gone as g;
 	}
 }
 
+mod move_item {
+	use super::*;
+	use rscode::edit::Movement;
+
+	fn move_item(ws: &Workspace, target: &str, position: InsertPosition) -> Result<Movement, Error> {
+		rscode::edit::move_item(&Resolver::new(ws), &path(target), &position)
+	}
+
+	#[test]
+	fn reorders_siblings_with_their_docs_attributes_and_comments() {
+		let lib = "\
+//! Moving items.
+
+pub fn first() {}
+
+// Explains second.
+/// Second docs.
+#[allow(dead_code)]
+pub fn second() {} // trailing
+
+pub fn third() {}
+";
+		let expected = "\
+//! Moving items.
+
+// Explains second.
+/// Second docs.
+#[allow(dead_code)]
+pub fn second() {} // trailing
+
+pub fn first() {}
+
+pub fn third() {}
+";
+		let dir = TempDir::with_files("move-sibling", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::second", InsertPosition::Before("crate::first".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+		assert_eq!(movement.moved, ["fixture::second"]);
+		assert_eq!(dir.relative(&[movement.file]), ["src/lib.rs"]);
+		assert_eq!(movement.edits.edits(&dir.path("src/lib.rs")).len(), 1);
+	}
+
+	#[test]
+	fn moves_mutually_exclusive_cfg_variants_as_one_group() {
+		let lib = "\
+pub fn first() {}
+
+// The feature implementation.
+#[cfg(feature = \"x\")]
+pub fn selected() -> u8 { 1 }
+
+#[cfg(not(feature = \"x\"))]
+pub fn selected() -> u8 { 2 }
+
+pub fn last() {}
+";
+		let expected = "\
+pub fn first() {}
+
+pub fn last() {}
+
+// The feature implementation.
+#[cfg(feature = \"x\")]
+pub fn selected() -> u8 { 1 }
+
+#[cfg(not(feature = \"x\"))]
+pub fn selected() -> u8 { 2 }
+";
+		let dir = TempDir::with_files("move-cfg-variants", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::selected", InsertPosition::End).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+		assert_eq!(movement.moved, ["fixture::selected"]);
+	}
+
+	#[test]
+	fn preserves_multiline_source_bytes() {
+		let lib = "\
+pub fn first() {}
+
+#[rustfmt::skip]
+pub type Complex =
+    Result<
+        u8,
+        u16,
+    >;
+
+pub fn last() {}
+";
+		let expected = "\
+#[rustfmt::skip]
+pub type Complex =
+    Result<
+        u8,
+        u16,
+    >;
+
+pub fn first() {}
+
+pub fn last() {}
+";
+		let dir = TempDir::with_files("move-multiline-verbatim", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::Complex", InsertPosition::Before("crate::first".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+	}
+
+	#[test]
+	fn preserves_indentation_when_an_item_follows_code_on_its_line() {
+		let lib = "pub mod m {\n\tpub fn first() {} pub fn second() {}\n}\n";
+		let expected = "pub mod m {\n\tpub fn second() {}\n\n\tpub fn first() {}\n}\n";
+		let dir = TempDir::with_files("move-same-line", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::m::second", InsertPosition::Before("crate::m::first".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+	}
+
+	#[test]
+	fn preserves_an_unindented_items_line_origin() {
+		let lib = "pub mod m {\nfn first() {}\n\tfn second() {}\n}\n";
+		let expected = "pub mod m {\n\tfn second() {}\n\nfn first() {}\n}\n";
+		let dir = TempDir::with_files("move-unindented", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::m::first", InsertPosition::After("crate::m::second".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+	}
+
+	#[test]
+	fn carries_a_trailing_comment_from_a_shared_line() {
+		let lib = "pub fn first() {} pub fn second() {} // Second.\npub fn third() {}\n";
+		let expected = "pub fn second() {} // Second.\n\npub fn first() {}\npub fn third() {}\n";
+		let dir = TempDir::with_files("move-shared-line-comment", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::second", InsertPosition::Before("crate::first".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+	}
+
+	#[test]
+	fn carries_an_attached_comment_when_following_code_shares_the_line() {
+		let lib = "// About a.\npub fn a() {} pub fn b() {}\npub fn c() {}\n";
+		let expected = "pub fn b() {}\npub fn c() {}\n\n// About a.\npub fn a() {}\n";
+		let dir = TempDir::with_files("move-leading-comment-shared-line", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::a", InsertPosition::After("crate::c".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+
+		let lib = "pub mod m {\n\t// About a.\n\tpub fn a() {} pub fn b() {}\n\tpub fn c() {}\n}\n";
+		let expected = "pub mod m {\n\tpub fn b() {}\n\tpub fn c() {}\n\n\t// About a.\n\tpub fn a() {}\n}\n";
+		let dir = TempDir::with_files("move-leading-comment-shared-line-indented", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::m::a", InsertPosition::After("crate::m::c".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+	}
+
+	#[test]
+	fn already_satisfied_moves_preserve_every_byte() {
+		let cases = [
+			("move-noop-adjacent", "pub fn a() {} pub fn b() {}", "crate::a", InsertPosition::Before("crate::b".to_owned())),
+			("move-noop-after", "pub fn a() {} pub fn b() {}", "crate::b", InsertPosition::After("crate::a".to_owned())),
+			("move-noop-start", "pub fn a() {}\npub fn b() {}\n", "crate::a", InsertPosition::Start),
+			("move-noop-last", "pub fn a() {}\npub fn b() {}\n", "crate::b", InsertPosition::End),
+			("move-noop-eof", "pub fn only() {}", "crate::only", InsertPosition::End),
+			("move-noop-unindented", "pub mod m {\nfn only() {}\n}\n", "crate::m::only", InsertPosition::End),
+		];
+
+		for (name, lib, target, position) in cases {
+			let dir = TempDir::with_files(name, &[("src/lib.rs", lib)]);
+			let ws = load(&dir);
+			let movement = move_item(&ws, target, position).unwrap();
+
+			assert!(movement.edits.is_empty(), "{name}");
+			assert!(movement.edits.preview().unwrap().is_empty(), "{name}");
+		}
+	}
+
+	#[test]
+	fn reorders_associated_items_in_an_impl() {
+		let lib = "pub struct S;\n\nimpl S {\n\tpub fn first() {}\n\n\tpub fn second() {}\n}\n";
+		let expected = "pub struct S;\n\nimpl S {\n\tpub fn second() {}\n\n\tpub fn first() {}\n}\n";
+		let dir = TempDir::with_files("move-impl-item", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::S::second", InsertPosition::Before("crate::S::first".to_owned())).unwrap();
+
+		assert_eq!(edited(&dir, &movement.edits, "src/lib.rs"), expected);
+	}
+
+	#[test]
+	fn keeps_crlf_when_moving_the_only_item() {
+		let lib = "pub fn only() {}\r\n";
+		let dir = TempDir::with_files("move-only-crlf", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+		let movement = move_item(&ws, "crate::only", InsertPosition::End).unwrap();
+
+		assert!(movement.edits.is_empty());
+		assert!(movement.edits.preview().unwrap().is_empty());
+	}
+
+	#[test]
+	fn refuses_other_containers_and_unsafe_item_shapes() {
+		let lib = "\
+macro_rules! local {
+	() => {};
+}
+
+local!();
+
+pub fn item() {}
+
+pub mod nested {
+	pub fn anchor() {}
+}
+
+pub mod out;
+
+pub enum Choice {
+	One,
+}
+";
+		let dir = TempDir::with_files("move-errors", &[("src/lib.rs", lib), ("src/out.rs", "pub fn f() {}\n")]);
+		let ws = load(&dir);
+
+		assert!(matches!(
+			move_item(&ws, "crate::item", InsertPosition::Before("crate::nested::anchor".to_owned())),
+			Err(Error::Unsupported(message)) if message.contains("not a sibling")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::out", InsertPosition::Start),
+			Err(Error::Unsupported(message)) if message.contains("out-of-line module")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::Choice::One", InsertPosition::End),
+			Err(Error::Unsupported(message)) if message.contains("enum variants")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::local", InsertPosition::End),
+			Err(Error::Unsupported(message)) if message.contains("lexical position")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::local!", InsertPosition::End),
+			Err(Error::Unsupported(message)) if message.contains("lexical position")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::item", InsertPosition::After("crate::item".to_owned())),
+			Err(Error::Unsupported(message)) if message.contains("relative to itself")
+		));
+	}
+
+	#[test]
+	fn refuses_to_cross_macro_definitions_and_invocations() {
+		let lib = "\
+pub fn before() {}
+
+macro_rules! local {
+	() => {};
+}
+
+pub fn middle() {}
+
+local!();
+
+pub fn after() {}
+";
+		let dir = TempDir::with_files("move-macro-barriers", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+
+		for (target, position) in [
+			("crate::before", InsertPosition::After("crate::middle".to_owned())),
+			("crate::middle", InsertPosition::After("crate::after".to_owned())),
+		] {
+			assert!(matches!(
+				move_item(&ws, target, position),
+				Err(Error::Unsupported(message)) if message.contains("macro-scope barrier")
+			));
+		}
+	}
+
+	#[test]
+	fn refuses_macro_use_targets_and_crossings() {
+		let lib = "\
+#[macro_use]
+pub mod macros {
+	macro_rules! local {
+		() => {};
+	}
+}
+
+pub fn middle() {}
+
+#[cfg_attr(macro_use, allow(dead_code))]
+pub mod ordinary {}
+
+#[cfg_attr(feature = \"macros\", macro_use)]
+pub mod conditional {}
+
+pub fn after() {}
+";
+		let dir = TempDir::with_files("move-macro-use-barriers", &[("src/lib.rs", lib)]);
+		let ws = load(&dir);
+
+		assert!(matches!(
+			move_item(&ws, "crate::macros", InsertPosition::End),
+			Err(Error::Unsupported(message)) if message.contains("macro-scope barriers")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::middle", InsertPosition::Start),
+			Err(Error::Unsupported(message)) if message.contains("macro-scope barrier")
+		));
+		assert!(matches!(
+			move_item(&ws, "crate::after", InsertPosition::Before("crate::middle".to_owned())),
+			Err(Error::Unsupported(message)) if message.contains("macro-scope barrier")
+		));
+		assert!(move_item(&ws, "crate::middle", InsertPosition::After("crate::ordinary".to_owned())).is_ok());
+	}
+}
+
 mod replace {
 	use super::*;
 
@@ -957,6 +1281,13 @@ mod replace {
 		match result {
 			Err(Error::InvalidSource(message)) => message,
 			other => panic!("expected invalid source, got {other:?}"),
+		}
+	}
+
+	fn kind_change(result: Result<rscode::edit::Replacement, Error>) -> String {
+		match result {
+			Err(Error::KindChange(message)) => message,
+			other => panic!("expected a kind change, got {other:?}"),
 		}
 	}
 
@@ -1096,11 +1427,11 @@ pub mod out;
 		let ws = load(&dir);
 
 		assert_eq!(
-			invalid_source(replace(&ws, "crate::add", "pub struct Add;", &ReplaceOptions::default())),
+			kind_change(replace(&ws, "crate::add", "pub struct Add;", &ReplaceOptions::default())),
 			"`fixture::add` is a fn, but the source is a struct (allow a kind change to replace it anyway)"
 		);
 		assert!(
-			invalid_source(replace(&ws, "crate::add", "pub fn add() {}\npub fn sub() {}", &ReplaceOptions::default()))
+			kind_change(replace(&ws, "crate::add", "pub fn add() {}\npub fn sub() {}", &ReplaceOptions::default()))
 				.starts_with("the source has 2 items, but `fixture::add` can only be replaced by one fn")
 		);
 		assert_eq!(
@@ -2038,6 +2369,50 @@ pub mod out;
 	}
 
 	#[test]
+	fn inserts_inner_attributes_only_at_the_start_of_modules() {
+		let empty = TempDir::with_files(
+			"insert-inner-attributes-empty-file",
+			&[("src/lib.rs", "#[path = \"tests.rs\"]\nmod tests;\n"), ("src/tests.rs", "")],
+		);
+		let empty_ws = load(&empty);
+		let source = "//! Added docs.\n#![allow(dead_code)]\npub fn added() {}";
+		let start = at_position(InsertPosition::Start);
+		let insertion = insert(&empty_ws, "crate::tests", source, &start).unwrap();
+
+		assert_eq!(edited(&empty, &insertion.edits, "src/tests.rs"), format!("{source}\n"));
+
+		let dir = dir("insert-inner-attributes");
+		let ws = load(&dir);
+		let insertion = insert(&ws, "crate::out", source, &start).unwrap();
+
+		assert_eq!(
+			edited(&dir, &insertion.edits, "src/out.rs"),
+			"//! Out.\n\n//! Added docs.\n#![allow(dead_code)]\npub fn added() {}\n\npub fn o() {}\n"
+		);
+
+		let insertion = insert(&ws, "crate::empty", source, &start).unwrap();
+
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("pub mod empty {\n\t//! Added docs.\n\t#![allow(dead_code)]\n\tpub fn added() {}\n}"));
+
+		for position in [InsertPosition::End, InsertPosition::Before("o".to_owned())] {
+			assert!(matches!(
+				insert(&ws, "crate::out", source, &at_position(position)),
+				Err(Error::InvalidSource(message)) if message.contains("inner attributes")
+			));
+		}
+
+		assert!(matches!(
+			insert(&ws, "<crate::S>", source, &start),
+			Err(Error::InvalidSource(message)) if message.contains("inner attributes")
+		));
+
+		assert!(matches!(
+			rscode::edit::replace(&Resolver::new(&ws), &path("crate::util::a"), source, &ReplaceOptions::default()),
+			Err(Error::InvalidSource(message)) if message.contains("inner attributes")
+		));
+	}
+
+	#[test]
 	fn inserts_next_to_siblings() {
 		let dir = dir("insert-siblings");
 		let ws = load(&dir);
@@ -2161,6 +2536,12 @@ pub mod out;
 			Err(Error::Collision { collisions, .. }) => assert_eq!(collisions, ["`x`: another item of the source"]),
 			other => panic!("{other:?}"),
 		}
+
+		// Mutually exclusive cfg variants are one Rust binding at a time, so they do not collide with one another.
+		let variants = "#[cfg(target_os = \"windows\")]\ntype Body = u8;\n\
+			#[cfg(not(target_os = \"windows\"))]\ntype Body = u16;";
+
+		assert!(insert(&ws, "crate::empty", variants, &InsertOptions::default()).is_ok());
 
 		// different namespaces, and glob imports, do not collide
 		assert!(insert(&ws, "crate::util", "pub struct a {}", &InsertOptions::default()).is_ok());
@@ -2657,9 +3038,10 @@ mod format {
 	}
 
 	#[test]
-	fn skips_children_when_sorting() {
-		let lib = "pub mod m {\n\tpub fn b() {}\n\tpub fn a() {}\n\n\tpub mod inner {\n\t\tpub fn d() {}\n\t\tpub fn c() {}\n\t}\n}\n";
-		let dir = TempDir::with_files("format-sort-children", &[("src/lib.rs", lib)]);
+	fn skips_child_files_but_sorts_inline_children() {
+		let lib = "pub mod m {\n\tpub fn b() {}\n\tpub fn a() {}\n\n\tpub mod inner {\n\t\tpub fn d() {}\n\t\tpub fn c() {}\n\t}\n\n\tpub mod child;\n}\n";
+		let child = "pub fn d() {}\npub fn c() {}\n";
+		let dir = TempDir::with_files("format-sort-children", &[("src/lib.rs", lib), ("src/m/child.rs", child)]);
 		let ws = load(&dir);
 
 		let formatting = format(&ws, &["crate::m"], &sort_only()).unwrap();
@@ -2667,12 +3049,15 @@ mod format {
 
 		assert!(sorted.find("fn a").unwrap() < sorted.find("fn b").unwrap(), "{sorted}");
 		assert!(sorted.find("fn c").unwrap() < sorted.find("fn d").unwrap(), "{sorted}");
+		let sorted_child = edited(&dir, &formatting.edits, "src/m/child.rs");
+		assert!(sorted_child.find("fn c").unwrap() < sorted_child.find("fn d").unwrap(), "{sorted_child}");
 
 		let formatting = format(&ws, &["crate::m"], &FmtOptions { skip_children: true, ..sort_only() }).unwrap();
 		let sorted = edited(&dir, &formatting.edits, "src/lib.rs");
 
 		assert!(sorted.find("fn a").unwrap() < sorted.find("fn b").unwrap(), "{sorted}");
-		assert!(sorted.find("fn d").unwrap() < sorted.find("fn c").unwrap(), "{sorted}");
+		assert!(sorted.find("fn c").unwrap() < sorted.find("fn d").unwrap(), "{sorted}");
+		assert_eq!(processed(&dir, &formatting), [("src/lib.rs".to_owned(), true)]);
 	}
 
 	#[test]
@@ -3046,7 +3431,10 @@ mod create_module {
 		match create(&ws, "crate", "util", "") {
 			Err(Error::Collision { name, collisions }) => {
 				assert_eq!(name, "util");
-				assert!(collisions[0].starts_with("`util`: `edit_ops::util` (mod) at src/lib.rs:"), "{collisions:?}");
+				assert!(
+					collisions[0].starts_with(&native("`util`: `edit_ops::util` (mod) at src/lib.rs:")),
+					"{collisions:?}"
+				);
 			}
 			other => panic!("{other:?}"),
 		}
@@ -3395,9 +3783,9 @@ mod a;
 		match import(&ws, "crate::util", &["crate::other::Circle"]) {
 			Err(Error::Collision { name, collisions }) => {
 				assert_eq!(name, "Circle");
-				let expected = "`Circle`: the import of `fixture::shapes::Circle` at src/util.rs:1:";
+				let expected = native("`Circle`: the import of `fixture::shapes::Circle` at src/util.rs:1:");
 
-				assert!(collisions[0].starts_with(expected), "{collisions:?}");
+				assert!(collisions[0].starts_with(&expected), "{collisions:?}");
 			}
 			other => panic!("{other:?}"),
 		}
@@ -3518,7 +3906,10 @@ mod private {
 		match import(&ws, "crate", &["other::B"]) {
 			Err(Error::Collision { name, collisions }) => {
 				assert_eq!(name, "B");
-				assert!(collisions[0].starts_with("`B`: the import of `fixture::a::B` at src/lib.rs:5:"), "{collisions:?}");
+				assert!(
+					collisions[0].starts_with(&native("`B`: the import of `fixture::a::B` at src/lib.rs:5:")),
+					"{collisions:?}"
+				);
 			}
 			other => panic!("{other:?}"),
 		}
@@ -4402,18 +4793,25 @@ pub fn make() -> (Qux, Pick) {
 		// `as _` imports of one module with the same `cfg`s are not `cfg` variants of each other
 		let unnamed = candidates(replace("use crate::_", "use shapes::T1 as _;", true));
 
-		assert_eq!(unnamed.len(), 2, "{unnamed:?}");
-		let import = native("`use fixture::_` (import) at src/lib.rs:");
-
-		assert!(unnamed.iter().all(|candidate| candidate.starts_with(&import)), "{unnamed:?}");
+		assert_eq!(
+			unnamed,
+			[
+				native("`use fixture::_[1]` (import) at src/lib.rs:26:5"),
+				native("`use fixture::_[2]` (import) at src/lib.rs:27:5"),
+			]
+		);
 		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("use crate::_")));
 
 		// `cfg` variants are, and are listed as the imports
 		let picks = candidates(replace("use crate::Pick", "use shapes::Circle as Pick;", false));
 
-		let import = native("`use fixture::Pick` (import) at src/lib.rs:");
-
-		assert!(picks.iter().all(|candidate| candidate.starts_with(&import)), "{picks:?}");
+		assert_eq!(
+			picks,
+			[
+				native("`use fixture::Pick[1]` (import) at src/lib.rs:22:5 with #[cfg(feature = \"a\")]"),
+				native("`use fixture::Pick[2]` (import) at src/lib.rs:24:5 with #[cfg(not(feature = \"a\"))]"),
+			]
+		);
 		assert!(rscode::edit::replaces_all_variants(&resolver, &path("use crate::Pick")));
 
 		// a `use` item all of whose imports the path names
@@ -4444,10 +4842,13 @@ pub fn make() -> (Qux, Pick) {
 
 		assert!(text.contains("use shapes::Square as Pick;\n\npub struct Anchored;\n"), "{text}");
 
-		// the glob imports of one `use` item are shown once
+		// the glob imports of one `use` item have distinct selectors
 		let views = rscode::View::new().path("use crate::globs::*").unwrap().run_with(&resolver).unwrap();
 
-		assert_eq!(views.len(), 1, "{views:#?}");
+		assert_eq!(
+			views.iter().map(|view| view.path.as_str()).collect::<Vec<_>>(),
+			["use fixture::globs::*[1]", "use fixture::globs::*[2]"]
+		);
 
 		// a `use` pattern does not make other patterns match imports
 		let find = |patterns: &[&str]| {

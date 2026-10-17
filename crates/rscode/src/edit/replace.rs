@@ -11,6 +11,7 @@ pub(super) mod item;
 mod order;
 mod parse;
 
+use crate::CfgExpr;
 use crate::Error;
 use crate::edit::EditSet;
 use crate::edit::describe;
@@ -39,6 +40,7 @@ use parse::NewItem;
 use parse::ParsedSource;
 use parse::cfg_attributes;
 use parse::parse_source;
+use parse::parse_source_at_start;
 use serde::Deserialize;
 use serde::Serialize;
 use smol_str::SmolStr;
@@ -77,7 +79,8 @@ pub enum InsertPosition {
 	#[default]
 	End,
 
-	/// Before the first item of the container (after inner attributes and `//!` docs).
+	/// Before the first item of the container (after its existing inner attributes and `//!` docs).
+	/// Source inserted at the start of a module may itself begin with inner attributes or inner docs.
 	Start,
 
 	/// Before the named sibling item.
@@ -389,13 +392,13 @@ fn check_kinds(kind: ItemKind, path: &str, items: &[NewItem], container: Contain
 		_ if allow_kind_change => Ok(()),
 		[item] if item.kind == kind => Ok(()),
 
-		[item] => Err(Error::InvalidSource(format!(
+		[item] => Err(Error::KindChange(format!(
 			"`{path}` is {}, but the source is {} (allow a kind change to replace it anyway)",
 			article(kind),
 			article(item.kind),
 		))),
 
-		items => Err(Error::InvalidSource(format!(
+		items => Err(Error::KindChange(format!(
 			"the source has {} items, but `{path}` can only be replaced by one {kind} (allow a kind change to replace \
 			 it by several items)",
 			items.len(),
@@ -414,34 +417,69 @@ fn code_follows(text: &str, offset: usize) -> bool {
 /// Existing bindings the new items would clash with: `(name, description of the existing binding)`.
 fn collisions(resolver: &Resolver<'_>, target: &Target<'_>, items: &[NewItem]) -> Vec<(SmolStr, String)> {
 	let mut collisions: Vec<(SmolStr, String)> = Vec::new();
-	let mut seen: Vec<(&SmolStr, Namespace)> = Vec::new();
+	let mut seen: Vec<(&SmolStr, Namespace, Option<&CfgExpr>)> = Vec::new();
 
-	for binding in items.iter().flat_map(|item| &item.bindings) {
-		let namespaces = match target.container {
-			Container::Module => module_namespaces(resolver, target.item, binding),
-			_ => binding.namespaces.to_vec(),
-		};
-
-		// `macro_rules!` macros may shadow each other, and other macros are left to the compiler
-		for namespace in namespaces.into_iter().filter(|&namespace| namespace != Namespace::Macro) {
-			if seen.contains(&(&binding.name, namespace)) {
-				push_unique(&mut collisions, (binding.name.clone(), "another item of the source".to_owned()));
-			}
-
-			seen.push((&binding.name, namespace));
-
-			let existing = match target.container {
-				Container::Module => module_collisions(resolver, target.item, &binding.name, namespace),
-				_ => assoc_collisions(resolver, target.item, &binding.name, namespace),
+	for item in items {
+		for binding in &item.bindings {
+			let namespaces = match target.container {
+				Container::Module => module_namespaces(resolver, target.item, binding),
+				_ => binding.namespaces.to_vec(),
 			};
 
-			for existing in existing {
-				push_unique(&mut collisions, (binding.name.clone(), existing));
+			// `macro_rules!` macros may shadow each other, and other macros are left to the compiler
+			for namespace in namespaces.into_iter().filter(|&namespace| namespace != Namespace::Macro) {
+				let collides_with_source = seen
+					.iter()
+					.any(|(name, seen_namespace, cfg)| *name == &binding.name && *seen_namespace == namespace && !cfgs_are_exclusive(*cfg, item.cfg.as_ref()));
+
+				if collides_with_source {
+					push_unique(&mut collisions, (binding.name.clone(), "another item of the source".to_owned()));
+				}
+
+				seen.push((&binding.name, namespace, item.cfg.as_ref()));
+
+				let existing = match target.container {
+					Container::Module => module_collisions(resolver, target.item, &binding.name, namespace),
+					_ => assoc_collisions(resolver, target.item, &binding.name, namespace),
+				};
+
+				for existing in existing {
+					push_unique(&mut collisions, (binding.name.clone(), existing));
+				}
 			}
 		}
 	}
 
 	collisions
+}
+
+/// Whether two understood `cfg` predicates cannot both be true.
+fn cfgs_are_exclusive(left: Option<&CfgExpr>, right: Option<&CfgExpr>) -> bool {
+	fn false_predicate(expression: &CfgExpr) -> bool {
+		match expression {
+			CfgExpr::Bool(value) => !value,
+			CfgExpr::All(expressions) => expressions.iter().any(false_predicate),
+			CfgExpr::Any(expressions) => expressions.iter().all(false_predicate),
+			CfgExpr::Not(expression) => matches!(expression.as_ref(), CfgExpr::Bool(true)),
+			CfgExpr::Name(_) | CfgExpr::KeyValue(_, _) | CfgExpr::Other(_) => false,
+		}
+	}
+
+	fn opposites(left: &CfgExpr, right: &CfgExpr) -> bool {
+		match (left, right) {
+			(CfgExpr::All(expressions), right) => expressions.iter().any(|left| opposites(left, right)),
+			(left, CfgExpr::All(expressions)) => expressions.iter().any(|right| opposites(left, right)),
+			(CfgExpr::Not(left), right) => left.as_ref() == right,
+			(left, CfgExpr::Not(right)) => left == right.as_ref(),
+			_ => false,
+		}
+	}
+
+	let (Some(left), Some(right)) = (left, right) else {
+		return false;
+	};
+
+	false_predicate(left) || false_predicate(right) || opposites(left, right)
 }
 
 /// A binding for messages: the item, or the import and what it imports.
@@ -531,7 +569,10 @@ pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, 
 	};
 	let canonical = resolver.canonical_path(target.item).to_string();
 	let parent = parent.map_or_else(|| canonical.clone(), ToString::to_string);
-	let parsed = parse_source(source, target.container)?;
+	let parsed = match &options.position {
+		InsertPosition::Start => parse_source_at_start(source, target.container)?,
+		InsertPosition::End | InsertPosition::Before(_) | InsertPosition::After(_) => parse_source(source, target.container)?,
+	};
 
 	if parsed.items.is_empty() {
 		return Err(Error::InvalidSource(format!("the source contains no {}", target.container.items())));
@@ -783,7 +824,8 @@ fn push_unique<T: PartialEq>(list: &mut Vec<T>, value: T) {
 /// [`Error::NotFound`] when `path` names nothing, [`Error::Ambiguous`] when it names several items (`cfg` variants,
 /// see [`ReplaceOptions::all_variants`]; items of `impl` blocks whose headers differ, which generic arguments in the
 /// path tell apart; or items of one crate that are compiled together, like `impl` blocks with the same header, which
-/// a selector tells apart), and [`Error::InvalidSource`] when `source` is not a valid replacement.
+/// a selector tells apart), [`Error::InvalidSource`] when `source` cannot be used in the item's container, and
+/// [`Error::KindChange`] when it has a different item kind or item count unless the option allows that.
 pub fn replace(resolver: &Resolver<'_>, path: &ItemPath, source: &str, options: &ReplaceOptions) -> Result<Replacement, Error> {
 	let source = &*pasted(source);
 	let ws = resolver.workspace();
@@ -1153,6 +1195,7 @@ mod tests {
 	fn checks_kinds() {
 		let item = |kind| NewItem {
 			kind,
+			cfg: None,
 			name: Some("x".into()),
 			bindings: Vec::new(),
 		};
@@ -1163,7 +1206,7 @@ mod tests {
 		assert!(check(ItemKind::Fn, &[item(ItemKind::Fn), item(ItemKind::Fn)], true).is_ok());
 
 		match check(ItemKind::Fn, &[item(ItemKind::Struct)], false) {
-			Err(Error::InvalidSource(message)) => {
+			Err(Error::KindChange(message)) => {
 				assert_eq!(
 					message,
 					"`c::x` is a fn, but the source is a struct (allow a kind change to replace it anyway)"
@@ -1174,7 +1217,7 @@ mod tests {
 		}
 
 		match check(ItemKind::Fn, &[item(ItemKind::Fn), item(ItemKind::Fn)], false) {
-			Err(Error::InvalidSource(message)) => assert!(message.starts_with("the source has 2 items"), "{message}"),
+			Err(Error::KindChange(message)) => assert!(message.starts_with("the source has 2 items"), "{message}"),
 			other => panic!("{other:?}"),
 		}
 

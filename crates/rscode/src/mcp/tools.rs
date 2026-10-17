@@ -9,6 +9,7 @@ use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
+use super::params::MoveParams;
 use super::params::ReferencesParams;
 use super::params::RemoveParams;
 use super::params::RenameParams;
@@ -210,7 +211,7 @@ pub(super) fn describe(error: &Error) -> String {
 		Error::PathParse(_) => {
 			"paths look like `crate::a::Item`, `::crate_name::Item`, `a::Item`, `Type::method`, `<Type as Trait>::method`, \
 			 `impl Trait for Type`, `impl Type[method]` (one of several blocks), `Type.field`, `a::macro_name!`, or \
-			 `use crate::a::Name` (an import itself); patterns may use `*` and `**`"
+			 `use crate::a::Name[2]` (an import itself, with an optional index); patterns may use `*` and `**`"
 		}
 
 		_ => return error.to_string(),
@@ -457,6 +458,13 @@ fn found_text(
 			if let Some(hint) = unloaded_hint(workspace, member) {
 				writeln!(text, "hint: {hint}").unwrap();
 			}
+
+			if !params.pattern.contains('*')
+				&& let Ok(path) = ItemPath::parse(params.pattern.trim())
+				&& let Some(hint) = retry::macro_invocation_hint(resolver, &path)
+			{
+				writeln!(text, "hint: {hint}").unwrap();
+			}
 		}
 
 		// (only when the call left the selection to the server)
@@ -555,6 +563,21 @@ fn inserted_targets(plan: &Insertion, parent: Option<&ItemPath>) -> Result<Vec<(
 		.map(|(_, name)| child(name, true));
 
 	Ok(named.chain(imports).collect())
+}
+
+/// `move_item`
+pub(crate) fn move_item(load: &LoadOptions, params: &MoveParams, permit: &Permit<'_>) -> Output {
+	let position = params.position()?;
+	let path = parse_path(&params.path)?;
+
+	retry::run(load, &params.selection, Search::OneCrate, |_, workspace, resolver| {
+		let plan = edit::move_item(resolver, &path, &position).map_err(|error| retry::fail(error, resolver))?;
+		let root = workspace.root();
+		let mut text = render::movement(root, &plan, params.dry_run);
+
+		finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
+		Ok(text)
+	})
 }
 
 /// Loads the workspace, with a hint when there is no `Cargo.toml` to load it from.
@@ -689,6 +712,11 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 				Error::InvalidSource(_) if let Some(hint) = resolver.field_hint(&path) => {
 					Failure::Message(format!("{error}\nhint: {hint}"))
 				}
+
+				Error::KindChange(_) => Failure::Message(format!(
+					"{error}\nhint: replace one item here and add sibling items with `insert_items`, or set \
+					 `allow_kind_change` to replace it with another kind or several items (references are not renamed)"
+				)),
 
 				error => retry::fail(error, resolver),
 			}

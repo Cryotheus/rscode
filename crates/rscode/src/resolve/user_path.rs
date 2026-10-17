@@ -207,12 +207,20 @@ impl Resolver<'_> {
 			return Vec::new();
 		};
 
-		(modules.into_iter())
+		let mut imports: Vec<ItemId> = (modules.into_iter())
 			.flat_map(|module| self.ws.children(module))
 			.filter(|&child| self.ws.item(child).kind == ItemKind::Use)
 			.flat_map(|use_item| self.ws.children(use_item))
 			.filter(|&import| self.ws.item(import).import_info().is_some_and(|info| info.path_name() == *name))
-			.collect()
+			.collect();
+
+		imports.sort();
+		imports.dedup();
+
+		match &path.selector {
+			Some(selector) => self.select(imports, selector),
+			None => imports,
+		}
 	}
 
 	/// `m::name!`: the item-position macro invocations in the module(s) `m` names (every `cfg` variant) of macros whose
