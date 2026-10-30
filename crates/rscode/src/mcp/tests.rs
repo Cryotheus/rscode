@@ -123,17 +123,56 @@ impl Client {
 }
 
 #[tokio::test]
-async fn a_session_without_a_handshake_is_an_error() {
+async fn an_initialization_notification_before_the_handshake_is_an_error() {
 	let (mut client, server) = tokio::io::duplex(1 << 16);
 
 	client
-		.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
+		.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
 		.await
 		.unwrap();
 
-	let error = serve(ServerOptions::default(), server).await.unwrap_err();
+	let error = tokio::time::timeout(Duration::from_secs(5), serve(ServerOptions::default(), server))
+		.await
+		.expect("the invalid initialization notification must end the handshake within five seconds")
+		.unwrap_err();
 
 	assert!(error.to_string().starts_with("MCP connection: failed to start the session"), "{error}");
+}
+
+#[tokio::test]
+async fn a_request_without_a_handshake_reports_an_error_and_allows_initializing() {
+	tokio::time::timeout(Duration::from_secs(5), async {
+		let (client, server_end) = tokio::io::duplex(1 << 16);
+		let server = tokio::spawn(serve(ServerOptions::default(), server_end));
+		let (reader, writer) = tokio::io::split(client);
+		let mut client = Client {
+			lines: BufReader::new(reader).lines(),
+			writer,
+			server,
+			next_id: 0,
+		};
+		let response = client.request("tools/list", json!({})).await;
+
+		assert_eq!(response["error"]["code"], -32602, "{response}");
+		assert!(response["error"]["message"].as_str().unwrap().contains("_meta"), "{response}");
+
+		let initialize = json!({
+			"protocolVersion": "2025-06-18",
+			"capabilities": {},
+			"clientInfo": { "name": "rscode-tests", "version": "0.0.0" },
+		});
+		let response = client.request("initialize", initialize).await;
+
+		assert_eq!(response["result"]["serverInfo"]["name"], "rscode", "{response}");
+		client.send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+
+		let response = client.request("tools/list", json!({})).await;
+
+		assert!(response["result"]["tools"].is_array(), "{response}");
+		client.close().await.unwrap();
+	})
+	.await
+	.expect("the protocol error and subsequent initialization must finish within five seconds");
 }
 
 fn all_tools() -> Vec<String> {

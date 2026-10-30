@@ -103,9 +103,11 @@ fn check(line: &[u8]) -> Option<String> {
 	if quoted.len() < text.len() {
 		quoted.push_str("...");
 	}
-	let tab_hint = has_literal_tab_in_string(line)
-		.then_some("; a tab inside a JSON string must be escaped as `\\t`")
-		.unwrap_or_default();
+	let tab_hint = if has_literal_tab_in_string(line) {
+		"; a tab inside a JSON string must be escaped as `\\t`"
+	} else {
+		""
+	};
 
 	Some(format!(
 		"rscode mcp: ignored a line of input that is not JSON ({error}){tab_hint}, so nothing answers it: {quoted}"

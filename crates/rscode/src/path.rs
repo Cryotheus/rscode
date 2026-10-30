@@ -137,7 +137,7 @@ impl CanonicalPath {
 			None => format!("<{self_ty}>{selector}"),
 		};
 		let name = self.name.as_deref().unwrap_or_default();
-		let raw = (is_keyword(name) && !is_unrawable(name)).then_some("r#").unwrap_or_default();
+		let raw = if is_keyword(name) && !is_unrawable(name) { "r#" } else { "" };
 
 		format!("{qualifier}::{raw}{name}")
 	}
