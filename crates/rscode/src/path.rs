@@ -1167,14 +1167,14 @@ fn write_ident(f: &mut Formatter<'_>, name: &str) -> std::fmt::Result {
 	f.write_str(name)
 }
 
-/// Writes names separated by `::`.
-fn write_segments(f: &mut Formatter<'_>, segments: &[SmolStr]) -> std::fmt::Result {
-	for (index, segment) in segments.iter().enumerate() {
+/// Writes names separated by `::`, with `r#` before keywords.
+pub(crate) fn write_segments(f: &mut Formatter<'_>, segments: impl IntoIterator<Item = impl AsRef<str>>) -> std::fmt::Result {
+	for (index, segment) in segments.into_iter().enumerate() {
 		if index > 0 {
 			f.write_str("::")?;
 		}
 
-		write_ident(f, segment)?;
+		write_ident(f, segment.as_ref())?;
 	}
 
 	Ok(())

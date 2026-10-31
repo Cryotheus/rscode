@@ -7,6 +7,7 @@ use crate::CfgExpr;
 use crate::Tristate;
 use crate::path::Anchor;
 use crate::path::ItemPath;
+use crate::path::write_segments;
 use crate::source::FileId;
 use crate::source::LineCol;
 use crate::source::SourceFile;
@@ -882,6 +883,18 @@ impl PathRef {
 	/// The names of the segments.
 	pub fn names(&self) -> impl Iterator<Item = &str> {
 		self.segments.iter().map(|segment| segment.name.as_str())
+	}
+
+	/// The path as written in source, with `r#` before keywords (`k::r#match`), unlike its
+	/// [`Display`](std::fmt::Display), which writes the unraw'd names.
+	pub(crate) fn written(&self) -> impl std::fmt::Display {
+		std::fmt::from_fn(|f| {
+			if self.leading_colon {
+				f.write_str("::")?;
+			}
+
+			write_segments(f, self.names())
+		})
 	}
 }
 

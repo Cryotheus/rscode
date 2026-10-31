@@ -31,8 +31,9 @@ use std::path::PathBuf;
 /// (`crate::Error` finds `my_crate::error::Error` when the crate root re-exports it), and so do the types of qualified
 /// patterns (`<crate::Error as *>::*`).
 ///
-/// `use` patterns without a selector also match underscore imports by the last segment of the path they import:
-/// `use *Write*` finds `use std::fmt::Write as _;` (whose path is `use my_crate::m::_`).
+/// `use` patterns with wildcards (or without an anchor: `use Write` is `use **::Write`) and without a selector also
+/// match underscore imports by the last segment of the path they import: `use *Write*` finds `use std::fmt::Write as _;`
+/// (whose path is `use my_crate::m::_`), while `use crate::m::Write` only finds what its path names.
 ///
 /// ```no_run
 /// # fn main() -> Result<(), rscode::Error> {
@@ -100,7 +101,7 @@ impl Find {
 					let by_name = may_match(pattern, data.kind, name)
 						&& (matches(resolver, pattern, item, &path, selected) || resolved.matches_owner(resolver, item, &path, selected));
 
-					by_name || matches_underscore_import(pattern, data, &path, selected)
+					by_name || resolver.matches_underscore_import(pattern, item, &path, selected)
 				});
 
 		if !matched {
@@ -442,28 +443,6 @@ fn matches(resolver: &Resolver<'_>, pattern: &PathPattern, item: ItemId, path: &
 		|| workspace.item(item).kind == ItemKind::Impl || workspace.parent(item).is_some_and(|parent| workspace.item(parent).kind == ItemKind::Impl);
 
 	(!pattern.is_qualified() || in_impl()) && resolver.matches_pattern(pattern, item, path, selected)
-}
-
-/// Whether a `use` pattern without a selector matches an underscore import (`use std::fmt::Write as _;`, whose path is
-/// `use m::_`) by the last segment of the path it imports, as if it bound that name (`use *Write*`).
-fn matches_underscore_import(pattern: &PathPattern, data: &ItemData, path: &CanonicalPath, selected: bool) -> bool {
-	if !pattern.is_import() || pattern.selector.is_some() {
-		return false;
-	}
-
-	let Some(imported) = (data.import_info())
-		.filter(|info| !info.glob && info.binding_name().is_none())
-		.and_then(|info| info.path.last())
-	else {
-		return false;
-	};
-	let renamed = CanonicalPath {
-		name: Some(imported.name.clone()),
-		selector: None,
-		..path.clone()
-	};
-
-	pattern.matches(&renamed, selected)
 }
 
 /// Whether an item could match a pattern, judging by its kind and name only (before computing its canonical path).

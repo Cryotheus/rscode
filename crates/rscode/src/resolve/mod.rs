@@ -47,10 +47,13 @@ use crate::model::ItemId;
 use crate::model::ItemKind;
 use crate::model::PathRef;
 use crate::model::Workspace;
+use crate::path::Anchor;
 use crate::path::CanonicalPath;
 use crate::path::ItemPath;
 use crate::path::Qualifier;
 use crate::path::Selector;
+use crate::pattern::PathPattern;
+use crate::pattern::SegmentPattern;
 use build::ImportIndex;
 use fxhash::FxHashSet;
 use impls::ImplIndex;
@@ -343,6 +346,33 @@ impl<'ws> Resolver<'ws> {
 		vis::declared_vis(self.ws, item).is_visible_from(&self.tables.tree, self.ws.module_of(module))
 	}
 
+	/// Whether a `use` pattern with wildcards (or without an anchor: `use Write` is `use **::Write`) and without a
+	/// selector matches an underscore import (`use std::fmt::Write as _;`, whose canonical path `path` is `use m::_`) by
+	/// the last segment of the path it imports, as if the import bound that name (`use *Write*`). An exact pattern
+	/// (`use crate::m::Write`) only names what its path names, which no underscore import is.
+	pub(crate) fn matches_underscore_import(&self, pattern: &PathPattern, item: ItemId, path: &CanonicalPath, is_selected: bool) -> bool {
+		let exact = pattern.anchor != Anchor::None
+			&& (pattern.segments.iter()).all(|segment| matches!(segment, SegmentPattern::Ident(name) if name.is_exact()));
+
+		if !pattern.is_import() || pattern.selector.is_some() || exact {
+			return false;
+		}
+
+		let Some(imported) = (self.ws.item(item).import_info())
+			.filter(|info| !info.glob && info.binding_name().is_none())
+			.and_then(|info| info.path.last())
+		else {
+			return false;
+		};
+		let renamed = CanonicalPath {
+			name: Some(imported.name.clone()),
+			selector: None,
+			..path.clone()
+		};
+
+		pattern.matches(&renamed, is_selected)
+	}
+
 	/// Every name bound in a module's scope, sorted.
 	pub fn names(&self, module: ItemId, namespace: Namespace) -> Vec<SmolStr> {
 		let module = self.ws.module_of(module);
@@ -496,7 +526,7 @@ impl<'ws> Resolver<'ws> {
 				..underscore.clone()
 			};
 
-			named.push((index, format!("`{picked}` names `use {} as _`", info.path)));
+			named.push((index, format!("`{picked}` names `use {} as _`", info.path.written())));
 		}
 
 		named.sort();

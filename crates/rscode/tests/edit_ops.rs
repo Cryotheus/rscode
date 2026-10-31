@@ -4865,8 +4865,9 @@ pub fn make() -> (Qux, Pick) {
 		assert_eq!(find(&["Circle", "use Pick"]).len(), find(&["Circle"]).len() + 2);
 	}
 
-	/// `use` patterns find underscore imports by the last segment of what they import, and a `use` path of that name
-	/// (which names nothing) gets a hint with the paths that name them.
+	/// `use` patterns with wildcards (or without an anchor) find underscore imports by the last segment of what they
+	/// import, and so do formatting targets with wildcards, while a `use` path of that name (which names nothing) gets a
+	/// hint with the paths that name them.
 	#[test]
 	fn underscore_imports_are_found_and_named_by_what_they_import() {
 		let dir = variants_dir("imports-underscore");
@@ -4880,9 +4881,13 @@ pub fn make() -> (Qux, Pick) {
 		let hint = |text: &str| resolver.import_hint(&path(text)).unwrap_or_default();
 
 		assert_eq!(find(pattern("use *T1*")), ["use fixture::_[1]", "use fixture::traits::_[1]"]);
-		assert_eq!(find(pattern("use crate::traits::T2")), ["use fixture::traits::_[2]"]);
+		assert_eq!(find(pattern("use T2")), ["use fixture::_[2]", "use fixture::traits::_[2]"]);
+		assert_eq!(find(pattern("use crate::traits::*2")), ["use fixture::traits::_[2]"]);
 
-		// not glob imports by what they import from, nor with a selector, which picks among the imports a path names
+		// not by exact patterns, which name what their paths name, nor glob imports by what they import from, nor with a
+		// selector, which picks among the imports a path names
+		assert_eq!(find(pattern("use crate::traits::T2")), Vec::<String>::new());
+		assert_eq!(find(PathPattern::exact(&path("use ::fixture::traits::T2"))), Vec::<String>::new());
 		assert_eq!(find(pattern("use *shapes*")), Vec::<String>::new());
 		assert_eq!(find(PathPattern::exact(&path("use crate::T1[1]"))), Vec::<String>::new());
 
@@ -4910,7 +4915,7 @@ pub fn make() -> (Qux, Pick) {
 				("Cargo.toml", MANIFEST),
 				(
 					"src/lib.rs",
-					"pub mod a {\n\tpub trait Tr {}\n}\n\npub mod b {\n\tpub use crate::a::Tr;\n}\n\nmod one {\n\tuse crate::a::Tr as _;\n}\n\nuse a::Tr as _;\nuse b::Tr as _;\n",
+					"pub mod a {\n\tpub trait Tr {}\n}\n\npub mod b {\n\tpub use crate::a::Tr;\n}\n\npub mod r#type {\n\tpub trait r#match {}\n}\n\nmod one {\n\tuse crate::a::Tr as _;\n}\n\nmod r#impl {\n\tuse crate::r#type::r#match as _;\n}\n\nuse a::Tr as _;\nuse b::Tr as _;\n",
 				),
 			],
 		);
@@ -4927,6 +4932,24 @@ pub fn make() -> (Qux, Pick) {
 			"underscore imports are named `_`: `use _[1]` names `use a::Tr as _`, `use _[2]` names `use b::Tr as _`"
 		);
 		assert_eq!(paths_of(&resolver, "use _[2]"), ["use fixture::_[2]"]);
+
+		// keywords are raw in both paths
+		assert_eq!(
+			hint("use crate::r#impl::r#match"),
+			"underscore imports are named `_`: `use crate::r#impl::_` names `use crate::r#type::r#match as _`"
+		);
+
+		// formatting targets with wildcards select the imports that `Find` finds
+		let dir = TempDir::with_files(
+			"imports-underscore-format",
+			&[("Cargo.toml", MANIFEST), ("src/lib.rs", "use std::fmt::Write   as _;\nuse std::io::Write  ;\n")],
+		);
+		let ws = load(&dir);
+		let options =
+			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None), ..FmtOptions::default() };
+		let formatting = rscode::edit::format(&Resolver::new(&ws), &[pattern("use *Write*")], &options).unwrap();
+
+		assert_eq!(edited(&dir, &formatting.edits, "src/lib.rs"), "use std::fmt::Write as _;\nuse std::io::Write;\n");
 	}
 
 	/// Imports through removed imports break: they are left dangling, or pruned.

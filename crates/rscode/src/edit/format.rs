@@ -203,9 +203,10 @@ fn file_error(path: &Path, error: FormatError) -> Error {
 ///
 /// Other targets (with wildcards, or qualified like `<Type as Trait>::name`) are matched against the canonical paths
 /// of the items of the selected crates, as by [`Find`](crate::Find): qualified targets match `impl` blocks and their
-/// items. An enum variant stands for its enum. Fails with [`Error::NotFound`] when a target without wildcards names
-/// nothing, and with the error of the formatter for the first file (by path) that cannot be formatted; targets with
-/// wildcards that match nothing only give a warning.
+/// items, and `use` targets also match underscore imports by what they import (`use *Write*` matches
+/// `use std::fmt::Write as _;`). An enum variant stands for its enum. Fails with [`Error::NotFound`] when a target
+/// without wildcards names nothing, and with the error of the formatter for the first file (by path) that cannot be
+/// formatted; targets with wildcards that match nothing only give a warning.
 pub fn format(resolver: &Resolver<'_>, targets: &[PathPattern], options: &FmtOptions) -> Result<Formatting, Error> {
 	let ws = resolver.workspace();
 	let mut plan = Formatting {
@@ -362,7 +363,9 @@ fn matching(resolver: &Resolver<'_>, pattern: &PathPattern) -> Vec<ItemId> {
 				continue;
 			}
 
-			if resolver.matches_pattern(pattern, item, &resolver.canonical_path(item), true) {
+			let path = resolver.canonical_path(item);
+
+			if resolver.matches_pattern(pattern, item, &path, true) || resolver.matches_underscore_import(pattern, item, &path, true) {
 				items.push(item);
 			}
 		}

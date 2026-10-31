@@ -92,10 +92,11 @@ Patterns are item paths with wildcards (no regex):
   **::b, a::**::b              `b` at any depth (below `a`)
   crate::a::b, ::krate::a      anchored at the selected crates, or `krate`
   <Type as Trait>::name        items of matching trait impls
-  'use a::*', 'use Foo'        imports: every import in `a`, the imports binding `Foo`
+  'use a::*', 'use Foo'        imports: all in `a`, those binding `Foo` or importing it `as _`
 Patterns without an anchor match anywhere: `Foo` finds every item named `Foo`, and `m::*Error` every `...Error` \
 item directly in a module `m`. Imports are found by `use` patterns, `--imports`, or `-k import`, and printed as the \
-`use` paths that name them (`use my_crate::a::Foo`).";
+`use` paths that name them (`use my_crate::a::Foo`). `use` patterns with wildcards or without an anchor also match \
+`as _` imports by what they import.";
 
 /// `--message-format` values of every other subcommand.
 pub(crate) const FORMATS: &[&str] = &["human", "json"];
