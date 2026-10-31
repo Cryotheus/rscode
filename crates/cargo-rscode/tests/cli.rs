@@ -1573,125 +1573,6 @@ mod mcp {
 	use std::time::Duration;
 	use std::time::Instant;
 
-	#[test]
-	fn help_explains_registration() {
-		let mcp = run(&fixture(), &["mcp", "--help"]).success();
-
-		assert!(mcp.stdout.contains("claude mcp add rscode -- cargo rscode mcp"), "{}", mcp.stdout);
-		assert!(mcp.stdout.contains("\"mcpServers\""), "{}", mcp.stdout);
-	}
-
-	/// Runs a server in `dir` with `args`, initializes a session, and sends it `requests` (methods and their params),
-	/// each once the one before is answered. Returns their responses, after checking the handshake, that nothing but
-	/// the protocol is on stdout, and that the server ends when the client disconnects.
-	fn exchange(dir: &Path, args: &[&str], requests: &[(&str, Value)]) -> Vec<Value> {
-		let mut child = command(dir, &["mcp"])
-			.args(args)
-			.stdin(Stdio::piped())
-			.stdout(Stdio::piped())
-			.stderr(Stdio::null())
-			.spawn()
-			.unwrap();
-		let mut stdin = child.stdin.take().unwrap();
-		let stdout = child.stdout.take().unwrap();
-		let (sender, receiver) = mpsc::channel();
-
-		std::thread::spawn(move || {
-			for line in BufReader::new(stdout).lines() {
-				if sender.send(line).is_err() {
-					break;
-				}
-			}
-		});
-
-		let initialize = json!({
-			"protocolVersion": "2025-11-25",
-			"capabilities": {},
-			"clientInfo": {"name": "cargo-rscode-tests", "version": "0.0.0"},
-		});
-		let mut responses = Vec::new();
-
-		for (index, (method, params)) in [("initialize", initialize)].iter().chain(requests).enumerate() {
-			let id = index + 1;
-
-			writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).unwrap();
-			stdin.flush().unwrap();
-
-			let response = loop {
-				let line = receiver.recv_timeout(Duration::from_secs(60)).expect("a response").unwrap();
-
-				// nothing but the protocol on stdout
-				let message: Value = serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"));
-
-				if message["id"] == id {
-					break message;
-				}
-			};
-
-			match id {
-				1 => {
-					assert_eq!(response["result"]["serverInfo"]["name"], "rscode", "{response}");
-					writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).unwrap();
-				}
-
-				_ => responses.push(response),
-			}
-		}
-
-		// the server ends when the client disconnects
-		drop(stdin);
-
-		let deadline = Instant::now() + Duration::from_secs(30);
-
-		loop {
-			if let Some(status) = child.try_wait().unwrap() {
-				assert!(status.success(), "{status}");
-				break;
-			}
-
-			assert!(Instant::now() < deadline, "the server did not exit");
-			std::thread::sleep(Duration::from_millis(20));
-		}
-
-		responses
-	}
-
-	/// The names of the tools the server lists.
-	fn tools(extra: &[&str]) -> BTreeSet<String> {
-		let manifest = fixture().join("Cargo.toml");
-		let args = [&["--manifest-path", manifest.to_str().unwrap()][..], extra].concat();
-		let responses = exchange(&fixture(), &args, &[("tools/list", json!({}))]);
-		let tools = responses[0]["result"]["tools"].as_array().cloned();
-
-		tools.unwrap_or_default().iter().filter_map(|tool| tool["name"].as_str()).map(str::to_owned).collect()
-	}
-
-	#[test]
-	fn serves_tools_over_stdio() {
-		let all = tools(&[]);
-
-		for tool in [
-			"workspace_info",
-			"find_items",
-			"view_items",
-			"find_references",
-			"rename_item",
-			"remove_items",
-			"replace_item",
-			"edit_item",
-			"insert_items",
-			"format_items",
-		] {
-			assert!(all.contains(tool), "{tool}: {all:?}");
-		}
-
-		let read_only = tools(&["--read-only"]);
-
-		assert!(read_only.contains("find_items") && read_only.contains("view_items"), "{read_only:?}");
-		assert!(read_only.contains("find_references"), "{read_only:?}");
-		assert!(!read_only.contains("rename_item") && !read_only.contains("edit_item"), "{read_only:?}");
-	}
-
 	/// A server without a workspace of its own says how long ago its connection started while nothing is attached,
 	/// so that a client whose server restarted (losing what it attached) knows to attach again.
 	#[test]
@@ -1743,5 +1624,132 @@ mod mcp {
 			message.ends_with("\nhint: attach one with `attach_source`, and pass its name as `attached`"),
 			"{message}"
 		);
+	}
+
+	/// Runs a server in `dir` with `args`, initializes a session, and sends it `requests` (methods and their params),
+	/// each once the one before is answered. Returns their responses, after checking the handshake, that nothing but
+	/// the protocol is on stdout, and that the server ends when the client disconnects.
+	fn exchange(dir: &Path, args: &[&str], requests: &[(&str, Value)]) -> Vec<Value> {
+		let mut child = command(dir, &["mcp"])
+			.args(args)
+			.stdin(Stdio::piped())
+			.stdout(Stdio::piped())
+			.stderr(Stdio::null())
+			.spawn()
+			.unwrap();
+		let mut stdin = child.stdin.take().unwrap();
+		let stdout = child.stdout.take().unwrap();
+		let (sender, receiver) = mpsc::channel();
+
+		std::thread::spawn(move || {
+			for line in BufReader::new(stdout).lines() {
+				if sender.send(line).is_err() {
+					break;
+				}
+			}
+		});
+
+		let initialize = json!({
+			"protocolVersion": "2025-11-25",
+			"capabilities": {},
+			"clientInfo": {"name": "cargo-rscode-tests", "version": "0.0.0"},
+		});
+		let mut responses = Vec::new();
+		// a line of stdout, which must be a protocol message: nothing but the protocol is on stdout
+		let protocol = |line: std::io::Result<String>| -> Value {
+			let line = line.unwrap();
+
+			serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"))
+		};
+
+		for (index, (method, params)) in [("initialize", initialize)].iter().chain(requests).enumerate() {
+			let id = index + 1;
+
+			writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).unwrap();
+			stdin.flush().unwrap();
+
+			let response = loop {
+				let message = protocol(receiver.recv_timeout(Duration::from_secs(60)).expect("a response"));
+
+				if message["id"] == id {
+					break message;
+				}
+			};
+
+			match id {
+				1 => {
+					assert_eq!(response["result"]["serverInfo"]["name"], "rscode", "{response}");
+					writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).unwrap();
+				}
+
+				_ => responses.push(response),
+			}
+		}
+
+		// the server ends when the client disconnects
+		drop(stdin);
+
+		let deadline = Instant::now() + Duration::from_secs(30);
+
+		loop {
+			if let Some(status) = child.try_wait().unwrap() {
+				assert!(status.success(), "{status}");
+				break;
+			}
+
+			assert!(Instant::now() < deadline, "the server did not exit");
+			std::thread::sleep(Duration::from_millis(20));
+		}
+
+		// nor after the last response: the reader ends with stdout, which ends with the server
+		for line in receiver {
+			protocol(line);
+		}
+
+		responses
+	}
+
+	#[test]
+	fn help_explains_registration() {
+		let mcp = run(&fixture(), &["mcp", "--help"]).success();
+
+		assert!(mcp.stdout.contains("claude mcp add rscode -- cargo rscode mcp"), "{}", mcp.stdout);
+		assert!(mcp.stdout.contains("\"mcpServers\""), "{}", mcp.stdout);
+	}
+
+	/// The names of the tools the server lists.
+	fn tools(extra: &[&str]) -> BTreeSet<String> {
+		let manifest = fixture().join("Cargo.toml");
+		let args = [&["--manifest-path", manifest.to_str().unwrap()][..], extra].concat();
+		let responses = exchange(&fixture(), &args, &[("tools/list", json!({}))]);
+		let tools = responses[0]["result"]["tools"].as_array().cloned();
+
+		tools.unwrap_or_default().iter().filter_map(|tool| tool["name"].as_str()).map(str::to_owned).collect()
+	}
+
+	#[test]
+	fn serves_tools_over_stdio() {
+		let all = tools(&[]);
+
+		for tool in [
+			"workspace_info",
+			"find_items",
+			"view_items",
+			"find_references",
+			"rename_item",
+			"remove_items",
+			"replace_item",
+			"edit_item",
+			"insert_items",
+			"format_items",
+		] {
+			assert!(all.contains(tool), "{tool}: {all:?}");
+		}
+
+		let read_only = tools(&["--read-only"]);
+
+		assert!(read_only.contains("find_items") && read_only.contains("view_items"), "{read_only:?}");
+		assert!(read_only.contains("find_references"), "{read_only:?}");
+		assert!(!read_only.contains("rename_item") && !read_only.contains("edit_item"), "{read_only:?}");
 	}
 }
