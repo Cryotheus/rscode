@@ -1278,6 +1278,115 @@ mod end_to_end {
 		client.close().await.unwrap();
 	}
 
+	/// On a server that exposes directories, the first editing call of a connection that works on the server's own
+	/// workspace for want of `attached`, while nothing has been attached on the connection, notes it: a caller whose
+	/// server restarted, losing the source it made the default, sees where its edits go now.
+	#[tokio::test]
+	async fn edits_note_the_servers_own_workspace_once_while_nothing_is_attached() {
+		let package = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n");
+		let fixture = Fixture::with_files(
+			"own-workspace-note",
+			&[
+				("own/Cargo.toml", &package("own")),
+				("own/src/lib.rs", "pub fn mine() {}\n"),
+				("other/Cargo.toml", &package("other")),
+				("other/src/lib.rs", "pub fn mine() {}\n"),
+			],
+		);
+		let root = sources::resolve(&fixture.root);
+		let own = root.join("own/Cargo.toml");
+		let options = ServerOptions {
+			load: LoadOptions {
+				manifest_path: Some(own.clone()),
+				silent: true,
+				..LoadOptions::default()
+			},
+			exposed: vec![Exposure::new(Access::Write, root.join("other").to_str().unwrap()).unwrap()],
+			..ServerOptions::default()
+		};
+		let attach = |use_it: bool| json!({ "manifest_path": root.join("other/Cargo.toml").to_str().unwrap(), "name": "other", "write": true, "use": use_it });
+		let edit = json!({ "path": "crate::mine", "old": "{}", "new": "{ todo!() }" });
+		let preview = json!({ "path": "crate::mine", "doc": "Mine.", "dry_run": true });
+		let edited = "pub fn mine() { todo!() }\n";
+
+		// before a restart, calls without `attached` edit the source attached with `use`
+		let mut client = Client::connect(options.clone()).await;
+		let (failed, text) = client.call("attach_source", attach(true)).await;
+
+		assert!(!failed, "{text}");
+
+		let (failed, text) = client.call("edit_item", edit.clone()).await;
+
+		assert!(!failed, "{text}");
+		assert!(!text.contains("note:"), "{text}");
+		assert_eq!(fixture.read("other/src/lib.rs"), edited);
+		client.close().await.unwrap();
+
+		// after it, they edit the server's own workspace: the first one says so, unlike queries and calls that name it
+		let mut client = Client::connect(options.clone()).await;
+		let (_, text) = client.call("find_items", json!({ "pattern": "*" })).await;
+
+		assert_contains(&text, &["own::mine  fn"]);
+		assert!(!text.contains("note:"), "{text}");
+
+		let mut named = preview.clone();
+
+		named["attached"] = json!("");
+
+		let (failed, text) = client.call("edit_item", named).await;
+
+		assert!(!failed, "{text}");
+		assert!(!text.contains("note:"), "{text}");
+
+		let (failed, text) = client.call("edit_item", preview.clone()).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				"nothing was written",
+				&format!(
+					"\nnote: this call ran on the server's own workspace ({}); this connection started ",
+					own.display()
+				),
+				" ago and has no sources attached (attachments do not survive a server restart or reconnect)\n",
+			],
+		);
+		assert!(text.ends_with("reconnect)\n"), "{text}");
+
+		// once per connection
+		let (failed, text) = client.call("edit_item", edit.clone()).await;
+
+		assert!(!failed, "{text}");
+		assert!(!text.contains("note:"), "{text}");
+		assert_eq!(fixture.read("own/src/lib.rs"), edited);
+		client.close().await.unwrap();
+
+		// a connection that attached something has nothing to note, even with nothing attached any more
+		let mut client = Client::connect(options.clone()).await;
+
+		client.call("attach_source", attach(false)).await;
+		client.call("detach_source", json!({ "name": "other" })).await;
+
+		let (failed, text) = client.call("edit_item", preview.clone()).await;
+
+		assert!(!failed, "{text}");
+		assert!(!text.contains("note:"), "{text}");
+		client.close().await.unwrap();
+
+		// nor does a server that exposes nothing
+		let mut client = Client::connect(ServerOptions {
+			exposed: Vec::new(),
+			..options
+		})
+		.await;
+		let (failed, text) = client.call("edit_item", preview).await;
+
+		assert!(!failed, "{text}");
+		assert!(!text.contains("note:"), "{text}");
+		client.close().await.unwrap();
+	}
+
 	/// Fields are named by paths with a `.`, and `Type::name` names a method of that name.
 	#[tokio::test]
 	async fn fields() {

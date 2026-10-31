@@ -205,7 +205,9 @@ their `Cargo.toml` (or its directory) and a name of their choice, and then pass 
   active), except that attaching the same `Cargo.toml` for writing makes a read-only attachment writable.
   `list_sources` shows the attached sources and the exposed directories. A reconnect creates a new connection, so its
   sources must be attached again. `list_sources`, and the errors of calls that need a source while none is attached,
-  say how long ago the connection started, so a client can tell that a server restart lost what it attached.
+  say how long ago the connection started, so a client can tell that a server restart lost what it attached. So does
+  a note on the first editing call of a connection (`dry_run` included) that works on the server's own workspace for
+  want of `attached` while nothing has been attached on the connection: the note names that workspace.
 - The server's own workspace (`--manifest-path`, or the one containing the working directory) remains the default
   when a tool call names no `attached` source, unless `use_source` (or `attach_source` with `use`) makes an attached
   source the connection-wide default. That default is shared by every caller using the connection; concurrent agent

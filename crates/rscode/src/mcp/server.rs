@@ -58,6 +58,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
@@ -113,6 +115,10 @@ pub(crate) struct Server {
 	/// When this connection started (a server serves one): sources attached before then were attached on another one,
 	/// and went with it.
 	started: Instant,
+
+	/// Whether editing calls are done noting that they work on the server's own workspace: only the first one does,
+	/// and only while nothing has been attached on this connection (see [`Server::own_workspace_note`]).
+	noted: AtomicBool,
 
 	/// Every tool; the editing tools are disabled when the server is read-only, and the tools about sources when it
 	/// exposes no directories.
@@ -382,8 +388,14 @@ impl Server {
 		let verdict = {
 			let mut session = self.session();
 			let verdict = sources::register(&mut session.sources, &name, &source);
+			let attached = matches!(verdict, Verdict::Attach | Verdict::Upgrade);
 
-			if params.use_it && matches!(verdict, Verdict::Attach | Verdict::Upgrade) {
+			// a caller that attached something knows what it attached: no note about the server's own workspace
+			if attached {
+				self.noted.store(true, Ordering::Relaxed);
+			}
+
+			if params.use_it && attached {
 				session.default = Some(name.clone());
 			}
 
@@ -514,6 +526,7 @@ impl Server {
 			options,
 			session: std::sync::Mutex::default(),
 			started: Instant::now(),
+			noted: AtomicBool::new(false),
 			tool_router,
 			edits: Arc::default(),
 		}
@@ -598,7 +611,7 @@ impl Server {
 
 	/// Runs an editing tool's job, one at a time. The job gets a [`Permit`] telling whether the request was cancelled
 	/// and where it may write, which it checks right before writing. A source attached read-only is only previewed
-	/// (`dry_run`).
+	/// (`dry_run`). The result may end with a note about the server's own workspace (see [`Self::own_workspace_note`]).
 	async fn edit(
 		&self,
 		name: &'static str,
@@ -631,6 +644,7 @@ impl Server {
 			return respond(name, Err(message));
 		}
 
+		let note = self.own_workspace_note(&target);
 		let guard = self.edits.clone().lock_owned().await;
 		let token = context.ct;
 		let result = worker::run(name, move || {
@@ -646,8 +660,20 @@ impl Server {
 			)
 		})
 		.await;
+		let mut response = respond(name, result.and_then(identity));
 
-		respond(name, result.and_then(identity))
+		// after truncating, which would cut it off
+		if let Some(note) = note
+			&& let Some(ContentBlock::Text(content)) = response.content.first_mut()
+		{
+			if !content.text.ends_with('\n') {
+				content.text.push('\n');
+			}
+
+			writeln!(content.text, "{note}").unwrap();
+		}
+
+		response
 	}
 
 	/// The lock editing calls hold while they run.
@@ -664,6 +690,28 @@ impl Server {
 
 		self.session().default = Some(name.to_owned());
 		text + "calls without `attached` work on it now\n"
+	}
+
+	/// The note that an editing call's result ends with when the call works on the server's own workspace for want of
+	/// `attached` (and of a default) on a server that exposes directories. Only the first such call of a connection
+	/// gets it, and only while nothing has been attached on the connection: it shows a caller whose server restarted,
+	/// losing the source it attached (and made the default), that the call went to the server's own workspace.
+	fn own_workspace_note(&self, target: &Target) -> Option<String> {
+		if target.source.is_some() || !target.by_default || self.exposed.is_empty() {
+			return None;
+		}
+
+		let manifest = self.options.load.manifest_path.clone().or_else(|| nearest_manifest()?.1)?;
+
+		if self.noted.swap(true, Ordering::Relaxed) {
+			return None;
+		}
+
+		Some(format!(
+			"note: this call ran on the server's own workspace ({}); {}",
+			manifest.display(),
+			sources::nothing_attached(self.started.elapsed())
+		))
 	}
 
 	/// Runs a read-only tool's job.
@@ -748,7 +796,7 @@ impl Server {
 		Ok(Target {
 			load,
 			scope,
-			by_default: by_default && source.is_some(),
+			by_default,
 			source,
 		})
 	}
@@ -833,7 +881,8 @@ struct Target {
 	/// The attached source, if the call works on one (rather than on the server's own workspace).
 	source: Option<(String, Source)>,
 
-	/// Whether the source is the connection's default (see `use_source`), rather than named by the call.
+	/// Whether the call names no `attached`, so that it works on the connection's default: the source that `use_source`
+	/// chose, or else the server's own workspace.
 	by_default: bool,
 }
 

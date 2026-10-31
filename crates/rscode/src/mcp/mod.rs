@@ -54,8 +54,11 @@
 //! Names belong to one live connection: over stdio, a server has exactly one client, and clients do not see (or break)
 //! each other's names. Reconnecting starts with no attachments: `list_sources`, and the errors of calls that need a
 //! source while none is attached, say how long ago the connection started, so a client can tell that a server restart
-//! lost what it attached. Attaching is cheap, since it only records the name for the canonical path of the
-//! `Cargo.toml` (after checking that cargo can plan loading it); every call loads its source anyway.
+//! lost what it attached. So does a note on the first editing call of a connection (`dry_run` included) that works on
+//! the server's own workspace for want of `attached` while nothing has been attached on the connection, naming that
+//! workspace: after a restart, such a call no longer goes to the source a client made the default. Attaching is cheap,
+//! since it only records the name for the canonical path of the `Cargo.toml` (after checking that cargo can plan
+//! loading it); every call loads its source anyway.
 //!
 //! A name keeps its source until `detach_source` forgets it, since clients work on a source by its name. Attaching
 //! under a taken name changes nothing, and the response says what the name has: an ordinary result when it is the same
