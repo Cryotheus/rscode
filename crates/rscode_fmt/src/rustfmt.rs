@@ -167,6 +167,16 @@ fn run(source: &str, options: &RustFmtOptions, forced: &[(&str, &str)]) -> Resul
 
 	command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
+	// a host without a console (a GUI application) would otherwise get a console window flashing up for each run
+	#[cfg(windows)]
+	{
+		use std::os::windows::process::CommandExt;
+
+		const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+		command.creation_flags(CREATE_NO_WINDOW);
+	}
+
 	let io_error = |source: io::Error| FormatError::RustFmtSpawn {
 		program: program.display().to_string(),
 		source,
