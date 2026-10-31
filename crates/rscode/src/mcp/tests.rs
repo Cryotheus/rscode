@@ -2623,4 +2623,51 @@ mod end_to_end {
 		assert_contains(&text, &["the server's own workspace (used without `attached`): "]);
 		client.close().await.unwrap();
 	}
+
+	/// Underscore imports are found by what they import, and a `use` path of that name says which path names them.
+	#[tokio::test]
+	async fn underscore_imports() {
+		let fixture = Fixture::with_files(
+			"underscore-imports",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", "pub mod doorways;\n"),
+				(
+					"src/doorways.rs",
+					"use std::fmt::Write as _;\nuse std::io::Write;\nuse std::error::Error as _;\n",
+				),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let (failed, text) = client.call("find_items", json!({ "pattern": "use *Write*" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&native("use demo::doorways::_[1]  import  src/doorways.rs:1  -> std::fmt::Write"),
+				&native("use demo::doorways::Write  import  src/doorways.rs:2  -> std::io::Write"),
+			],
+		);
+		assert!(!text.contains("Error"), "{text}");
+
+		let removed = json!({ "paths": "use crate::doorways::Error", "dry_run": true });
+		let (failed, text) = client.call("remove_items", removed).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&["hint: underscore imports are named `_`: `use crate::doorways::_[2]` names `use std::error::Error as _`"],
+		);
+
+		let removed = json!({ "paths": "use crate::doorways::_[2]", "dry_run": true });
+		let (failed, text) = client.call("remove_items", removed).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["-use std::error::Error as _;", "nothing was written"]);
+		client.close().await.unwrap();
+	}
 }

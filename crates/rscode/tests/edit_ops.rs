@@ -4865,6 +4865,70 @@ pub fn make() -> (Qux, Pick) {
 		assert_eq!(find(&["Circle", "use Pick"]).len(), find(&["Circle"]).len() + 2);
 	}
 
+	/// `use` patterns find underscore imports by the last segment of what they import, and a `use` path of that name
+	/// (which names nothing) gets a hint with the paths that name them.
+	#[test]
+	fn underscore_imports_are_found_and_named_by_what_they_import() {
+		let dir = variants_dir("imports-underscore");
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let find = |pattern: PathPattern| {
+			let found = rscode::Find::new().path_pattern(pattern).run_with(&resolver).unwrap();
+
+			found.into_iter().map(|found| found.path).collect::<Vec<_>>()
+		};
+		let hint = |text: &str| resolver.import_hint(&path(text)).unwrap_or_default();
+
+		assert_eq!(find(pattern("use *T1*")), ["use fixture::_[1]", "use fixture::traits::_[1]"]);
+		assert_eq!(find(pattern("use crate::traits::T2")), ["use fixture::traits::_[2]"]);
+
+		// not glob imports by what they import from, nor with a selector, which picks among the imports a path names
+		assert_eq!(find(pattern("use *shapes*")), Vec::<String>::new());
+		assert_eq!(find(PathPattern::exact(&path("use crate::T1[1]"))), Vec::<String>::new());
+
+		// the hint spells the module like the path, and its paths name those imports
+		assert_eq!(
+			hint("use crate::T2"),
+			"underscore imports are named `_`: `use crate::_[2]` names `use shapes::T2 as _`"
+		);
+		assert_eq!(paths_of(&resolver, "use crate::_[2]"), ["use fixture::_[2]"]);
+		assert_eq!(
+			hint("use fixture::traits::T1"),
+			"underscore imports are named `_`: `use fixture::traits::_[1]` names `use crate::shapes::T1 as _`"
+		);
+		assert_eq!(paths_of(&resolver, "use fixture::traits::_[1]"), ["use fixture::traits::_[1]"]);
+		assert!(
+			hint("use crate::T3").starts_with("a `use` path names the imports of the module"),
+			"{}",
+			hint("use crate::T3")
+		);
+
+		// one underscore import needs no index, and several of one name are all given
+		let dir = TempDir::with_files(
+			"imports-underscore-same",
+			&[
+				("Cargo.toml", MANIFEST),
+				(
+					"src/lib.rs",
+					"pub mod a {\n\tpub trait Tr {}\n}\n\npub mod b {\n\tpub use crate::a::Tr;\n}\n\nmod one {\n\tuse crate::a::Tr as _;\n}\n\nuse a::Tr as _;\nuse b::Tr as _;\n",
+				),
+			],
+		);
+		let ws = load(&dir);
+		let resolver = Resolver::new(&ws);
+		let hint = |text: &str| resolver.import_hint(&path(text)).unwrap_or_default();
+
+		assert_eq!(
+			hint("use crate::one::Tr"),
+			"underscore imports are named `_`: `use crate::one::_` names `use crate::a::Tr as _`"
+		);
+		assert_eq!(
+			hint("use Tr"),
+			"underscore imports are named `_`: `use _[1]` names `use a::Tr as _`, `use _[2]` names `use b::Tr as _`"
+		);
+		assert_eq!(paths_of(&resolver, "use _[2]"), ["use fixture::_[2]"]);
+	}
+
 	/// Imports through removed imports break: they are left dangling, or pruned.
 	#[test]
 	fn removing_imports_that_other_imports_go_through() {

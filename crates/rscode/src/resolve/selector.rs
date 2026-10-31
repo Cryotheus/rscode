@@ -161,25 +161,30 @@ impl Resolver<'_> {
 		self.cached_selector(call, || self.call_selectors(call, base))
 	}
 
+	/// The index that picks `import` among `imports` (those that a `use` path without a selector names), numbered like
+	/// [`Resolver::select`] numbers them, when they are at several places. `None` when they are all at one place, or
+	/// `import` is not one of them.
+	pub(super) fn import_index(&self, imports: &[ItemId], import: ItemId) -> Option<u32> {
+		if !imports.contains(&import) {
+			return None;
+		}
+
+		let places = places(self.ws, imports);
+
+		(places.len() > 1)
+			.then(|| places.iter().position(|&candidate| candidate == place(self.ws, import)))
+			.flatten()
+			.and_then(|index| u32::try_from(index + 1).ok())
+	}
+
 	/// The index that the canonical path of an import shows when its `use` path names imports at several places.
 	pub(super) fn import_selector(&self, import: ItemId, base: &CanonicalPath) -> Option<Selector> {
 		let mut unselected = base.clone();
 
 		unselected.selector = None;
 		let path = ItemPath::parse(&unselected.to_string()).ok()?;
-		let imports = self.compute_item_path(&path);
 
-		if !imports.contains(&import) {
-			return None;
-		}
-
-		let places = places(self.ws, &imports);
-
-		(places.len() > 1)
-			.then(|| places.iter().position(|&candidate| candidate == place(self.ws, import)))
-			.flatten()
-			.and_then(|index| u32::try_from(index + 1).ok())
-			.map(Selector::Index)
+		self.import_index(&self.compute_item_path(&path), import).map(Selector::Index)
 	}
 
 	/// Whether an item with this canonical path matches a pattern, with the pattern's selector tested by what it picks

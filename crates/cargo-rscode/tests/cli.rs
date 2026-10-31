@@ -554,6 +554,41 @@ fn names_imports_by_use_paths() {
 	assert!(pasted.stderr.contains("hint: a `use` path names the imports of the module"), "{pasted:#?}");
 }
 
+/// Underscore imports are found by what they import, and a `use` path of that name says which path names them.
+#[test]
+fn finds_and_names_underscore_imports() {
+	let copy = TempCopy::with_files(
+		"underscore-imports",
+		&[
+			("Cargo.toml", "[package]\nname = \"doors\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+			("src/lib.rs", "pub mod doorways;\n"),
+			(
+				"src/doorways.rs",
+				"use std::fmt::Write as _;\nuse std::io::Write;\nuse std::error::Error as _;\n",
+			),
+		],
+	);
+	let found = run(copy.path(), &["find", "use *Write*"]).success();
+
+	assert_eq!(
+		found.lines(),
+		[
+			native("use doors::doorways::_[1]  import  src/doorways.rs:1:5  -> std::fmt::Write"),
+			native("use doors::doorways::Write  import  src/doorways.rs:2:5  -> std::io::Write"),
+		]
+	);
+
+	let missing = run(copy.path(), &["remove", "use crate::doorways::Error", "--dry-run"]);
+	let hint = "hint: underscore imports are named `_`: `use crate::doorways::_[2]` names `use std::error::Error as _`";
+
+	assert_eq!(missing.code, Some(1), "{missing:#?}");
+	assert!(missing.stderr.contains(hint), "{missing:#?}");
+
+	let removal = run(copy.path(), &["remove", "use crate::doorways::_[2]", "--dry-run"]).success();
+
+	assert!(removal.stdout.contains("-use std::error::Error as _;"), "{removal:#?}");
+}
+
 #[test]
 fn finds_items() {
 	let circle = run(&fixture(), &["find", "Circle"]).success();

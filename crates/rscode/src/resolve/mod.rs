@@ -50,6 +50,7 @@ use crate::model::Workspace;
 use crate::path::CanonicalPath;
 use crate::path::ItemPath;
 use crate::path::Qualifier;
+use crate::path::Selector;
 use build::ImportIndex;
 use fxhash::FxHashSet;
 use impls::ImplIndex;
@@ -290,10 +291,15 @@ impl<'ws> Resolver<'ws> {
 		impls
 	}
 
-	/// For a path that names nothing, a hint about imports, for messages: what a `use` path names, or the `use` path
-	/// of the imports that a plain path names (when they import items that are not loaded).
+	/// For a path that names nothing, a hint about imports, for messages: what a `use` path names (or, when its module
+	/// has underscore imports of its last segment, their paths: `use m::_[2]` for `use m::Name`), or the `use` path of
+	/// the imports that a plain path names (when they import items that are not loaded).
 	pub fn import_hint(&self, path: &ItemPath) -> Option<String> {
 		if path.import {
+			if let Some(hint) = self.underscore_hint(path) {
+				return Some(hint);
+			}
+
 			let name = path.name().map_or("Name", SmolStr::as_str);
 
 			return Some(format!(
@@ -463,6 +469,42 @@ impl<'ws> Resolver<'ws> {
 		counterparts.sort();
 		counterparts.dedup();
 		counterparts
+	}
+
+	/// For a `use m::Name` path that names nothing, a hint naming the underscore imports of `m` that import a `Name`
+	/// (`use std::fmt::Write as _;` for `use m::Write`) by their own paths, spelled like `path`: `use m::_`, with the
+	/// index that picks each one when `m` has underscore imports at several places (`use m::_[2]`).
+	fn underscore_hint(&self, path: &ItemPath) -> Option<String> {
+		let name = path.name().filter(|name| !matches!(name.as_str(), "_" | "*"))?;
+		let mut underscore = ItemPath {
+			selector: None,
+			..path.clone()
+		};
+
+		*underscore.segments.last_mut()? = SmolStr::new_static("_");
+
+		let imports = self.compute_item_path(&underscore);
+		let mut named: Vec<(Option<u32>, String)> = Vec::new();
+
+		for &import in &imports {
+			let Some(info) = (self.ws.item(import).import_info()).filter(|info| info.path.last().is_some_and(|last| last.name == *name)) else {
+				continue;
+			};
+			let index = self.import_index(&imports, import);
+			let picked = ItemPath {
+				selector: index.map(Selector::Index),
+				..underscore.clone()
+			};
+
+			named.push((index, format!("`{picked}` names `use {} as _`", info.path)));
+		}
+
+		named.sort();
+		named.dedup();
+
+		let named: Vec<String> = named.into_iter().map(|(_, text)| text).collect();
+
+		(!named.is_empty()).then(|| format!("underscore imports are named `_`: {}", named.join(", ")))
 	}
 
 	/// Imports that resolved to nothing (typically paths into items produced by macros).
