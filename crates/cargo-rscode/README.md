@@ -58,7 +58,7 @@ cargo rscode fmt crate::ffi --check
 
 Every command takes cargo's selection flags (`-p`, `--workspace`, `--exclude`, `--features`, `--all-features`,
 `--no-default-features`, `--manifest-path`, `--lib`, `--bin`, `--tests`, ..., `--target`), plus `--cfg` and
-`--message-format human|json`. `cargo rscode <command> --help` documents everything. Edits are checked to still parse
+`--message-format human|json`; `--all` is short for `--workspace --all-features`. `cargo rscode <command> --help` documents everything. Edits are checked to still parse
 before anything is written, and `--dry-run`/`--check` print a diff instead of writing.
 
 ## MCP server

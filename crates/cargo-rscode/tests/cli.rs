@@ -1097,6 +1097,45 @@ fn errors_name_the_options_that_get_past_them() {
 	);
 }
 
+/// `--all` is `--workspace --all-features`; in a single package, where `--workspace` selects that package, it comes to
+/// `--all-features`.
+#[test]
+fn all_selects_every_member_with_every_feature() {
+	let package = |name: &str, extra: &str| {
+		format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nextra = []\n{extra}")
+	};
+	let gated = "#[cfg(feature = \"extra\")]\npub fn gated() {}\n";
+	let workspace = TempCopy::with_files(
+		"all-workspace",
+		&[
+			("Cargo.toml", &package("a", "\n[workspace]\nmembers = [\"b\"]\n")),
+			("src/lib.rs", gated),
+			("b/Cargo.toml", &package("b", "")),
+			("b/src/lib.rs", gated),
+		],
+	);
+	let found = run(workspace.path(), &["find", "--active-only", "gated"]).success();
+
+	assert!(found.stdout.is_empty(), "{}", found.stdout);
+
+	let found = run(workspace.path(), &["find", "--active-only", "gated", "--all"]).success();
+
+	assert_eq!(found.lines(), [native("b::gated  fn  b/src/lib.rs:1:1"), native("a::gated  fn  src/lib.rs:1:1")]);
+	assert!(!found.stderr.contains("not selected"), "{}", found.stderr);
+
+	let single = TempCopy::with_files("all-single", &[("Cargo.toml", &package("a", "")), ("src/lib.rs", gated)]);
+	let all = run(single.path(), &["find", "--active-only", "gated", "--all"]).success();
+	let all_features = run(single.path(), &["find", "--active-only", "gated", "--all-features"]).success();
+
+	assert_eq!(all.lines(), [native("a::gated  fn  src/lib.rs:1:1")]);
+	assert_eq!((&all.stdout, &all.stderr), (&all_features.stdout, &all_features.stderr));
+
+	let refused = run(single.path(), &["find", "gated", "--all", "--workspace"]);
+
+	assert_eq!(refused.code, Some(2));
+	assert!(refused.stderr.contains("the argument '--all' cannot be used with '--workspace'"), "{}", refused.stderr);
+}
+
 /// Searching the members that are not selected leaves the other paths of a command naming what they named.
 #[test]
 fn searches_members_for_one_path_only() {

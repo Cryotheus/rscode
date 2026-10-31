@@ -58,7 +58,8 @@ cargo rscode sort                             # only sort; formatting is left as
 
 Every subcommand accepts cargo's selection flags (`-p`, `--workspace`, `--exclude`, `--features`,
 `--all-features`, `--no-default-features`, `--manifest-path`, `--lib`, `--bin`, `--tests`, ..., `--target`) plus
-`--cfg` and `--message-format human|json`. Without `-p` or `--workspace`, a path that names nothing in cargo's default
+`--cfg` and `--message-format human|json`. `--all` is short for `--workspace --all-features` (and cannot be combined
+with other package or feature flags). Without `-p` or `--workspace`, a path that names nothing in cargo's default
 members is looked up in the other workspace members (with a note), and a path that still names nothing gets
 suggestions. `cargo rscode <subcommand> --help` documents everything.
 

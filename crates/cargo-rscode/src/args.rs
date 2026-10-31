@@ -898,17 +898,19 @@ fn load_options_with_config(
     list_available_on_bare_values(matches, &config)?;
 
     let mut targets = matches.targets()?;
+    // `--workspace --all-features` (clap refuses it with any other package or feature selection)
+    let all = matches.flag("all");
 
     anyhow::ensure!(targets.len() <= 1, "only one `--target` can be given");
 
     Ok(LoadOptions {
         manifest_path: matches._value_of("manifest-path").map(absolute_path),
         packages: matches._values_of("package"),
-        workspace: matches.flag("workspace"),
+        workspace: all || matches.flag("workspace"),
         exclude: matches._values_of("exclude"),
         targets: target_selection(matches),
         features: split_features(&matches._values_of("features")),
-        all_features: matches.flag("all-features"),
+        all_features: all || matches.flag("all-features"),
         no_default_features: matches.flag("no-default-features"),
         target: targets.pop(),
         cfgs: matches._values_of("cfg"),
@@ -1813,6 +1815,15 @@ mod tests {
                 .contains("--exclude can only be used together with --workspace"),
             "{error}"
         );
+
+        // `--all` is `--workspace --all-features`, and may come with target flags
+        let options =
+            load_options(&parse(&["cargo-rscode", "remove", "x", "--all", "--all-targets"])).unwrap();
+
+        assert!(options.workspace && options.all_features, "{options:?}");
+        assert!(options.packages.is_empty() && options.exclude.is_empty() && options.features.is_empty());
+        assert!(!options.no_default_features);
+        assert!(options.targets.all_targets, "{options:?}");
     }
 
     /// The subcommand's matches of a command line.

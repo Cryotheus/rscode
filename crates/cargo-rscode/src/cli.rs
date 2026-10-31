@@ -104,8 +104,8 @@ pub(crate) const FORMATS: &[&str] = &["human", "json"];
 const LONG_ABOUT: &str = "\
 View, search, format, and edit Rust source by item path.
 
-Crates are loaded from the cargo workspace (like `cargo check`, selected with -p/--workspace and the target flags) \
-and parsed without being compiled or macro-expanded. Items behind `cfg`s that are disabled for the selected features \
+Crates are loaded from the cargo workspace (like `cargo check`, selected with -p/--workspace and the target flags; \
+--all is --workspace --all-features) and parsed without being compiled or macro-expanded. Items behind `cfg`s that are disabled for the selected features \
 and target are still found; they are marked inactive.
 
 Item paths are written like Rust paths:
@@ -628,6 +628,21 @@ fn load_args(command: Command) -> Command {
             "Exclude packages (with --workspace)",
             ArgValueCandidates::new(complete::package_candidates),
         )
+        .arg(
+            flag(
+                "all",
+                "Operate on all packages with all features (--workspace --all-features)",
+            )
+            .conflicts_with_all([
+                "package",
+                "workspace",
+                "exclude",
+                "features",
+                "all-features",
+                "no-default-features",
+            ])
+            .help_heading(heading::PACKAGE_SELECTION),
+        )
         .arg_targets_all(
             "Load the package's library",
             "Load the specified binary",
@@ -1022,6 +1037,13 @@ mod tests {
                 "--no-sort",
                 "--no-merge-extern-blocks",
             ],
+            // `--all` is a package and feature selection of its own
+            &["cargo-rscode", "find", "x", "--all", "--workspace"],
+            &["cargo-rscode", "find", "x", "--all", "-p", "a"],
+            &["cargo-rscode", "find", "x", "--all", "--exclude", "a"],
+            &["cargo-rscode", "find", "x", "--all", "--features", "f"],
+            &["cargo-rscode", "find", "x", "--all", "--all-features"],
+            &["cargo-rscode", "fmt", "--all", "--no-default-features"],
         ] {
             let error = cli().try_get_matches_from(words).unwrap_err();
 
@@ -1038,6 +1060,7 @@ mod tests {
         for subcommand in cli().get_subcommands() {
             for id in [
                 "package",
+                "all",
                 "workspace",
                 "exclude",
                 "features",
