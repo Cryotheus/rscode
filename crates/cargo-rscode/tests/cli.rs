@@ -1562,14 +1562,12 @@ mod mcp {
 		assert!(mcp.stdout.contains("\"mcpServers\""), "{}", mcp.stdout);
 	}
 
-	/// The names of the tools the server lists, after checking its handshake.
-	fn tools(extra: &[&str]) -> BTreeSet<String> {
-		let manifest = fixture().join("Cargo.toml");
-		let mut child = Command::new(BIN)
-			.arg("mcp")
-			.arg("--manifest-path")
-			.arg(&manifest)
-			.args(extra)
+	/// Runs a server in `dir` with `args`, initializes a session, and sends it `requests` (methods and their params),
+	/// each once the one before is answered. Returns their responses, after checking the handshake, that nothing but
+	/// the protocol is on stdout, and that the server ends when the client disconnects.
+	fn exchange(dir: &Path, args: &[&str], requests: &[(&str, Value)]) -> Vec<Value> {
+		let mut child = command(dir, &["mcp"])
+			.args(args)
 			.stdin(Stdio::piped())
 			.stdout(Stdio::piped())
 			.stderr(Stdio::null())
@@ -1587,34 +1585,37 @@ mod mcp {
 			}
 		});
 
-		let messages = [
-			json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-				"protocolVersion": "2025-11-25",
-				"capabilities": {},
-				"clientInfo": {"name": "cargo-rscode-tests", "version": "0.0.0"},
-			}}),
-			json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-			json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
-		];
+		let initialize = json!({
+			"protocolVersion": "2025-11-25",
+			"capabilities": {},
+			"clientInfo": {"name": "cargo-rscode-tests", "version": "0.0.0"},
+		});
+		let mut responses = Vec::new();
 
-		for message in messages {
-			writeln!(stdin, "{message}").unwrap();
-		}
+		for (index, (method, params)) in [("initialize", initialize)].iter().chain(requests).enumerate() {
+			let id = index + 1;
 
-		stdin.flush().unwrap();
+			writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})).unwrap();
+			stdin.flush().unwrap();
 
-		let mut tools = None;
+			let response = loop {
+				let line = receiver.recv_timeout(Duration::from_secs(60)).expect("a response").unwrap();
 
-		while tools.is_none() {
-			let line = receiver.recv_timeout(Duration::from_secs(60)).expect("a response").unwrap();
+				// nothing but the protocol on stdout
+				let message: Value = serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"));
 
-			// nothing but the protocol on stdout
-			let message: Value = serde_json::from_str(&line).unwrap_or_else(|error| panic!("{error}: {line}"));
+				if message["id"] == id {
+					break message;
+				}
+			};
 
-			match message["id"].as_i64() {
-				Some(1) => assert_eq!(message["result"]["serverInfo"]["name"], "rscode", "{message}"),
-				Some(2) => tools = message["result"]["tools"].as_array().cloned(),
-				_ => {}
+			match id {
+				1 => {
+					assert_eq!(response["result"]["serverInfo"]["name"], "rscode", "{response}");
+					writeln!(stdin, "{}", json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).unwrap();
+				}
+
+				_ => responses.push(response),
 			}
 		}
 
@@ -1632,6 +1633,16 @@ mod mcp {
 			assert!(Instant::now() < deadline, "the server did not exit");
 			std::thread::sleep(Duration::from_millis(20));
 		}
+
+		responses
+	}
+
+	/// The names of the tools the server lists.
+	fn tools(extra: &[&str]) -> BTreeSet<String> {
+		let manifest = fixture().join("Cargo.toml");
+		let args = [&["--manifest-path", manifest.to_str().unwrap()][..], extra].concat();
+		let responses = exchange(&fixture(), &args, &[("tools/list", json!({}))]);
+		let tools = responses[0]["result"]["tools"].as_array().cloned();
 
 		tools.unwrap_or_default().iter().filter_map(|tool| tool["name"].as_str()).map(str::to_owned).collect()
 	}
@@ -1660,5 +1671,58 @@ mod mcp {
 		assert!(read_only.contains("find_items") && read_only.contains("view_items"), "{read_only:?}");
 		assert!(read_only.contains("find_references"), "{read_only:?}");
 		assert!(!read_only.contains("rename_item") && !read_only.contains("edit_item"), "{read_only:?}");
+	}
+
+	/// A server without a workspace of its own says how long ago its connection started while nothing is attached,
+	/// so that a client whose server restarted (losing what it attached) knows to attach again.
+	#[test]
+	fn a_server_without_a_workspace_says_when_its_connection_started() {
+		let home = TempCopy::with_files("mcp-no-workspace", &[("notes.txt", "")]);
+
+		// (only where the temporary directory is in no cargo workspace)
+		if home.path().ancestors().any(|dir| dir.join("Cargo.toml").is_file()) {
+			return;
+		}
+
+		let demo = fixture();
+		let expose = format!("read={}", demo.display());
+		let edit = json!({"name": "edit_item", "arguments": {"path": "crate::add", "old": "a", "new": "b"}});
+		let attach = json!({"name": "attach_source", "arguments": {"manifest_path": demo.join("Cargo.toml"), "name": "demo"}});
+		let requests = [("tools/call", edit.clone()), ("tools/call", attach), ("tools/call", edit)];
+		let responses = exchange(home.path(), &["--expose", &expose], &requests);
+		// whether a call failed, and its text
+		let outcome = |index: usize| {
+			let result = &responses[index]["result"];
+
+			(result["isError"] == true, result["content"][0]["text"].as_str().unwrap_or_default().to_owned())
+		};
+		let (failed, message) = outcome(0);
+
+		assert!(failed, "{message}");
+		assert!(
+			message.starts_with("the server has no workspace of its own: its working directory ("),
+			"{message}"
+		);
+		assert!(message.contains("\nhint: this connection started "), "{message}");
+		assert!(
+			message.ends_with(
+				" ago and has no sources attached (attachments do not survive a server restart or reconnect): attach one \
+				 with `attach_source`, and pass its name as `attached`"
+			),
+			"{message}"
+		);
+
+		let (failed, message) = outcome(1);
+
+		assert!(!failed, "{message}");
+
+		// with a source attached, the hint has no word about the connection
+		let (failed, message) = outcome(2);
+
+		assert!(failed, "{message}");
+		assert!(
+			message.ends_with("\nhint: attach one with `attach_source`, and pass its name as `attached`"),
+			"{message}"
+		);
 	}
 }

@@ -58,6 +58,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 /// Guidance for the client (and its model), sent when connecting.
@@ -108,6 +109,10 @@ pub(crate) struct Server {
 
 	/// The sources this session attached, and the one it uses by default. The lock is never held across an `await`.
 	session: std::sync::Mutex<Session>,
+
+	/// When this connection started (a server serves one): sources attached before then were attached on another one,
+	/// and went with it.
+	started: Instant,
 
 	/// Every tool; the editing tools are disabled when the server is read-only, and the tools about sources when it
 	/// exposes no directories.
@@ -508,6 +513,7 @@ impl Server {
 			exposed: options.exposed.clone().into(),
 			options,
 			session: std::sync::Mutex::default(),
+			started: Instant::now(),
 			tool_router,
 			edits: Arc::default(),
 		}
@@ -522,27 +528,25 @@ impl Server {
 	}
 
 	/// Fails when a call uses the server's own workspace, but it has none while sources could be attached. (Without
-	/// exposed directories, loading fails with a hint for the user instead.)
+	/// exposed directories, loading fails with a hint for the user instead.) With nothing attached, the hint says when
+	/// the connection started, as a server restart loses the sources (and the default) a caller attached before.
 	fn check_own_workspace(&self) -> Result<(), String> {
 		if self.exposed.is_empty() || self.options.load.manifest_path.is_some() {
 			return Ok(());
 		}
 
-		match nearest_manifest() {
-			Some((_, Some(_))) => Ok(()),
+		let why = match nearest_manifest() {
+			Some((_, Some(_))) => return Ok(()),
+			Some((directory, None)) => format!("its working directory ({}) is not in a cargo workspace", directory.display()),
+			None => "its working directory is unknown".to_owned(),
+		};
+		let advice = "attach one with `attach_source`, and pass its name as `attached`";
+		let hint = match self.session().sources.is_empty() {
+			true => format!("{}: {advice}", sources::nothing_attached(self.started.elapsed())),
+			false => advice.to_owned(),
+		};
 
-			Some((directory, None)) => Err(format!(
-				"the server has no workspace of its own: its working directory ({}) is not in a cargo workspace\nhint: \
-				 attach one with `attach_source`, and pass its name as `attached`",
-				directory.display()
-			)),
-
-			None => Err(
-				"the server has no workspace of its own: its working directory is unknown\nhint: attach one with \
-			             `attach_source`, and pass its name as `attached`"
-					.to_owned(),
-			),
-		}
+		Err(format!("the server has no workspace of its own: {why}\nhint: {hint}"))
 	}
 
 	/// What `list_sources` shows.
@@ -574,11 +578,13 @@ impl Server {
 		}
 
 		let width = session.sources.keys().map(String::len).max().unwrap_or(0);
+		let age = sources::age(self.started.elapsed());
 
 		match session.sources.is_empty() {
-			true => text.push_str("\nno sources are attached (see `attach_source`)\n"),
-			false => text.push_str("\nattached sources (pass the name as `attached`):\n"),
+			true => writeln!(text, "\nno sources are attached (connection started {age} ago; see `attach_source`)"),
+			false => writeln!(text, "\nattached sources (connection started {age} ago; pass the name as `attached`):"),
 		}
+		.unwrap();
 
 		for (name, source) in session.sources.iter() {
 			writeln!(text, "  {name:width$}  {:14}  {}", source.access.describe(), source.manifest.display()).unwrap();
@@ -761,7 +767,7 @@ impl Server {
 				 (it was started without `--expose`)\nhint: leave out `attached` to work on the server's own workspace"
 			),
 
-			false => sources::unknown(name, attached),
+			false => sources::unknown(name, attached, self.started.elapsed()),
 		}
 	}
 }

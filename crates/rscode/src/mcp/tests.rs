@@ -2330,9 +2330,23 @@ mod end_to_end {
 					"the server's own workspace (used without `attached`): {}",
 					root.join("own/Cargo.toml").display()
 				),
-				"no sources are attached",
+				"no sources are attached (connection started ",
 				&format!("write  {}", project.resolved_pattern()),
 				&format!("read   {}", refs.resolved_pattern()),
+			],
+		);
+
+		// with nothing attached, a name that is not attached comes with when the connection started, which tells a
+		// caller whose server restarted (losing what it attached) to attach again
+		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "attached": "log" })).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&[
+				"no source is attached as `log`\nhint: this connection started ",
+				" ago and has no sources attached (attachments do not survive a server restart or reconnect): attach one with \
+				 `attach_source`",
 			],
 		);
 
@@ -2475,12 +2489,13 @@ mod end_to_end {
 		// names
 		let (_, text) = client.call("list_sources", json!({})).await;
 
-		assert_contains(&text, &["engine  read and write", "log     read-only"]);
+		assert_contains(&text, &["attached sources (connection started ", "engine  read and write", "log     read-only"]);
 
 		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "attached": "nope" })).await;
 
 		assert!(failed);
 		assert_contains(&text, &["no source is attached as `nope`", "the attached sources are `engine`, `log`"]);
+		assert!(!text.contains("connection started"), "{text}");
 
 		let (failed, text) = client.call("detach_source", json!({ "name": "log" })).await;
 

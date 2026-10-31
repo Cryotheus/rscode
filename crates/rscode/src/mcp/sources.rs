@@ -20,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The attached sources of a session, by name.
 pub(crate) type Sources = BTreeMap<String, Source>;
@@ -265,6 +266,14 @@ pub(crate) fn access(exposed: &[Exposure], directory: &Path) -> Option<Access> {
 	exposed.iter().filter(|exposure| exposure.matches(directory)).map(Exposure::access).max()
 }
 
+/// How long something has been going, tersely: in seconds under a minute, else in whole minutes.
+pub(crate) fn age(elapsed: Duration) -> String {
+	match elapsed.as_secs() {
+		seconds @ 0..60 => format!("{seconds} s"),
+		seconds => format!("{} min", seconds / 60),
+	}
+}
+
 /// Checks that a client may attach `source` (with the access the client asks for), and that cargo can plan loading it.
 /// Returns a summary of its packages. `cap` is the most access the server gives, for messages.
 pub(crate) fn attach(source: &Source, exposed: &[Exposure], cap: Access, own: &LoadOptions) -> Result<String, String> {
@@ -498,6 +507,16 @@ fn normalized(mut base: PathBuf, components: &[Component<'_>]) -> PathBuf {
 	base
 }
 
+/// A hint's account of a connection that has no sources attached, `elapsed` after it started: a caller that attached
+/// sources before then lost them, as a server restart or a reconnect starts a new connection.
+pub(crate) fn nothing_attached(elapsed: Duration) -> String {
+	format!(
+		"this connection started {} ago and has no sources attached (attachments do not survive a server restart or \
+		 reconnect)",
+		age(elapsed)
+	)
+}
+
 /// Attaches `source` as `name`, unless the name keeps what it has (see [`verdict`]). Deciding and attaching are one
 /// step on `sources`, so that two calls for the same name at once cannot both attach.
 pub(crate) fn register(sources: &mut Sources, name: &str, source: &Source) -> Verdict {
@@ -526,12 +545,12 @@ pub(crate) fn resolve(path: &Path) -> PathBuf {
 	normalized(PathBuf::new(), &components)
 }
 
-/// The error for a name that no source has.
-pub(crate) fn unknown(name: &str, sources: &Sources) -> String {
+/// The error for a name that no source has, on a connection that started `elapsed` ago, with `sources` attached.
+pub(crate) fn unknown(name: &str, sources: &Sources, elapsed: Duration) -> String {
 	let mut message = format!("no source is attached as `{name}`");
 
 	match sources.is_empty() {
-		true => message.push_str("\nhint: attach one with `attach_source`"),
+		true => write!(message, "\nhint: {}: attach one with `attach_source`", nothing_attached(elapsed)).unwrap(),
 
 		false => {
 			let names: Vec<String> = sources.keys().map(|name| format!("`{name}`")).collect();
@@ -624,6 +643,15 @@ mod tests {
 		fn drop(&mut self) {
 			let _ = std::fs::remove_dir_all(&self.0);
 		}
+	}
+
+	/// Ages are terse: seconds under a minute, else whole minutes.
+	#[test]
+	fn ages_are_seconds_then_minutes() {
+		assert_eq!(age(Duration::ZERO), "0 s");
+		assert_eq!(age(Duration::from_millis(59_999)), "59 s");
+		assert_eq!(age(Duration::from_secs(60)), "1 min");
+		assert_eq!(age(Duration::from_secs(3 * 3600 + 59)), "180 min");
 	}
 
 	/// Files that an edit creates (and their new directories) must be in a directory exposed for writing too.
@@ -871,6 +899,30 @@ mod tests {
 				"{text}"
 			);
 		}
+	}
+
+	/// The error for a name that is not attached lists the attached names, or, with none, says when the connection
+	/// started: a caller whose server restarted since it attached sees that its sources are gone.
+	#[test]
+	fn unknown_names_list_the_attached_ones_or_say_when_the_connection_started() {
+		let mut sources = Sources::new();
+
+		assert_eq!(
+			unknown("engine", &sources, Duration::from_secs(200)),
+			"no source is attached as `engine`\nhint: this connection started 3 min ago and has no sources attached \
+			 (attachments do not survive a server restart or reconnect): attach one with `attach_source`"
+		);
+
+		let log = Source {
+			manifest: PathBuf::from("/refs/log/Cargo.toml"),
+			access: Access::Read,
+		};
+
+		sources.insert("log".to_owned(), log);
+		assert_eq!(
+			unknown("engine", &sources, Duration::from_secs(200)),
+			"no source is attached as `engine`\nhint: the attached sources are `log`"
+		);
 	}
 
 	#[test]
