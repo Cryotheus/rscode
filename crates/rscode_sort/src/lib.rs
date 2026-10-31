@@ -37,7 +37,8 @@
 //! 7. Statics.
 //! 8. Mutable statics.
 //! 9. Data types (structs, enums, unions, traits, and trait aliases), each followed by its `impl` blocks: inherent
-//!    impls first, then trait impls.
+//!    impls first, then trait impls, then the impls of types and traits defined elsewhere whose trait has the type as
+//!    its only type argument (`impl From<Foo> for String` follows `Foo`).
 //! 10. `impl` blocks of types that are not defined in the module.
 //! 11. `extern` blocks. Blocks with the same safety, ABI, and attributes merge into one (`extern {}` counts as
 //!     `extern "C" {}`).

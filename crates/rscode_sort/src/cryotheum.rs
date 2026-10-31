@@ -18,6 +18,18 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use syn::ext::IdentExt;
 
+/// How an `impl` block follows a data type (or trait) of its module: the impls of the type itself come first, then
+/// the impls of other types whose trait names it as its only type argument.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum Attachment {
+	/// `impl Foo`, `impl Trait for Foo`, and for a trait `Foo`, `impl Foo for u8`.
+	Own,
+
+	/// `impl From<Foo> for String`: neither the self type nor the trait is defined in the module, and the trait's only
+	/// type argument is `Foo`.
+	Argument,
+}
+
 /// rustfmt's order of `extern crate` items: by the crate's name (in bytes), then without a rename first, then by the
 /// rename.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -263,8 +275,9 @@ enum Key {
 
 	Use(UseKey),
 
-	/// An `impl` block following its data type: inherent impls first.
-	AttachedImpl(ImplKey),
+	/// An `impl` block following its data type (or trait): its own impls (inherent ones first), then the impls naming it
+	/// as their trait's type argument.
+	AttachedImpl(Attachment, ImplKey),
 
 	/// An `impl` block of a type defined elsewhere.
 	LooseImpl(ImplKey),
@@ -283,7 +296,7 @@ impl Key {
 			(Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
 			(Self::ExternCrate(a), Self::ExternCrate(b)) => a.cmp(b),
 			(Self::Use(a), Self::Use(b)) => a.cmp(b),
-			(Self::AttachedImpl(a), Self::AttachedImpl(b)) => a.attached_cmp(b),
+			(Self::AttachedImpl(a, a_key), Self::AttachedImpl(b, b_key)) => a.cmp(b).then_with(|| a_key.attached_cmp(b_key)),
 			(Self::LooseImpl(a), Self::LooseImpl(b)) => a.loose_cmp(b),
 			(Self::ExternBlock(a), Self::ExternBlock(b)) => a.cmp(b),
 
@@ -454,6 +467,7 @@ enum OrderingSchemaItem {
 	/// maybe `DataType` isn't a fitting name
 	/// but `impl Trait for Type` goes with the `Type` definition if in the same module
 	/// otherwise, it falls back to going below the trait defitinion
+	/// and else, `impl Trait<Type> for Other` goes after the impls of `Type` when `Type` is the trait's only type argument
 	///
 	/// `enum Foo { ... }`
 	/// `struct Foo;`
@@ -605,20 +619,24 @@ pub(crate) enum Spacing {
 	Barrier,
 }
 
-/// The data type (or trait) an `impl` block attaches to.
-fn attachment(block: &syn::ItemImpl, types: &HashMap<String, usize>, traits: &HashMap<String, usize>) -> Option<usize> {
-	if let Some(ident) = self_type_ident(&block.self_ty) {
-		let name = ident.unraw().to_string();
-		let is_generic = block.generics.type_params().any(|param| param.ident.unraw() == name);
-
-		if !is_generic && let Some(&owner) = types.get(&name) {
-			return Some(owner);
-		}
+/// The data type (or trait) an `impl` block attaches to, and how: its self type, else its trait, else the only type
+/// argument of its trait (so `impl From<Foo> for String` follows `Foo`).
+fn attachment(block: &syn::ItemImpl, types: &HashMap<String, usize>, traits: &HashMap<String, usize>) -> Option<(usize, Attachment)> {
+	if let Some(owner) = self_type_ident(&block.self_ty).and_then(|ident| local_type(block, ident, types)) {
+		return Some((owner, Attachment::Own));
 	}
 
 	let (path, _) = block.trait_.as_ref()?;
 
-	traits.get(&local_ident(path)?.unraw().to_string()).copied()
+	if let Some(&owner) = local_ident(path).and_then(|ident| traits.get(&ident.unraw().to_string())) {
+		return Some((owner, Attachment::Own));
+	}
+
+	let owner = only_type_argument(path)
+		.and_then(self_type_ident)
+		.and_then(|ident| local_type(block, ident, types))?;
+
+	Some((owner, Attachment::Argument))
 }
 
 /// The group and sort key of an item of an `impl` block.
@@ -812,6 +830,19 @@ fn local_ident(path: &syn::Path) -> Option<&syn::Ident> {
 	}
 }
 
+/// The data type of the container that `ident` names (by index), unless a generic parameter of the `impl` block
+/// shadows it.
+fn local_type(block: &syn::ItemImpl, ident: &syn::Ident, types: &HashMap<String, usize>) -> Option<usize> {
+	let name = ident.unraw().to_string();
+	let is_type_param = block.generics.type_params().any(|param| param.ident.unraw() == name);
+	let is_const_param = block.generics.const_params().any(|param| param.ident.unraw() == name);
+
+	match is_type_param || is_const_param {
+		true => None,
+		false => types.get(&name).copied(),
+	}
+}
+
 /// The names of the data types and traits of a container, mapped to the index of the first of each name in sorted
 /// order (the one `impl` blocks attach to when several `cfg` variants exist).
 fn local_type_names(items: &[&syn::Item], data_types: &[Sortable<'_>]) -> (HashMap<String, usize>, HashMap<String, usize>) {
@@ -876,6 +907,24 @@ fn module_cfg(attrs: &[syn::Attribute]) -> OrderingSchemaModule {
 		(None, _) => OrderingSchemaModule::Typical,
 		(Some(attr), None) if matches!(&attr.meta, syn::Meta::List(list) if list.tokens.to_string() == "test") => OrderingSchemaModule::Test,
 		_ => OrderingSchemaModule::Cfg,
+	}
+}
+
+/// The only type argument of the last segment of a trait's path: `Foo` in `From<Foo>` and `PartialEq<&'a Foo>`
+/// (lifetime and const arguments do not count), but nothing in `Tr<Foo, Bar>`.
+fn only_type_argument(path: &syn::Path) -> Option<&syn::Type> {
+	let syn::PathArguments::AngleBracketed(arguments) = &path.segments.last()?.arguments else {
+		return None;
+	};
+
+	let mut types = arguments.args.iter().filter_map(|argument| match argument {
+		syn::GenericArgument::Type(ty) => Some(ty),
+		_ => None,
+	});
+
+	match (types.next(), types.next()) {
+		(Some(ty), None) => Some(ty),
+		_ => None,
 	}
 }
 
@@ -976,10 +1025,10 @@ fn plan_module_segment(
 		let key = ImplKey::new(block);
 
 		match attachment(block, &types, &traits) {
-			Some(owner) => attached
+			Some((owner, how)) => attached
 				.entry(owner)
 				.or_default()
-				.push(Sortable::new(index, Key::AttachedImpl(key), ties)),
+				.push(Sortable::new(index, Key::AttachedImpl(how, key), ties)),
 
 			None => loose.push(Sortable::new(index, Key::LooseImpl(key), ties)),
 		}
@@ -1269,6 +1318,64 @@ mod tests {
 
 		// `#[cfg(unix)]` sorts first by token text
 		assert_eq!(plan.entries().map(|entry| entry.index).collect::<Vec<_>>(), [2, 1, 0]);
+	}
+
+	#[test]
+	fn impls_attach_to_the_only_type_argument_of_their_trait() {
+		// after the impls of the type itself, even when the trait sorts before theirs
+		let source = "
+			impl From<Chord> for String {}
+			struct Chord;
+			impl TryFrom<String> for Chord {}
+			impl Display for Chord {}
+			enum Key {}
+			impl Chord {}
+			impl FromStr for Chord {}
+		";
+
+		assert_eq!(
+			planned(source),
+			"struct Chord, impl Chord, impl Display for Chord, impl FromStr for Chord, impl TryFrom<String> for Chord, \
+			 impl From<Chord> for String, enum Key"
+		);
+
+		// by trait, then self type; a trait path of several segments, a reference, and `self::` count
+		let source = "
+			impl<'a> PartialEq<&'a Foo> for &'a str {}
+			impl From<Foo> for Vec<u8> {}
+			impl std::convert::From<Bar> for u16 {}
+			impl From<self::Foo> for String {}
+			struct Foo;
+			struct Bar;
+		";
+
+		assert_eq!(
+			planned(source),
+			"struct Bar, impl std::convert::From<Bar> for u16, \
+			 struct Foo, impl From<Foo> for Vec<u8>, impl From<self::Foo> for String, impl PartialEq<&'a Foo> for &'a str"
+		);
+
+		// not with several type arguments, a type argument naming something else, or a generic parameter of that name
+		assert_eq!(
+			planned(
+				"struct Foo; struct Bar; impl Tr<Foo, Bar> for u8 {} impl From<Vec<Foo>> for u8 {} impl From<crate::Foo> for u8 {} \
+				 impl<Foo> From<Foo> for u16 {} impl<const Foo: usize> Tr<Foo> for u32 {}"
+			),
+			"struct Bar, struct Foo | impl From<Vec<Foo>> for u8, impl From<crate::Foo> for u8, impl Tr<Foo,Bar> for u8, \
+			 impl From<Foo> for u16, impl Tr<Foo> for u32"
+		);
+
+		// lifetime and const arguments do not count
+		assert_eq!(
+			planned("struct Foo; impl Tr<'static, Foo, 3> for u8 {}"),
+			"struct Foo, impl Tr<'static,Foo,3> for u8"
+		);
+
+		// the self type wins, then a local trait
+		assert_eq!(
+			planned("struct Foo; struct Bar; trait Tr<T> {} impl From<Foo> for Bar {} impl Tr<Foo> for u8 {}"),
+			"struct Bar, impl From<Foo> for Bar, struct Foo, trait Tr, impl Tr<Foo> for u8"
+		);
 	}
 
 	#[test]

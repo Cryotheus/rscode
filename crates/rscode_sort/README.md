@@ -40,7 +40,8 @@ The items of a module are grouped in this order:
 3. `use` items, ordered exactly as rustfmt orders them
 4. re-exports (`pub use`, `pub(crate) use`, ...)
 5. type aliases, then constants, statics, and mutable statics
-6. data types (structs, enums, unions, traits), each followed by its `impl` blocks, inherent ones first
+6. data types (structs, enums, unions, traits), each followed by its `impl` blocks, inherent ones first, and last
+   the impls of foreign traits for foreign types with the type as only type argument (`impl From<Foo> for String`)
 7. `impl` blocks of types defined elsewhere
 8. `extern` blocks, merged when their safety, ABI, and attributes match
 9. functions
