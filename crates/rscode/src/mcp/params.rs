@@ -356,6 +356,16 @@ pub(crate) enum Formatter {
 	None,
 }
 
+impl From<Formatter> for RsFormatter {
+	fn from(formatter: Formatter) -> Self {
+		match formatter {
+			Formatter::Rustfmt => Self::RustFmt,
+			Formatter::Prettyplease => Self::PrettyPlease,
+			Formatter::None => Self::None,
+		}
+	}
+}
+
 /// Parameters of `insert_items`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -436,6 +446,16 @@ pub(crate) enum Mode {
 	Auto,
 	Full,
 	Outline,
+}
+
+impl From<Mode> for ViewMode {
+	fn from(mode: Mode) -> Self {
+		match mode {
+			Mode::Auto => Self::Auto,
+			Mode::Full => Self::Full,
+			Mode::Outline => Self::Outline,
+		}
+	}
 }
 
 /// Where `insert_items` inserts or `move_item` moves an item.
@@ -851,26 +871,6 @@ impl ViewParams {
 			imports: self.imports,
 			impls: self.impls,
 			active_only: self.active_only,
-		}
-	}
-}
-
-impl From<Formatter> for RsFormatter {
-	fn from(formatter: Formatter) -> Self {
-		match formatter {
-			Formatter::Rustfmt => Self::RustFmt,
-			Formatter::Prettyplease => Self::PrettyPlease,
-			Formatter::None => Self::None,
-		}
-	}
-}
-
-impl From<Mode> for ViewMode {
-	fn from(mode: Mode) -> Self {
-		match mode {
-			Mode::Auto => Self::Auto,
-			Mode::Full => Self::Full,
-			Mode::Outline => Self::Outline,
 		}
 	}
 }

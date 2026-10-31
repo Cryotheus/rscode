@@ -152,6 +152,17 @@ impl clap::ValueEnum for Edition {
 	}
 }
 
+impl From<Edition> for rscode_sort::StyleEdition {
+	fn from(edition: Edition) -> Self {
+		match edition {
+			Edition::E2015 => Self::E2015,
+			Edition::E2018 => Self::E2018,
+			Edition::E2021 => Self::E2021,
+			Edition::E2024 => Self::E2024,
+		}
+	}
+}
+
 /// Errors produced while formatting.
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
@@ -488,17 +499,6 @@ impl RustFmtOptions {
 	/// [`RustFmtOptions::config_path`]), and read every time.
 	pub fn style_edition_in_effect(&self) -> Edition {
 		config::style_edition(self)
-	}
-}
-
-impl From<Edition> for rscode_sort::StyleEdition {
-	fn from(edition: Edition) -> Self {
-		match edition {
-			Edition::E2015 => Self::E2015,
-			Edition::E2018 => Self::E2018,
-			Edition::E2021 => Self::E2021,
-			Edition::E2024 => Self::E2024,
-		}
 	}
 }
 
