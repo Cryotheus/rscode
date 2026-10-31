@@ -107,12 +107,12 @@ No regex. `*` matches within an identifier, `**` matches whole path segments:
 
 `fmt` and `sort` order items with the Cryotheum schema: module declarations, imports, re-exports, type aliases,
 constants, statics, data types each followed by their `impl` blocks (inherent first, then trait impls, then impls
-like `impl From<Foo> for String` of foreign types whose foreign trait has the type as only type argument), loose
-`impl` blocks, `extern` blocks (merged when their ABI and attributes match), functions, inline modules; `impl` and
-`trait` items are ordered `type`, `const`, `new`, other functions, then methods. Imports are ordered like rustfmt orders them
-in the style edition it uses for the crate (its edition, unless `rustfmt.toml` sets `style_edition`), so `sort`,
-`fmt`, and `cargo fmt` agree. `macro_rules!` definitions and item-position
-macro invocations are never moved, and nothing is moved across them, because macros are scoped textually. Function
+like `impl From<Foo> for String`, whose trait and self type are defined elsewhere and whose trait has the type as its
+only type argument), loose `impl` blocks, `extern` blocks (merged when their ABI and attributes match), functions,
+inline modules; `impl` and `trait` items are ordered `type`, `const`, `new`, other functions, then methods. Imports
+are ordered like rustfmt orders them in the style edition it uses for the crate (its edition, unless `rustfmt.toml`
+sets `style_edition`), so `sort`, `fmt`, and `cargo fmt` agree. `macro_rules!` definitions and item-position macro
+invocations are never moved, and nothing is moved across them, because macros are scoped textually. Function
 bodies, expressions, fields, and variants are never reordered. See the [`rscode_sort`](crates/rscode_sort) docs.
 
 Imports, module declarations, `extern crate` items, type aliases, constants, and statics (and associated types and

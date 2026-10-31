@@ -16,6 +16,7 @@ use quote::ToTokens;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use syn::ext::IdentExt;
 
 /// How an `impl` block follows a data type (or trait) of its module: the impls of the type itself come first, then
@@ -303,6 +304,50 @@ impl Key {
 			// different kinds of keys never share a group
 			_ => Ordering::Equal,
 		}
+	}
+}
+
+/// The names of a container that its `impl` blocks may name: its data types and traits, mapped to the index of the
+/// first of each name in sorted order (the one `impl` blocks attach to when several `cfg` variants exist), and its
+/// constants.
+#[derive(Debug, Default)]
+struct LocalNames {
+	types: HashMap<String, usize>,
+	traits: HashMap<String, usize>,
+	consts: HashSet<String>,
+}
+
+impl LocalNames {
+	/// The names of a container with the items `items`, of which `data_types` are the data types, in sorted order.
+	fn new(items: &[&syn::Item], data_types: &[Sortable<'_>]) -> Self {
+		let mut names = Self::default();
+
+		for entry in data_types {
+			let (ident, is_trait) = match items[entry.index] {
+				syn::Item::Struct(item) => (&item.ident, false),
+				syn::Item::Enum(item) => (&item.ident, false),
+				syn::Item::Union(item) => (&item.ident, false),
+				syn::Item::Trait(item) => (&item.ident, true),
+				syn::Item::TraitAlias(item) => (&item.ident, false),
+				_ => continue,
+			};
+			let name = ident.unraw().to_string();
+
+			if is_trait {
+				names.traits.entry(name.clone()).or_insert(entry.index);
+			}
+
+			names.types.entry(name).or_insert(entry.index);
+		}
+
+		names.consts = (items.iter())
+			.filter_map(|item| match item {
+				syn::Item::Const(item) => Some(item.ident.unraw().to_string()),
+				_ => None,
+			})
+			.collect();
+
+		names
 	}
 }
 
@@ -621,20 +666,18 @@ pub(crate) enum Spacing {
 
 /// The data type (or trait) an `impl` block attaches to, and how: its self type, else its trait, else the only type
 /// argument of its trait (so `impl From<Foo> for String` follows `Foo`).
-fn attachment(block: &syn::ItemImpl, types: &HashMap<String, usize>, traits: &HashMap<String, usize>) -> Option<(usize, Attachment)> {
-	if let Some(owner) = self_type_ident(&block.self_ty).and_then(|ident| local_type(block, ident, types)) {
+fn attachment(block: &syn::ItemImpl, names: &LocalNames) -> Option<(usize, Attachment)> {
+	if let Some(owner) = local_type(block, &block.self_ty, names) {
 		return Some((owner, Attachment::Own));
 	}
 
 	let (path, _) = block.trait_.as_ref()?;
 
-	if let Some(&owner) = local_ident(path).and_then(|ident| traits.get(&ident.unraw().to_string())) {
+	if let Some(&owner) = local_ident(path).and_then(|ident| names.traits.get(&ident.unraw().to_string())) {
 		return Some((owner, Attachment::Own));
 	}
 
-	let owner = only_type_argument(path)
-		.and_then(self_type_ident)
-		.and_then(|ident| local_type(block, ident, types))?;
+	let owner = local_type(block, only_type_argument(block, path, names)?, names)?;
 
 	Some((owner, Attachment::Argument))
 }
@@ -830,44 +873,18 @@ fn local_ident(path: &syn::Path) -> Option<&syn::Ident> {
 	}
 }
 
-/// The data type of the container that `ident` names (by index), unless a generic parameter of the `impl` block
-/// shadows it.
-fn local_type(block: &syn::ItemImpl, ident: &syn::Ident, types: &HashMap<String, usize>) -> Option<usize> {
-	let name = ident.unraw().to_string();
-	let is_type_param = block.generics.type_params().any(|param| param.ident.unraw() == name);
-	let is_const_param = block.generics.const_params().any(|param| param.ident.unraw() == name);
+/// The data type of the container (by index) that a type names: `Foo` in `Foo`, `Foo<T>`, `self::Foo`, `&Foo`,
+/// `&mut (Foo)`, and so on, unless a lone `Foo` is a type parameter of the `impl` block. (Const parameters are values,
+/// which never hide a type, and `self::Foo` is never a parameter.)
+fn local_type(block: &syn::ItemImpl, ty: &syn::Type, names: &LocalNames) -> Option<usize> {
+	let path = type_path(ty)?;
+	let name = local_ident(path)?.unraw().to_string();
+	let is_type_param = path.segments.len() == 1 && block.generics.type_params().any(|param| param.ident.unraw() == name);
 
-	match is_type_param || is_const_param {
+	match is_type_param {
 		true => None,
-		false => types.get(&name).copied(),
+		false => names.types.get(&name).copied(),
 	}
-}
-
-/// The names of the data types and traits of a container, mapped to the index of the first of each name in sorted
-/// order (the one `impl` blocks attach to when several `cfg` variants exist).
-fn local_type_names(items: &[&syn::Item], data_types: &[Sortable<'_>]) -> (HashMap<String, usize>, HashMap<String, usize>) {
-	let mut types = HashMap::new();
-	let mut traits = HashMap::new();
-
-	for entry in data_types {
-		let (ident, is_trait) = match items[entry.index] {
-			syn::Item::Struct(item) => (&item.ident, false),
-			syn::Item::Enum(item) => (&item.ident, false),
-			syn::Item::Union(item) => (&item.ident, false),
-			syn::Item::Trait(item) => (&item.ident, true),
-			syn::Item::TraitAlias(item) => (&item.ident, false),
-			_ => continue,
-		};
-		let name = ident.unraw().to_string();
-
-		if is_trait {
-			traits.entry(name.clone()).or_insert(entry.index);
-		}
-
-		types.entry(name).or_insert(entry.index);
-	}
-
-	(types, traits)
 }
 
 /// Sorted `extern` blocks, where every mergeable block with the same unsafety, ABI, and attributes as an earlier
@@ -910,15 +927,33 @@ fn module_cfg(attrs: &[syn::Attribute]) -> OrderingSchemaModule {
 	}
 }
 
-/// The only type argument of the last segment of a trait's path: `Foo` in `From<Foo>` and `PartialEq<&'a Foo>`
-/// (lifetime and const arguments do not count), but nothing in `Tr<Foo, Bar>`.
-fn only_type_argument(path: &syn::Path) -> Option<&syn::Type> {
+/// Whether a generic argument that parses as a type names a constant instead: a lone name of a const parameter of the
+/// `impl` block or of a constant of the container, which no type parameter or data type of the container shares
+/// (types are looked up first).
+fn names_const(block: &syn::ItemImpl, ty: &syn::Type, names: &LocalNames) -> bool {
+	let syn::Type::Path(path) = ty else {
+		return false;
+	};
+	let Some(name) = path.path.get_ident().filter(|_| path.qself.is_none()).map(|ident| ident.unraw().to_string()) else {
+		return false;
+	};
+	let generics = &block.generics;
+
+	!names.types.contains_key(&name)
+		&& !generics.type_params().any(|param| param.ident.unraw() == name)
+		&& (names.consts.contains(&name) || generics.const_params().any(|param| param.ident.unraw() == name))
+}
+
+/// The only type argument of the last segment of a trait's path: `Foo` in `From<Foo>` and `PartialEq<&'a Foo>`, but
+/// nothing in `Tr<Foo, Bar>`. Lifetimes and constants do not count, nor do constants given by name (`N` in
+/// `Tr<N, Foo>`, see [`names_const`]).
+fn only_type_argument<'a>(block: &syn::ItemImpl, path: &'a syn::Path, names: &LocalNames) -> Option<&'a syn::Type> {
 	let syn::PathArguments::AngleBracketed(arguments) = &path.segments.last()?.arguments else {
 		return None;
 	};
 
 	let mut types = arguments.args.iter().filter_map(|argument| match argument {
-		syn::GenericArgument::Type(ty) => Some(ty),
+		syn::GenericArgument::Type(ty) if !names_const(block, ty, names) => Some(ty),
 		_ => None,
 	});
 
@@ -1014,7 +1049,7 @@ fn plan_module_segment(
 	}
 
 	let data_types = buckets.get(&OrderingSchemaItem::DataType).map_or(&[][..], Vec::as_slice);
-	let (types, traits) = local_type_names(items, data_types);
+	let names = LocalNames::new(items, data_types);
 	let mut attached: HashMap<usize, Vec<Sortable<'_>>> = HashMap::new();
 	let mut loose = Vec::new();
 
@@ -1024,7 +1059,7 @@ fn plan_module_segment(
 		};
 		let key = ImplKey::new(block);
 
-		match attachment(block, &types, &traits) {
+		match attachment(block, &names) {
 			Some((owner, how)) => attached
 				.entry(owner)
 				.or_default()
@@ -1063,18 +1098,6 @@ pub(crate) fn plan_trait_items(items: &[&syn::TraitItem], ties: &[String]) -> Pl
 	plan_groups(classified, ties, OrderingSchemaAssociated::spacing)
 }
 
-/// The name of an `impl` block's self type if it may be a data type of the same container:
-/// `Foo`, `Foo<T>`, `self::Foo`, `&Foo`, `&mut (Foo)`, and so on.
-fn self_type_ident(ty: &syn::Type) -> Option<&syn::Ident> {
-	match ty {
-		syn::Type::Reference(reference) => self_type_ident(&reference.elem),
-		syn::Type::Paren(paren) => self_type_ident(&paren.elem),
-		syn::Type::Group(group) => self_type_ident(&group.elem),
-		syn::Type::Path(path) if path.qself.is_none() => local_ident(&path.path),
-		_ => None,
-	}
-}
-
 /// Sorts by key, then by tie-breaking text, then by original position.
 fn sort_entries(entries: &mut [Sortable<'_>]) {
 	entries.sort_by(|a, b| {
@@ -1086,6 +1109,18 @@ fn sort_entries(entries: &mut [Sortable<'_>]) {
 			})
 			.then(a.index.cmp(&b.index))
 	});
+}
+
+/// The path of a type, through references, parentheses, and invisible groups (`Foo<T>` in `&mut (Foo<T>)`): what may
+/// name a data type of the same container. `None` for qualified paths (`<T as X>::Y`) and other types.
+fn type_path(ty: &syn::Type) -> Option<&syn::Path> {
+	match ty {
+		syn::Type::Reference(reference) => type_path(&reference.elem),
+		syn::Type::Paren(paren) => type_path(&paren.elem),
+		syn::Type::Group(group) => type_path(&group.elem),
+		syn::Type::Path(path) if path.qself.is_none() => Some(&path.path),
+		_ => None,
+	}
 }
 
 /// Data types in order, each followed by its attached `impl` blocks.
@@ -1355,20 +1390,33 @@ mod tests {
 			 struct Foo, impl From<Foo> for Vec<u8>, impl From<self::Foo> for String, impl PartialEq<&'a Foo> for &'a str"
 		);
 
-		// not with several type arguments, a type argument naming something else, or a generic parameter of that name
+		// not with several type arguments, a type argument naming something else, or a type parameter of that name
 		assert_eq!(
 			planned(
 				"struct Foo; struct Bar; impl Tr<Foo, Bar> for u8 {} impl From<Vec<Foo>> for u8 {} impl From<crate::Foo> for u8 {} \
-				 impl<Foo> From<Foo> for u16 {} impl<const Foo: usize> Tr<Foo> for u32 {}"
+				 impl<Foo> From<Foo> for u16 {}"
 			),
 			"struct Bar, struct Foo | impl From<Vec<Foo>> for u8, impl From<crate::Foo> for u8, impl Tr<Foo,Bar> for u8, \
-			 impl From<Foo> for u16, impl Tr<Foo> for u32"
+			 impl From<Foo> for u16"
 		);
 
-		// lifetime and const arguments do not count
+		// a type parameter does not hide `self::Foo`, and a const parameter (a value) never hides a type
 		assert_eq!(
-			planned("struct Foo; impl Tr<'static, Foo, 3> for u8 {}"),
-			"struct Foo, impl Tr<'static,Foo,3> for u8"
+			planned(
+				"struct Foo; struct N; impl<Foo> From<self::Foo> for u8 {} impl<const Foo: usize> Tr<Foo> for u32 {} \
+				 impl<const N: usize> From<[u8; N]> for N {}"
+			),
+			"struct Foo, impl From<self::Foo> for u8, impl Tr<Foo> for u32, struct N, impl From<[u8;N]> for N"
+		);
+
+		// lifetimes and constants do not count, nor do constants given by name, unless a type has the name
+		assert_eq!(
+			planned(
+				"struct Foo; const SIZE: usize = 4; impl Tr<'static, Foo, 3> for u8 {} impl<const N: usize> Tr<N, Foo> for [u8; N] {} \
+				 impl Tr<SIZE, Foo> for u16 {} impl<T> Tr<T, Foo> for Vec<T> {} impl Tr<Unknown, Foo> for u32 {}"
+			),
+			"const SIZE | struct Foo, impl Tr<'static,Foo,3> for u8, impl Tr<N,Foo> for [u8;N], impl Tr<SIZE,Foo> for u16 \
+			 | impl Tr<T,Foo> for Vec<T>, impl Tr<Unknown,Foo> for u32"
 		);
 
 		// the self type wins, then a local trait
