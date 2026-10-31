@@ -77,6 +77,16 @@ impl CfgContext {
 			command.args(["--target", target]);
 		}
 
+		// a host without a console (a GUI application) would otherwise get a console window flashing up
+		#[cfg(windows)]
+		{
+			use std::os::windows::process::CommandExt;
+
+			const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+			command.creation_flags(CREATE_NO_WINDOW);
+		}
+
 		let output = command
 			.output()
 			.map_err(|error| crate::Error::Rustc(format!("failed to run `{}`: {error}", rustc.to_string_lossy())))?;
