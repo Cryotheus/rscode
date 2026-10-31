@@ -168,7 +168,9 @@ pub(super) fn item_snippet(
 
 	if !docs {
 		// (the docs of collapsed `use` items go with them)
-		let docs = within(&syntax.docs, source.region).iter().filter(|&&range| !collapsed.iter().any(|run| run.contains_range(range)));
+		let docs = within(&syntax.docs, source.region)
+			.iter()
+			.filter(|&&range| !collapsed.iter().any(|run| run.contains_range(range)));
 
 		edits.extend(docs.map(|&range| Edit::Delete(range)));
 	}

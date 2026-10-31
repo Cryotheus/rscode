@@ -151,6 +151,7 @@ fn inherited_vis(ws: &Workspace, item: ItemId, home: ItemId) -> Vis {
 	match parent_data.kind {
 		// (the fields of variants are as visible as their enum)
 		ItemKind::Enum | ItemKind::Trait | ItemKind::Variant => declared_vis(ws, parent),
+
 		ItemKind::Impl if parent_data.impl_info().is_some_and(|info| info.trait_path.is_some()) => Vis::Public,
 		_ => Vis::Module(home),
 	}

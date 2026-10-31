@@ -170,17 +170,6 @@ fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> ErrorKind {
 		.map_or(ErrorKind::Other, std::io::Error::kind)
 }
 
-/// Classifies why a running session stopped. A join failure may be returned either by awaiting the service task or
-/// inside rmcp's [`QuitReason`]; neither is a clean disconnect.
-fn session_stopped(stopped: Result<QuitReason, tokio::task::JoinError>) -> Result<(), Error> {
-	match stopped {
-		Ok(QuitReason::Closed) => Ok(()),
-		Ok(QuitReason::Cancelled) => Ok(()),
-		Ok(QuitReason::JoinError(error)) | Err(error) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {error}"))),
-		Ok(reason) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {reason:?}"))),
-	}
-}
-
 async fn run<T, E, A>(server: Server, transport: T) -> Result<(), Error>
 where
 	T: IntoTransport<RoleServer, E, A>,
@@ -221,4 +210,15 @@ pub async fn serve_stdio(options: ServerOptions) -> Result<(), Error> {
 	let input = CheckedInput::new(tokio::io::stdin(), |message| eprintln!("{message}"));
 
 	serve(options, (input, tokio::io::stdout())).await
+}
+
+/// Classifies why a running session stopped. A join failure may be returned either by awaiting the service task or
+/// inside rmcp's [`QuitReason`]; neither is a clean disconnect.
+fn session_stopped(stopped: Result<QuitReason, tokio::task::JoinError>) -> Result<(), Error> {
+	match stopped {
+		Ok(QuitReason::Closed) => Ok(()),
+		Ok(QuitReason::Cancelled) => Ok(()),
+		Ok(QuitReason::JoinError(error)) | Err(error) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {error}"))),
+		Ok(reason) => Err(connection_error(ErrorKind::Other, format!("the server stopped unexpectedly: {reason:?}"))),
+	}
 }

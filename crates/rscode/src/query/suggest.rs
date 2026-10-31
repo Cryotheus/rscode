@@ -35,7 +35,11 @@ pub struct Suggestions {
 /// (`macro_call`), the name of the macro of an invocation in a module (not that of a `macro_rules!` definition).
 fn compared_name<'ws>(ws: &Workspace, item: ItemId, data: &'ws ItemData, macro_call: bool) -> Option<&'ws str> {
 	match macro_call {
-		true => ws.parent(item).filter(|&parent| ws.item(parent).kind == ItemKind::Module).and_then(|_| data.macro_name()),
+		true => ws
+			.parent(item)
+			.filter(|&parent| ws.item(parent).kind == ItemKind::Module)
+			.and_then(|_| data.macro_name()),
+
 		false => data.name.as_deref().filter(|_| data.kind.is_nameable() && data.kind != ItemKind::Import),
 	}
 }

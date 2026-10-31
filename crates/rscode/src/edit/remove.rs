@@ -228,9 +228,7 @@ fn broken_imports(resolver: &Resolver<'_>, removed: &HashSet<ItemId>) -> BTreeMa
 fn check_variants(resolver: &Resolver<'_>, path: &ItemPath, items: &[ItemId]) -> Result<(), Error> {
 	let ws = resolver.workspace();
 	let selectable: Vec<ItemId> = (items.iter().copied())
-		.filter(|&item| {
-			(ws.parent(item).into_iter().chain([item])).any(|item| matches!(ws.item(item).kind, ItemKind::Impl | ItemKind::MacroCall))
-		})
+		.filter(|&item| (ws.parent(item).into_iter().chain([item])).any(|item| matches!(ws.item(item).kind, ItemKind::Impl | ItemKind::MacroCall)))
 		.collect();
 
 	if !super::impl_headers_differ(ws, items) && !super::coexisting_items(ws, &selectable) {
@@ -555,10 +553,8 @@ pub fn remove(resolver: &Resolver<'_>, paths: &[ItemPath], options: &RemoveOptio
 	}
 
 	if targets.iter().any(|&item| ws.item(item).kind == ItemKind::Field) {
-		plan.warnings.push(
-			"the uses of removed fields (field accesses, struct literals, and patterns) are not searched for: check them"
-				.to_owned(),
-		);
+		plan.warnings
+			.push("the uses of removed fields (field accesses, struct literals, and patterns) are not searched for: check them".to_owned());
 	}
 
 	if targets.iter().any(|&item| ws.entry_macro(item).is_some()) {

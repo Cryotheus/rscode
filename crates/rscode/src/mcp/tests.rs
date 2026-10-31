@@ -27,10 +27,11 @@ const EDIT_TOOLS: [&str; 9] = [
 	"replace_item",
 ];
 
+const QUERY_TOOLS: [&str; 4] = ["find_items", "find_references", "view_items", "workspace_info"];
+
 /// Parameters every non-source tool accepts as part of its selection.
 const SELECTION: [&str; 6] = ["workspace", "features", "all_features", "all_targets", "lib", "bin"];
 
-const QUERY_TOOLS: [&str; 4] = ["find_items", "find_references", "view_items", "workspace_info"];
 const SOURCE_TOOLS: [&str; 4] = ["attach_source", "detach_source", "list_sources", "use_source"];
 
 /// A client talking to a server over an in-process pipe, with newline-delimited JSON-RPC like stdio.
@@ -123,23 +124,6 @@ impl Client {
 }
 
 #[tokio::test]
-async fn an_initialization_notification_before_the_handshake_is_an_error() {
-	let (mut client, server) = tokio::io::duplex(1 << 16);
-
-	client
-		.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
-		.await
-		.unwrap();
-
-	let error = tokio::time::timeout(Duration::from_secs(5), serve(ServerOptions::default(), server))
-		.await
-		.expect("the invalid initialization notification must end the handshake within five seconds")
-		.unwrap_err();
-
-	assert!(error.to_string().starts_with("MCP connection: failed to start the session"), "{error}");
-}
-
-#[tokio::test]
 async fn a_request_without_a_handshake_reports_an_error_and_allows_initializing() {
 	tokio::time::timeout(Duration::from_secs(5), async {
 		let (client, server_end) = tokio::io::duplex(1 << 16);
@@ -177,6 +161,23 @@ async fn a_request_without_a_handshake_reports_an_error_and_allows_initializing(
 
 fn all_tools() -> Vec<String> {
 	sorted(QUERY_TOOLS.iter().chain(&EDIT_TOOLS))
+}
+
+#[tokio::test]
+async fn an_initialization_notification_before_the_handshake_is_an_error() {
+	let (mut client, server) = tokio::io::duplex(1 << 16);
+
+	client
+		.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+		.await
+		.unwrap();
+
+	let error = tokio::time::timeout(Duration::from_secs(5), serve(ServerOptions::default(), server))
+		.await
+		.expect("the invalid initialization notification must end the handshake within five seconds")
+		.unwrap_err();
+
+	assert!(error.to_string().starts_with("MCP connection: failed to start the session"), "{error}");
 }
 
 #[test]
@@ -354,51 +355,6 @@ async fn failures_are_tool_errors() {
 	client.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn parameter_errors_report_unknown_and_all_missing_names() {
-	let mut client = Client::connect(ServerOptions::default()).await;
-	let (failed, text) = client
-		.call("create_module", json!({ "content": "fn f() {}", "before": "crate::f", "mystery": true }))
-		.await;
-
-	assert!(failed, "{text}");
-	assert!(text.contains("unknown: before, mystery"), "{text}");
-	assert!(text.contains("missing required: name, parent"), "{text}");
-	assert!(text.contains("content"), "{text}");
-	assert!(text.contains("content -> source"), "{text}");
-	assert!(text.contains(r#"example arguments: {"name":"value","parent":"crate"}"#), "{text}");
-	assert!(!text.contains("unknown: content"), "{text}");
-
-	let (failed, text) = client.call("insert_items", json!({ "soruce": "fn f() {}" })).await;
-
-	assert!(failed, "{text}");
-	assert!(text.contains("unknown: soruce"), "{text}");
-	assert!(text.contains("missing required: parent, source"), "{text}");
-	assert!(text.contains(r#"example arguments: {"parent":"crate","source":"fn example() {}"}"#), "{text}");
-
-	let (failed, text) = client.call("insert_items", json!({ "before": "crate::f" })).await;
-
-	assert!(failed, "{text}");
-	assert!(text.contains("unknown: before"), "{text}");
-	assert!(text.contains("missing required: parent, source"), "{text}");
-	assert!(text.contains(r#"example arguments: {"parent":"crate","source":"fn example() {}"}"#), "{text}");
-
-	let (failed, text) = client.call("move_item", json!({ "path": "crate::f", "position": "before" })).await;
-
-	assert!(failed, "{text}");
-	assert!(text.contains("missing required: anchor"), "{text}");
-	assert!(text.contains(r#"example arguments: {"path":"crate::item"}"#), "{text}");
-
-	let (failed, text) = client.call("edit_item", json!({ "paht": "crate::f" })).await;
-
-	assert!(failed, "{text}");
-	assert!(
-		text.contains(r#"example arguments: {"new":"new text","old":"old text","path":"crate::item"}"#),
-		"{text}"
-	);
-	client.close().await.unwrap();
-}
-
 #[test]
 fn handshake_failures() {
 	let kind = |result: Result<(), Error>| match result {
@@ -432,29 +388,6 @@ fn handshake_failures() {
 }
 
 #[tokio::test]
-async fn service_join_failures_are_not_clean_shutdowns() {
-	let message = |result| match session_stopped(result) {
-		Err(Error::Io { path, source }) => {
-			assert_eq!(path, Path::new("MCP connection"));
-			source.to_string()
-		}
-
-		other => panic!("not a connection error: {other:?}"),
-	};
-	let join_error = || async {
-		let task = tokio::spawn(std::future::pending::<()>());
-
-		task.abort();
-		task.await.unwrap_err()
-	};
-
-	assert!(session_stopped(Ok(QuitReason::Closed)).is_ok());
-	assert!(session_stopped(Ok(QuitReason::Cancelled)).is_ok());
-	assert!(message(Err(join_error().await)).contains("cancelled"));
-	assert!(message(Ok(QuitReason::JoinError(join_error().await))).contains("cancelled"));
-}
-
-#[tokio::test]
 async fn hanging_up_before_initializing_is_not_an_error() {
 	let (client, server) = tokio::io::duplex(1024);
 
@@ -477,7 +410,10 @@ fn input_schemas_are_objects_with_described_properties() {
 		}
 
 		// (the instructions describe the parameters that tools share)
-		for (name, property) in properties.iter().filter(|(name, _)| !["dry_run", "format", "packages"].contains(&name.as_str())) {
+		for (name, property) in properties
+			.iter()
+			.filter(|(name, _)| !["dry_run", "format", "packages"].contains(&name.as_str()))
+		{
 			let description = property["description"].as_str().unwrap_or_default();
 
 			assert!(description.len() > 10, "{}.{name} is not described: {property}", tool.name);
@@ -532,6 +468,57 @@ fn offers_every_tool() {
 	let server = Server::new(ServerOptions::default());
 
 	assert_eq!(sorted(server.tools().iter().map(|tool| &tool.name)), all_tools());
+}
+
+#[tokio::test]
+async fn parameter_errors_report_unknown_and_all_missing_names() {
+	let mut client = Client::connect(ServerOptions::default()).await;
+	let (failed, text) = client
+		.call("create_module", json!({ "content": "fn f() {}", "before": "crate::f", "mystery": true }))
+		.await;
+
+	assert!(failed, "{text}");
+	assert!(text.contains("unknown: before, mystery"), "{text}");
+	assert!(text.contains("missing required: name, parent"), "{text}");
+	assert!(text.contains("content"), "{text}");
+	assert!(text.contains("content -> source"), "{text}");
+	assert!(text.contains(r#"example arguments: {"name":"value","parent":"crate"}"#), "{text}");
+	assert!(!text.contains("unknown: content"), "{text}");
+
+	let (failed, text) = client.call("insert_items", json!({ "soruce": "fn f() {}" })).await;
+
+	assert!(failed, "{text}");
+	assert!(text.contains("unknown: soruce"), "{text}");
+	assert!(text.contains("missing required: parent, source"), "{text}");
+	assert!(
+		text.contains(r#"example arguments: {"parent":"crate","source":"fn example() {}"}"#),
+		"{text}"
+	);
+
+	let (failed, text) = client.call("insert_items", json!({ "before": "crate::f" })).await;
+
+	assert!(failed, "{text}");
+	assert!(text.contains("unknown: before"), "{text}");
+	assert!(text.contains("missing required: parent, source"), "{text}");
+	assert!(
+		text.contains(r#"example arguments: {"parent":"crate","source":"fn example() {}"}"#),
+		"{text}"
+	);
+
+	let (failed, text) = client.call("move_item", json!({ "path": "crate::f", "position": "before" })).await;
+
+	assert!(failed, "{text}");
+	assert!(text.contains("missing required: anchor"), "{text}");
+	assert!(text.contains(r#"example arguments: {"path":"crate::item"}"#), "{text}");
+
+	let (failed, text) = client.call("edit_item", json!({ "paht": "crate::f" })).await;
+
+	assert!(failed, "{text}");
+	assert!(
+		text.contains(r#"example arguments: {"new":"new text","old":"old text","path":"crate::item"}"#),
+		"{text}"
+	);
+	client.close().await.unwrap();
 }
 
 fn read_only() -> ServerOptions {
@@ -611,11 +598,17 @@ fn schemas_say_only_what_a_call_needs() {
 
 	// no defaults that say nothing, no `null` types, no descriptions of what the instructions describe
 	assert_eq!(edit_item["properties"]["dry_run"], json!({ "type": "boolean" }));
-	assert_eq!(edit_item["properties"]["packages"], json!({ "type": "array", "items": { "type": "string" } }));
+	assert_eq!(
+		edit_item["properties"]["packages"],
+		json!({ "type": "array", "items": { "type": "string" } })
+	);
 	assert_eq!(edit_item["properties"]["vis"]["type"], "string");
 	assert!(edit_item["properties"]["vis"].get("default").is_none(), "{edit_item}");
 	assert!(edit_item["properties"]["edits"]["items"].get("description").is_none(), "{edit_item}");
-	assert_eq!(schema("find_items")["properties"]["limit"], json!({ "type": "integer", "default": 100, "description": "Most matches to list (0 only counts them)." }));
+	assert_eq!(
+		schema("find_items")["properties"]["limit"],
+		json!({ "type": "integer", "default": 100, "description": "Most matches to list (0 only counts them)." })
+	);
 	assert!(schema("view_items")["properties"]["line_numbers"].get("default").is_none());
 
 	// what schemas leave out is still accepted
@@ -687,6 +680,29 @@ async fn servers_without_exposed_directories_explain_the_source_tools() {
 	);
 	assert!(!text.contains("attach_source"), "{text}");
 	client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn service_join_failures_are_not_clean_shutdowns() {
+	let message = |result| match session_stopped(result) {
+		Err(Error::Io { path, source }) => {
+			assert_eq!(path, Path::new("MCP connection"));
+			source.to_string()
+		}
+
+		other => panic!("not a connection error: {other:?}"),
+	};
+	let join_error = || async {
+		let task = tokio::spawn(std::future::pending::<()>());
+
+		task.abort();
+		task.await.unwrap_err()
+	};
+
+	assert!(session_stopped(Ok(QuitReason::Closed)).is_ok());
+	assert!(session_stopped(Ok(QuitReason::Cancelled)).is_ok());
+	assert!(message(Err(join_error().await)).contains("cancelled"));
+	assert!(message(Ok(QuitReason::JoinError(join_error().await))).contains("cancelled"));
 }
 
 #[tokio::test]
@@ -878,7 +894,10 @@ mod end_to_end {
 		let fixture = Fixture::with_files(
 			"add-import",
 			&[
-				("Cargo.toml", "[package]\nname = \"imports\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"),
+				(
+					"Cargo.toml",
+					"[package]\nname = \"imports\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
 				("src/lib.rs", lib),
 			],
 		);
@@ -936,7 +955,10 @@ mod end_to_end {
 		// refusals name the parameter to change
 		for (arguments, needle) in [
 			(json!({ "module": "crate", "paths": "other::fmt" }), "hint: import it under another name"),
-			(json!({ "module": "crate", "paths": "not a path" }), "hint: each of `paths` is a `use` tree"),
+			(
+				json!({ "module": "crate", "paths": "not a path" }),
+				"hint: each of `paths` is a `use` tree",
+			),
 			(json!({ "module": "crate", "paths": [] }), "`paths` is empty"),
 		] {
 			let (failed, text) = client.call("add_import", arguments).await;
@@ -982,16 +1004,28 @@ mod end_to_end {
 		let (failed, text) = client.call("create_module", arguments).await;
 
 		assert!(!failed, "{text}");
-		assert_eq!(text, native("created src/render.rs; inserted `pub mod render;` into `crate` (src/lib.rs:3)\n"));
+		assert_eq!(
+			text,
+			native("created src/render.rs; inserted `pub mod render;` into `crate` (src/lib.rs:3)\n")
+		);
 		assert_eq!(fixture.read("src/render.rs"), "pub fn draw() {}\n");
-		assert_eq!(fixture.read("src/lib.rs"), original.replace("pub mod shapes;", "pub mod render;\npub mod shapes;"));
+		assert_eq!(
+			fixture.read("src/lib.rs"),
+			original.replace("pub mod shapes;", "pub mod render;\npub mod shapes;")
+		);
 
 		// refusals name the parameter to change, and write nothing
 		let refusals = [
 			(json!({ "parent": "crate", "name": "render" }), "hint: choose another `name`"),
-			(json!({ "parent": "crate", "name": "crate::x" }), "hint: `name` is the new module's identifier"),
+			(
+				json!({ "parent": "crate", "name": "crate::x" }),
+				"hint: `name` is the new module's identifier",
+			),
 			(json!({ "parent": "crate", "name": "x", "vis": "public" }), "hint: `vis` is `pub`"),
-			(json!({ "parent": "crate", "name": "x", "source": "fn (" }), "hint: `source` is the whole file"),
+			(
+				json!({ "parent": "crate", "name": "x", "source": "fn (" }),
+				"hint: `source` is the whole file",
+			),
 			(json!({ "parent": "crate", "name": " " }), "`name` is empty"),
 		];
 
@@ -1006,107 +1040,48 @@ mod end_to_end {
 		let (failed, text) = client.call("create_module", json!({ "parent": "crate", "name": "stray" })).await;
 
 		assert!(failed && text.contains("hint: declare the existing file with `insert_items`"), "{text}");
-		assert_eq!(fixture.read("src/lib.rs"), original.replace("pub mod shapes;", "pub mod render;\npub mod shapes;"));
+		assert_eq!(
+			fixture.read("src/lib.rs"),
+			original.replace("pub mod shapes;", "pub mod render;\npub mod shapes;")
+		);
 
 		client.close().await.unwrap();
 	}
 
 	#[tokio::test]
-	async fn moves_an_item_after_previewing_with_every_dry_run_alias() {
-		let original = "pub fn first() {}\n\n// Keep this with second.\npub fn second() {}\n\npub fn third() {}\n";
+	async fn duplicate_imports_have_indexed_paths() {
 		let fixture = Fixture::with_files(
-			"move-item",
+			"duplicate-imports",
 			&[
 				(
 					"Cargo.toml",
-					"[package]\nname = \"moves\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
 				),
-				("src/lib.rs", original),
-			],
-		);
-		let mut client = Client::connect(fixture.options()).await;
-
-		for flag in ["dryRun", "dry-run", "check"] {
-			let mut arguments = json!({
-				"path": "crate::second",
-				"position": "before",
-				"anchor": "crate::first",
-			});
-
-			arguments[flag] = json!(true);
-
-			let (failed, text) = client.call("move_item", arguments).await;
-
-			assert!(!failed, "{flag}: {text}");
-			assert_contains(&text, &["would move 1 item within `moves`", "moves::second", "nothing was written"]);
-			assert_eq!(fixture.read("src/lib.rs"), original);
-		}
-
-		let arguments = json!({
-			"path": "crate::second",
-			"position": "before",
-			"anchor": "crate::first",
-		});
-		let (failed, text) = client.call("move_item", arguments).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(&text, &["moved 1 item within `moves`", "moves::second"]);
-
-		let moved = fixture.read("src/lib.rs");
-		let second = moved.find("// Keep this with second.\npub fn second() {}").unwrap();
-		let first = moved.find("pub fn first() {}").unwrap();
-		let third = moved.find("pub fn third() {}").unwrap();
-
-		assert!(second < first && first < third, "{moved}");
-
-		let arguments = json!({
-			"path": "crate::second",
-			"position": "before",
-			"anchor": "crate::first",
-		});
-		let (failed, text) = client.call("move_item", arguments).await;
-
-		assert!(!failed, "{text}");
-		assert_eq!(text, "nothing changed\n");
-		assert_eq!(fixture.read("src/lib.rs"), moved);
-
-		let arguments = json!({
-			"path": "crate::second",
-			"position": "before",
-			"anchor": "crate::first",
-			"dry_run": true,
-		});
-		let (failed, text) = client.call("move_item", arguments).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(&text, &["nothing would change", "nothing was written (dry run)"]);
-		assert_eq!(fixture.read("src/lib.rs"), moved);
-		client.close().await.unwrap();
-	}
-
-	#[tokio::test]
-	async fn format_paths_alias_is_scoped_and_does_not_sort_by_default() {
-		let original = "pub fn b( ) ->i32{1}\n\npub fn a( )->i32 { 2 }\n";
-		let fixture = Fixture::with_files(
-			"format-paths-alias",
-			&[
 				(
-					"Cargo.toml",
-					"[package]\nname = \"format_scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+					"src/lib.rs",
+					"pub struct A;\npub struct B;\n\nuse crate::A as Same;\nuse crate::B as Same;\n",
 				),
-				("src/lib.rs", original),
 			],
 		);
 		let mut client = Client::connect(fixture.options()).await;
-		let (failed, text) = client.call("format_items", json!({ "paths": "crate::b" })).await;
+		let (failed, text) = client.call("find_items", json!({ "pattern": "use *Same*" })).await;
 
 		assert!(!failed, "{text}");
+		assert_contains(&text, &["use demo::Same[1]", "use demo::Same[2]"]);
 
-		let formatted = fixture.read("src/lib.rs");
+		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Same[2]" })).await;
 
-		assert!(formatted.starts_with("pub fn b() -> i32 {\n    1\n}"), "{formatted}");
-		assert!(formatted.ends_with("pub fn a( )->i32 { 2 }\n"), "{formatted}");
-		assert!(formatted.find("fn b").unwrap() < formatted.find("fn a").unwrap(), "{formatted}");
+		assert!(!failed, "{text}");
+		assert!(text.contains("use crate::B as Same;"), "{text}");
+		assert!(!text.contains("use crate::A as Same;"), "{text}");
+
+		let (failed, text) = client
+			.call("remove_items", json!({ "paths": "use crate::Same[2]", "dry_run": true }))
+			.await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["-use crate::B as Same;", "nothing was written"]);
+		assert!(!text.contains("-use crate::A as Same;"), "{text}");
 		client.close().await.unwrap();
 	}
 
@@ -1224,11 +1199,16 @@ mod end_to_end {
 		let (failed, text) = client.call("edit_item", arguments).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&fixture.read("src/lib.rs"), &["\n/// Three.\n#[must_use]\npub(crate) fn three() -> i32 {\n"]);
+		assert_contains(
+			&fixture.read("src/lib.rs"),
+			&["\n/// Three.\n#[must_use]\npub(crate) fn three() -> i32 {\n"],
+		);
 
 		// text that does not occur once writes nothing, and tells what to do
 		let lib = fixture.read("src/lib.rs");
-		let (failed, text) = client.call("edit_item", json!({ "path": "crate::add", "old": "a - b", "new": "a * b" })).await;
+		let (failed, text) = client
+			.call("edit_item", json!({ "path": "crate::add", "old": "a - b", "new": "a * b" }))
+			.await;
 
 		assert!(failed);
 		assert_eq!(
@@ -1304,7 +1284,8 @@ mod end_to_end {
 			exposed: vec![Exposure::new(Access::Write, root.join("other").to_str().unwrap()).unwrap()],
 			..ServerOptions::default()
 		};
-		let attach = |use_it: bool| json!({ "manifest_path": root.join("other/Cargo.toml").to_str().unwrap(), "name": "other", "write": true, "use": use_it });
+		let attach =
+			|use_it: bool| json!({ "manifest_path": root.join("other/Cargo.toml").to_str().unwrap(), "name": "other", "write": true, "use": use_it });
 		let edit = json!({ "path": "crate::mine", "old": "{}", "new": "{ todo!() }" });
 		let preview = json!({ "path": "crate::mine", "doc": "Mine.", "dry_run": true });
 		let edited = "pub fn mine() { todo!() }\n";
@@ -1426,12 +1407,19 @@ mod end_to_end {
 			&["hint: `crate::Counter::count` names an associated item or variant; the field is `crate::Counter.count`"],
 		);
 
-		let (failed, text) = client.call("replace_item", json!({ "path": "crate::Counter.count", "source": "pub count: u64," })).await;
+		let (failed, text) = client
+			.call("replace_item", json!({ "path": "crate::Counter.count", "source": "pub count: u64," }))
+			.await;
 
 		assert!(!failed, "{text}");
-		assert_eq!(fixture.read("src/lib.rs"), lib.replace("/// The count.\n\tpub count: u32", "pub count: u64"));
+		assert_eq!(
+			fixture.read("src/lib.rs"),
+			lib.replace("/// The count.\n\tpub count: u32", "pub count: u64")
+		);
 
-		let (failed, text) = client.call("remove_items", json!({ "paths": ["crate::Counter.count"], "dry_run": true })).await;
+		let (failed, text) = client
+			.call("remove_items", json!({ "paths": ["crate::Counter.count"], "dry_run": true }))
+			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(&text, &["warning: the uses of removed fields"]);
@@ -1448,6 +1436,32 @@ mod end_to_end {
 		};
 
 		assert!(!Path::new(&root).exists());
+	}
+
+	#[tokio::test]
+	async fn format_paths_alias_is_scoped_and_does_not_sort_by_default() {
+		let original = "pub fn b( ) ->i32{1}\n\npub fn a( )->i32 { 2 }\n";
+		let fixture = Fixture::with_files(
+			"format-paths-alias",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"format_scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", original),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let (failed, text) = client.call("format_items", json!({ "paths": "crate::b" })).await;
+
+		assert!(!failed, "{text}");
+
+		let formatted = fixture.read("src/lib.rs");
+
+		assert!(formatted.starts_with("pub fn b() -> i32 {\n    1\n}"), "{formatted}");
+		assert!(formatted.ends_with("pub fn a( )->i32 { 2 }\n"), "{formatted}");
+		assert!(formatted.find("fn b").unwrap() < formatted.find("fn a").unwrap(), "{formatted}");
+		client.close().await.unwrap();
 	}
 
 	/// Formatting after an edit formats what the edit touched: a replaced glob import, and an inserted `use` item.
@@ -1508,7 +1522,9 @@ mod end_to_end {
 		let mut client = Client::connect(fixture.options()).await;
 
 		// the candidates are paths to each block, and `all_variants` is not offered for them
-		let (failed, text) = client.call("replace_item", json!({ "path": "impl Tools", "source": "impl Tools {}" })).await;
+		let (failed, text) = client
+			.call("replace_item", json!({ "path": "impl Tools", "source": "impl Tools {}" }))
+			.await;
 
 		assert!(failed);
 		assert_contains(
@@ -1521,7 +1537,9 @@ mod end_to_end {
 		);
 		assert!(!text.contains("all_variants"), "{text}");
 
-		let (failed, text) = client.call("view_items", json!({ "paths": ["impl Tools[#allow]", "<Tools>[2]::kick"] })).await;
+		let (failed, text) = client
+			.call("view_items", json!({ "paths": ["impl Tools[#allow]", "<Tools>[2]::kick"] }))
+			.await;
 
 		assert!(!failed, "{text}");
 		assert_contains(
@@ -1545,7 +1563,11 @@ mod end_to_end {
 		let (failed, text) = client.call("insert_items", inserted).await;
 
 		assert!(!failed && !text.contains("matches no item"), "{text}");
-		assert!(fixture.read("src/lib.rs").contains("pub fn unban() {}\n}\n"), "{}", fixture.read("src/lib.rs"));
+		assert!(
+			fixture.read("src/lib.rs").contains("pub fn unban() {}\n}\n"),
+			"{}",
+			fixture.read("src/lib.rs")
+		);
 
 		// a selector that picks nothing
 		let (failed, text) = client.call("view_items", json!({ "paths": ["impl Tools[3]"] })).await;
@@ -1587,10 +1609,7 @@ mod end_to_end {
 		let (failed, text) = client.call("find_items", json!({ "pattern": "use *" })).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(
-			&text,
-			&[&native("use demo::Circle  import  src/lib.rs:5  -> demo::shapes::Circle")],
-		);
+		assert_contains(&text, &[&native("use demo::Circle  import  src/lib.rs:5  -> demo::shapes::Circle")]);
 
 		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Circle" })).await;
 
@@ -1637,38 +1656,6 @@ mod end_to_end {
 		client.close().await.unwrap();
 	}
 
-	#[tokio::test]
-	async fn duplicate_imports_have_indexed_paths() {
-		let fixture = Fixture::with_files(
-			"duplicate-imports",
-			&[
-				(
-					"Cargo.toml",
-					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
-				),
-				("src/lib.rs", "pub struct A;\npub struct B;\n\nuse crate::A as Same;\nuse crate::B as Same;\n"),
-			],
-		);
-		let mut client = Client::connect(fixture.options()).await;
-		let (failed, text) = client.call("find_items", json!({ "pattern": "use *Same*" })).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(&text, &["use demo::Same[1]", "use demo::Same[2]"]);
-
-		let (failed, text) = client.call("view_items", json!({ "paths": "use crate::Same[2]" })).await;
-
-		assert!(!failed, "{text}");
-		assert!(text.contains("use crate::B as Same;"), "{text}");
-		assert!(!text.contains("use crate::A as Same;"), "{text}");
-
-		let (failed, text) = client.call("remove_items", json!({ "paths": "use crate::Same[2]", "dry_run": true })).await;
-
-		assert!(!failed, "{text}");
-		assert_contains(&text, &["-use crate::B as Same;", "nothing was written"]);
-		assert!(!text.contains("-use crate::A as Same;"), "{text}");
-		client.close().await.unwrap();
-	}
-
 	/// An insertion next to an item of an `impl` of a type that is not loaded, whose container has no path: with
 	/// `format`, the edit is written and the items are left unformatted, with a note (once the edit is written,
 	/// formatting it cannot fail the call).
@@ -1697,7 +1684,10 @@ mod end_to_end {
 				"note: the inserted items were not formatted: `demo::<impl Tr for Vec<u8>>` has no path to name them by",
 			],
 		);
-		assert_eq!(fixture.read("src/lib.rs"), lib.replace("f(&self) {}\n}", "f(&self) {}\n\n\tfn g(&self) {}\n}"));
+		assert_eq!(
+			fixture.read("src/lib.rs"),
+			lib.replace("f(&self) {}\n}", "f(&self) {}\n\n\tfn g(&self) {}\n}")
+		);
 		client.close().await.unwrap();
 	}
 
@@ -1756,6 +1746,79 @@ mod end_to_end {
 
 		assert!(!failed, "{text}");
 		assert_eq!(fixture.read("src/lib.rs"), lib.replace("{ quit }", "{ stop }"));
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn moves_an_item_after_previewing_with_every_dry_run_alias() {
+		let original = "pub fn first() {}\n\n// Keep this with second.\npub fn second() {}\n\npub fn third() {}\n";
+		let fixture = Fixture::with_files(
+			"move-item",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"moves\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", original),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+
+		for flag in ["dryRun", "dry-run", "check"] {
+			let mut arguments = json!({
+				"path": "crate::second",
+				"position": "before",
+				"anchor": "crate::first",
+			});
+
+			arguments[flag] = json!(true);
+
+			let (failed, text) = client.call("move_item", arguments).await;
+
+			assert!(!failed, "{flag}: {text}");
+			assert_contains(&text, &["would move 1 item within `moves`", "moves::second", "nothing was written"]);
+			assert_eq!(fixture.read("src/lib.rs"), original);
+		}
+
+		let arguments = json!({
+			"path": "crate::second",
+			"position": "before",
+			"anchor": "crate::first",
+		});
+		let (failed, text) = client.call("move_item", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["moved 1 item within `moves`", "moves::second"]);
+
+		let moved = fixture.read("src/lib.rs");
+		let second = moved.find("// Keep this with second.\npub fn second() {}").unwrap();
+		let first = moved.find("pub fn first() {}").unwrap();
+		let third = moved.find("pub fn third() {}").unwrap();
+
+		assert!(second < first && first < third, "{moved}");
+
+		let arguments = json!({
+			"path": "crate::second",
+			"position": "before",
+			"anchor": "crate::first",
+		});
+		let (failed, text) = client.call("move_item", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(text, "nothing changed\n");
+		assert_eq!(fixture.read("src/lib.rs"), moved);
+
+		let arguments = json!({
+			"path": "crate::second",
+			"position": "before",
+			"anchor": "crate::first",
+			"dry_run": true,
+		});
+		let (failed, text) = client.call("move_item", arguments).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["nothing would change", "nothing was written (dry run)"]);
+		assert_eq!(fixture.read("src/lib.rs"), moved);
 		client.close().await.unwrap();
 	}
 
@@ -2005,12 +2068,17 @@ mod end_to_end {
 
 		assert!(!failed && text.starts_with("would edit `helper::assist`"), "{text}");
 
-		let (failed, text) = client.call("view_items", json!({ "paths": ["::helper::assist"], "packages": "demo" })).await;
+		let (failed, text) = client
+			.call("view_items", json!({ "paths": ["::helper::assist"], "packages": "demo" }))
+			.await;
 
 		assert!(failed);
 		assert_contains(
 			&text,
-			&["no item found for `::helper::assist`", "`helper` is a workspace member that is not selected"],
+			&[
+				"no item found for `::helper::assist`",
+				"`helper` is a workspace member that is not selected",
+			],
 		);
 		assert!(!text.contains("find_items"), "{text}");
 
@@ -2032,7 +2100,10 @@ mod end_to_end {
 		// matches in the selection say which members were not searched
 		let (_, text) = client.call("find_items", json!({ "pattern": "add" })).await;
 
-		assert_contains(&text, &["demo::add  fn", "note: not searched: helper (members not selected; see `packages`)"]);
+		assert_contains(
+			&text,
+			&["demo::add  fn", "note: not searched: helper (members not selected; see `packages`)"],
+		);
 
 		let (_, text) = client.call("find_items", json!({ "pattern": "add", "packages": "demo" })).await;
 
@@ -2057,10 +2128,15 @@ mod end_to_end {
 		assert!(failed);
 		assert_contains(&text, &["no item found for `crate::assists`", "hint: search with `find_items`"]);
 
-		let (failed, text) = client.call("remove_items", json!({ "paths": "crate::helper::assist", "dry_run": true })).await;
+		let (failed, text) = client
+			.call("remove_items", json!({ "paths": "crate::helper::assist", "dry_run": true }))
+			.await;
 
 		assert!(failed);
-		assert_contains(&text, &["no item found for `crate::helper::assist`", "hint: did you mean `helper::assist`?"]);
+		assert_contains(
+			&text,
+			&["no item found for `crate::helper::assist`", "hint: did you mean `helper::assist`?"],
+		);
 
 		// `crate` is the root of the library and of the binary: `lib` or `bin` picks one
 		let (failed, text) = client
@@ -2254,9 +2330,7 @@ mod end_to_end {
 
 		assert_eq!(
 			text,
-			native(
-				"2 references in 2 files; showing 2-2\nsrc/shapes.rs (demo::shapes)\n  6:6 in impl Circle: impl Circle {\n"
-			)
+			native("2 references in 2 files; showing 2-2\nsrc/shapes.rs (demo::shapes)\n  6:6 in impl Circle: impl Circle {\n")
 		);
 
 		let parameters = json!({ "path": "Circle::area", "method_calls": true });
@@ -2268,13 +2342,19 @@ mod end_to_end {
 		let (failed, text) = client.call("find_references", json!({ "path": "new" })).await;
 
 		assert!(!failed, "{text}");
-		assert!(text.starts_with("note: no item found for `new`; using `demo::shapes::Circle::new`"), "{text}");
+		assert!(
+			text.starts_with("note: no item found for `new`; using `demo::shapes::Circle::new`"),
+			"{text}"
+		);
 		assert_contains(&text, &["no references to `new` found"]);
 
 		let (failed, text) = client.call("find_references", json!({ "path": "impl Circle" })).await;
 
 		assert!(failed);
-		assert_eq!(text, "`impl demo::shapes::Circle` is an `impl` block, whose references cannot be searched");
+		assert_eq!(
+			text,
+			"`impl demo::shapes::Circle` is an `impl` block, whose references cannot be searched"
+		);
 
 		let (failed, text) = client.call("find_references", json!({ "path": "crate::nope" })).await;
 
@@ -2285,11 +2365,8 @@ mod end_to_end {
 
 	#[tokio::test]
 	async fn searches_the_members_that_are_not_selected() {
-		let package = |name: &str, workspace: &str| {
-			format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{workspace}")
-		};
-		let workspace =
-			"\n[dependencies]\nleft = { path = \"left\" }\n\n[workspace]\nmembers = [\"left\", \"right\", \"twin\"]\n";
+		let package = |name: &str, workspace: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{workspace}");
+		let workspace = "\n[dependencies]\nleft = { path = \"left\" }\n\n[workspace]\nmembers = [\"left\", \"right\", \"twin\"]\n";
 		let fixture = Fixture::with_files(
 			"unselected",
 			&[
@@ -2353,7 +2430,14 @@ mod end_to_end {
 		let (failed, text) = client.call("rename_item", rename).await;
 
 		assert!(!failed, "{text}");
-		assert_contains(&text, &["note: found in unselected workspace member `twin`", "+\tutil::paired();", "+pub fn paired() {}"]);
+		assert_contains(
+			&text,
+			&[
+				"note: found in unselected workspace member `twin`",
+				"+\tutil::paired();",
+				"+pub fn paired() {}",
+			],
+		);
 
 		// only the member the path is found in is selected besides the selection: `crate::cmd` still names one module,
 		// and `from` is the module of the selection
@@ -2375,7 +2459,10 @@ mod end_to_end {
 		assert!(failed, "{text}");
 		assert_contains(
 			&text,
-			&["`crate::cmd` is ambiguous", "packages (`right`, `demo`): start it with the name of one of these crates"],
+			&[
+				"`crate::cmd` is ambiguous",
+				"packages (`right`, `demo`): start it with the name of one of these crates",
+			],
 		);
 
 		let import = json!({ "module": "demo::cmd", "paths": ["right_only"], "dry_run": true });
@@ -2598,7 +2685,10 @@ mod end_to_end {
 		// names
 		let (_, text) = client.call("list_sources", json!({})).await;
 
-		assert_contains(&text, &["attached sources (connection started ", "engine  read and write", "log     read-only"]);
+		assert_contains(
+			&text,
+			&["attached sources (connection started ", "engine  read and write", "log     read-only"],
+		);
 
 		let (failed, text) = client.call("find_items", json!({ "pattern": "*", "attached": "nope" })).await;
 
@@ -2660,9 +2750,7 @@ mod end_to_end {
 		};
 		let mut client = Client::connect(options).await;
 		let manifest = |name: &str| root.join(name).join("Cargo.toml");
-		let attach = |name: &str, write: bool, use_it: bool| {
-			json!({ "manifest_path": manifest(name).to_str().unwrap(), "name": name, "write": write, "use": use_it })
-		};
+		let attach = |name: &str, write: bool, use_it: bool| json!({ "manifest_path": manifest(name).to_str().unwrap(), "name": name, "write": write, "use": use_it });
 
 		let (failed, text) = client.call("attach_source", attach("log", false, false)).await;
 
@@ -2705,13 +2793,19 @@ mod end_to_end {
 		let (failed, text) = client.call("use_source", json!({ "name": "log" })).await;
 
 		assert!(!failed, "{text}");
-		assert_eq!(text, format!("calls without `attached` work on `log` (read-only): {}\n", manifest("log").display()));
+		assert_eq!(
+			text,
+			format!("calls without `attached` work on `log` (read-only): {}\n", manifest("log").display())
+		);
 
 		let (_, text) = client.call("list_sources", json!({})).await;
 
 		assert_contains(
 			&text,
-			&["the server's own workspace: ", "calls without `attached` work on `log` (see `use_source`)"],
+			&[
+				"the server's own workspace: ",
+				"calls without `attached` work on `log` (see `use_source`)",
+			],
 		);
 
 		let (failed, text) = client.call("rename_item", json!({ "path": "crate::info", "new_name": "notice" })).await;

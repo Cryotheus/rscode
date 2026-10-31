@@ -299,9 +299,7 @@ impl Merging<'_> {
 		let range = group.span().byte_range();
 		let multi_line = self.item[range.clone()].contains('\n');
 		let le = self.line_ending;
-		let sorts_after = |element: &&UseTree| {
-			rscode_sort::use_tree_cmp(element, &tree, self.style_edition) == Ordering::Greater
-		};
+		let sorts_after = |element: &&UseTree| rscode_sort::use_tree_cmp(element, &tree, self.style_edition) == Ordering::Greater;
 		let after = group.items.iter().find(sorts_after);
 
 		if let Some(element) = after {
@@ -495,12 +493,7 @@ struct UseItem {
 /// a bare name that names no loaded item, with [`Error::Ambiguous`] for a bare name that names several items, and with
 /// [`Error::Unsupported`] when `module` is not a module, and for what the module cannot import (an item that is not
 /// visible from it, or an associated item).
-pub fn add_imports(
-	resolver: &Resolver<'_>,
-	module: &ItemPath,
-	imports: &[String],
-	options: &ImportOptions,
-) -> Result<ImportAddition, Error> {
+pub fn add_imports(resolver: &Resolver<'_>, module: &ItemPath, imports: &[String], options: &ImportOptions) -> Result<ImportAddition, Error> {
 	let ws = resolver.workspace();
 	let mut leaves = Vec::new();
 
@@ -537,8 +530,7 @@ pub fn add_imports(
 		let imports = |use_item: &UseItem| {
 			let vis = &ws.item(use_item.item).vis;
 
-			(ws.children(use_item.item).filter_map(|import| ws.item(import).import_info()))
-				.any(|info| leaf.is_imported_by(info, vis))
+			(ws.children(use_item.item).filter_map(|import| ws.item(import).import_info())).any(|info| leaf.is_imported_by(info, vis))
 		};
 		let existing = (uses.iter())
 			.filter(|use_item| ws.item(use_item.item).cfg.is_none())
@@ -646,6 +638,7 @@ pub fn add_imports(
 	for (index, outcome, place) in placed {
 		let line = match place {
 			Place::Original(offset) => new_line(file, &edits, None, offset),
+
 			Place::Inserted(edit, within) => {
 				new_line(file, &edits, Some(edit), edits[edit].range.start) + newlines(&edits[edit].replacement[..within])
 			}
@@ -740,12 +733,7 @@ fn bound_already(resolver: &Resolver<'_>, module: ItemId, leaf: &Leaf) -> Option
 }
 
 /// Fails with [`Error::Collision`] when the new imports bind names that the module binds otherwise (unless forced).
-fn check_collisions(
-	resolver: &Resolver<'_>,
-	target: &super::Target<'_>,
-	leaves: &[&Leaf],
-	options: &ImportOptions,
-) -> Result<(), Error> {
+fn check_collisions(resolver: &Resolver<'_>, target: &super::Target<'_>, leaves: &[&Leaf], options: &ImportOptions) -> Result<(), Error> {
 	if options.force || leaves.is_empty() {
 		return Ok(());
 	}
@@ -867,12 +855,7 @@ fn granularity(uses: &[&UseItem]) -> Granularity {
 /// `group_imports = "StdExternalCrate"`), and how it is spaced there: in order in the run of its origin, which it
 /// joins without blank lines; or, when no run has its origin and the runs are in the order of their origins, as a run
 /// of its own where its origin goes. `None` when the module does not group them so (sorting then decides).
-fn grouped_placement(
-	siblings: &Siblings,
-	uses: &[UseItem],
-	leaf: &Leaf,
-	order: &ItemOrder,
-) -> Option<(Placement, Spacing)> {
+fn grouped_placement(siblings: &Siblings, uses: &[UseItem], leaf: &Leaf, order: &ItemOrder) -> Option<(Placement, Spacing)> {
 	let mut runs = siblings.runs(order);
 
 	if runs.len() < 2 {
@@ -1024,6 +1007,7 @@ fn leaves_of(tree: &UseTree, prefix: &mut Vec<String>, leaf: &mut impl FnMut(Vec
 
 		UseTree::Name(name) if name.ident == "self" => leaf(prefix.clone(), Last::SelfModule(None)),
 		UseTree::Name(name) => leaf(prefix.clone(), Last::Name(name.ident.to_string(), None)),
+
 		UseTree::Rename(rename) => {
 			let alias = Some(rename.rename.to_string());
 
@@ -1073,8 +1057,8 @@ fn merge_target(uses: &[UseItem], leaf: &Leaf) -> Option<usize> {
 
 	match granularity(&mergeable) {
 		Granularity::Item => None,
-
 		Granularity::Module if module.is_empty() => None,
+
 		Granularity::Module => {
 			let groups_singles = groups_by_module(&mergeable);
 
@@ -1185,7 +1169,10 @@ fn parse_leaves(text: &str) -> Result<Vec<Leaf>, Error> {
 		});
 
 		// (`self` names the module before it)
-		match leaves.iter().any(|leaf| leaf.segments.is_empty() && matches!(leaf.last, Last::SelfModule(_))) {
+		match leaves
+			.iter()
+			.any(|leaf| leaf.segments.is_empty() && matches!(leaf.last, Last::SelfModule(_)))
+		{
 			true => Err(invalid()),
 			false => Ok(leaves),
 		}
@@ -1197,12 +1184,7 @@ fn parse_leaves(text: &str) -> Result<Vec<Leaf>, Error> {
 /// usable from `module` (named `module_path`, like `crate::shapes::Circle`). Fails with [`Error::Unsupported`] when no
 /// item of the workspace has the name, or the one that has it cannot be named from `module`, and with
 /// [`Error::Ambiguous`] when several items have it.
-fn path_of_bare_name(
-	resolver: &Resolver<'_>,
-	module: ItemId,
-	module_path: &ItemPath,
-	leaf: &Leaf,
-) -> Result<Option<Leaf>, Error> {
+fn path_of_bare_name(resolver: &Resolver<'_>, module: ItemId, module_path: &ItemPath, leaf: &Leaf) -> Result<Option<Leaf>, Error> {
 	let Last::Name(name, alias) = &leaf.last else {
 		return Ok(None);
 	};
@@ -1221,7 +1203,11 @@ fn path_of_bare_name(
 		}],
 	};
 
-	if resolver.resolve_prefixes(module, &bare, None, PathKind::Use).last().is_some_and(|found| !found.is_empty()) {
+	if resolver
+		.resolve_prefixes(module, &bare, None, PathKind::Use)
+		.last()
+		.is_some_and(|found| !found.is_empty())
+	{
 		return Ok(None);
 	}
 
@@ -1233,7 +1219,10 @@ fn path_of_bare_name(
 	let importable = |kind: ItemKind| {
 		use ItemKind::*;
 
-		matches!(kind, Module | Struct | Enum | Union | Trait | TraitAlias | TypeAlias | Fn | Const | Static | Variant)
+		matches!(
+			kind,
+			Module | Struct | Enum | Union | Trait | TraitAlias | TypeAlias | Fn | Const | Static | Variant
+		)
 	};
 	let mut found: Vec<(String, ItemId)> = (ws.crates().iter())
 		.flat_map(|krate| krate.items())
@@ -1267,6 +1256,7 @@ fn path_of_bare_name(
 				"`{name}` names `{item_path}`, which is not visible from `{module_path}`: make it visible there, or \
 				 re-export it"
 			)),
+
 			false => unnameable(resolver, module, item, name),
 		});
 	};
@@ -1289,10 +1279,12 @@ fn shared_segments(tree: &UseTree, leaf: &Leaf, depth: usize) -> usize {
 	match tree {
 		UseTree::Path(path) if same(&path.ident) => 1 + shared_segments(&path.tree, leaf, depth + 1),
 		UseTree::Name(name) if same(&name.ident) => 1,
+
 		UseTree::Group(group) => (group.items.iter())
 			.map(|element| shared_segments(element, leaf, depth))
 			.max()
 			.unwrap_or(0),
+
 		_ => 0,
 	}
 }

@@ -18,6 +18,26 @@ use crate::source::TextRange;
 use serde::Serialize;
 use std::path::PathBuf;
 
+/// The physical container whose siblings are being reordered.
+#[derive(Debug, Clone, Copy)]
+struct Container<'ws> {
+	item: ItemId,
+	file: &'ws SourceFile,
+	body: TextRange,
+}
+
+impl Container<'_> {
+	fn same_place(&self, other: &Self) -> bool {
+		self.file.path() == other.file.path() && self.body == other.body
+	}
+}
+
+/// A moved source block and whether its first non-blank line began a line in the original text.
+struct ContentBlock {
+	text: String,
+	starts_line: bool,
+}
+
 /// A planned move of one item path within its existing container.
 #[derive(Debug, Clone, Serialize)]
 pub struct Movement {
@@ -35,276 +55,125 @@ pub struct Movement {
 	pub file: PathBuf,
 }
 
-/// The physical container whose siblings are being reordered.
-#[derive(Debug, Clone, Copy)]
-struct Container<'ws> {
-	item: ItemId,
-	file: &'ws SourceFile,
-	body: TextRange,
-}
+/// Whether removing the moved sibling ranges and inserting them at `position` would leave their sibling order
+/// unchanged. Such a move is a true no-op: returning before source extraction preserves comments and whitespace byte
+/// for byte.
+fn already_positioned(
+	ws: &Workspace,
+	container: &Container<'_>,
+	moved: &[TextRange],
+	position: &InsertPosition,
+	anchors: Option<&[TextRange]>,
+) -> bool {
+	let mut children: Vec<TextRange> = ws.children(container.item).map(|child| ws.item(child).range).collect();
 
-/// A moved source block and whether its first non-blank line began a line in the original text.
-struct ContentBlock {
-	text: String,
-	starts_line: bool,
-}
+	children.sort();
+	children.dedup();
 
-impl Container<'_> {
-	fn same_place(&self, other: &Self) -> bool {
-		self.file.path() == other.file.path() && self.body == other.body
-	}
-}
-
-/// Plans moving the item named by `path` within its existing syntactic container.
-///
-/// [`InsertPosition::Before`] and [`InsertPosition::After`] name a sibling in that same container; `start` and `end`
-/// mean the first and last sibling positions. Variants with directly complementary `cfg` predicates, such as `X` and
-/// `not(X)`, move as one group. The item's complete source moves with it, including outer docs and attributes,
-/// attached comments above it, and a trailing comment that ends its line.
-///
-/// The move is one whole-file replacement in an [`EditSet`], so it previews and applies atomically. Imports (`use`
-/// items and their leaves), fields, variants, macro definitions/invocations and their entries, `#[macro_use]` modules
-/// and `extern crate` items, and out-of-line module declarations are refused because their surrounding syntax, lexical
-/// scope, or file-resolution semantics need specialized handling. No item may cross a direct-sibling macro-scope
-/// barrier (`macro_rules!`, an item-position macro invocation, or a `#[macro_use]` item). The destination must be in the
-/// existing container; this operation never changes paths or references.
-pub fn move_item(resolver: &Resolver<'_>, path: &ItemPath, position: &InsertPosition) -> Result<Movement, Error> {
-	let ws = resolver.workspace();
-	let items = moved_items(resolver, path)?;
-	let first = *items.first().expect("moved_items returns at least one item");
-	let container = container_of(ws, first, path)?;
-
-	for &item in &items[1..] {
-		let other = container_of(ws, item, path)?;
-
-		if !container.same_place(&other) {
-			return Err(Error::Unsupported(format!(
-				"the `cfg` variants of `{path}` are not siblings of the same container"
-			)));
-		}
-	}
-
-	let mut item_ranges: Vec<TextRange> = items.iter().map(|&item| ws.item(item).range).collect();
-
-	item_ranges.sort();
-	item_ranges.dedup();
-
-	let text = container.file.text();
-	let anchors = match position {
-		InsertPosition::Before(anchor) | InsertPosition::After(anchor) => {
-			let anchor = ItemPath::parse(anchor)?;
-
-			Some(anchor_ranges(resolver, &container, &items, &anchor)?)
-		}
-		InsertPosition::Start | InsertPosition::End => None,
-	};
-
-	if already_positioned(ws, &container, &item_ranges, position, anchors.as_deref()) {
-		return Ok(movement(resolver, &container, &items, EditSet::new()));
-	}
-
-	let removed = trivia::movement_ranges(text, &item_ranges);
-	let line_ending = trivia::line_ending(text);
-	let separator = format!("{line_ending}{line_ending}");
-	let blocks: Vec<ContentBlock> = removed
+	let positions: Vec<usize> = children
 		.iter()
-		.filter_map(|&range| content_block(text, range))
-		.filter(|block| !block.text.is_empty())
+		.enumerate()
+		.filter_map(|(index, range)| moved.contains(range).then_some(index))
 		.collect();
-	let without = without_ranges(text, &removed);
-	let body = shifted_range(container.body, &removed);
-	let placement = destination(ws, &container, &items, &removed, position, body, anchors.as_deref());
-
-	check_macro_barriers(ws, &container, &items, &removed, placement, path)?;
-
-	let indent = trivia::body_indent(&without, body);
-	let source = content_source(&blocks, &separator, &indent);
-	let starts_line = blocks.first().is_none_or(|block| block.starts_line);
-	let insertion = trivia::verbatim_insertion(&without, placement, &source, starts_line, &indent, line_ending, Spacing::default());
-	let mut final_text = without;
-
-	final_text.replace_range(insertion.range.start..insertion.range.end, &insertion.replacement);
-
-	let mut edits = EditSet::new();
-
-	edits.replace_file(container.file, final_text);
-
-	Ok(movement(resolver, &container, &items, edits))
-}
-
-fn movement(resolver: &Resolver<'_>, container: &Container<'_>, items: &[ItemId], edits: EditSet) -> Movement {
-	let mut moved = Vec::new();
-
-	for &item in items {
-		let canonical = resolver.canonical_path(item).to_string();
-
-		if !moved.contains(&canonical) {
-			moved.push(canonical);
-		}
-	}
-
-	Movement {
-		edits,
-		moved,
-		parent: resolver.canonical_path(container.item).to_string(),
-		file: container.file.path().to_path_buf(),
-	}
-}
-
-/// Resolves and validates the items that move together.
-fn moved_items(resolver: &Resolver<'_>, path: &ItemPath) -> Result<Vec<ItemId>, Error> {
-	let ws = resolver.workspace();
-	let mut items = resolver.resolve_item_path(path);
-
-	if items.is_empty() {
-		return Err(Error::NotFound(path.to_string()));
-	}
-
-	super::check_private_imports(resolver, path, &mut items)?;
-	distinct_places(ws, &mut items);
-
-	if items.len() > 1 {
-		let exclusive = items.iter().enumerate().all(|(index, &left)| {
-			items[index + 1..]
-				.iter()
-				.all(|&right| cfgs_are_exclusive(ws.effective_cfg(left).as_ref(), ws.effective_cfg(right).as_ref()))
-		});
-
-		if !exclusive || super::impl_headers_differ(ws, &items) {
-			return Err(Error::Ambiguous {
-				path: path.to_string(),
-				candidates: items.iter().map(|&item| describe(resolver, item)).collect(),
-			});
-		}
-	}
-
-	for &item in &items {
-		check_movable(ws, item, path)?;
-	}
-
-	Ok(items)
-}
-
-/// The container in whose body `item` is a direct child.
-fn container_of<'ws>(ws: &'ws Workspace, item: ItemId, path: &ItemPath) -> Result<Container<'ws>, Error> {
-	let Some(parent) = ws.parent(item) else {
-		return Err(Error::Unsupported(format!("`{path}` is a crate root, which cannot be moved")));
+	let Some((&first, rest)) = positions.split_first() else {
+		return false;
 	};
+	let last = *positions.last().unwrap_or(&first);
 
-	container(ws, parent).ok_or_else(|| Error::Unsupported(format!("`{path}` is not a sibling item of a module, `impl` block, trait, or `extern` block")))
-}
-
-/// The editable body of `item`, when it is a supported sibling container.
-fn container(ws: &Workspace, item: ItemId) -> Option<Container<'_>> {
-	let data = ws.item(item);
-
-	if data.kind == ItemKind::Module {
-		let info = data.module_info()?;
-
-		return match info.inline {
-			true => Some(Container {
-				item,
-				file: ws.file_of(item),
-				body: info.body?,
-			}),
-
-			false => {
-				let file = ws.krate(item.krate()).file(info.file?);
-
-				Some(Container {
-					item,
-					file,
-					body: TextRange::new(0, file.text().len()),
-				})
-			}
-		};
+	if positions.len() != moved.len() || rest.iter().enumerate().any(|(index, &position)| position != first + index + 1) {
+		return false;
 	}
 
-	if !matches!(data.kind, ItemKind::Impl | ItemKind::Trait | ItemKind::ExternBlock) {
-		return None;
-	}
+	match position {
+		InsertPosition::Start => first == 0,
+		InsertPosition::End => last + 1 == children.len(),
 
-	Some(Container {
-		item,
-		file: ws.file_of(item),
-		body: data.body()?,
-	})
-}
-
-fn check_movable(ws: &Workspace, item: ItemId, path: &ItemPath) -> Result<(), Error> {
-	let data = ws.item(item);
-	let why = if has_macro_use(ws, item) {
-		Some("items with `#[macro_use]` are macro-scope barriers")
-	} else {
-		match data.kind {
-			ItemKind::Use | ItemKind::Import => Some("imports need use-tree-aware movement"),
-			ItemKind::Field => Some("fields need comma-aware movement"),
-			ItemKind::Variant => Some("enum variants need comma-aware movement"),
-			ItemKind::MacroRules | ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro => Some("macros can depend on their lexical position"),
-			ItemKind::Module if data.module_info().is_some_and(|info| !info.inline) => {
-				Some("moving an out-of-line module declaration can change how its file is resolved")
-			}
-			_ if ws.parent(item).is_some_and(|parent| ws.item(parent).kind == ItemKind::MacroCall) => {
-				Some("entries of macro invocations need macro-specific movement")
-			}
-			_ => None,
-		}
-	};
-
-	match why {
-		Some(why) => Err(Error::Unsupported(format!("cannot move `{path}`: {why}"))),
-		None => Ok(()),
-	}
-}
-
-/// Whether an item is a lexical macro-scope barrier. The model flag covers active and unknown `cfg_attr`s; inspecting
-/// module and `extern crate` syntax also catches `cfg_attr(..., macro_use)` when its predicate is currently false.
-fn is_macro_barrier(ws: &Workspace, item: ItemId) -> bool {
-	let data = ws.item(item);
-
-	matches!(
-		data.kind,
-		ItemKind::MacroRules | ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro
-	) || has_macro_use(ws, item)
-}
-
-fn has_macro_use(ws: &Workspace, item: ItemId) -> bool {
-	let data = ws.item(item);
-
-	if data.attrs.macro_use {
-		return true;
-	}
-
-	fn attributes_have_macro_use(attrs: &[syn::Attribute]) -> bool {
-		fn meta_has_macro_use(meta: &syn::Meta) -> bool {
-			if meta.path().is_ident("macro_use") {
-				return true;
-			}
-
-			let syn::Meta::List(list) = meta else {
-				return false;
-			};
-
-			if !list.path.is_ident("cfg_attr") {
-				return false;
-			}
-
-			CfgExpr::parse_cfg_attr(list.tokens.clone()).is_ok_and(|(_, attrs)| {
-				attrs
-					.into_iter()
-					.filter_map(|tokens| syn::parse2::<syn::Meta>(tokens).ok())
-					.any(|meta| meta_has_macro_use(&meta))
+		InsertPosition::Before(_) => anchors
+			.and_then(|anchors| {
+				anchors
+					.iter()
+					.filter_map(|anchor| children.iter().position(|child| child == anchor))
+					.min()
 			})
+			.is_some_and(|anchor| last + 1 == anchor),
+
+		InsertPosition::After(_) => anchors
+			.and_then(|anchors| {
+				anchors
+					.iter()
+					.filter_map(|anchor| children.iter().position(|child| child == anchor))
+					.max()
+			})
+			.is_some_and(|anchor| anchor + 1 == first),
+	}
+}
+
+/// The ranges of the direct siblings named by `anchor`.
+fn anchor_ranges(resolver: &Resolver<'_>, container: &Container<'_>, moved: &[ItemId], anchor: &ItemPath) -> Result<Vec<TextRange>, Error> {
+	let ws = resolver.workspace();
+	let mut resolved = resolver.resolve_item_path(anchor);
+
+	if resolved.is_empty() {
+		return Err(Error::NotFound(anchor.to_string()));
+	}
+
+	super::check_private_imports(resolver, anchor, &mut resolved)?;
+	let mut siblings = Vec::new();
+
+	for item in resolved {
+		if let Some(sibling) = sibling_in(ws, item, container)
+			&& !siblings.iter().any(|&known| same_place(ws, known, sibling))
+		{
+			siblings.push(sibling);
 		}
-
-		attrs.iter().any(|attr| meta_has_macro_use(&attr.meta))
 	}
 
-	match (data.kind, syn::parse_str::<syn::Item>(ws.item_text(item))) {
-		(ItemKind::Module, Ok(syn::Item::Mod(item))) => attributes_have_macro_use(&item.attrs),
-		(ItemKind::ExternCrate, Ok(syn::Item::ExternCrate(item))) => attributes_have_macro_use(&item.attrs),
-		_ => false,
+	if siblings.is_empty() {
+		return Err(Error::Unsupported(format!(
+			"`{anchor}` is not a sibling in `{}`",
+			resolver.canonical_path(container.item)
+		)));
 	}
+
+	if siblings.iter().any(|&anchor| moved.iter().any(|&item| same_place(ws, item, anchor))) {
+		return Err(Error::Unsupported("an item cannot be moved relative to itself".to_owned()));
+	}
+
+	let mut ranges: Vec<TextRange> = siblings.into_iter().map(|item| ws.item(item).range).collect();
+
+	ranges.sort();
+	ranges.dedup();
+
+	Ok(ranges)
+}
+
+/// Whether two understood `cfg` predicates cannot both be true.
+fn cfgs_are_exclusive(left: Option<&CfgExpr>, right: Option<&CfgExpr>) -> bool {
+	fn false_predicate(expression: &CfgExpr) -> bool {
+		match expression {
+			CfgExpr::Bool(value) => !value,
+			CfgExpr::All(expressions) => expressions.iter().any(false_predicate),
+			CfgExpr::Any(expressions) => expressions.iter().all(false_predicate),
+			CfgExpr::Not(expression) => matches!(expression.as_ref(), CfgExpr::Bool(true)),
+			CfgExpr::Name(_) | CfgExpr::KeyValue(_, _) | CfgExpr::Other(_) => false,
+		}
+	}
+
+	fn opposites(left: &CfgExpr, right: &CfgExpr) -> bool {
+		match (left, right) {
+			(CfgExpr::All(expressions), right) => expressions.iter().any(|left| opposites(left, right)),
+			(left, CfgExpr::All(expressions)) => expressions.iter().any(|right| opposites(left, right)),
+			(CfgExpr::Not(left), right) => left.as_ref() == right,
+			(left, CfgExpr::Not(right)) => left == right.as_ref(),
+			_ => false,
+		}
+	}
+
+	let (Some(left), Some(right)) = (left, right) else {
+		return false;
+	};
+
+	false_predicate(left) || false_predicate(right) || opposites(left, right)
 }
 
 /// Refuses a move across a direct-sibling macro definition, invocation, or `#[macro_use]` item. These barriers split
@@ -349,183 +218,86 @@ fn check_macro_barriers(
 	}
 }
 
-fn macro_barrier(path: &ItemPath) -> Error {
-	Error::Unsupported(format!(
-		"cannot move `{path}` across a macro-scope barrier (`macro_rules!`, a macro invocation, or a `#[macro_use]` item)"
-	))
-}
+fn check_movable(ws: &Workspace, item: ItemId, path: &ItemPath) -> Result<(), Error> {
+	let data = ws.item(item);
+	let why = if has_macro_use(ws, item) {
+		Some("items with `#[macro_use]` are macro-scope barriers")
+	} else {
+		match data.kind {
+			ItemKind::Use | ItemKind::Import => Some("imports need use-tree-aware movement"),
+			ItemKind::Field => Some("fields need comma-aware movement"),
+			ItemKind::Variant => Some("enum variants need comma-aware movement"),
 
-/// Whether removing the moved sibling ranges and inserting them at `position` would leave their sibling order
-/// unchanged. Such a move is a true no-op: returning before source extraction preserves comments and whitespace byte
-/// for byte.
-fn already_positioned(ws: &Workspace, container: &Container<'_>, moved: &[TextRange], position: &InsertPosition, anchors: Option<&[TextRange]>) -> bool {
-	let mut children: Vec<TextRange> = ws.children(container.item).map(|child| ws.item(child).range).collect();
+			ItemKind::MacroRules | ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro => {
+				Some("macros can depend on their lexical position")
+			}
 
-	children.sort();
-	children.dedup();
+			ItemKind::Module if data.module_info().is_some_and(|info| !info.inline) => {
+				Some("moving an out-of-line module declaration can change how its file is resolved")
+			}
 
-	let positions: Vec<usize> = children
-		.iter()
-		.enumerate()
-		.filter_map(|(index, range)| moved.contains(range).then_some(index))
-		.collect();
-	let Some((&first, rest)) = positions.split_first() else {
-		return false;
-	};
-	let last = *positions.last().unwrap_or(&first);
+			_ if ws.parent(item).is_some_and(|parent| ws.item(parent).kind == ItemKind::MacroCall) => {
+				Some("entries of macro invocations need macro-specific movement")
+			}
 
-	if positions.len() != moved.len() || rest.iter().enumerate().any(|(index, &position)| position != first + index + 1) {
-		return false;
-	}
-
-	match position {
-		InsertPosition::Start => first == 0,
-		InsertPosition::End => last + 1 == children.len(),
-
-		InsertPosition::Before(_) => anchors
-			.and_then(|anchors| anchors.iter().filter_map(|anchor| children.iter().position(|child| child == anchor)).min())
-			.is_some_and(|anchor| last + 1 == anchor),
-
-		InsertPosition::After(_) => anchors
-			.and_then(|anchors| anchors.iter().filter_map(|anchor| children.iter().position(|child| child == anchor)).max())
-			.is_some_and(|anchor| anchor + 1 == first),
-	}
-}
-
-/// Finds the destination in the text after the moved ranges have been removed.
-fn destination(
-	ws: &Workspace,
-	container: &Container<'_>,
-	moved: &[ItemId],
-	removed: &[TextRange],
-	position: &InsertPosition,
-	body: TextRange,
-	anchors: Option<&[TextRange]>,
-) -> Placement {
-	let moved_ranges: Vec<TextRange> = moved.iter().map(|&item| ws.item(item).range).collect();
-	let remaining = || {
-		ws.children(container.item)
-			.filter(|&child| !moved_ranges.contains(&ws.item(child).range))
-			.map(|child| shifted_range(ws.item(child).range, removed))
+			_ => None,
+		}
 	};
 
-	match position {
-		InsertPosition::Start => remaining().min_by_key(|range| range.start).map_or(Placement::End(body), Placement::Before),
-		InsertPosition::End => remaining().max_by_key(|range| range.start).map_or(Placement::End(body), Placement::After),
-
-		InsertPosition::Before(_) | InsertPosition::After(_) => {
-			let anchors = anchors.expect("relative positions have resolved anchor ranges");
-			let shifted = anchors.iter().map(|&range| shifted_range(range, removed));
-			let range = match position {
-				InsertPosition::Before(_) => shifted.min_by_key(|range| range.start).map(Placement::Before),
-				InsertPosition::After(_) => shifted.max_by_key(|range| range.start).map(Placement::After),
-				_ => unreachable!(),
-			};
-
-			range.expect("anchor_ranges returns at least one range")
-		}
+	match why {
+		Some(why) => Err(Error::Unsupported(format!("cannot move `{path}`: {why}"))),
+		None => Ok(()),
 	}
 }
 
-/// The ranges of the direct siblings named by `anchor`.
-fn anchor_ranges(resolver: &Resolver<'_>, container: &Container<'_>, moved: &[ItemId], anchor: &ItemPath) -> Result<Vec<TextRange>, Error> {
-	let ws = resolver.workspace();
-	let mut resolved = resolver.resolve_item_path(anchor);
+/// The editable body of `item`, when it is a supported sibling container.
+fn container(ws: &Workspace, item: ItemId) -> Option<Container<'_>> {
+	let data = ws.item(item);
 
-	if resolved.is_empty() {
-		return Err(Error::NotFound(anchor.to_string()));
+	if data.kind == ItemKind::Module {
+		let info = data.module_info()?;
+
+		return match info.inline {
+			true => Some(Container {
+				item,
+				file: ws.file_of(item),
+				body: info.body?,
+			}),
+
+			false => {
+				let file = ws.krate(item.krate()).file(info.file?);
+
+				Some(Container {
+					item,
+					file,
+					body: TextRange::new(0, file.text().len()),
+				})
+			}
+		};
 	}
 
-	super::check_private_imports(resolver, anchor, &mut resolved)?;
-	let mut siblings = Vec::new();
-
-	for item in resolved {
-		if let Some(sibling) = sibling_in(ws, item, container)
-			&& !siblings.iter().any(|&known| same_place(ws, known, sibling))
-		{
-			siblings.push(sibling);
-		}
+	if !matches!(data.kind, ItemKind::Impl | ItemKind::Trait | ItemKind::ExternBlock) {
+		return None;
 	}
 
-	if siblings.is_empty() {
-		return Err(Error::Unsupported(format!(
-			"`{anchor}` is not a sibling in `{}`",
-			resolver.canonical_path(container.item)
-		)));
-	}
-
-	if siblings.iter().any(|&anchor| moved.iter().any(|&item| same_place(ws, item, anchor))) {
-		return Err(Error::Unsupported("an item cannot be moved relative to itself".to_owned()));
-	}
-
-	let mut ranges: Vec<TextRange> = siblings.into_iter().map(|item| ws.item(item).range).collect();
-
-	ranges.sort();
-	ranges.dedup();
-
-	Ok(ranges)
+	Some(Container {
+		item,
+		file: ws.file_of(item),
+		body: data.body()?,
+	})
 }
 
-/// The direct child of `container` that contains `item`.
-fn sibling_in(ws: &Workspace, mut item: ItemId, expected: &Container<'_>) -> Option<ItemId> {
-	loop {
-		let parent = ws.parent(item)?;
-
-		if container(ws, parent).is_some_and(|container| container.same_place(expected)) {
-			return Some(item);
-		}
-
-		if !matches!(ws.item(parent).kind, ItemKind::Use | ItemKind::ExternBlock | ItemKind::MacroCall) {
-			return None;
-		}
-
-		item = parent;
-	}
-}
-
-fn same_place(ws: &Workspace, left: ItemId, right: ItemId) -> bool {
-	left == right || (ws.file_of(left).path() == ws.file_of(right).path() && ws.item(left).range == ws.item(right).range)
-}
-
-fn distinct_places(ws: &Workspace, items: &mut Vec<ItemId>) {
-	let mut distinct = Vec::new();
-
-	for item in items.drain(..) {
-		if !distinct.iter().any(|&known| same_place(ws, known, item)) {
-			distinct.push(item);
-		}
-	}
-
-	*items = distinct;
-}
-
-/// Whether two understood `cfg` predicates cannot both be true.
-fn cfgs_are_exclusive(left: Option<&CfgExpr>, right: Option<&CfgExpr>) -> bool {
-	fn false_predicate(expression: &CfgExpr) -> bool {
-		match expression {
-			CfgExpr::Bool(value) => !value,
-			CfgExpr::All(expressions) => expressions.iter().any(false_predicate),
-			CfgExpr::Any(expressions) => expressions.iter().all(false_predicate),
-			CfgExpr::Not(expression) => matches!(expression.as_ref(), CfgExpr::Bool(true)),
-			CfgExpr::Name(_) | CfgExpr::KeyValue(_, _) | CfgExpr::Other(_) => false,
-		}
-	}
-
-	fn opposites(left: &CfgExpr, right: &CfgExpr) -> bool {
-		match (left, right) {
-			(CfgExpr::All(expressions), right) => expressions.iter().any(|left| opposites(left, right)),
-			(left, CfgExpr::All(expressions)) => expressions.iter().any(|right| opposites(left, right)),
-			(CfgExpr::Not(left), right) => left.as_ref() == right,
-			(left, CfgExpr::Not(right)) => left == right.as_ref(),
-			_ => false,
-		}
-	}
-
-	let (Some(left), Some(right)) = (left, right) else {
-		return false;
+/// The container in whose body `item` is a direct child.
+fn container_of<'ws>(ws: &'ws Workspace, item: ItemId, path: &ItemPath) -> Result<Container<'ws>, Error> {
+	let Some(parent) = ws.parent(item) else {
+		return Err(Error::Unsupported(format!("`{path}` is a crate root, which cannot be moved")));
 	};
 
-	false_predicate(left) || false_predicate(right) || opposites(left, right)
+	container(ws, parent).ok_or_else(|| {
+		Error::Unsupported(format!(
+			"`{path}` is not a sibling item of a module, `impl` block, trait, or `extern` block"
+		))
+	})
 }
 
 /// The non-blank lines of a removal range, retaining every byte on those lines (including indentation and trailing
@@ -593,23 +365,245 @@ fn content_source(blocks: &[ContentBlock], separator: &str, indent: &str) -> Str
 	source
 }
 
-/// Removes sorted, disjoint ranges from a text.
-fn without_ranges(text: &str, ranges: &[TextRange]) -> String {
-	let mut result = String::with_capacity(text.len());
-	let mut at = 0;
+/// Finds the destination in the text after the moved ranges have been removed.
+fn destination(
+	ws: &Workspace,
+	container: &Container<'_>,
+	moved: &[ItemId],
+	removed: &[TextRange],
+	position: &InsertPosition,
+	body: TextRange,
+	anchors: Option<&[TextRange]>,
+) -> Placement {
+	let moved_ranges: Vec<TextRange> = moved.iter().map(|&item| ws.item(item).range).collect();
+	let remaining = || {
+		ws.children(container.item)
+			.filter(|&child| !moved_ranges.contains(&ws.item(child).range))
+			.map(|child| shifted_range(ws.item(child).range, removed))
+	};
 
-	for range in ranges {
-		result.push_str(&text[at..range.start]);
-		at = range.end;
+	match position {
+		InsertPosition::Start => remaining()
+			.min_by_key(|range| range.start)
+			.map_or(Placement::End(body), Placement::Before),
+
+		InsertPosition::End => remaining().max_by_key(|range| range.start).map_or(Placement::End(body), Placement::After),
+
+		InsertPosition::Before(_) | InsertPosition::After(_) => {
+			let anchors = anchors.expect("relative positions have resolved anchor ranges");
+			let shifted = anchors.iter().map(|&range| shifted_range(range, removed));
+			let range = match position {
+				InsertPosition::Before(_) => shifted.min_by_key(|range| range.start).map(Placement::Before),
+				InsertPosition::After(_) => shifted.max_by_key(|range| range.start).map(Placement::After),
+				_ => unreachable!(),
+			};
+
+			range.expect("anchor_ranges returns at least one range")
+		}
 	}
-
-	result.push_str(&text[at..]);
-	result
 }
 
-/// Adjusts a range to its offsets after `removed` ranges have been deleted.
-fn shifted_range(range: TextRange, removed: &[TextRange]) -> TextRange {
-	TextRange::new(shifted_offset(range.start, removed), shifted_offset(range.end, removed))
+fn distinct_places(ws: &Workspace, items: &mut Vec<ItemId>) {
+	let mut distinct = Vec::new();
+
+	for item in items.drain(..) {
+		if !distinct.iter().any(|&known| same_place(ws, known, item)) {
+			distinct.push(item);
+		}
+	}
+
+	*items = distinct;
+}
+
+fn has_macro_use(ws: &Workspace, item: ItemId) -> bool {
+	let data = ws.item(item);
+
+	if data.attrs.macro_use {
+		return true;
+	}
+
+	fn attributes_have_macro_use(attrs: &[syn::Attribute]) -> bool {
+		fn meta_has_macro_use(meta: &syn::Meta) -> bool {
+			if meta.path().is_ident("macro_use") {
+				return true;
+			}
+
+			let syn::Meta::List(list) = meta else {
+				return false;
+			};
+
+			if !list.path.is_ident("cfg_attr") {
+				return false;
+			}
+
+			CfgExpr::parse_cfg_attr(list.tokens.clone()).is_ok_and(|(_, attrs)| {
+				attrs
+					.into_iter()
+					.filter_map(|tokens| syn::parse2::<syn::Meta>(tokens).ok())
+					.any(|meta| meta_has_macro_use(&meta))
+			})
+		}
+
+		attrs.iter().any(|attr| meta_has_macro_use(&attr.meta))
+	}
+
+	match (data.kind, syn::parse_str::<syn::Item>(ws.item_text(item))) {
+		(ItemKind::Module, Ok(syn::Item::Mod(item))) => attributes_have_macro_use(&item.attrs),
+		(ItemKind::ExternCrate, Ok(syn::Item::ExternCrate(item))) => attributes_have_macro_use(&item.attrs),
+		_ => false,
+	}
+}
+
+/// Whether an item is a lexical macro-scope barrier. The model flag covers active and unknown `cfg_attr`s; inspecting
+/// module and `extern crate` syntax also catches `cfg_attr(..., macro_use)` when its predicate is currently false.
+fn is_macro_barrier(ws: &Workspace, item: ItemId) -> bool {
+	let data = ws.item(item);
+
+	matches!(
+		data.kind,
+		ItemKind::MacroRules | ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro
+	) || has_macro_use(ws, item)
+}
+
+fn macro_barrier(path: &ItemPath) -> Error {
+	Error::Unsupported(format!(
+		"cannot move `{path}` across a macro-scope barrier (`macro_rules!`, a macro invocation, or a `#[macro_use]` item)"
+	))
+}
+
+/// Plans moving the item named by `path` within its existing syntactic container.
+///
+/// [`InsertPosition::Before`] and [`InsertPosition::After`] name a sibling in that same container; `start` and `end`
+/// mean the first and last sibling positions. Variants with directly complementary `cfg` predicates, such as `X` and
+/// `not(X)`, move as one group. The item's complete source moves with it, including outer docs and attributes,
+/// attached comments above it, and a trailing comment that ends its line.
+///
+/// The move is one whole-file replacement in an [`EditSet`], so it previews and applies atomically. Imports (`use`
+/// items and their leaves), fields, variants, macro definitions/invocations and their entries, `#[macro_use]` modules
+/// and `extern crate` items, and out-of-line module declarations are refused because their surrounding syntax, lexical
+/// scope, or file-resolution semantics need specialized handling. No item may cross a direct-sibling macro-scope
+/// barrier (`macro_rules!`, an item-position macro invocation, or a `#[macro_use]` item). The destination must be in the
+/// existing container; this operation never changes paths or references.
+pub fn move_item(resolver: &Resolver<'_>, path: &ItemPath, position: &InsertPosition) -> Result<Movement, Error> {
+	let ws = resolver.workspace();
+	let items = moved_items(resolver, path)?;
+	let first = *items.first().expect("moved_items returns at least one item");
+	let container = container_of(ws, first, path)?;
+
+	for &item in &items[1..] {
+		let other = container_of(ws, item, path)?;
+
+		if !container.same_place(&other) {
+			return Err(Error::Unsupported(format!(
+				"the `cfg` variants of `{path}` are not siblings of the same container"
+			)));
+		}
+	}
+
+	let mut item_ranges: Vec<TextRange> = items.iter().map(|&item| ws.item(item).range).collect();
+
+	item_ranges.sort();
+	item_ranges.dedup();
+
+	let text = container.file.text();
+	let anchors = match position {
+		InsertPosition::Before(anchor) | InsertPosition::After(anchor) => {
+			let anchor = ItemPath::parse(anchor)?;
+
+			Some(anchor_ranges(resolver, &container, &items, &anchor)?)
+		}
+
+		InsertPosition::Start | InsertPosition::End => None,
+	};
+
+	if already_positioned(ws, &container, &item_ranges, position, anchors.as_deref()) {
+		return Ok(movement(resolver, &container, &items, EditSet::new()));
+	}
+
+	let removed = trivia::movement_ranges(text, &item_ranges);
+	let line_ending = trivia::line_ending(text);
+	let separator = format!("{line_ending}{line_ending}");
+	let blocks: Vec<ContentBlock> = removed
+		.iter()
+		.filter_map(|&range| content_block(text, range))
+		.filter(|block| !block.text.is_empty())
+		.collect();
+	let without = without_ranges(text, &removed);
+	let body = shifted_range(container.body, &removed);
+	let placement = destination(ws, &container, &items, &removed, position, body, anchors.as_deref());
+
+	check_macro_barriers(ws, &container, &items, &removed, placement, path)?;
+
+	let indent = trivia::body_indent(&without, body);
+	let source = content_source(&blocks, &separator, &indent);
+	let starts_line = blocks.first().is_none_or(|block| block.starts_line);
+	let insertion = trivia::verbatim_insertion(&without, placement, &source, starts_line, &indent, line_ending, Spacing::default());
+	let mut final_text = without;
+
+	final_text.replace_range(insertion.range.start..insertion.range.end, &insertion.replacement);
+
+	let mut edits = EditSet::new();
+
+	edits.replace_file(container.file, final_text);
+
+	Ok(movement(resolver, &container, &items, edits))
+}
+
+/// Resolves and validates the items that move together.
+fn moved_items(resolver: &Resolver<'_>, path: &ItemPath) -> Result<Vec<ItemId>, Error> {
+	let ws = resolver.workspace();
+	let mut items = resolver.resolve_item_path(path);
+
+	if items.is_empty() {
+		return Err(Error::NotFound(path.to_string()));
+	}
+
+	super::check_private_imports(resolver, path, &mut items)?;
+	distinct_places(ws, &mut items);
+
+	if items.len() > 1 {
+		let exclusive = items.iter().enumerate().all(|(index, &left)| {
+			items[index + 1..]
+				.iter()
+				.all(|&right| cfgs_are_exclusive(ws.effective_cfg(left).as_ref(), ws.effective_cfg(right).as_ref()))
+		});
+
+		if !exclusive || super::impl_headers_differ(ws, &items) {
+			return Err(Error::Ambiguous {
+				path: path.to_string(),
+				candidates: items.iter().map(|&item| describe(resolver, item)).collect(),
+			});
+		}
+	}
+
+	for &item in &items {
+		check_movable(ws, item, path)?;
+	}
+
+	Ok(items)
+}
+
+fn movement(resolver: &Resolver<'_>, container: &Container<'_>, items: &[ItemId], edits: EditSet) -> Movement {
+	let mut moved = Vec::new();
+
+	for &item in items {
+		let canonical = resolver.canonical_path(item).to_string();
+
+		if !moved.contains(&canonical) {
+			moved.push(canonical);
+		}
+	}
+
+	Movement {
+		edits,
+		moved,
+		parent: resolver.canonical_path(container.item).to_string(),
+		file: container.file.path().to_path_buf(),
+	}
+}
+
+fn same_place(ws: &Workspace, left: ItemId, right: ItemId) -> bool {
+	left == right || (ws.file_of(left).path() == ws.file_of(right).path() && ws.item(left).range == ws.item(right).range)
 }
 
 fn shifted_offset(offset: usize, removed: &[TextRange]) -> usize {
@@ -626,4 +620,40 @@ fn shifted_offset(offset: usize, removed: &[TextRange]) -> usize {
 	}
 
 	offset - deleted
+}
+
+/// Adjusts a range to its offsets after `removed` ranges have been deleted.
+fn shifted_range(range: TextRange, removed: &[TextRange]) -> TextRange {
+	TextRange::new(shifted_offset(range.start, removed), shifted_offset(range.end, removed))
+}
+
+/// The direct child of `container` that contains `item`.
+fn sibling_in(ws: &Workspace, mut item: ItemId, expected: &Container<'_>) -> Option<ItemId> {
+	loop {
+		let parent = ws.parent(item)?;
+
+		if container(ws, parent).is_some_and(|container| container.same_place(expected)) {
+			return Some(item);
+		}
+
+		if !matches!(ws.item(parent).kind, ItemKind::Use | ItemKind::ExternBlock | ItemKind::MacroCall) {
+			return None;
+		}
+
+		item = parent;
+	}
+}
+
+/// Removes sorted, disjoint ranges from a text.
+fn without_ranges(text: &str, ranges: &[TextRange]) -> String {
+	let mut result = String::with_capacity(text.len());
+	let mut at = 0;
+
+	for range in ranges {
+		result.push_str(&text[at..range.start]);
+		at = range.end;
+	}
+
+	result.push_str(&text[at..]);
+	result
 }

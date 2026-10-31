@@ -75,11 +75,7 @@ impl LoadOptions {
 		options.workspace = true;
 		options.packages.clear();
 		options.exclude.clear();
-		Some(Widening {
-			options,
-			members,
-			selected,
-		})
+		Some(Widening { options, members, selected })
 	}
 
 	/// Options that select the workspace members `members` (package names) besides the packages that these options

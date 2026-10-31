@@ -114,7 +114,16 @@ impl Builder<'_> {
 		for (index, field) in fields.into_iter().enumerate() {
 			let field_vis = vis(parsed, &field.vis, default.clone());
 			let range = parsed.range_of(field);
-			let mut data = data(parsed, dirs, ItemKind::Field, field.ident.as_ref(), &field.attrs, field_vis, range, ItemDetail::None);
+			let mut data = data(
+				parsed,
+				dirs,
+				ItemKind::Field,
+				field.ident.as_ref(),
+				&field.attrs,
+				field_vis,
+				range,
+				ItemDetail::None,
+			);
 
 			if field.ident.is_none() {
 				data.name = Some(index.to_string().into());

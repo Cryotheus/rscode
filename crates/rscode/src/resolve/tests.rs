@@ -165,31 +165,6 @@ fn canonical_paths_of_every_kind() {
 }
 
 #[test]
-fn import_indexes_select_one_of_several_same_named_imports() {
-	let ws = single(
-		r#"
-		pub struct A;
-		pub struct B;
-
-		pub mod m {
-			use crate::A as Same;
-			use crate::B as Same;
-		}
-		"#,
-	);
-	let resolver = Resolver::new(&ws);
-	let both = resolver.resolve_item_path(&ItemPath::parse("use crate::m::Same").unwrap());
-
-	assert_eq!(both.len(), 2);
-	assert_eq!(resolver.canonical_path(both[0]).to_string(), "use t::m::Same[1]");
-	assert_eq!(resolver.canonical_path(both[1]).to_string(), "use t::m::Same[2]");
-	assert_eq!(resolver.resolve_item_path(&ItemPath::parse("use crate::m::Same[2]").unwrap()), [both[1]]);
-	assert!(resolver.selects(&Selector::Index(1), both[0]));
-	assert!(!resolver.selects(&Selector::Index(2), both[0]));
-	assert!(resolver.selects(&Selector::Index(2), both[1]));
-}
-
-#[test]
 fn cfg_variants_are_all_kept() {
 	let ws = single(
 		r#"
@@ -1275,6 +1250,31 @@ fn import_cycles_are_given_up_on_without_losing_other_imports() {
 }
 
 #[test]
+fn import_indexes_select_one_of_several_same_named_imports() {
+	let ws = single(
+		r#"
+		pub struct A;
+		pub struct B;
+
+		pub mod m {
+			use crate::A as Same;
+			use crate::B as Same;
+		}
+		"#,
+	);
+	let resolver = Resolver::new(&ws);
+	let both = resolver.resolve_item_path(&ItemPath::parse("use crate::m::Same").unwrap());
+
+	assert_eq!(both.len(), 2);
+	assert_eq!(resolver.canonical_path(both[0]).to_string(), "use t::m::Same[1]");
+	assert_eq!(resolver.canonical_path(both[1]).to_string(), "use t::m::Same[2]");
+	assert_eq!(resolver.resolve_item_path(&ItemPath::parse("use crate::m::Same[2]").unwrap()), [both[1]]);
+	assert!(resolver.selects(&Selector::Index(1), both[0]));
+	assert!(!resolver.selects(&Selector::Index(2), both[0]));
+	assert!(resolver.selects(&Selector::Index(2), both[1]));
+}
+
+#[test]
 fn imports_through_glob_imported_modules() {
 	let ws = single(
 		r#"
@@ -1508,7 +1508,10 @@ fn macro_invocations_are_named_by_their_macro_and_a_bang() {
 	let resolver = Resolver::new(&ws);
 
 	// the invocations of every macro whose path ends with the name; the canonical paths of several have an index
-	assert_eq!(resolve(&resolver, "crate::commands!"), ["t::commands![1]", "t::commands![2]", "t::commands![3]"]);
+	assert_eq!(
+		resolve(&resolver, "crate::commands!"),
+		["t::commands![1]", "t::commands![2]", "t::commands![3]"]
+	);
 	assert_eq!(resolve(&resolver, "commands![2]"), ["t::commands![2]"]);
 	assert_eq!(resolve(&resolver, "::t::single!"), ["t::single!"]);
 	assert_eq!(resolve(&resolver, "m::commands!"), ["t::m::commands!"]);
@@ -2301,7 +2304,10 @@ fn selectors_of_many_impl_blocks_with_one_header() {
 	println!("the canonical paths of 3000 impl blocks with one header computed in {elapsed:?}");
 
 	assert_eq!(paths.len(), 3000);
-	assert_eq!((paths[0].as_str(), paths[2999].as_str()), ("impl t::Tools[#attr_0]", "impl t::Tools[#attr_2999]"));
+	assert_eq!(
+		(paths[0].as_str(), paths[2999].as_str()),
+		("impl t::Tools[#attr_0]", "impl t::Tools[#attr_2999]")
+	);
 	assert_eq!(items.len(), 3000);
 	assert!(elapsed.as_secs() < 5, "{elapsed:?}");
 }
@@ -2341,15 +2347,24 @@ fn selectors_tell_impl_blocks_with_the_same_header_apart() {
 		resolve(&resolver, "<Tools>"),
 		["impl t::Tools[add_bots]", "impl t::Tools[#rmcp::handler]", "impl t::Tools[kick]"]
 	);
-	assert_eq!(resolve(&resolver, "<Tools as Tr>"), ["impl Tr for t::Tools[1]", "impl Tr for t::Tools[2]"]);
-	assert_eq!(resolve(&resolver, "<Tools as Tr>::f"), ["<t::Tools as Tr>[1]::f", "<t::Tools as Tr>[2]::f"]);
+	assert_eq!(
+		resolve(&resolver, "<Tools as Tr>"),
+		["impl Tr for t::Tools[1]", "impl Tr for t::Tools[2]"]
+	);
+	assert_eq!(
+		resolve(&resolver, "<Tools as Tr>::f"),
+		["<t::Tools as Tr>[1]::f", "<t::Tools as Tr>[2]::f"]
+	);
 	assert_eq!(resolve(&resolver, "<Single>"), ["impl t::Single"]);
 	assert_eq!(resolve(&resolver, "Single::new"), ["t::Single::new"]);
 	assert_eq!(resolve(&resolver, "Tools::kick"), ["t::Tools::kick"]);
 
 	// selectors pick blocks by an item, an attribute (or the end of its path), or their place
 	assert_eq!(resolve(&resolver, "<Tools>[shared]"), ["impl t::Tools[add_bots]", "impl t::Tools[kick]"]);
-	assert_eq!(resolve(&resolver, "<Tools>[#tool_router]"), ["impl t::Tools[add_bots]", "impl t::Tools[#rmcp::handler]"]);
+	assert_eq!(
+		resolve(&resolver, "<Tools>[#tool_router]"),
+		["impl t::Tools[add_bots]", "impl t::Tools[#rmcp::handler]"]
+	);
 	assert_eq!(resolve(&resolver, "<Tools>[#handler]"), ["impl t::Tools[#rmcp::handler]"]);
 	assert_eq!(resolve(&resolver, "<Tools>[#router]"), Vec::<String>::new());
 	assert_eq!(resolve(&resolver, "<Tools>[3]::kick"), ["t::Tools::kick"]);

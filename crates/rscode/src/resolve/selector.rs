@@ -112,9 +112,7 @@ impl Resolver<'_> {
 			}
 		}
 
-		let only_at = |places: Option<&FxHashSet<usize>>, index: usize| {
-			places.is_some_and(|places| places.len() == 1 && places.contains(&index))
-		};
+		let only_at = |places: Option<&FxHashSet<usize>>, index: usize| places.is_some_and(|places| places.len() == 1 && places.contains(&index));
 
 		(same.into_iter())
 			.map(|block| {
@@ -128,7 +126,10 @@ impl Resolver<'_> {
 						.map(Selector::Attribute)
 				};
 
-				(block, item.or_else(attribute).or_else(|| u32::try_from(index + 1).ok().map(Selector::Index)))
+				(
+					block,
+					item.or_else(attribute).or_else(|| u32::try_from(index + 1).ok().map(Selector::Index)),
+				)
 			})
 			.collect()
 	}
@@ -142,23 +143,6 @@ impl Resolver<'_> {
 	/// take time quadratic in the number of blocks.)
 	pub(super) fn impl_selector(&self, impl_block: ItemId, base: &CanonicalPath) -> Option<Selector> {
 		self.cached_selector(impl_block, || self.header_selectors(impl_block, base))
-	}
-
-	/// The invocations that the path of a macro invocation names (`base` is its canonical path without a selector):
-	/// those of the same macro in its module (and the module's `cfg` variants), the invocation among them. `None` when
-	/// the path does not name it.
-	fn macro_calls(&self, call: ItemId, base: &CanonicalPath) -> Option<Vec<ItemId>> {
-		let named = self.compute_item_path(&ItemPath::parse(&base.to_string()).ok()?);
-
-		named.contains(&call).then_some(named)
-	}
-
-	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
-	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
-	///
-	/// (Like [`Resolver::impl_selector`], the indexes of invocations with the same path are computed together, once.)
-	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
-		self.cached_selector(call, || self.call_selectors(call, base))
 	}
 
 	/// The index that picks `import` among `imports` (those that a `use` path without a selector names), numbered like
@@ -185,6 +169,23 @@ impl Resolver<'_> {
 		let path = ItemPath::parse(&unselected.to_string()).ok()?;
 
 		self.import_index(&self.compute_item_path(&path), import).map(Selector::Index)
+	}
+
+	/// The invocations that the path of a macro invocation names (`base` is its canonical path without a selector):
+	/// those of the same macro in its module (and the module's `cfg` variants), the invocation among them. `None` when
+	/// the path does not name it.
+	fn macro_calls(&self, call: ItemId, base: &CanonicalPath) -> Option<Vec<ItemId>> {
+		let named = self.compute_item_path(&ItemPath::parse(&base.to_string()).ok()?);
+
+		named.contains(&call).then_some(named)
+	}
+
+	/// The index that the canonical path of a macro invocation shows (`base` is that path without it), when the path
+	/// names other invocations too (of the same macro, in the module or its `cfg` variants).
+	///
+	/// (Like [`Resolver::impl_selector`], the indexes of invocations with the same path are computed together, once.)
+	pub(super) fn macro_selector(&self, call: ItemId, base: &CanonicalPath) -> Option<Selector> {
+		self.cached_selector(call, || self.call_selectors(call, base))
 	}
 
 	/// Whether an item with this canonical path matches a pattern, with the pattern's selector tested by what it picks
@@ -267,10 +268,13 @@ impl Resolver<'_> {
 
 			ItemKind::Impl => None,
 
-			_ => self.macro_calls(target, &CanonicalPath {
-				selector: None,
-				..self.compute_canonical_path(target)
-			}),
+			_ => self.macro_calls(
+				target,
+				&CanonicalPath {
+					selector: None,
+					..self.compute_canonical_path(target)
+				},
+			),
 		};
 
 		self.select(named.unwrap_or_else(|| vec![target]), selector).contains(&target)

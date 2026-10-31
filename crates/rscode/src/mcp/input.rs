@@ -169,6 +169,23 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn explains_literal_tabs_in_json_strings() {
+		let (_, reports) = read(&[b"{\"old\":\"a\tb\"}\n"]).await;
+
+		assert_eq!(reports.len(), 1);
+		assert!(
+			reports[0].contains("a tab inside a JSON string must be escaped as `\\t`"),
+			"{}",
+			reports[0]
+		);
+
+		let (_, reports) = read(&[b"{\tbad}\n"]).await;
+
+		assert_eq!(reports.len(), 1);
+		assert!(!reports[0].contains("tab inside a JSON string"), "{}", reports[0]);
+	}
+
+	#[tokio::test]
 	async fn ignores_an_unfinished_last_line() {
 		let (output, reports) = read(&[b"{\"a\":", b" 1}\n{\"b\""]).await;
 
@@ -212,18 +229,5 @@ mod tests {
 		assert_eq!(reports.len(), 1, "{reports:?}");
 		assert!(reports[0].starts_with("rscode mcp: ignored a line of input that is not JSON (key must be a string"));
 		assert!(reports[0].ends_with("so nothing answers it: {this is not json"), "{}", reports[0]);
-	}
-
-	#[tokio::test]
-	async fn explains_literal_tabs_in_json_strings() {
-		let (_, reports) = read(&[b"{\"old\":\"a\tb\"}\n"]).await;
-
-		assert_eq!(reports.len(), 1);
-		assert!(reports[0].contains("a tab inside a JSON string must be escaped as `\\t`"), "{}", reports[0]);
-
-		let (_, reports) = read(&[b"{\tbad}\n"]).await;
-
-		assert_eq!(reports.len(), 1);
-		assert!(!reports[0].contains("tab inside a JSON string"), "{}", reports[0]);
 	}
 }

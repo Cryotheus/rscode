@@ -428,6 +428,34 @@ pub(crate) fn module_creation(root: &Path, plan: &ModuleCreation, parent: &str, 
 	out
 }
 
+/// What moving an item within its container did (or would do).
+pub(crate) fn movement(root: &Path, plan: &Movement, dry_run: bool) -> String {
+	if plan.edits.is_empty() {
+		return match dry_run {
+			true => "nothing would change\n".to_owned(),
+			false => "nothing changed\n".to_owned(),
+		};
+	}
+
+	let mut out = String::new();
+
+	writeln!(
+		out,
+		"{} {} within `{}` ({}):",
+		done(dry_run, "moved", "move"),
+		count(plan.moved.len(), "item", "items"),
+		plan.parent,
+		display(root, &plan.file)
+	)
+	.unwrap();
+
+	for path in &plan.moved {
+		writeln!(out, "  {path}").unwrap();
+	}
+
+	out
+}
+
 /// `counted` (the count of a search's results), and which of them are shown when not all of them are.
 fn paged(counted: String, shown: usize, page: Page) -> String {
 	let Page { offset, limit, total } = page;
@@ -574,7 +602,10 @@ fn references_by_file(root: &Path, references: &[Reference]) -> String {
 		}
 	}
 
-	files.iter().map(|(file, places)| format!("  {}: {}\n", display(root, file), places.join(", "))).collect()
+	files
+		.iter()
+		.map(|(file, places)| format!("  {}: {}\n", display(root, file), places.join(", ")))
+		.collect()
 }
 
 /// A path for display: relative to the workspace root when it is inside of it.
@@ -583,34 +614,6 @@ pub(crate) fn relative(root: &Path, path: &Path) -> PathBuf {
 		Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
 		_ => path.to_path_buf(),
 	}
-}
-
-/// What moving an item within its container did (or would do).
-pub(crate) fn movement(root: &Path, plan: &Movement, dry_run: bool) -> String {
-	if plan.edits.is_empty() {
-		return match dry_run {
-			true => "nothing would change\n".to_owned(),
-			false => "nothing changed\n".to_owned(),
-		};
-	}
-
-	let mut out = String::new();
-
-	writeln!(
-		out,
-		"{} {} within `{}` ({}):",
-		done(dry_run, "moved", "move"),
-		count(plan.moved.len(), "item", "items"),
-		plan.parent,
-		display(root, &plan.file)
-	)
-	.unwrap();
-
-	for path in &plan.moved {
-		writeln!(out, "  {path}").unwrap();
-	}
-
-	out
 }
 
 /// What a removal did (or would do): removed items, deleted files, dangling references, and warnings.

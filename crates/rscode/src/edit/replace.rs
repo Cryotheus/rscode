@@ -344,6 +344,35 @@ fn binds_name(ws: &Workspace, item: ItemId, name: &str) -> bool {
 	}
 }
 
+/// Whether two understood `cfg` predicates cannot both be true.
+fn cfgs_are_exclusive(left: Option<&CfgExpr>, right: Option<&CfgExpr>) -> bool {
+	fn false_predicate(expression: &CfgExpr) -> bool {
+		match expression {
+			CfgExpr::Bool(value) => !value,
+			CfgExpr::All(expressions) => expressions.iter().any(false_predicate),
+			CfgExpr::Any(expressions) => expressions.iter().all(false_predicate),
+			CfgExpr::Not(expression) => matches!(expression.as_ref(), CfgExpr::Bool(true)),
+			CfgExpr::Name(_) | CfgExpr::KeyValue(_, _) | CfgExpr::Other(_) => false,
+		}
+	}
+
+	fn opposites(left: &CfgExpr, right: &CfgExpr) -> bool {
+		match (left, right) {
+			(CfgExpr::All(expressions), right) => expressions.iter().any(|left| opposites(left, right)),
+			(left, CfgExpr::All(expressions)) => expressions.iter().any(|right| opposites(left, right)),
+			(CfgExpr::Not(left), right) => left.as_ref() == right,
+			(left, CfgExpr::Not(right)) => left == right.as_ref(),
+			_ => false,
+		}
+	}
+
+	let (Some(left), Some(right)) = (left, right) else {
+		return false;
+	};
+
+	false_predicate(left) || false_predicate(right) || opposites(left, right)
+}
+
 /// Refuses an anchor that names statics declared by entries of a macro invocation (other than `thread_local!`, see
 /// [`Workspace::entry_macro`]): the new items would go into the container after the invocation, not into it. A single
 /// name names the entries of the container's invocations too, like in [`siblings`].
@@ -356,7 +385,11 @@ fn check_entry_anchor(resolver: &Resolver<'_>, target: &Target<'_>, anchor: &Ite
 	{
 		let calls = ws.children(target.item).filter(|&child| ws.item(child).kind == ItemKind::MacroCall);
 
-		named.extend(calls.flat_map(|call| ws.children(call)).filter(|&entry| ws.item(entry).name.as_ref() == Some(name)));
+		named.extend(
+			calls
+				.flat_map(|call| ws.children(call))
+				.filter(|&entry| ws.item(entry).name.as_ref() == Some(name)),
+		);
 	}
 
 	match named.into_iter().find(|&item| ws.entry_macro(item).is_some()) {
@@ -372,7 +405,10 @@ fn check_field_form(data: &ItemData, path: &str, items: &[NewItem]) -> Result<()
 		return Ok(());
 	}
 
-	let named = data.name.as_deref().is_some_and(|name| !name.starts_with(|char: char| char.is_ascii_digit()));
+	let named = data
+		.name
+		.as_deref()
+		.is_some_and(|name| !name.starts_with(|char: char| char.is_ascii_digit()));
 
 	match items.iter().any(|item| item.name.is_some() != named) {
 		false => Ok(()),
@@ -428,9 +464,9 @@ fn collisions(resolver: &Resolver<'_>, target: &Target<'_>, items: &[NewItem]) -
 
 			// `macro_rules!` macros may shadow each other, and other macros are left to the compiler
 			for namespace in namespaces.into_iter().filter(|&namespace| namespace != Namespace::Macro) {
-				let collides_with_source = seen
-					.iter()
-					.any(|(name, seen_namespace, cfg)| *name == &binding.name && *seen_namespace == namespace && !cfgs_are_exclusive(*cfg, item.cfg.as_ref()));
+				let collides_with_source = seen.iter().any(|(name, seen_namespace, cfg)| {
+					*name == &binding.name && *seen_namespace == namespace && !cfgs_are_exclusive(*cfg, item.cfg.as_ref())
+				});
 
 				if collides_with_source {
 					push_unique(&mut collisions, (binding.name.clone(), "another item of the source".to_owned()));
@@ -451,35 +487,6 @@ fn collisions(resolver: &Resolver<'_>, target: &Target<'_>, items: &[NewItem]) -
 	}
 
 	collisions
-}
-
-/// Whether two understood `cfg` predicates cannot both be true.
-fn cfgs_are_exclusive(left: Option<&CfgExpr>, right: Option<&CfgExpr>) -> bool {
-	fn false_predicate(expression: &CfgExpr) -> bool {
-		match expression {
-			CfgExpr::Bool(value) => !value,
-			CfgExpr::All(expressions) => expressions.iter().any(false_predicate),
-			CfgExpr::Any(expressions) => expressions.iter().all(false_predicate),
-			CfgExpr::Not(expression) => matches!(expression.as_ref(), CfgExpr::Bool(true)),
-			CfgExpr::Name(_) | CfgExpr::KeyValue(_, _) | CfgExpr::Other(_) => false,
-		}
-	}
-
-	fn opposites(left: &CfgExpr, right: &CfgExpr) -> bool {
-		match (left, right) {
-			(CfgExpr::All(expressions), right) => expressions.iter().any(|left| opposites(left, right)),
-			(left, CfgExpr::All(expressions)) => expressions.iter().any(|right| opposites(left, right)),
-			(CfgExpr::Not(left), right) => left.as_ref() == right,
-			(left, CfgExpr::Not(right)) => left == right.as_ref(),
-			_ => false,
-		}
-	}
-
-	let (Some(left), Some(right)) = (left, right) else {
-		return false;
-	};
-
-	false_predicate(left) || false_predicate(right) || opposites(left, right)
 }
 
 /// A binding for messages: the item, or the import and what it imports.
@@ -653,7 +660,9 @@ fn is_view_header(line: &str) -> bool {
 	let Some((path_kind_file, lines)) = rest.rsplit_once(':') else {
 		return false;
 	};
-	let is_lines = lines.split('-').all(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
+	let is_lines = lines
+		.split('-')
+		.all(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()));
 	let Some(path_kind) = (path_kind_file.rsplit_once(' ')).and_then(|(path_kind, _)| path_kind.strip_suffix(')')) else {
 		return false;
 	};
@@ -749,7 +758,13 @@ fn pasted(source: &str) -> Cow<'_, str> {
 		&& lines.iter().all(|line| line.trim().is_empty() || item::gutter_len(line).is_some());
 
 	match (headers, numbered) {
-		(_, true) => Cow::Owned(lines.iter().map(|line| &line[item::gutter_len(line).unwrap_or(0)..]).collect::<Vec<_>>().join("\n")),
+		(_, true) => Cow::Owned(
+			lines
+				.iter()
+				.map(|line| &line[item::gutter_len(line).unwrap_or(0)..])
+				.collect::<Vec<_>>()
+				.join("\n"),
+		),
 
 		// (keeping the line endings)
 		(true, false) => Cow::Owned(

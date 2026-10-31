@@ -220,8 +220,8 @@ impl ItemOrder {
 
 			// `impl` blocks go with the data types, or right after them
 			(OrderGroup::Impl, OrderGroup::Item(other)) => impl_cmp(other)?,
-			(OrderGroup::Item(other), OrderGroup::Impl) => impl_cmp(other)?.reverse(),
 
+			(OrderGroup::Item(other), OrderGroup::Impl) => impl_cmp(other)?.reverse(),
 			_ => return None,
 		};
 
@@ -934,7 +934,12 @@ fn names_const(block: &syn::ItemImpl, ty: &syn::Type, names: &LocalNames) -> boo
 	let syn::Type::Path(path) = ty else {
 		return false;
 	};
-	let Some(name) = path.path.get_ident().filter(|_| path.qself.is_none()).map(|ident| ident.unraw().to_string()) else {
+	let Some(name) = path
+		.path
+		.get_ident()
+		.filter(|_| path.qself.is_none())
+		.map(|ident| ident.unraw().to_string())
+	else {
 		return false;
 	};
 	let generics = &block.generics;

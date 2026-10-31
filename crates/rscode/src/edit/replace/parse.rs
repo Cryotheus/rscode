@@ -254,6 +254,33 @@ pub(super) fn cfg_attributes(attributes: &str) -> Vec<String> {
 	})
 }
 
+/// The conjunction of the outer `cfg` attributes in an item's tokens, when each predicate parses.
+fn cfg_expression(tokens: TokenStream) -> Option<CfgExpr> {
+	let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+	let mut expressions = Vec::new();
+
+	for pair in tokens.windows(2) {
+		let [TokenTree::Punct(pound), TokenTree::Group(attribute)] = pair else {
+			continue;
+		};
+
+		if pound.as_char() != '#' || attribute.delimiter() != Delimiter::Bracket {
+			continue;
+		}
+
+		let contents: Vec<TokenTree> = attribute.stream().into_iter().collect();
+		let [TokenTree::Ident(name), TokenTree::Group(predicate)] = contents.as_slice() else {
+			continue;
+		};
+
+		if name == "cfg" && predicate.delimiter() == Delimiter::Parenthesis {
+			expressions.push(CfgExpr::from_tokens(predicate.stream()).ok()?);
+		}
+	}
+
+	CfgExpr::all(expressions)
+}
+
 /// Tuple and unit structs (and variants) are also constructors.
 fn data_namespaces(fields: &Fields) -> &'static [Namespace] {
 	match fields {
@@ -325,39 +352,6 @@ fn has_cfg_attributes(text: &str) -> bool {
 
 		_ => false,
 	})
-}
-
-/// The conjunction of the outer `cfg` attributes in an item's tokens, when each predicate parses.
-fn cfg_expression(tokens: TokenStream) -> Option<CfgExpr> {
-	let tokens: Vec<TokenTree> = tokens.into_iter().collect();
-	let mut expressions = Vec::new();
-
-	for pair in tokens.windows(2) {
-		let [TokenTree::Punct(pound), TokenTree::Group(attribute)] = pair else {
-			continue;
-		};
-
-		if pound.as_char() != '#' || attribute.delimiter() != Delimiter::Bracket {
-			continue;
-		}
-
-		let contents: Vec<TokenTree> = attribute.stream().into_iter().collect();
-		let [TokenTree::Ident(name), TokenTree::Group(predicate)] = contents.as_slice() else {
-			continue;
-		};
-
-		if name == "cfg" && predicate.delimiter() == Delimiter::Parenthesis {
-			expressions.push(CfgExpr::from_tokens(predicate.stream()).ok()?);
-		}
-	}
-
-	CfgExpr::all(expressions)
-}
-
-/// Adds the item's `cfg` predicate to its classification.
-fn with_cfg(mut item: NewItem, tokens: TokenStream) -> NewItem {
-	item.cfg = cfg_expression(tokens);
-	item
 }
 
 /// The unraw'd name of an identifier, `None` for `_`.
@@ -529,7 +523,9 @@ fn parse_fields(text: &str) -> syn::Result<Parsed> {
 		}
 	};
 
-	parser(true).parse_str(text).or_else(|named| parser(false).parse_str(text).map_err(|_| named))
+	parser(true)
+		.parse_str(text)
+		.or_else(|named| parser(false).parse_str(text).map_err(|_| named))
 }
 
 fn parse_list<T: Parse + ToTokens>(text: &str, classify: impl Fn(&T) -> NewItem, allow_inner_attributes: bool) -> syn::Result<Parsed> {
@@ -795,9 +791,29 @@ fn verbatim(tokens: &TokenStream, container: Container) -> NewItem {
 	}
 }
 
+/// Adds the item's `cfg` predicate to its classification.
+fn with_cfg(mut item: NewItem, tokens: TokenStream) -> NewItem {
+	item.cfg = cfg_expression(tokens);
+	item
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn allows_inner_attributes_only_at_the_start_of_modules() {
+		let source = "//! docs\n#![allow(dead_code)]\nfn f() {}";
+		let parsed = parse_source_at_start(source, Container::Module).unwrap();
+
+		assert_eq!(parsed.text, source);
+		assert_eq!(parsed.items.len(), 1);
+		assert_eq!(parsed.items[0].kind, ItemKind::Fn);
+		assert_eq!(parsed.items[0].name.as_deref(), Some("f"));
+
+		assert!(matches!(parse_source(source, Container::Module), Err(Error::InvalidSource(_))));
+		assert!(matches!(parse_source_at_start(source, Container::Impl), Err(Error::InvalidSource(_))));
+	}
 
 	#[test]
 	fn classifies_associated_foreign_and_variant_items() {
@@ -1042,19 +1058,5 @@ mod tests {
 
 		// a byte order mark does not count as a column
 		assert!(error("\u{feff}fn 1() {}", Container::Module).contains("at 1:4:"));
-	}
-
-	#[test]
-	fn allows_inner_attributes_only_at_the_start_of_modules() {
-		let source = "//! docs\n#![allow(dead_code)]\nfn f() {}";
-		let parsed = parse_source_at_start(source, Container::Module).unwrap();
-
-		assert_eq!(parsed.text, source);
-		assert_eq!(parsed.items.len(), 1);
-		assert_eq!(parsed.items[0].kind, ItemKind::Fn);
-		assert_eq!(parsed.items[0].name.as_deref(), Some("f"));
-
-		assert!(matches!(parse_source(source, Container::Module), Err(Error::InvalidSource(_))));
-		assert!(matches!(parse_source_at_start(source, Container::Impl), Err(Error::InvalidSource(_))));
 	}
 }

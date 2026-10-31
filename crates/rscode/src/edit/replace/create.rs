@@ -158,6 +158,7 @@ fn declaration(name: &NewName, vis: &str) -> Result<String, Error> {
 
 	match is_visibility {
 		true => Ok(declaration),
+
 		false => Err(Error::InvalidSource(format!(
 			"`{vis}` is not a visibility (such as `pub`, `pub(crate)`, or `pub(super)`)"
 		))),
@@ -185,7 +186,10 @@ fn file_contents(source: &str, parent_text: &str) -> Result<String, Error> {
 
 	match parsed {
 		Ok(()) => Ok(text),
-		Err(error) => Err(Error::InvalidSource(format!("the source does not parse as the file of a module at {error}"))),
+
+		Err(error) => Err(Error::InvalidSource(format!(
+			"the source does not parse as the file of a module at {error}"
+		))),
 	}
 }
 
@@ -200,8 +204,8 @@ fn line_of(start: LineCol, replacement: &str, declaration: &str) -> usize {
 /// when its other out-of-line modules (declared without `#[path]`) are all in `mod.rs` files. Fails when either file
 /// exists.
 fn module_file(ws: &Workspace, target: &Target<'_>, parent: &ItemPath, name: &str) -> Result<PathBuf, Error> {
-	let directory = child_dir(ws, target.item)
-		.ok_or_else(|| Error::Unsupported(format!("cannot tell where the files of the modules of `{parent}` go")))?;
+	let directory =
+		child_dir(ws, target.item).ok_or_else(|| Error::Unsupported(format!("cannot tell where the files of the modules of `{parent}` go")))?;
 
 	let modules: Vec<&Path> = ws
 		.children(target.item)

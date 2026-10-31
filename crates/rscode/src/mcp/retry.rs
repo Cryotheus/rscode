@@ -100,12 +100,44 @@ fn in_several_crates(workspace: &Workspace, items: &[ItemId]) -> bool {
 	crates.len() > 1
 }
 
+/// A hint for code written inside a module-level macro invocation, which is not loaded as separate items.
+pub(super) fn macro_invocation_hint(resolver: &Resolver<'_>, path: &ItemPath) -> Option<String> {
+	if path.import || path.qualifier.is_some() || path.field.is_some() || path.macro_call {
+		return None;
+	}
+
+	let mut module_path = path.clone();
+	module_path.segments.pop()?;
+	module_path.arguments = None;
+	module_path.selector = None;
+	let ws = resolver.workspace();
+	let mut invocations: Vec<String> = (resolver.resolve_item_path(&module_path).into_iter())
+		.filter(|&item| ws.item(item).kind == ItemKind::Module)
+		.flat_map(|module| ws.children(module))
+		.filter(|&item| ws.item(item).kind == ItemKind::MacroCall)
+		.map(|item| resolver.canonical_path(item).input_path())
+		.collect();
+
+	invocations.sort();
+	invocations.dedup();
+	invocations.truncate(5);
+
+	let paths: Vec<String> = invocations.into_iter().map(|path| format!("`{path}`")).collect();
+	let [first, rest @ ..] = paths.as_slice() else {
+		return None;
+	};
+	let listed = match rest {
+		[] => first.clone(),
+		_ => format!("{} or {}", paths[..paths.len() - 1].join(", "), paths.last().unwrap()),
+	};
+
+	Some(format!(
+		"the name may be code inside a macro invocation, whose contents are not separate items; edit {listed} with exact text"
+	))
+}
+
 /// The workspace members among `members` that `items` are in.
-pub(crate) fn members_of(
-	workspace: &Workspace,
-	items: impl IntoIterator<Item = ItemId>,
-	members: &[SmolStr],
-) -> Vec<SmolStr> {
+pub(crate) fn members_of(workspace: &Workspace, items: impl IntoIterator<Item = ItemId>, members: &[SmolStr]) -> Vec<SmolStr> {
 	let packages: BTreeSet<&SmolStr> = (items.into_iter())
 		.filter_map(|item| workspace.krate(item.krate()).package())
 		.map(|package| &workspace.package(package).name)
@@ -302,40 +334,4 @@ fn suggestion(resolver: &Resolver<'_>, path: Option<&ItemPath>) -> String {
 	}
 
 	hint
-}
-
-/// A hint for code written inside a module-level macro invocation, which is not loaded as separate items.
-pub(super) fn macro_invocation_hint(resolver: &Resolver<'_>, path: &ItemPath) -> Option<String> {
-	if path.import || path.qualifier.is_some() || path.field.is_some() || path.macro_call {
-		return None;
-	}
-
-	let mut module_path = path.clone();
-	module_path.segments.pop()?;
-	module_path.arguments = None;
-	module_path.selector = None;
-	let ws = resolver.workspace();
-	let mut invocations: Vec<String> = (resolver.resolve_item_path(&module_path).into_iter())
-		.filter(|&item| ws.item(item).kind == ItemKind::Module)
-		.flat_map(|module| ws.children(module))
-		.filter(|&item| ws.item(item).kind == ItemKind::MacroCall)
-		.map(|item| resolver.canonical_path(item).input_path())
-		.collect();
-
-	invocations.sort();
-	invocations.dedup();
-	invocations.truncate(5);
-
-	let paths: Vec<String> = invocations.into_iter().map(|path| format!("`{path}`")).collect();
-	let [first, rest @ ..] = paths.as_slice() else {
-		return None;
-	};
-	let listed = match rest {
-		[] => first.clone(),
-		_ => format!("{} or {}", paths[..paths.len() - 1].join(", "), paths.last().unwrap()),
-	};
-
-	Some(format!(
-		"the name may be code inside a macro invocation, whose contents are not separate items; edit {listed} with exact text"
-	))
 }

@@ -100,8 +100,7 @@ impl Siblings {
 		let previous = index.checked_sub(1).map(|previous| &self.items[previous].order);
 		let next = self.items.get(index + 1).map(|next| &next.order);
 
-		previous.is_none_or(|previous| !after(previous, new) || after(previous, old))
-			&& next.is_none_or(|next| !after(new, next) || after(old, next))
+		previous.is_none_or(|previous| !after(previous, new) || after(previous, old)) && next.is_none_or(|next| !after(new, next) || after(old, next))
 	}
 
 	/// The siblings above and below new items placed at `placement` (by index); `None` when it is not next to a
@@ -127,7 +126,9 @@ impl Siblings {
 	/// Where a new item of the order `new` goes among the siblings of `run` (indices, in order): before the first
 	/// that sorts after it, else after the last.
 	pub(super) fn placement_in(&self, run: &[usize], new: &ItemOrder) -> Option<Placement> {
-		let after = run.iter().find(|&&index| self.items[index].order.compare(new) == Some(std::cmp::Ordering::Greater));
+		let after = run
+			.iter()
+			.find(|&&index| self.items[index].order.compare(new) == Some(std::cmp::Ordering::Greater));
 
 		Some(match after {
 			Some(&index) => Placement::Before(self.items[index].range),

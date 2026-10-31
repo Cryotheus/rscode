@@ -174,6 +174,7 @@ impl Renderer<'_, '_> {
 		let line_numbers = match self.options.line_numbers {
 			LineNumbers::Never => false,
 			LineNumbers::Always => true,
+
 			// (the header of a module with a file gives the line of its declaration)
 			LineNumbers::Auto => source.module_file || !snippet.is_consecutive_from(first_line),
 		};

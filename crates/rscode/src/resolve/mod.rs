@@ -432,12 +432,7 @@ impl<'ws> Resolver<'ws> {
 	/// Resolves every prefix of a `use` path written inside of `module`, like [`Resolver::resolve_prefixes`] with
 	/// [`PathKind::Use`], but finds only the bindings visible from `module`, as rustc does: what another module binds
 	/// privately (or with a visibility that does not reach `module`) is not found.
-	pub(crate) fn resolve_visible_prefixes(
-		&self,
-		module: ItemId,
-		path: &PathRef,
-		namespace: Option<Namespace>,
-	) -> Vec<Vec<Res>> {
+	pub(crate) fn resolve_visible_prefixes(&self, module: ItemId, path: &PathRef, namespace: Option<Namespace>) -> Vec<Vec<Res>> {
 		let walker = Walker::visible(self.ws, &self.tables, self.ws.module_of(module), PathKind::Use);
 
 		prefixes(walker, path, namespace)

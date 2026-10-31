@@ -143,14 +143,15 @@ pub(crate) fn parse_entries(input: ParseStream<'_>) -> syn::Result<Vec<Entry>> {
 /// Whether a token of a value starts the next entry instead: `static` (not the lifetime `'static`), a visibility
 /// (`pub`), or an outer attribute (`#` followed by brackets).
 fn starts_entry(token: &TokenTree, previous: Option<&TokenTree>, next: Option<TokenTree>) -> bool {
-	let after_quote =
-		matches!(previous, Some(TokenTree::Punct(punct)) if punct.as_char() == '\'' && punct.spacing() == Spacing::Joint);
+	let after_quote = matches!(previous, Some(TokenTree::Punct(punct)) if punct.as_char() == '\'' && punct.spacing() == Spacing::Joint);
 
 	match token {
 		TokenTree::Ident(ident) => !after_quote && (ident == "static" || ident == "pub"),
+
 		TokenTree::Punct(punct) if punct.as_char() == '#' => {
 			matches!(next, Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket)
 		}
+
 		_ => false,
 	}
 }
@@ -190,10 +191,23 @@ mod tests {
 
 	#[test]
 	fn parses_entries() {
-		assert_eq!(names("static SAY = fn say() { x(); } static HELP = 2;"), Some(vec!["SAY".to_owned(), "HELP".to_owned()]));
-		assert_eq!(names("pub static ref A: Vec<u8> = vec![]; static B: &'static str = \"b\""), Some(vec!["A".to_owned(), "B".to_owned()]));
-		assert_eq!(names("/// Docs.\n#[cfg(x)] static C = 1 pub(crate) static D = 2"), Some(vec!["C".to_owned(), "D".to_owned()]));
-		assert_eq!(names("static E = #[allow(x)] 1;"), Some(vec!["E".to_owned()]), "a value has at least one token");
+		assert_eq!(
+			names("static SAY = fn say() { x(); } static HELP = 2;"),
+			Some(vec!["SAY".to_owned(), "HELP".to_owned()])
+		);
+		assert_eq!(
+			names("pub static ref A: Vec<u8> = vec![]; static B: &'static str = \"b\""),
+			Some(vec!["A".to_owned(), "B".to_owned()])
+		);
+		assert_eq!(
+			names("/// Docs.\n#[cfg(x)] static C = 1 pub(crate) static D = 2"),
+			Some(vec!["C".to_owned(), "D".to_owned()])
+		);
+		assert_eq!(
+			names("static E = #[allow(x)] 1;"),
+			Some(vec!["E".to_owned()]),
+			"a value has at least one token"
+		);
 		assert_eq!(names("static F = 1 #[cfg(x)] static G = 2"), Some(vec!["F".to_owned(), "G".to_owned()]));
 	}
 }

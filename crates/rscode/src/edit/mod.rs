@@ -128,8 +128,7 @@ impl EditSet {
 	/// could not be undone, if anything). Symbolic links are written through, and permissions are preserved.
 	pub fn apply(&self) -> Result<Applied, Error> {
 		let changes = self.preview()?;
-		let (to_create, edited): (Vec<&FileChange>, Vec<&FileChange>) =
-			changes.iter().partition(|change| self.created.contains(&change.path));
+		let (to_create, edited): (Vec<&FileChange>, Vec<&FileChange>) = changes.iter().partition(|change| self.created.contains(&change.path));
 		let to_write: Vec<&FileChange> = edited.into_iter().filter(|change| change.is_changed()).collect();
 
 		for change in &to_write {
@@ -228,10 +227,13 @@ impl EditSet {
 			replacement: text.into(),
 		};
 
-		self.files.insert(path.clone(), FileEdits {
-			original: Arc::from(""),
-			edits: vec![creation],
-		});
+		self.files.insert(
+			path.clone(),
+			FileEdits {
+				original: Arc::from(""),
+				edits: vec![creation],
+			},
+		);
 		self.created.insert(path);
 	}
 
@@ -570,8 +572,9 @@ impl Step<'_> {
 				fs::remove_dir(directory).map_err(|error| format!("the new directory `{}` stays ({error})", directory.display()))
 			}
 
-			Step::CreatedFile { path, contents } => remove_created(path, contents)
-				.map_err(|error| format!("the new file `{}` stays ({error})", path.display())),
+			Step::CreatedFile { path, contents } => {
+				remove_created(path, contents).map_err(|error| format!("the new file `{}` stays ({error})", path.display()))
+			}
 
 			Step::Moved { from, to, through } => match through {
 				None => move_back(to, from).map_err(|error| stays_moved(from, to, error)),
@@ -879,9 +882,10 @@ pub(crate) fn coexisting_items(ws: &Workspace, items: &[ItemId]) -> bool {
 		_ => true,
 	};
 
-	items.iter().enumerate().any(|(index, &a)| {
-		(items[index + 1..].iter()).any(|&b| a.krate() == b.krate() && place(a) != place(b) && coexist(a, b))
-	})
+	items
+		.iter()
+		.enumerate()
+		.any(|(index, &a)| (items[index + 1..].iter()).any(|&b| a.krate() == b.krate() && place(a) != place(b) && coexist(a, b)))
 }
 
 fn delete_path(path: &Path) -> io::Result<()> {

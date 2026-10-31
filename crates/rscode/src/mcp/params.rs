@@ -198,10 +198,7 @@ impl EditItemParams {
 		};
 
 		if edit.is_empty() {
-			return Err(
-				"nothing to change: give `old` and `new` (or `edits`), `vis`, `doc`, `add_attributes`, or `remove_attributes`"
-					.to_owned(),
-			);
+			return Err("nothing to change: give `old` and `new` (or `edits`), `vis`, `doc`, `add_attributes`, or `remove_attributes`".to_owned());
 		}
 
 		edit.check().map_err(|error| error.to_string())?;
@@ -408,9 +405,11 @@ impl InsertParams {
 		let anchor = self.anchor.as_deref().map(str::trim).filter(|anchor| !anchor.is_empty());
 
 		if self.parent().is_none() && !matches!(self.position, Position::Before | Position::After) {
-			return Err("`parent` is required unless `position` is `before` or `after` (an `anchor`'s container is then the \
+			return Err(
+				"`parent` is required unless `position` is `before` or `after` (an `anchor`'s container is then the \
 			            parent)"
-				.to_owned());
+					.to_owned(),
+			);
 		}
 
 		let position = match (self.position, anchor) {
@@ -458,18 +457,6 @@ impl From<Mode> for ViewMode {
 	}
 }
 
-/// Where `insert_items` inserts or `move_item` moves an item.
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars", inline)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Position {
-	#[default]
-	End,
-	Start,
-	Before,
-	After,
-}
-
 /// Parameters of `move_item`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
@@ -514,6 +501,18 @@ impl MoveParams {
 			(Position::End | Position::Start, Some(_)) => Err("`anchor` is only used with position `before` or `after`".to_owned()),
 		}
 	}
+}
+
+/// Where `insert_items` inserts or `move_item` moves an item.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Position {
+	#[default]
+	End,
+	Start,
+	Before,
+	After,
 }
 
 /// Parameters of `find_references`.
@@ -773,6 +772,28 @@ impl Selection {
 	}
 }
 
+struct StringBoolean;
+
+impl<'de> Visitor<'de> for StringBoolean {
+	type Value = bool;
+
+	fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str("a boolean or the string `true` or `false`")
+	}
+
+	fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+		Ok(value)
+	}
+
+	fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+		match value.trim() {
+			value if value.eq_ignore_ascii_case("true") => Ok(true),
+			value if value.eq_ignore_ascii_case("false") => Ok(false),
+			_ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
+		}
+	}
+}
+
 struct StringList;
 
 impl<'de> Visitor<'de> for StringList {
@@ -896,37 +917,15 @@ fn split_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>,
 		.collect())
 }
 
-/// Deserializes a list of strings, also accepting a single string (or `null` for none).
-fn string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-	deserializer.deserialize_any(StringList)
-}
-
-struct StringBoolean;
-
-impl<'de> Visitor<'de> for StringBoolean {
-	type Value = bool;
-
-	fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		formatter.write_str("a boolean or the string `true` or `false`")
-	}
-
-	fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
-		Ok(value)
-	}
-
-	fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-		match value.trim() {
-			value if value.eq_ignore_ascii_case("true") => Ok(true),
-			value if value.eq_ignore_ascii_case("false") => Ok(false),
-			_ => Err(E::invalid_value(serde::de::Unexpected::Str(value), &self)),
-		}
-	}
-}
-
 /// Deserializes a boolean, also accepting the strings `true` and `false` for compatibility with clients that
 /// stringify tool arguments.
 fn string_boolean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
 	deserializer.deserialize_any(StringBoolean)
+}
+
+/// Deserializes a list of strings, also accepting a single string (or `null` for none).
+fn string_list<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+	deserializer.deserialize_any(StringList)
 }
 
 /// Lists the kinds that can be found: named items, and `impl` blocks (with qualified patterns).
@@ -1008,20 +1007,6 @@ mod tests {
 	}
 
 	#[test]
-	fn move_positions_require_an_anchor_only_when_relative() {
-		let params = |arguments| parse::<MoveParams>(arguments).position();
-
-		assert_eq!(params(json!({ "path": "a" })).unwrap(), InsertPosition::End);
-		assert_eq!(params(json!({ "path": "a", "position": "start" })).unwrap(), InsertPosition::Start);
-		assert_eq!(
-			params(json!({ "path": "a", "position": "before", "anchor": "crate::b" })).unwrap(),
-			InsertPosition::Before("crate::b".to_owned())
-		);
-		assert!(params(json!({ "path": "a", "position": "after" })).unwrap_err().contains("`anchor`"));
-		assert!(params(json!({ "path": "a", "anchor": "crate::b" })).unwrap_err().contains("only used"));
-	}
-
-	#[test]
 	fn edit_item_edits() {
 		let edit: EditItemParams = parse(json!({
 			"path": "crate::f",
@@ -1034,7 +1019,10 @@ mod tests {
 		}));
 		let item_edit = edit.edit().unwrap();
 
-		assert_eq!(item_edit.replacements.iter().map(|edit| (&*edit.old, &*edit.new)).collect::<Vec<_>>(), [("a", "b"), ("c", "d")]);
+		assert_eq!(
+			item_edit.replacements.iter().map(|edit| (&*edit.old, &*edit.new)).collect::<Vec<_>>(),
+			[("a", "b"), ("c", "d")]
+		);
 		assert_eq!(item_edit.visibility.as_deref(), Some("pub(crate)"));
 		assert_eq!(item_edit.add_attributes, ["must_use"]);
 		assert!(edit.options().all_variants && !edit.options().allow_kind_change);
@@ -1147,9 +1135,17 @@ mod tests {
 		// without a parent, the anchor's container is the parent
 		let insert = |position: &str| parse::<InsertParams>(json!({ "source": "", "position": position, "anchor": "a::b", "parent": " " }));
 
-		assert_eq!(insert("after").options().map(|options| options.position), Ok(InsertPosition::After("a::b".to_owned())));
+		assert_eq!(
+			insert("after").options().map(|options| options.position),
+			Ok(InsertPosition::After("a::b".to_owned()))
+		);
 		assert_eq!(insert("after").parent(), None);
-		assert!(insert("end").options().unwrap_err().starts_with("`parent` is required unless `position` is `before` or `after`"));
+		assert!(
+			insert("end")
+				.options()
+				.unwrap_err()
+				.starts_with("`parent` is required unless `position` is `before` or `after`")
+		);
 	}
 
 	#[test]
@@ -1204,14 +1200,32 @@ mod tests {
 	}
 
 	#[test]
-	fn tool_parameter_aliases_are_understood() {
-		let create: CreateModuleParams = parse(json!({ "parent": "crate", "name": "new", "content": "fn f() {}" }));
-		let insert: InsertParams = parse(json!({ "parent": "crate", "content": "fn f() {}" }));
-		let format: FormatParams = parse(json!({ "paths": ["crate::a", "crate::b"] }));
+	fn malformed_values_are_refused() {
+		assert!(error::<FindParams>(json!({})).contains("missing field `pattern`"));
+		assert!(error::<FindParams>(json!({ "pattern": 3 })).contains("invalid type"));
+		assert!(error::<ViewParams>(json!({ "paths": [1] })).contains("invalid type"));
+		assert!(error::<ViewParams>(json!({ "paths": {} })).contains("expected a list of strings"));
+		assert!(error::<ViewParams>(json!({ "paths": [], "mode": "Full" })).contains("unknown variant `Full`"));
+		assert!(error::<FindParams>(json!({ "pattern": "x", "limit": -1 })).contains("invalid value"));
+		assert!(error::<RenameParams>(json!({ "path": "a" })).contains("missing field `new_name`"));
+	}
 
-		assert_eq!(create.source, "fn f() {}");
-		assert_eq!(insert.source, "fn f() {}");
-		assert_eq!(format.targets(), ["crate::a", "crate::b"]);
+	#[test]
+	fn move_positions_require_an_anchor_only_when_relative() {
+		let params = |arguments| parse::<MoveParams>(arguments).position();
+
+		assert_eq!(params(json!({ "path": "a" })).unwrap(), InsertPosition::End);
+		assert_eq!(params(json!({ "path": "a", "position": "start" })).unwrap(), InsertPosition::Start);
+		assert_eq!(
+			params(json!({ "path": "a", "position": "before", "anchor": "crate::b" })).unwrap(),
+			InsertPosition::Before("crate::b".to_owned())
+		);
+		assert!(params(json!({ "path": "a", "position": "after" })).unwrap_err().contains("`anchor`"));
+		assert!(params(json!({ "path": "a", "anchor": "crate::b" })).unwrap_err().contains("only used"));
+	}
+
+	fn parse<T: DeserializeOwned>(value: serde_json::Value) -> T {
+		serde_json::from_value(value).unwrap()
 	}
 
 	#[test]
@@ -1228,21 +1242,6 @@ mod tests {
 		assert!(selection.all_targets);
 		assert!(!selection.lib);
 		assert!(error::<Selection>(json!({ "workspace": "yes" })).contains("a boolean or the string"));
-	}
-
-	#[test]
-	fn malformed_values_are_refused() {
-		assert!(error::<FindParams>(json!({})).contains("missing field `pattern`"));
-		assert!(error::<FindParams>(json!({ "pattern": 3 })).contains("invalid type"));
-		assert!(error::<ViewParams>(json!({ "paths": [1] })).contains("invalid type"));
-		assert!(error::<ViewParams>(json!({ "paths": {} })).contains("expected a list of strings"));
-		assert!(error::<ViewParams>(json!({ "paths": [], "mode": "Full" })).contains("unknown variant `Full`"));
-		assert!(error::<FindParams>(json!({ "pattern": "x", "limit": -1 })).contains("invalid value"));
-		assert!(error::<RenameParams>(json!({ "path": "a" })).contains("missing field `new_name`"));
-	}
-
-	fn parse<T: DeserializeOwned>(value: serde_json::Value) -> T {
-		serde_json::from_value(value).unwrap()
 	}
 
 	#[test]
@@ -1274,6 +1273,17 @@ mod tests {
 		assert_eq!(everything.exclude, ["excluded"]);
 		assert!(everything.all_features);
 		assert!(everything.targets.all_targets);
+	}
+
+	#[test]
+	fn tool_parameter_aliases_are_understood() {
+		let create: CreateModuleParams = parse(json!({ "parent": "crate", "name": "new", "content": "fn f() {}" }));
+		let insert: InsertParams = parse(json!({ "parent": "crate", "content": "fn f() {}" }));
+		let format: FormatParams = parse(json!({ "paths": ["crate::a", "crate::b"] }));
+
+		assert_eq!(create.source, "fn f() {}");
+		assert_eq!(insert.source, "fn f() {}");
+		assert_eq!(format.targets(), ["crate::a", "crate::b"]);
 	}
 
 	#[test]

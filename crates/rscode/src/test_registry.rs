@@ -11,7 +11,11 @@ pub(crate) fn locked_version(name: &str) -> String {
 
 	lock.split("[[package]]")
 		.filter(|package| package.lines().any(|line| line.trim() == name_line))
-		.filter_map(|package| package.lines().find_map(|line| line.trim().strip_prefix("version = \"")?.strip_suffix('"')))
+		.filter_map(|package| {
+			package
+				.lines()
+				.find_map(|line| line.trim().strip_prefix("version = \"")?.strip_suffix('"'))
+		})
 		.max_by_key(|version| version.split('.').map(|part| part.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>())
 		.unwrap_or_else(|| panic!("{name} is not in Cargo.lock"))
 		.to_owned()

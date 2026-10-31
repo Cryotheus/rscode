@@ -145,8 +145,10 @@ impl Server {
 		let target = self.target(&params.selection, false);
 		let dry_run = params.dry_run;
 
-		self.edit("add_import", context, target, dry_run, move |load, permit| tools::add_import(load, &params, permit))
-			.await
+		self.edit("add_import", context, target, dry_run, move |load, permit| {
+			tools::add_import(load, &params, permit)
+		})
+		.await
 	}
 
 	/// Create a module: write its file (`source`, may be empty) where rustc looks for it, and declare it in `parent`
@@ -297,7 +299,8 @@ impl Server {
 	async fn find_references(&self, Parameters(params): Parameters<ReferencesParams>) -> CallToolResult {
 		let target = self.target(&params.selection, true);
 
-		self.query("find_references", target, move |target| tools::references(&target.load, &params)).await
+		self.query("find_references", target, move |target| tools::references(&target.load, &params))
+			.await
 	}
 
 	/// Show items by path, in full or outlined (the default for modules: bodies elided, and runs of private `use`
@@ -636,9 +639,7 @@ impl Server {
 			let mut message = self.read_only_source(name, source, attached);
 
 			if target.by_default {
-				message.push_str(
-					"\nhint: the connection uses it by default (see `use_source`): pass `attached` to work on another one",
-				);
+				message.push_str("\nhint: the connection uses it by default (see `use_source`): pass `attached` to work on another one");
 			}
 
 			return respond(name, Err(message));
@@ -899,6 +900,43 @@ impl Target {
 	}
 }
 
+/// A compact, valid-looking value for a required parameter in an error's example call.
+fn example_value(name: &str, schema: &Value) -> Value {
+	if let Some(value) = schema.get("default") {
+		return value.clone();
+	}
+
+	if let Some(value) = schema.get("enum").and_then(Value::as_array).and_then(|values| values.first()) {
+		return value.clone();
+	}
+
+	match schema.get("type").and_then(Value::as_str) {
+		Some("array") => Value::Array(vec![Value::String(
+			match name {
+				"paths" | "targets" => "crate::item",
+				_ => "value",
+			}
+			.to_owned(),
+		)]),
+
+		Some("boolean") => Value::Bool(false),
+		Some("integer" | "number") => Value::from(0),
+
+		_ => Value::String(
+			match name {
+				"manifest_path" => "/path/to/Cargo.toml",
+				"module" | "parent" => "crate",
+				"path" => "crate::item",
+				"pattern" => "*",
+				"source" => "fn example() {}",
+				"new_name" => "new_name",
+				_ => "value",
+			}
+			.to_owned(),
+		),
+	}
+}
+
 /// The working directory, and the nearest `Cargo.toml` in it or above it (from which cargo finds the workspace).
 fn nearest_manifest() -> Option<(PathBuf, Option<PathBuf>)> {
 	let directory = std::env::current_dir().ok()?;
@@ -915,22 +953,6 @@ fn nothing_exposed(tool: &str) -> CallToolResult {
 		"`{tool}` is not available: this rscode server exposes no directories to attach sources from (it was started \
 		 without `--expose`)"
 	))])
-}
-
-fn read_only(tool: &str) -> CallToolResult {
-	CallToolResult::error(vec![ContentBlock::text(format!(
-		"`{tool}` modifies files, but this rscode server is read-only (it was started with `--read-only`)"
-	))])
-}
-
-/// A tool's result for the client: text, or an error the model can react to. Overlong text is truncated.
-fn respond(tool: &str, result: Result<String, String>) -> CallToolResult {
-	let truncate = |text| render::truncate(text, render::MAX_OUTPUT_CHARS, render::truncation_hint(tool));
-
-	match result {
-		Ok(text) => CallToolResult::success(vec![ContentBlock::text(truncate(text))]),
-		Err(message) => CallToolResult::error(vec![ContentBlock::text(truncate(message))]),
-	}
 }
 
 /// Alternate spellings accepted by serde for a tool parameter.
@@ -961,6 +983,100 @@ fn parameter_aliases(tool: &str) -> &'static [(&'static str, &'static str)] {
 	}
 }
 
+fn read_only(tool: &str) -> CallToolResult {
+	CallToolResult::error(vec![ContentBlock::text(format!(
+		"`{tool}` modifies files, but this rscode server is read-only (it was started with `--read-only`)"
+	))])
+}
+
+/// A tool's result for the client: text, or an error the model can react to. Overlong text is truncated.
+fn respond(tool: &str, result: Result<String, String>) -> CallToolResult {
+	let truncate = |text| render::truncate(text, render::MAX_OUTPUT_CHARS, render::truncation_hint(tool));
+
+	match result {
+		Ok(text) => CallToolResult::success(vec![ContentBlock::text(truncate(text))]),
+		Err(message) => CallToolResult::error(vec![ContentBlock::text(truncate(message))]),
+	}
+}
+
+/// Slims a tool's input schema to what a model needs to call the tool (the schemas of every tool are sent with every
+/// request): no `$schema`, no defaults that say nothing (`false`, `null`, empty), no `null` types of optional
+/// parameters (leaving a parameter out is the same), and no descriptions of [`SHARED_PARAMETERS`].
+fn slim(tool: &mut Tool) {
+	let mut schema = (*tool.input_schema).clone();
+
+	schema.remove("$schema");
+
+	if let Some(Value::Object(properties)) = schema.get_mut("properties") {
+		for (name, property) in properties.iter_mut() {
+			let Value::Object(property) = property else {
+				continue;
+			};
+
+			let says_nothing = |default: &Value| match default {
+				Value::Null | Value::Bool(false) => true,
+				Value::String(text) => text.is_empty(),
+				Value::Array(values) => values.is_empty(),
+				_ => false,
+			};
+
+			if property.get("default").is_some_and(says_nothing) {
+				property.remove("default");
+			}
+
+			if let Some(Value::Array(types)) = property.get("type")
+				&& let [ty] = types.iter().filter(|ty| *ty != "null").collect::<Vec<_>>().as_slice()
+			{
+				let ty = (*ty).clone();
+
+				property.insert("type".to_owned(), ty);
+			}
+
+			// (`uint` and its minimum say what `integer` and the description say)
+			if property.get("format").is_some_and(|format| format == "uint") {
+				property.remove("format");
+				property.remove("minimum");
+			}
+
+			if SHARED_PARAMETERS.contains(&name.as_str()) {
+				property.remove("description");
+			}
+
+			// (what the items of lists are, and their fields, the list's description says)
+			if let Some(Value::Object(items)) = property.get_mut("items") {
+				items.remove("description");
+
+				if let Some(Value::Object(fields)) = items.get_mut("properties") {
+					for field in fields.values_mut().filter_map(Value::as_object_mut) {
+						field.remove("description");
+					}
+				}
+			}
+		}
+	}
+
+	tool.input_schema = Arc::new(schema);
+}
+
+/// Appended to [`INSTRUCTIONS`] for servers that expose directories, followed by a list of them.
+fn sources_instructions(read_only: bool) -> String {
+	let (write, writing) = match read_only {
+		true => ("", ""),
+
+		false => (
+			", and `write` if you need to edit them",
+			", for writing only where the pattern is marked write",
+		),
+	};
+
+	format!(
+		"\n\nOther workspaces and packages can be attached with attach_source (the path of their Cargo.toml, and a \
+		 name{write}), then named as any tool's `attached`, or made the connection-wide default with use_source. Names \
+		 last until detach_source or this MCP connection ends: list_sources lists them. Attachable are the directories that match \
+		 (`*` within a path component, `**` across){writing}:"
+	)
+}
+
 /// Validates names and required parameters together, before serde can ignore an unknown name or stop at the first
 /// missing field. Aliases count as their canonical parameters.
 fn validate_arguments(tool: &Tool, arguments: Option<&serde_json::Map<String, Value>>) -> Result<(), String> {
@@ -975,7 +1091,9 @@ fn validate_arguments(tool: &Tool, arguments: Option<&serde_json::Map<String, Va
 		.into_iter()
 		.flat_map(|arguments| arguments.keys())
 		.filter(|name| {
-			!properties.contains_key(*name) && !aliases.iter().any(|(alias, _)| *alias == name.as_str()) && !(accepts_selection && name.as_str() == "attached")
+			!properties.contains_key(*name)
+				&& !aliases.iter().any(|(alias, _)| *alias == name.as_str())
+				&& !(accepts_selection && name.as_str() == "attached")
 		})
 		.map(String::as_str)
 		.collect();
@@ -1064,121 +1182,6 @@ fn validate_arguments(tool: &Tool, arguments: Option<&serde_json::Map<String, Va
 
 	write!(message, "example arguments: {}", Value::Object(example)).unwrap();
 	Err(message)
-}
-
-/// A compact, valid-looking value for a required parameter in an error's example call.
-fn example_value(name: &str, schema: &Value) -> Value {
-	if let Some(value) = schema.get("default") {
-		return value.clone();
-	}
-
-	if let Some(value) = schema.get("enum").and_then(Value::as_array).and_then(|values| values.first()) {
-		return value.clone();
-	}
-
-	match schema.get("type").and_then(Value::as_str) {
-		Some("array") => Value::Array(vec![Value::String(
-			match name {
-				"paths" | "targets" => "crate::item",
-				_ => "value",
-			}
-			.to_owned(),
-		)]),
-
-		Some("boolean") => Value::Bool(false),
-		Some("integer" | "number") => Value::from(0),
-
-		_ => Value::String(
-			match name {
-				"manifest_path" => "/path/to/Cargo.toml",
-				"module" | "parent" => "crate",
-				"path" => "crate::item",
-				"pattern" => "*",
-				"source" => "fn example() {}",
-				"new_name" => "new_name",
-				_ => "value",
-			}
-			.to_owned(),
-		),
-	}
-}
-
-/// Slims a tool's input schema to what a model needs to call the tool (the schemas of every tool are sent with every
-/// request): no `$schema`, no defaults that say nothing (`false`, `null`, empty), no `null` types of optional
-/// parameters (leaving a parameter out is the same), and no descriptions of [`SHARED_PARAMETERS`].
-fn slim(tool: &mut Tool) {
-	let mut schema = (*tool.input_schema).clone();
-
-	schema.remove("$schema");
-
-	if let Some(Value::Object(properties)) = schema.get_mut("properties") {
-		for (name, property) in properties.iter_mut() {
-			let Value::Object(property) = property else {
-				continue;
-			};
-
-			let says_nothing = |default: &Value| match default {
-				Value::Null | Value::Bool(false) => true,
-				Value::String(text) => text.is_empty(),
-				Value::Array(values) => values.is_empty(),
-				_ => false,
-			};
-
-			if property.get("default").is_some_and(says_nothing) {
-				property.remove("default");
-			}
-
-			if let Some(Value::Array(types)) = property.get("type")
-				&& let [ty] = types.iter().filter(|ty| *ty != "null").collect::<Vec<_>>().as_slice()
-			{
-				let ty = (*ty).clone();
-
-				property.insert("type".to_owned(), ty);
-			}
-
-			// (`uint` and its minimum say what `integer` and the description say)
-			if property.get("format").is_some_and(|format| format == "uint") {
-				property.remove("format");
-				property.remove("minimum");
-			}
-
-			if SHARED_PARAMETERS.contains(&name.as_str()) {
-				property.remove("description");
-			}
-
-			// (what the items of lists are, and their fields, the list's description says)
-			if let Some(Value::Object(items)) = property.get_mut("items") {
-				items.remove("description");
-
-				if let Some(Value::Object(fields)) = items.get_mut("properties") {
-					for field in fields.values_mut().filter_map(Value::as_object_mut) {
-						field.remove("description");
-					}
-				}
-			}
-		}
-	}
-
-	tool.input_schema = Arc::new(schema);
-}
-
-/// Appended to [`INSTRUCTIONS`] for servers that expose directories, followed by a list of them.
-fn sources_instructions(read_only: bool) -> String {
-	let (write, writing) = match read_only {
-		true => ("", ""),
-
-		false => (
-			", and `write` if you need to edit them",
-			", for writing only where the pattern is marked write",
-		),
-	};
-
-	format!(
-		"\n\nOther workspaces and packages can be attached with attach_source (the path of their Cargo.toml, and a \
-		 name{write}), then named as any tool's `attached`, or made the connection-wide default with use_source. Names \
-		 last until detach_source or this MCP connection ends: list_sources lists them. Attachable are the directories that match \
-		 (`*` within a path component, `**` across){writing}:"
-	)
 }
 
 /// Removes the `attached` parameter from a tool's input schema.

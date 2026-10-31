@@ -114,34 +114,6 @@ pub struct CanonicalPath {
 }
 
 impl CanonicalPath {
-	/// A path accepted by [`ItemPath`] that names this item when one can be written.
-	///
-	/// Most canonical paths already use the input syntax. Items of an `impl` whose self type is not a loaded item
-	/// are displayed with an informative pseudo-segment (`crate::m::<impl Type>::item`); for input, this returns the
-	/// equivalent qualifier (`<Type>::item`) or `impl` header.
-	pub fn input_path(&self) -> String {
-		let Some(self_ty) = &self.unresolved_self_ty else {
-			return self.to_string();
-		};
-		let selector = self.selector.as_ref().map(ToString::to_string).unwrap_or_default();
-
-		if self.is_impl {
-			return match &self.impl_trait {
-				Some(trait_text) => format!("impl {trait_text} for {self_ty}{selector}"),
-				None => format!("impl {self_ty}{selector}"),
-			};
-		}
-
-		let qualifier = match &self.impl_trait {
-			Some(trait_text) => format!("<{self_ty} as {trait_text}>{selector}"),
-			None => format!("<{self_ty}>{selector}"),
-		};
-		let name = self.name.as_deref().unwrap_or_default();
-		let raw = if is_keyword(name) && !is_unrawable(name) { "r#" } else { "" };
-
-		format!("{qualifier}::{raw}{name}")
-	}
-
 	/// The path for messages that list several items: its [`Display`](std::fmt::Display), except that an item of an
 	/// inherent `impl` whose type has generic arguments shows them, as a path naming it (`<my_crate::Wrapper<u8>>::get`):
 	/// the items of `impl Wrapper<u8>` and `impl Wrapper<u16>` have the same path otherwise.
@@ -191,6 +163,34 @@ impl CanonicalPath {
 			Some(trait_text) => format!("<impl {trait_text} for {self_ty}>"),
 			None => format!("<impl {self_ty}>"),
 		})
+	}
+
+	/// A path accepted by [`ItemPath`] that names this item when one can be written.
+	///
+	/// Most canonical paths already use the input syntax. Items of an `impl` whose self type is not a loaded item
+	/// are displayed with an informative pseudo-segment (`crate::m::<impl Type>::item`); for input, this returns the
+	/// equivalent qualifier (`<Type>::item`) or `impl` header.
+	pub fn input_path(&self) -> String {
+		let Some(self_ty) = &self.unresolved_self_ty else {
+			return self.to_string();
+		};
+		let selector = self.selector.as_ref().map(ToString::to_string).unwrap_or_default();
+
+		if self.is_impl {
+			return match &self.impl_trait {
+				Some(trait_text) => format!("impl {trait_text} for {self_ty}{selector}"),
+				None => format!("impl {self_ty}{selector}"),
+			};
+		}
+
+		let qualifier = match &self.impl_trait {
+			Some(trait_text) => format!("<{self_ty} as {trait_text}>{selector}"),
+			None => format!("<{self_ty}>{selector}"),
+		};
+		let name = self.name.as_deref().unwrap_or_default();
+		let raw = if is_keyword(name) && !is_unrawable(name) { "r#" } else { "" };
+
+		format!("{qualifier}::{raw}{name}")
 	}
 }
 
@@ -508,6 +508,7 @@ impl<'a> Parser<'a> {
 			Some(Token::Dot) if path.field.is_some() => Err("fields have no fields: a path names one field".to_owned()),
 			Some(Token::Dot) => Err("a field (`.name`) can only follow the plain path of a struct, union, or variant".to_owned()),
 			Some(Token::Bang) => Err("`!` (naming macro invocations) can only follow a plain path: `crate::m::name!`".to_owned()),
+
 			Some(Token::PathSep) if path.qualifier.is_some() && path.segments.is_empty() => {
 				let message = "an `impl` path ends with the header and selector: write `<Type>[selector]::name` for an item \
 				               of the block";
@@ -831,7 +832,10 @@ impl Selector {
 		if let Some(path) = text.strip_prefix('#') {
 			let segments: Vec<&str> = path.split("::").map(|segment| segment.trim_matches(is_whitespace)).collect();
 
-			if segments.iter().any(|segment| !is_ident_lexeme(segment.strip_prefix("r#").unwrap_or(segment))) {
+			if segments
+				.iter()
+				.any(|segment| !is_ident_lexeme(segment.strip_prefix("r#").unwrap_or(segment)))
+			{
 				return Err(format!("`{}` is not an attribute path", path.trim_matches(is_whitespace)));
 			}
 
@@ -1234,11 +1238,17 @@ mod tests {
 		assert_eq!(canonical(&["my_crate", "a"], Some("_")).to_string(), "my_crate::a::_");
 
 		// fields follow their owner with a `.`
-		let field = |segments: &[&str], name: &str| CanonicalPath { is_field: true, ..canonical(segments, Some(name)) };
+		let field = |segments: &[&str], name: &str| CanonicalPath {
+			is_field: true,
+			..canonical(segments, Some(name))
+		};
 
 		assert_eq!(field(&["my_crate", "Point"], "x").to_string(), "my_crate::Point.x");
 		assert_eq!(field(&["my_crate", "Pair"], "0").to_string(), "my_crate::Pair.0");
-		assert_eq!(field(&["my_crate", "Shape", "Circle"], "type").to_string(), "my_crate::Shape::Circle.r#type");
+		assert_eq!(
+			field(&["my_crate", "Shape", "Circle"], "type").to_string(),
+			"my_crate::Shape::Circle.r#type"
+		);
 		assert_eq!(field(&["my_crate", "Pair"], "0").flat_segments(), ["my_crate", "Pair", "0"]);
 
 		let trait_item = CanonicalPath {
@@ -1271,11 +1281,23 @@ mod tests {
 		assert_eq!(inherent_block.to_string(), "impl my_crate::a::Foo");
 
 		// selectors after the `impl` header
-		let selected = |selector: Selector, path: &CanonicalPath| CanonicalPath { selector: Some(selector), ..path.clone() };
+		let selected = |selector: Selector, path: &CanonicalPath| CanonicalPath {
+			selector: Some(selector),
+			..path.clone()
+		};
 
-		assert_eq!(selected(Selector::Item("new".into()), &inherent_block).to_string(), "impl my_crate::a::Foo[new]");
-		assert_eq!(selected(Selector::Index(2), &impl_block).to_string(), "impl Display for my_crate::a::Foo[2]");
-		assert_eq!(selected(Selector::Index(2), &trait_item).to_string(), "<my_crate::a::Foo as Display>[2]::fmt");
+		assert_eq!(
+			selected(Selector::Item("new".into()), &inherent_block).to_string(),
+			"impl my_crate::a::Foo[new]"
+		);
+		assert_eq!(
+			selected(Selector::Index(2), &impl_block).to_string(),
+			"impl Display for my_crate::a::Foo[2]"
+		);
+		assert_eq!(
+			selected(Selector::Index(2), &trait_item).to_string(),
+			"<my_crate::a::Foo as Display>[2]::fmt"
+		);
 		assert_eq!(
 			selected(Selector::Attribute("a::b".to_owned()), &inherent_block).distinct(),
 			"impl my_crate::a::Foo[#a::b]"
@@ -1331,7 +1353,10 @@ mod tests {
 
 		assert_eq!(unresolved.to_string(), "my_crate::a::<impl Trait for Vec<u8>>::method");
 		assert_eq!(unresolved.input_path(), "<Vec<u8> as Trait>::method");
-		assert_eq!(ItemPath::parse(&unresolved.input_path()).unwrap().to_string(), "<Vec<u8> as Trait>::method");
+		assert_eq!(
+			ItemPath::parse(&unresolved.input_path()).unwrap().to_string(),
+			"<Vec<u8> as Trait>::method"
+		);
 		assert_eq!(
 			CanonicalPath {
 				is_impl: true,
@@ -1502,13 +1527,20 @@ mod tests {
 		let field = |text: &str| {
 			let path = parse(text);
 
-			(path.anchor, path.segments.iter().map(SmolStr::as_str).collect::<Vec<_>>().join("::"), path.field)
+			(
+				path.anchor,
+				path.segments.iter().map(SmolStr::as_str).collect::<Vec<_>>().join("::"),
+				path.field,
+			)
 		};
 
 		assert_eq!(field("crate::Point.x"), (Anchor::Crate, "Point".to_owned(), Some("x".into())));
 		assert_eq!(field("Pair.0"), (Anchor::None, "Pair".to_owned(), Some("0".into())));
 		assert_eq!(field("Pair.12"), (Anchor::None, "Pair".to_owned(), Some("12".into())));
-		assert_eq!(field("Shape::Circle.r#match"), (Anchor::None, "Shape::Circle".to_owned(), Some("match".into())));
+		assert_eq!(
+			field("Shape::Circle.r#match"),
+			(Anchor::None, "Shape::Circle".to_owned(), Some("match".into()))
+		);
 		assert_eq!(field("crate::Point"), (Anchor::Crate, "Point".to_owned(), None));
 	}
 
@@ -1559,7 +1591,10 @@ mod tests {
 		let path = parse("crate::m::commands!");
 
 		assert!(path.macro_call && path.selector.is_none() && path.field.is_none());
-		assert_eq!((path.anchor, path.segments.as_slice()), (Anchor::Crate, ["m", "commands"].map(SmolStr::new).as_slice()));
+		assert_eq!(
+			(path.anchor, path.segments.as_slice()),
+			(Anchor::Crate, ["m", "commands"].map(SmolStr::new).as_slice())
+		);
 		assert_eq!(parse("commands![3]").selector, Some(Selector::Index(3)));
 		assert!(!parse("crate::m::commands").macro_call);
 	}
@@ -1624,7 +1659,10 @@ mod tests {
 		// brackets inside generic arguments are part of the type
 		let path = parse("impl Tr<[u8; 2]> for Tools[1]");
 
-		assert_eq!(path.qualifier.as_ref().unwrap().trait_path.as_ref().unwrap().arguments.as_deref(), Some("<[u8;2]>"));
+		assert_eq!(
+			path.qualifier.as_ref().unwrap().trait_path.as_ref().unwrap().arguments.as_deref(),
+			Some("<[u8;2]>")
+		);
 		assert_eq!(path.qualifier.unwrap().selector, Some(Selector::Index(1)));
 	}
 
@@ -1792,7 +1830,10 @@ mod tests {
 		assert_eq!(parse_error("Point."), "expected a field name or index after `.`");
 		assert_eq!(parse_error("Point.x.y"), "fields have no fields: a path names one field");
 		assert_eq!(parse_error("Point.x::y"), "unexpected `::`");
-		assert_eq!(parse_error("crate.x"), "expected the path of a struct, union, or variant before `.`, found `crate`");
+		assert_eq!(
+			parse_error("crate.x"),
+			"expected the path of a struct, union, or variant before `.`, found `crate`"
+		);
 		assert_eq!(parse_error(".x"), "expected an identifier, found `.`");
 		assert_eq!(parse_error("Pair.01"), "`01` is not a valid tuple index");
 		assert_eq!(parse_error("Pair.0x"), "`0x` is not a valid identifier");
@@ -1813,7 +1854,10 @@ mod tests {
 		assert_eq!(parse_error("<A>::x!"), bang);
 		assert_eq!(parse_error("use a::x!"), bang);
 		assert_eq!(parse_error("Point.x!"), bang);
-		assert_eq!(parse_error("x![name]"), "only an index selects one of several macro invocations: `name![2]`");
+		assert_eq!(
+			parse_error("x![name]"),
+			"only an index selects one of several macro invocations: `name![2]`"
+		);
 		assert_eq!(parse_error("x![0]"), "selector indexes start at 1");
 
 		// selectors

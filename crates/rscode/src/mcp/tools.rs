@@ -124,14 +124,9 @@ pub(crate) fn add_import(load: &LoadOptions, params: &AddImportParams, permit: &
 		let searched = params.selection.names_packages() || load.widened(workspace, None).is_none();
 		let plan = edit::add_imports(resolver, &module, &imports, &ImportOptions::default()).map_err(|error| {
 			let hint = match &error {
-				Error::NotFound(name) if searched && !name.contains("::") && *name != module.to_string() => {
-					OTHER_CRATE_HINT.to_owned()
-				}
-
+				Error::NotFound(name) if searched && !name.contains("::") && *name != module.to_string() => OTHER_CRATE_HINT.to_owned(),
 				Error::Ambiguous { .. } if let Some(hint) = select_one_crate(resolver, &module) => hint,
-				Error::Collision { .. } => {
-					"import it under another name (`x::Y as Z`), or remove what has the name (it names something else)".into()
-				}
+				Error::Collision { .. } => "import it under another name (`x::Y as Z`), or remove what has the name (it names something else)".into(),
 				Error::InvalidSource(_) => "each of `paths` is a `use` tree: `std::fs`, `crate::a::{B, C}`, or `x::Y as Z`".into(),
 				_ => return retry::fail(error, resolver),
 			};
@@ -163,9 +158,9 @@ pub(crate) fn create_module(load: &LoadOptions, params: &CreateModuleParams, per
 				Error::InvalidIdent(_) => "`name` is the new module's identifier alone (e.g. `render`), not a path".to_owned(),
 				Error::Collision { .. } => "choose another `name`".to_owned(),
 
-				Error::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists => format!(
-					"declare the existing file with `insert_items` (`source` `mod {name};`), or choose another `name`"
-				),
+				Error::Io { source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists => {
+					format!("declare the existing file with `insert_items` (`source` `mod {name};`), or choose another `name`")
+				}
 
 				Error::InvalidSource(message) if message.starts_with("the source") => {
 					"`source` is the whole file of the module: items, after `//!` docs and inner attributes if any".to_owned()
@@ -246,11 +241,9 @@ pub(crate) fn edit_item(load: &LoadOptions, params: &EditItemParams, permit: &Pe
 					"give `old` text that only one of them has, or set `all_variants` to edit every one of them".to_owned()
 				}
 
-				Error::KindChange(_) => {
-					"edit_item keeps the item one item of its kind: add items next to it with `insert_items`, or turn it \
+				Error::KindChange(_) => "edit_item keeps the item one item of its kind: add items next to it with `insert_items`, or turn it \
 					 into another kind of item with `replace_item` (and `allow_kind_change`)"
-						.to_owned()
-				}
+					.to_owned(),
 
 				Error::TextMismatch { ref lines, .. } if lines.is_empty() => {
 					"copy `old` exactly from the output of `view_items` (with or without its line numbers)".to_owned()
@@ -426,12 +419,7 @@ fn format_written(load: &LoadOptions, permit: &Permit<'_>, targets: &[(String, I
 }
 
 /// The text of `find_items`: the matches of `params`' page, and hints.
-fn found_text(
-	workspace: &Workspace,
-	resolver: &Resolver<'_>,
-	params: &FindParams,
-	found: (Vec<FindMatch>, Option<UsableFrom>),
-) -> String {
+fn found_text(workspace: &Workspace, resolver: &Resolver<'_>, params: &FindParams, found: (Vec<FindMatch>, Option<UsableFrom>)) -> String {
 	let (found, from) = found;
 	let total = found.len();
 	let mut page: Vec<FindMatch> = found.into_iter().skip(params.offset).take(params.limit).collect();
@@ -513,9 +501,7 @@ pub(crate) fn insert(load: &LoadOptions, params: &InsertParams, permit: &Permit<
 				.count();
 
 			if unnamed > 0 {
-				text.push_str(
-					"note: unnamed items (like `impl` blocks) are not formatted; use `format_items` on the parent\n",
-				);
+				text.push_str("note: unnamed items (like `impl` blocks) are not formatted; use `format_items` on the parent\n");
 			}
 
 			match targets {
@@ -535,9 +521,8 @@ fn inserted_targets(plan: &Insertion, parent: Option<&ItemPath>) -> Result<Vec<(
 	let parent = match parent {
 		Some(parent) => parent.clone(),
 
-		None => ItemPath::parse(&plan.parent).map_err(|_| {
-			format!("the inserted items were not formatted: `{}` has no path to name them by", plan.parent)
-		})?,
+		None => ItemPath::parse(&plan.parent)
+			.map_err(|_| format!("the inserted items were not formatted: `{}` has no path to name them by", plan.parent))?,
 	};
 	let child = |name: &str, import: bool| {
 		let mut path = ItemPath { import, ..parent.clone() };
@@ -565,21 +550,6 @@ fn inserted_targets(plan: &Insertion, parent: Option<&ItemPath>) -> Result<Vec<(
 	Ok(named.chain(imports).collect())
 }
 
-/// `move_item`
-pub(crate) fn move_item(load: &LoadOptions, params: &MoveParams, permit: &Permit<'_>) -> Output {
-	let position = params.position()?;
-	let path = parse_path(&params.path)?;
-
-	retry::run(load, &params.selection, Search::OneCrate, |_, workspace, resolver| {
-		let plan = edit::move_item(resolver, &path, &position).map_err(|error| retry::fail(error, resolver))?;
-		let root = workspace.root();
-		let mut text = render::movement(root, &plan, params.dry_run);
-
-		finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
-		Ok(text)
-	})
-}
-
 /// Loads the workspace, with a hint when there is no `Cargo.toml` to load it from.
 pub(super) fn load(options: &LoadOptions) -> Result<Workspace, String> {
 	load_workspace(options).map_err(|error| {
@@ -599,6 +569,21 @@ pub(super) fn load(options: &LoadOptions) -> Result<Workspace, String> {
 		}
 
 		message
+	})
+}
+
+/// `move_item`
+pub(crate) fn move_item(load: &LoadOptions, params: &MoveParams, permit: &Permit<'_>) -> Output {
+	let position = params.position()?;
+	let path = parse_path(&params.path)?;
+
+	retry::run(load, &params.selection, Search::OneCrate, |_, workspace, resolver| {
+		let plan = edit::move_item(resolver, &path, &position).map_err(|error| retry::fail(error, resolver))?;
+		let root = workspace.root();
+		let mut text = render::movement(root, &plan, params.dry_run);
+
+		finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
+		Ok(text)
 	})
 }
 
@@ -633,15 +618,20 @@ pub(crate) fn references(load: &LoadOptions, params: &ReferencesParams) -> Outpu
 				None => return Err(Failure::NotFound(Error::NotFound(path.to_string()))),
 			},
 		};
-		let report =
-			query::find_references(resolver, &[path], &params.options()).map_err(|error| retry::fail(error, resolver))?;
+		let report = query::find_references(resolver, &[path], &params.options()).map_err(|error| retry::fail(error, resolver))?;
 		let page = Page {
 			offset: params.offset,
 			limit: params.limit,
 			total: report.references.len(),
 		};
 
-		text.push_str(&render::references(workspace.root(), &params.path, &report, page, params.searches_everything()));
+		text.push_str(&render::references(
+			workspace.root(),
+			&params.path,
+			&report,
+			page,
+			params.searches_everything(),
+		));
 		text.push_str(&render::load_errors_note(workspace));
 		Ok(text)
 	})
@@ -709,9 +699,7 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 				}
 
 				// `Type::name` names a method, and the source is the field `Type.name`
-				Error::InvalidSource(_) if let Some(hint) = resolver.field_hint(&path) => {
-					Failure::Message(format!("{error}\nhint: {hint}"))
-				}
+				Error::InvalidSource(_) if let Some(hint) = resolver.field_hint(&path) => Failure::Message(format!("{error}\nhint: {hint}")),
 
 				Error::KindChange(_) => Failure::Message(format!(
 					"{error}\nhint: replace one item here and add sibling items with `insert_items`, or set \
@@ -740,12 +728,7 @@ pub(crate) fn replace(load: &LoadOptions, params: &ReplaceParams, permit: &Permi
 
 /// The matches of `find_items`' search, and the viewpoint of its `from`, in `resolver`'s workspace (of the `selected`
 /// packages when it names modules of several, see [`usable_from`]).
-fn search(
-	resolver: &Resolver<'_>,
-	find: &Find,
-	params: &FindParams,
-	selected: &[SmolStr],
-) -> Result<(Vec<FindMatch>, Option<UsableFrom>), String> {
+fn search(resolver: &Resolver<'_>, find: &Find, params: &FindParams, selected: &[SmolStr]) -> Result<(Vec<FindMatch>, Option<UsableFrom>), String> {
 	let from = params
 		.from
 		.as_deref()
@@ -864,8 +847,7 @@ pub(super) fn unloaded_hint(workspace: &Workspace, member: Option<&UnloadedMembe
 		return Some(hint);
 	}
 
-	let (selected, names): (Vec<&UnloadedMember>, Vec<&UnloadedMember>) =
-		workspace.unloaded_members().iter().partition(|member| is_selected(member));
+	let (selected, names): (Vec<&UnloadedMember>, Vec<&UnloadedMember>) = workspace.unloaded_members().iter().partition(|member| is_selected(member));
 	let names: Vec<&str> = names.iter().map(|member| member.name.as_str()).collect();
 	let selected: Vec<String> = selected.iter().map(|member| format!("`{}`", member.name)).collect();
 
@@ -989,9 +971,7 @@ pub(crate) fn view(load: &LoadOptions, params: &ViewParams) -> Output {
 	};
 	let member_path = (missing.first())
 		.map(|&(first, _)| first)
-		.filter(|&first| {
-			member_of(first).is_some() && missing.iter().all(|&(index, _)| member_of(index) == member_of(first))
-		})
+		.filter(|&first| member_of(first).is_some() && missing.iter().all(|&(index, _)| member_of(index) == member_of(first)))
 		.and_then(|first| ItemPath::parse(&params.paths[first]).ok());
 	let widening = (!missing.is_empty() && !params.selection.names_packages())
 		.then(|| load.widened(&workspace, member_path.as_ref()))
@@ -1064,11 +1044,7 @@ pub(crate) fn view(load: &LoadOptions, params: &ViewParams) -> Output {
 
 /// The views of the items that one path of `view_items` names; a plain path that names nothing stands for the only
 /// item whose path ends like it (with a note saying so).
-fn view_path(
-	resolver: &Resolver<'_>,
-	options: &ViewOptions,
-	text: &str,
-) -> Result<(Vec<ItemView>, Option<String>), Failure> {
+fn view_path(resolver: &Resolver<'_>, options: &ViewOptions, text: &str) -> Result<(Vec<ItemView>, Option<String>), Failure> {
 	let path = parse_path(text)?;
 	let view = |path: ItemPath| View::with_options(options.clone()).item_path(path).run_with(resolver);
 
@@ -1076,10 +1052,7 @@ fn view_path(
 		Ok(views) => Ok((views, None)),
 
 		Err(error @ Error::NotFound(_)) => match retry::by_suffix(resolver, &path) {
-			Some((found, note)) => {
-				(view(found).map(|views| (views, Some(note)))).map_err(|error| retry::fail(error, resolver))
-			}
-
+			Some((found, note)) => (view(found).map(|views| (views, Some(note)))).map_err(|error| retry::fail(error, resolver)),
 			None => Err(Failure::NotFound(error)),
 		},
 

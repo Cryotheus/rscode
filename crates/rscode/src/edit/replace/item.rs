@@ -219,8 +219,7 @@ impl ItemEdit {
 	fn checked(&self) -> Result<Checked, Error> {
 		if self.is_empty() {
 			return Err(Error::InvalidSource(
-				"nothing to change: give text to replace, attributes to add or remove, a doc comment, or a visibility"
-					.to_owned(),
+				"nothing to change: give text to replace, attributes to add or remove, a doc comment, or a visibility".to_owned(),
 			));
 		}
 
@@ -318,10 +317,7 @@ impl PlanFailure {
 
 impl From<Error> for PlanFailure {
 	fn from(error: Error) -> Self {
-		Self {
-			error,
-			replacement: None,
-		}
+		Self { error, replacement: None }
 	}
 }
 
@@ -444,7 +440,10 @@ impl<'ws> Region<'ws> {
 		}
 
 		let longest = old.len().min(new.len()) - prefix;
-		let mut suffix = (old.bytes().rev().zip(new.bytes().rev())).take(longest).take_while(|(a, b)| a == b).count();
+		let mut suffix = (old.bytes().rev().zip(new.bytes().rev()))
+			.take(longest)
+			.take_while(|(a, b)| a == b)
+			.count();
 
 		while !old.is_char_boundary(old.len() - suffix) {
 			suffix -= 1;
@@ -595,10 +594,7 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 		// after the last inner attribute (or inner doc comment): on a line of its own, unless code follows it
 		true => match prefix.attributes.iter().rfind(|attribute| attribute.inner) {
 			Some(last) => match line_end(&region.text, last.range.end) {
-				end if !region.text[last.range.end..end].trim().is_empty() => {
-					(TextRange::new(last.range.end, last.range.end), format!(" {text}"))
-				}
-
+				end if !region.text[last.range.end..end].trim().is_empty() => (TextRange::new(last.range.end, last.range.end), format!(" {text}")),
 				end if end == region.text.len() => (TextRange::new(end, end), format!("{line_ending}{text}")),
 
 				end => {
@@ -609,10 +605,7 @@ fn add_attribute(regions: &mut Regions<'_>, attribute: &NewAttribute, path: &str
 			},
 
 			None => match inner_start(region, &prefix) {
-				Some((start, indent, separator)) => {
-					(TextRange::new(start, start), format!("{indent}{text}{line_ending}{separator}"))
-				}
-
+				Some((start, indent, separator)) => (TextRange::new(start, start), format!("{indent}{text}{line_ending}{separator}")),
 
 				// (an inline module with code on the line of its `{`)
 				None => {
@@ -699,10 +692,7 @@ fn check_item(ws: &Workspace, item: ItemId, path: &str, region: &Region<'_>, all
 	let kind_change = |problem: String| Error::KindChange(after(problem));
 
 	let parsed = parse_source(&region.text[region.item..], container).map_err(|error| match error {
-		Error::InvalidSource(message) => {
-			Error::InvalidSource(after(message.strip_prefix("the source ").unwrap_or(&message).to_owned()))
-		}
-
+		Error::InvalidSource(message) => Error::InvalidSource(after(message.strip_prefix("the source ").unwrap_or(&message).to_owned())),
 		error => error,
 	})?;
 
@@ -710,7 +700,6 @@ fn check_item(ws: &Workspace, item: ItemId, path: &str, region: &Region<'_>, all
 		_ if is_the_item(&parsed.items) => {}
 		[] => return Err(Error::InvalidSource(after("is no item: remove items to remove them".to_owned()))),
 		_ if allow_kind_change => {}
-
 		[new] => return Err(kind_change(format!("is {} rather than {}", article(new.kind), article(data.kind)))),
 		items => return Err(kind_change(format!("is {} items", items.len()))),
 	}
@@ -733,8 +722,7 @@ fn closest(region: &Region<'_>, printed: &PrintedText, old: &str) -> String {
 
 	if let [at] = occurrences(&ended_text, &trim_line_ends(old.split('\n')))[..] {
 		let index = ended_text[..at].matches('\n').count();
-		let ending = (index..index + old.split('\n').count())
-			.find(|&index| lines.get(index).is_some_and(|(line, _)| line.ends_with([' ', '\t'])));
+		let ending = (index..index + old.split('\n').count()).find(|&index| lines.get(index).is_some_and(|(line, _)| line.ends_with([' ', '\t'])));
 
 		return format!(
 			"; it matches at line {} if whitespace at the ends of lines is ignored ({})",
@@ -807,7 +795,6 @@ fn deletions(region: &Region<'_>, ranges: &[TextRange]) -> Vec<(TextRange, Shape
 	for &range in ranges {
 		match merged.last_mut() {
 			Some(last) if spaces(&text[last.end..range.start]) == range.start - last.end => last.end = range.end,
-
 			_ => merged.push(range),
 		}
 	}
@@ -904,9 +891,11 @@ pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, opti
 	let plans: Vec<ItemPlan<'_>> = match items.as_slice() {
 		[] => return Err(Error::NotFound(path.to_string())),
 		[item] => vec![plan(*item).map_err(|failure| failure.error)?],
-		_ if options.all_variants && super::replaces_all_variants(resolver, path) => {
-			items.iter().map(|&item| plan(item).map_err(|failure| failure.error)).collect::<Result<_, _>>()?
-		}
+
+		_ if options.all_variants && super::replaces_all_variants(resolver, path) => items
+			.iter()
+			.map(|&item| plan(item).map_err(|failure| failure.error))
+			.collect::<Result<_, _>>()?,
 
 		_ if checked.replacements.is_empty() => return Err(super::ambiguous(resolver, path, &items, &imports)),
 
@@ -930,9 +919,7 @@ pub fn edit_item(resolver: &Resolver<'_>, path: &ItemPath, edit: &ItemEdit, opti
 				0 => {
 					let failures = failed.into_iter().filter_map(|(_, plan)| plan.err()).collect();
 
-					return Err(unfit(failures, &checked.replacements, path).unwrap_or_else(|| {
-						super::ambiguous(resolver, path, &items, &imports)
-					}));
+					return Err(unfit(failures, &checked.replacements, path).unwrap_or_else(|| super::ambiguous(resolver, path, &items, &imports)));
 				}
 
 				_ => return Err(super::ambiguous(resolver, path, &items, &imports)),
@@ -1038,7 +1025,15 @@ fn inner_start(region: &Region<'_>, prefix: &Prefix) -> Option<(usize, String, &
 	};
 	let next = text[start..line_end(text, start)].trim();
 
-	Some((start, indent, if next.is_empty() || next.starts_with('}') { "" } else { region.line_ending }))
+	Some((
+		start,
+		indent,
+		if next.is_empty() || next.starts_with('}') {
+			""
+		} else {
+			region.line_ending
+		},
+	))
 }
 
 /// Whether `offset` is strictly inside of one of the (sorted, disjoint) `ranges`.
@@ -1138,8 +1133,7 @@ fn parse_prefix(text: &str, offset: usize, module_file: bool, inline_module: boo
 			true => syn::Visibility::Inherited,
 			false => input.parse()?,
 		};
-		let mut attributes: Vec<(Attribute, bool)> =
-			(attributes.into_iter()).map(|attribute| (attribute, module_file)).collect();
+		let mut attributes: Vec<(Attribute, bool)> = (attributes.into_iter()).map(|attribute| (attribute, module_file)).collect();
 		let mut body = None;
 
 		// (the inner attributes of an inline module)
@@ -1416,7 +1410,11 @@ fn replace_text(region: &mut Region<'_>, replacement: &TextReplacement, name: &s
 
 	// a whole view copied with a line break at its end, which the item's text does not have
 	if let Some((old, new, line)) = attempts.first().filter(|(old, _, _)| old.ends_with('\n')) {
-		let trim = |text: &str| text.strip_suffix('\n').map_or(text, |text| text.strip_suffix('\r').unwrap_or(text)).to_owned();
+		let trim = |text: &str| {
+			text.strip_suffix('\n')
+				.map_or(text, |text| text.strip_suffix('\r').unwrap_or(text))
+				.to_owned()
+		};
 
 		attempts.push((trim(old), trim(new), *line));
 	}
@@ -1461,7 +1459,11 @@ fn set_doc(regions: &mut Regions<'_>, lines: &[String], path: &str) -> Result<Op
 			return Ok(false);
 		};
 
-		Ok(region.attributes(path)?.attributes.iter().any(|attribute| attribute.doc && attribute.inner == inner))
+		Ok(region
+			.attributes(path)?
+			.attributes
+			.iter()
+			.any(|attribute| attribute.doc && attribute.inner == inner))
 	};
 
 	// a module's inner docs, unless its declaration has docs (only those are removed), and an inline module's if it
@@ -1519,7 +1521,11 @@ fn set_docs_of(region: &mut Region<'_>, lines: &[String], inner: bool, path: &st
 		match shape {
 			Shape::Lines => lines.iter().map(|line| format!("{indent}{}{line_ending}", comment(line))).collect(),
 			Shape::BeforeCode => lines.iter().map(|line| format!("{}{line_ending}{indent}", comment(line))).collect(),
-			Shape::AfterCode => format!(" {}", lines.iter().map(comment).collect::<Vec<_>>().join(&format!("{line_ending}{indent}"))),
+
+			Shape::AfterCode => format!(
+				" {}",
+				lines.iter().map(comment).collect::<Vec<_>>().join(&format!("{line_ending}{indent}"))
+			),
 		}
 	};
 
@@ -1531,7 +1537,9 @@ fn set_docs_of(region: &mut Region<'_>, lines: &[String], inner: bool, path: &st
 
 		true if inner => {
 			let Some((start, _, separator)) = start else {
-				return Err(Error::Unsupported(format!("`{path}` has code on the line of its `{{`, where no `//!` can go")));
+				return Err(Error::Unsupported(format!(
+					"`{path}` has code on the line of its `{{`, where no `//!` can go"
+				)));
 			};
 
 			edits.push((TextRange::new(start, start), format!("{}{separator}", block(Shape::Lines))));
@@ -1607,6 +1615,7 @@ fn several_occurrences(region: &Region<'_>, found: &[Occurrence], name: &str, pl
 	// (text copied from a view that also occurs as written, which gives its lines another indentation)
 	let forms = match printed.is_empty() || written.is_empty() {
 		true => String::new(),
+
 		false => format!(
 			": as views print it at {}, and as written in the file at {}",
 			numbers(&printed),
@@ -1740,7 +1749,13 @@ fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize
 	}
 
 	let (range, new) = match found[..] {
-		[Occurrence { range, printed: Some((start, end)) }] => (range, reindented(&printed, start, end, new, line_ending)),
+		[
+			Occurrence {
+				range,
+				printed: Some((start, end)),
+			},
+		] => (range, reindented(&printed, start, end, new, line_ending)),
+
 		[Occurrence { range, printed: None }] => (range, new.replace("\r\n", "\n").replace('\n', line_ending)),
 
 		[] => {
@@ -1780,11 +1795,16 @@ fn unfit(mut failures: Vec<PlanFailure>, replacements: &[TextReplacement], path:
 				.min_by_key(|(rank, _)| *rank)
 				.map(|(_, rest)| format!("; the closest is in {rest}"))
 				.unwrap_or_default();
-			let name = old_name(index, replacements.len(), replacements.get(index).map_or("", |replacement| &replacement.old));
+			let name = old_name(
+				index,
+				replacements.len(),
+				replacements.get(index).map_or("", |replacement| &replacement.old),
+			);
 
 			Some(Error::TextMismatch {
 				message: match failures.len() == count {
 					true => format!("{name} not found in any of the {count} items that `{path}` names{closest}"),
+
 					false => format!(
 						"{name} not found in any of the {} items (of {count}) that `{path}` names with the text before \
 						 it{closest}",
@@ -1826,7 +1846,11 @@ fn visibility_text(visibility: &syn::Visibility) -> Option<String> {
 
 		syn::Visibility::Restricted(restricted) => {
 			let segments: Vec<String> = restricted.path.segments.iter().map(|segment| segment.ident.to_string()).collect();
-			let path = format!("{}{}", if restricted.path.leading_colon.is_some() { "::" } else { "" }, segments.join("::"));
+			let path = format!(
+				"{}{}",
+				if restricted.path.leading_colon.is_some() { "::" } else { "" },
+				segments.join("::")
+			);
 
 			match restricted.in_token {
 				Some(_) => Some(format!("pub(in {path})")),
@@ -1866,12 +1890,9 @@ fn without_visibility(ws: &Workspace, item: ItemId) -> Option<String> {
 	}
 
 	match data.kind {
-		ItemKind::Impl
-		| ItemKind::MacroCall
-		| ItemKind::AssocMacro
-		| ItemKind::ForeignMacro
-		| ItemKind::MacroRules
-		| ItemKind::ExternBlock => Some(format!("{}, which has no visibility", article(data.kind))),
+		ItemKind::Impl | ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro | ItemKind::MacroRules | ItemKind::ExternBlock => {
+			Some(format!("{}, which has no visibility", article(data.kind)))
+		}
 
 		_ if data.vis == Visibility::Inherited => Some(format!("{}, which has the visibility of its parent", article(data.kind))),
 		_ => None,
@@ -1984,21 +2005,27 @@ mod tests {
 		let error = |edit: ItemEdit| edit.check().unwrap_err().to_string();
 
 		assert!(error(ItemEdit::default()).starts_with("nothing to change"));
-		assert!(error(ItemEdit {
-			visibility: Some("public".to_owned()),
-			..ItemEdit::default()
-		})
-		.starts_with("`public` is not a visibility"));
-		assert!(error(ItemEdit {
-			add_attributes: vec!["#[doc = \"a\"]".to_owned()],
-			..ItemEdit::default()
-		})
-		.contains("is a doc comment"));
-		assert!(error(ItemEdit {
-			add_attributes: vec!["#[a] #[b]".to_owned()],
-			..ItemEdit::default()
-		})
-		.contains("expected one attribute"));
+		assert!(
+			error(ItemEdit {
+				visibility: Some("public".to_owned()),
+				..ItemEdit::default()
+			})
+			.starts_with("`public` is not a visibility")
+		);
+		assert!(
+			error(ItemEdit {
+				add_attributes: vec!["#[doc = \"a\"]".to_owned()],
+				..ItemEdit::default()
+			})
+			.contains("is a doc comment")
+		);
+		assert!(
+			error(ItemEdit {
+				add_attributes: vec!["#[a] #[b]".to_owned()],
+				..ItemEdit::default()
+			})
+			.contains("expected one attribute")
+		);
 		assert_eq!(
 			error(ItemEdit {
 				replacements: vec![TextReplacement::default()],
@@ -2055,7 +2082,10 @@ mod tests {
 		);
 		assert!(text[..derive.end].ends_with("serde::Serialize"));
 		assert_eq!(prefix.attributes[2].derive, None);
-		assert_eq!(isolated(|| new_attribute("derive(Eq)")).unwrap().derive.unwrap().paths, [("Eq".to_owned(), "Eq".to_owned())]);
+		assert_eq!(
+			isolated(|| new_attribute("derive(Eq)")).unwrap().derive.unwrap().paths,
+			[("Eq".to_owned(), "Eq".to_owned())]
+		);
 	}
 
 	#[test]
@@ -2099,7 +2129,10 @@ mod tests {
 		assert_eq!(strip_gutters("  14 │\n  15 │", ""), None);
 
 		// lines without a number are not from the file
-		assert_eq!(strip_gutters("\n     │ x\n  14 │ b", ""), Some(("\nb".to_owned(), String::new(), Some(13))));
+		assert_eq!(
+			strip_gutters("\n     │ x\n  14 │ b", ""),
+			Some(("\nb".to_owned(), String::new(), Some(13)))
+		);
 		assert_eq!(
 			strip_gutters("     │ // file: src/a.rs\n   1 │ //! A.", "     │ // file: src/a.rs\n   1 │ //! B."),
 			Some(("//! A.".to_owned(), "//! B.".to_owned(), Some(1)))

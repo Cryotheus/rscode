@@ -52,6 +52,7 @@ impl Resolver<'_> {
 					path.selector = self.compute_canonical_path(parent).selector;
 				}
 			}
+
 			(_, ItemKind::Trait | ItemKind::Enum) => path.segments = self.flat_path(parent),
 
 			(ItemKind::Import, _) => {

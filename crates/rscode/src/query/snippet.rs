@@ -321,7 +321,9 @@ impl Snippet {
 
 	/// Whether the lines that come from the file are its consecutive lines from line `first` on.
 	pub(super) fn is_consecutive_from(&self, first: usize) -> bool {
-		(self.lines.iter().filter_map(|line| line.number)).zip(first..).all(|(number, expected)| number == expected)
+		(self.lines.iter().filter_map(|line| line.number))
+			.zip(first..)
+			.all(|(number, expected)| number == expected)
 	}
 
 	/// The lines joined with `\n` (no line break at the end), each prefixed with its line number (right-aligned, then
@@ -1046,7 +1048,10 @@ mod tests {
 		assert_eq!(printed.text, "struct B {\n  b: u8,\n}");
 		assert_eq!(printed.source_offset(0), 0);
 		assert_eq!(printed.source_offset(printed.text.find("b:").unwrap()), "struct B {\n    ".len());
-		assert_eq!(multiline_strings("fn a() { \"x\ny\"; \"z\"; r#\"\n\"# }"), [TextRange::new(9, 14), TextRange::new(21, 27)]);
+		assert_eq!(
+			multiline_strings("fn a() { \"x\ny\"; \"z\"; r#\"\n\"# }"),
+			[TextRange::new(9, 14), TextRange::new(21, 27)]
+		);
 		assert!(multiline_strings("fn a() {").is_empty());
 	}
 

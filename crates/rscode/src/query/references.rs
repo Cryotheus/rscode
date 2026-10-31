@@ -74,10 +74,7 @@ struct ModuleFiles<'ws> {
 
 impl<'ws> ModuleFiles<'ws> {
 	fn new(ws: &'ws Workspace) -> Self {
-		Self {
-			ws,
-			crates: HashMap::new(),
-		}
+		Self { ws, crates: HashMap::new() }
 	}
 
 	/// The modules of `krate` whose own file is `file` (one, unless `#[path]` attributes load it several times).
@@ -137,7 +134,10 @@ fn check_searchable(resolver: &Resolver<'_>, item: ItemId) -> Result<(), Error> 
 	};
 
 	if let Some(what) = untracked {
-		return Err(Error::Unsupported(format!("`{}` is {what} are not tracked", resolver.canonical_path(item))));
+		return Err(Error::Unsupported(format!(
+			"`{}` is {what} are not tracked",
+			resolver.canonical_path(item)
+		)));
 	}
 
 	let what = match data.kind {
@@ -152,9 +152,7 @@ fn check_searchable(resolver: &Resolver<'_>, item: ItemId) -> Result<(), Error> 
 	};
 
 	let hint = match data.macro_name() {
-		_ if data.kind == ItemKind::Import => {
-			": search for the references of what it imports instead (its path without `use`)".to_owned()
-		}
+		_ if data.kind == ItemKind::Import => ": search for the references of what it imports instead (its path without `use`)".to_owned(),
 
 		Some(name) => {
 			format!(": search for the uses of the macro `{name}!` with the path of the macro itself, without `!`")
@@ -192,11 +190,7 @@ fn child_at(ws: &Workspace, parent: ItemId, offset: usize) -> Option<ItemId> {
 ///
 /// Fails with [`Error::NotFound`] when a path names nothing, and with [`Error::Unsupported`] when it names an item
 /// that code does not refer to by a name of its own (an `impl` block, an import, a crate root, ...).
-pub fn find_references(
-	resolver: &Resolver<'_>,
-	paths: &[ItemPath],
-	options: &FindReferencesOptions,
-) -> Result<ReferenceReport, Error> {
+pub fn find_references(resolver: &Resolver<'_>, paths: &[ItemPath], options: &FindReferencesOptions) -> Result<ReferenceReport, Error> {
 	let mut targets = Vec::new();
 
 	for path in paths {
@@ -264,13 +258,7 @@ fn innermost(ws: &Workspace, module: ItemId, offset: usize) -> ItemId {
 /// invocations, `extern` blocks, and unnamed items (`const _: () = { ... };`) have no paths of their own.
 fn is_transparent(data: &ItemData) -> bool {
 	match data.kind {
-		ItemKind::Use
-		| ItemKind::Import
-		| ItemKind::MacroCall
-		| ItemKind::AssocMacro
-		| ItemKind::ForeignMacro
-		| ItemKind::ExternBlock => true,
-
+		ItemKind::Use | ItemKind::Import | ItemKind::MacroCall | ItemKind::AssocMacro | ItemKind::ForeignMacro | ItemKind::ExternBlock => true,
 		ItemKind::Impl => false,
 		_ => data.name.is_none(),
 	}

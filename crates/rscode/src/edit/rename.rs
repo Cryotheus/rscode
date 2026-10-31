@@ -501,6 +501,7 @@ fn check_supported(resolver: &Resolver<'_>, target: ItemId) -> Result<(), Error>
 
 	let hint = match data.kind {
 		ItemKind::Import => ": rename what it imports instead, or replace its `use` item (for example with `use a::Name as NewName;`)",
+
 		ItemKind::Field => {
 			" (the uses of fields, in field accesses, struct literals, and patterns, are not found): replace the field, \
 			 and update its uses by hand"
@@ -510,6 +511,7 @@ fn check_supported(resolver: &Resolver<'_>, target: ItemId) -> Result<(), Error>
 			" (what the macro makes of it is unknown, so its uses are not found): replace the entry, and update its uses \
 			 by hand"
 		}
+
 		_ => "",
 	};
 

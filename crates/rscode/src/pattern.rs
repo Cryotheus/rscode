@@ -318,7 +318,9 @@ impl PathPattern {
 				.collect(),
 			arguments: path.arguments.clone(),
 			import: path.import,
-			selector: (path.qualifier.as_ref()).and_then(|qualifier| qualifier.selector.clone()).or_else(|| path.selector.clone()),
+			selector: (path.qualifier.as_ref())
+				.and_then(|qualifier| qualifier.selector.clone())
+				.or_else(|| path.selector.clone()),
 			field: (path.field.as_ref()).map(|field| IdentPattern::exact(field, MatchOptions::default())),
 			macro_call: path.macro_call,
 		}
@@ -458,10 +460,7 @@ impl PathPattern {
 		}
 
 		match &self.qualifier {
-			Some((self_ty, trait_pattern)) => {
-				selector_matches && self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref())
-			}
-
+			Some((self_ty, trait_pattern)) => selector_matches && self.matches_qualified(path, is_selected, self_ty, trait_pattern.as_deref()),
 			None if path.is_impl => false,
 
 			None if let Some(field) = &self.field => {
@@ -1546,20 +1545,32 @@ mod tests {
 		// fields
 		let field = pattern("a::Point . x*");
 
-		assert_eq!((field.segments, field.field), (pattern("a::Point").segments, Some(pattern("x*").segments[0].clone()).and_then(|segment| match segment {
-			SegmentPattern::Ident(ident) => Some(ident),
-			SegmentPattern::AnyDepth => None,
-		})));
+		assert_eq!(
+			(field.segments, field.field),
+			(
+				pattern("a::Point").segments,
+				Some(pattern("x*").segments[0].clone()).and_then(|segment| match segment {
+					SegmentPattern::Ident(ident) => Some(ident),
+					SegmentPattern::AnyDepth => None,
+				})
+			)
+		);
 		assert_eq!(pattern("**.0").to_string(), "**.0");
 		assert_eq!(pattern("crate::Pair.0").to_item_path().unwrap().to_string(), "crate::Pair.0");
 		assert_eq!(pattern("crate::Pair.00").to_item_path(), None);
 		assert_eq!(pattern("Point.x").to_item_path().unwrap().field.as_deref(), Some("x"));
 		assert_eq!(pattern("Point.*").to_item_path(), None);
 		assert_eq!(pattern_error(".x"), "expected a pattern of a struct, union, or variant before `.`");
-		assert_eq!(pattern_error("crate.x"), "expected a pattern of a struct, union, or variant before `.`, found `crate`");
+		assert_eq!(
+			pattern_error("crate.x"),
+			"expected a pattern of a struct, union, or variant before `.`, found `crate`"
+		);
 		assert_eq!(pattern_error("Point."), "expected a field pattern after `.`");
 		assert_eq!(pattern_error("Point.x.y"), "fields have no fields: a pattern names one field");
-		assert_eq!(pattern_error("use a.b"), "`use` patterns match the imports of modules, and cannot have fields or `!`");
+		assert_eq!(
+			pattern_error("use a.b"),
+			"`use` patterns match the imports of modules, and cannot have fields or `!`"
+		);
 		assert_eq!(pattern_error("<A.x>::b"), "fields cannot appear inside of a qualifier");
 
 		// macro invocations
@@ -1573,14 +1584,23 @@ mod tests {
 		assert!(pattern_error("a::b[2]").starts_with("'[' is not allowed in identifier patterns"));
 		assert_eq!(pattern_error("!"), "expected a pattern of a macro name before `!`");
 		assert_eq!(pattern_error("crate!"), "expected a pattern of a macro name before `!`, found `crate`");
-		assert_eq!(pattern_error("x![name]"), "only an index selects one of several macro invocations: `name![2]`");
-		assert_eq!(pattern_error("use x!"), "`use` patterns match the imports of modules, and cannot have fields or `!`");
+		assert_eq!(
+			pattern_error("x![name]"),
+			"only an index selects one of several macro invocations: `name![2]`"
+		);
+		assert_eq!(
+			pattern_error("use x!"),
+			"`use` patterns match the imports of modules, and cannot have fields or `!`"
+		);
 		assert_eq!(pattern_error("a.b!"), "macro invocation patterns cannot have fields");
 		assert_eq!(pattern_error("<a!>"), "`!` cannot appear inside of a qualifier");
 
 		// selectors
 		assert_eq!(pattern("impl Foo [new]").selector, Some(Selector::Item("new".into())));
-		assert_eq!(pattern("impl Tr<[u8; 2]> for Foo[#a::b]").selector, Some(Selector::Attribute("a::b".to_owned())));
+		assert_eq!(
+			pattern("impl Tr<[u8; 2]> for Foo[#a::b]").selector,
+			Some(Selector::Attribute("a::b".to_owned()))
+		);
 		assert_eq!(pattern("<Foo as *> [2] :: *").selector, Some(Selector::Index(2)));
 		assert_eq!(pattern("<Foo as *>[2]::*").to_string(), "<Foo as *>[2]::*");
 		assert_eq!(pattern("impl Foo[2]").to_item_path().unwrap().to_string(), "<Foo>[2]");
@@ -1649,7 +1669,10 @@ mod tests {
 		assert!(pattern("<Foo as Display>::**").matches(&display_fmt, true));
 
 		// patterns with fields match fields, whose owner the segments match; others match fields like other items
-		let field = CanonicalPath { is_field: true, ..item(&["c", "a", "Foo"], "x") };
+		let field = CanonicalPath {
+			is_field: true,
+			..item(&["c", "a", "Foo"], "x")
+		};
 
 		assert!(pattern("Foo.x").matches(&field, true));
 		assert!(pattern("crate::a::Foo.*").matches(&field, true));
@@ -1660,8 +1683,14 @@ mod tests {
 		assert!(pattern("Foo::*").matches(&field, true));
 
 		// patterns with `!` match macro invocations (and their index), whose name the last segment matches
-		let call = CanonicalPath { is_macro_call: true, ..item(&["c", "m"], "commands") };
-		let second = CanonicalPath { selector: Some(Selector::Index(2)), ..call.clone() };
+		let call = CanonicalPath {
+			is_macro_call: true,
+			..item(&["c", "m"], "commands")
+		};
+		let second = CanonicalPath {
+			selector: Some(Selector::Index(2)),
+			..call.clone()
+		};
 
 		assert!(pattern("m::commands!").matches(&call, true));
 		assert!(pattern("**::*!").matches(&second, true));
@@ -1671,7 +1700,10 @@ mod tests {
 		assert!(pattern("m::*").matches(&call, true));
 
 		// selectors must be those of the canonical path
-		let selected = |selector: Selector, path: &CanonicalPath| CanonicalPath { selector: Some(selector), ..path.clone() };
+		let selected = |selector: Selector, path: &CanonicalPath| CanonicalPath {
+			selector: Some(selector),
+			..path.clone()
+		};
 		let block = selected(Selector::Item("new".into()), &impl_block(&["c", "a", "Foo"], None));
 		let second_fmt = selected(Selector::Index(2), &display_fmt);
 

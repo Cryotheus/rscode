@@ -458,9 +458,9 @@ fn may_match(pattern: &PathPattern, kind: ItemKind, name: &str) -> bool {
 		// `use` patterns match imports, and only those, patterns with a field fields, and patterns with `!` macro
 		// invocations
 		_ if pattern.is_import() && kind != ItemKind::Import => false,
+
 		_ if pattern.is_macro_call() && kind != ItemKind::MacroCall => false,
 		_ if pattern.is_field() => kind == ItemKind::Field && pattern.field.as_ref().is_some_and(|field| field.matches(name)),
-
 		Some(SegmentPattern::Ident(last)) => last.matches(name),
 		_ => true,
 	}

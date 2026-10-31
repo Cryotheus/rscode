@@ -720,15 +720,7 @@ impl ItemKind {
 	pub fn is_container(self) -> bool {
 		matches!(
 			self,
-			Self::Module
-				| Self::Impl
-				| Self::Trait
-				| Self::ExternBlock
-				| Self::Enum
-				| Self::Use
-				| Self::Struct
-				| Self::Union
-				| Self::Variant
+			Self::Module | Self::Impl | Self::Trait | Self::ExternBlock | Self::Enum | Self::Use | Self::Struct | Self::Union | Self::Variant
 		)
 	}
 
@@ -1160,7 +1152,9 @@ impl Workspace {
 		let data = self.item(id);
 		let parent = self.parent(id).filter(|_| data.kind == ItemKind::Static && !data.is_thread_local())?;
 
-		(self.item(parent).kind == ItemKind::MacroCall).then(|| self.item(parent).macro_name()).flatten()
+		(self.item(parent).kind == ItemKind::MacroCall)
+			.then(|| self.item(parent).macro_name())
+			.flatten()
 	}
 
 	/// The file an item is defined in.

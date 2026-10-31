@@ -192,10 +192,7 @@ impl Resolver<'_> {
 		let Some(field) = &path.field else {
 			return Vec::new();
 		};
-		let owner = ItemPath {
-			field: None,
-			..path.clone()
-		};
+		let owner = ItemPath { field: None, ..path.clone() };
 
 		self.fields_of(self.compute_item_path(&owner), field)
 	}
