@@ -35,6 +35,9 @@ use std::path::PathBuf;
 /// The lines of context around the changes in diffs: enough to place them, since the edit says what changed.
 const DIFF_CONTEXT: usize = 1;
 
+/// How many files the reports of `format_items` list, and how many changed files its `check` shows a diff of.
+pub(crate) const MAX_LISTED_FILES: usize = 20;
+
 /// How many of the items whose references were searched `find_references` lists.
 const MAX_LISTED_TARGETS: usize = 5;
 
@@ -244,9 +247,7 @@ pub(crate) fn format_check(root: &Path, changes: &[FileChange], warnings: &[Stri
 		(processed, _) => format!("{} of {} would change:\n", changed.len(), count(processed, "file", "files")),
 	};
 
-	for change in &changed {
-		writeln!(out, "  {}", display(root, &change.path)).unwrap();
-	}
+	listed_files(&mut out, root, changed.iter().map(|change| change.path.as_path()));
 
 	self::warnings(&mut out, warnings);
 	out
@@ -260,9 +261,7 @@ pub(crate) fn format_written(root: &Path, processed: usize, written: &[PathBuf],
 		(processed, written) => format!("formatted {written} of {}:\n", count(processed, "file", "files")),
 	};
 
-	for file in written {
-		writeln!(out, "  {}", display(root, file)).unwrap();
-	}
+	listed_files(&mut out, root, written.iter().map(PathBuf::as_path));
 
 	self::warnings(&mut out, warnings);
 	out
@@ -379,6 +378,19 @@ fn lines(start: LineCol, end: LineCol) -> String {
 	match last_line(start, end) {
 		last if last > start.line => format!("{}-{last}", start.line),
 		_ => start.line.to_string(),
+	}
+}
+
+/// Lists files one per line, at most [`MAX_LISTED_FILES`] of them, then `  [and N more]`.
+fn listed_files<'a>(out: &mut String, root: &Path, files: impl ExactSizeIterator<Item = &'a Path>) {
+	let more = files.len().saturating_sub(MAX_LISTED_FILES);
+
+	for file in files.take(MAX_LISTED_FILES) {
+		writeln!(out, "  {}", display(root, file)).unwrap();
+	}
+
+	if more > 0 {
+		writeln!(out, "  [and {more} more]").unwrap();
 	}
 }
 
@@ -832,7 +844,7 @@ pub(crate) fn truncation_hint(tool: &str) -> &'static str {
 
 		"format_items" => {
 			"narrow the request: fewer or more specific `targets`, or `skip_children`; without `check`, the changes are \
-			 written and only the files are listed"
+			 written and only summarized"
 		}
 
 		_ => "without `dry_run`, the edit is written and only summarized",
@@ -1137,6 +1149,14 @@ mod tests {
 			"formatted 1 of 2 files:\n  src/lib.rs\n"
 		);
 		assert_eq!(format_written(root(), 3, &[], &[]), "3 files were already formatted\n");
+
+		// long lists are cut
+		let many: Vec<PathBuf> = (0..23).map(|index| PathBuf::from(format!("/ws/src/f{index}.rs"))).collect();
+		let report = format_written(root(), 30, &many, &[]);
+
+		assert!(report.starts_with("formatted 23 of 30 files:\n  src/f0.rs\n"), "{report}");
+		assert!(report.ends_with("  src/f19.rs\n  [and 3 more]\n"), "{report}");
+		assert!(!report.contains("f20"), "{report}");
 		assert_eq!(format_written(root(), 0, &[], &[]), "no files matched the targets\n");
 	}
 
