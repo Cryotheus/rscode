@@ -387,6 +387,19 @@ pub(crate) fn format(load: &LoadOptions, params: &FormatParams, permit: &Permit<
 
 	if params.check {
 		let mut text = render::format_check(root, &formatting.changes, &formatting.warnings);
+		let changed = formatting.changes.iter().filter(|change| change.is_changed()).count();
+
+		// (a diff of many files is too long to read: narrower targets show it)
+		if changed > render::MAX_LISTED_FILES {
+			writeln!(
+				text,
+				"\n[diff not shown for more than {} files; narrow `targets` to see it]",
+				render::MAX_LISTED_FILES
+			)
+			.unwrap();
+			return Ok(text);
+		}
+
 		let diff = render::diff(root, &formatting.changes, &formatting.edits);
 
 		if !diff.is_empty() {
