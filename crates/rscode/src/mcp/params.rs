@@ -125,7 +125,7 @@ pub(crate) struct EditItemParams {
 	/// The item; `use crate::a::Name` edits an import's `use` item.
 	pub(crate) path: String,
 
-	/// Exact text to replace, as view_items prints it (line numbers optional); must occur once in the item. In JSON,
+	/// Exact text to replace, as view_items prints it (line numbers optional); must occur once unless `replace_all` is true. In JSON,
 	/// write a hard tab as `\t` rather than as a literal control character.
 	#[serde(default)]
 	pub(crate) old: Option<String>,
@@ -133,6 +133,11 @@ pub(crate) struct EditItemParams {
 	/// What replaces `old` ("" deletes it). In JSON, write a hard tab as `\t`.
 	#[serde(default)]
 	pub(crate) new: Option<String>,
+
+	/// Replace every non-overlapping occurrence of each `old` text within the selected item (including `edits`).
+	/// Missing text still fails; numbered-view gutters do not restrict occurrences. Does not select more items or cfg variants.
+	#[serde(default)]
+	pub(crate) replace_all: bool,
 
 	/// More `{old, new}` replacements, applied in order after `old` and `new`.
 	#[serde(default)]
@@ -207,6 +212,7 @@ impl EditItemParams {
 
 	pub(crate) fn options(&self) -> EditItemOptions {
 		EditItemOptions {
+			replace_all: self.replace_all,
 			all_variants: self.all_variants,
 			allow_kind_change: false,
 		}

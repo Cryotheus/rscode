@@ -156,7 +156,12 @@ fn bin_spec(dir: &TempDir, name: &str, root: &str, library: &str) -> CrateSpec {
 	let mut bin = spec(dir, name, root);
 
 	bin.kind = TargetKind::Bin;
-	bin.dependencies.push(Dependency { name: library.into(), crate_name: library.into(), package: None, krate: None });
+	bin.dependencies.push(Dependency {
+		name: library.into(),
+		crate_name: library.into(),
+		package: None,
+		krate: None,
+	});
 	bin
 }
 
@@ -317,14 +322,22 @@ impl G<u16> {
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
 		let named = |text: &str| -> Vec<String> {
-			(resolver.resolve_item_path(&path(text)).into_iter()).map(|item| resolver.canonical_path(item).to_string()).collect()
+			(resolver.resolve_item_path(&path(text)).into_iter())
+				.map(|item| resolver.canonical_path(item).to_string())
+				.collect()
 		};
 
 		// the paths shown for the `impl` blocks and their items tell them apart, and name them
-		assert_eq!(named("impl From for crate::Wrapper"), ["impl From<u8> for fixture::Wrapper", "impl From<u16> for fixture::Wrapper"]);
+		assert_eq!(
+			named("impl From for crate::Wrapper"),
+			["impl From<u8> for fixture::Wrapper", "impl From<u16> for fixture::Wrapper"]
+		);
 		assert_eq!(named("impl From<u16> for fixture::Wrapper"), ["impl From<u16> for fixture::Wrapper"]);
 		assert_eq!(named("<crate::Wrapper as From< u8 >>::from"), ["<fixture::Wrapper as From<u8>>::from"]);
-		assert_eq!(named("<crate::G as crate::Tr>::f"), ["<fixture::G<u8> as Tr>::f", "<fixture::G<u16> as Tr>::f"]);
+		assert_eq!(
+			named("<crate::G as crate::Tr>::f"),
+			["<fixture::G<u8> as Tr>::f", "<fixture::G<u16> as Tr>::f"]
+		);
 		assert_eq!(named("<fixture::G<u16> as Tr>::f"), ["<fixture::G<u16> as Tr>::f"]);
 		assert!(named("<crate::G<u32> as crate::Tr>::f").is_empty());
 
@@ -338,19 +351,34 @@ impl G<u16> {
 				]
 				.map(native)
 			),
+
 			other => panic!("{other:?}"),
 		}
 
-		let removal = remove(&ws, &["impl From<u8> for crate::Wrapper", "<crate::G<u16> as crate::Tr>::f"], &RemoveOptions::default());
+		let removal = remove(
+			&ws,
+			&["impl From<u8> for crate::Wrapper", "<crate::G<u16> as crate::Tr>::f"],
+			&RemoveOptions::default(),
+		);
 		let edited = edited(&dir, &removal.edits, "src/lib.rs");
 
-		assert!(!edited.contains("impl From<u8>") && edited.contains("impl From<u16> for Wrapper"), "{edited}");
+		assert!(
+			!edited.contains("impl From<u8>") && edited.contains("impl From<u16> for Wrapper"),
+			"{edited}"
+		);
 		assert!(edited.contains("impl Tr for G<u16> {\n}") && edited.contains("\t\t8\n"), "{edited}");
 
 		// found by patterns with generic arguments too
-		let found = rscode::Find::new().pattern("<crate::G<u16> as *>::*").unwrap().run_with(&resolver).unwrap();
+		let found = rscode::Find::new()
+			.pattern("<crate::G<u16> as *>::*")
+			.unwrap()
+			.run_with(&resolver)
+			.unwrap();
 
-		assert_eq!(found.iter().map(|found| found.path.as_str()).collect::<Vec<_>>(), ["<fixture::G<u16> as Tr>::f"]);
+		assert_eq!(
+			found.iter().map(|found| found.path.as_str()).collect::<Vec<_>>(),
+			["<fixture::G<u16> as Tr>::f"]
+		);
 
 		// items of inherent `impl`s too, whose canonical paths leave out the arguments
 		assert_eq!(named("<crate::G<u16>>::get"), ["fixture::G::get"]);
@@ -359,10 +387,14 @@ impl G<u16> {
 			Err(Error::Ambiguous { candidates, .. }) => {
 				assert_eq!(
 					candidates,
-					["`<fixture::G<u8>>::get` at src/lib.rs:34:2", "`<fixture::G<u16>>::get` at src/lib.rs:40:2"]
-						.map(native)
+					[
+						"`<fixture::G<u8>>::get` at src/lib.rs:34:2",
+						"`<fixture::G<u16>>::get` at src/lib.rs:40:2"
+					]
+					.map(native)
 				);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -371,9 +403,15 @@ impl G<u16> {
 		assert_eq!(found.iter().map(|found| found.start.line).collect::<Vec<_>>(), [40]);
 
 		// `all_variants` replaces `cfg` variants together, not these
-		let all_variants = ReplaceOptions { all_variants: true, ..ReplaceOptions::default() };
+		let all_variants = ReplaceOptions {
+			all_variants: true,
+			..ReplaceOptions::default()
+		};
 
-		for (text, source) in [("<crate::G as Tr>::f", "fn f(&self) -> u8 {\n\t0\n}"), ("crate::G::get", "pub fn get(&self) {}")] {
+		for (text, source) in [
+			("<crate::G as Tr>::f", "fn f(&self) -> u8 {\n\t0\n}"),
+			("crate::G::get", "pub fn get(&self) {}"),
+		] {
 			let replaced = rscode::edit::replace(&resolver, &path(text), source, &all_variants);
 
 			assert!(matches!(replaced, Err(Error::Ambiguous { .. })), "{replaced:?}");
@@ -411,7 +449,10 @@ impl Tools {
 		let dir = TempDir::with_files("remove-same-header-impls", &[("src/lib.rs", lib)]);
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
-		let all_variants = ReplaceOptions { all_variants: true, ..ReplaceOptions::default() };
+		let all_variants = ReplaceOptions {
+			all_variants: true,
+			..ReplaceOptions::default()
+		};
 
 		assert_eq!(resolver.resolve_item_path(&path("impl crate::Tools")).len(), 4);
 		assert!(!rscode::edit::replaces_all_variants(&resolver, &path("impl crate::Tools")));
@@ -445,7 +486,10 @@ impl Tools {
 		let source = "impl Tools {}";
 		let replacement = rscode::edit::replace(&resolver, &path("impl fixture::Tools[kick]"), source, &ReplaceOptions::default()).unwrap();
 
-		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs"), lib.replace("impl Tools {\n\tpub fn kick() {}\n}", source));
+		assert_eq!(
+			edited(&dir, &replacement.edits, "src/lib.rs"),
+			lib.replace("impl Tools {\n\tpub fn kick() {}\n}", source)
+		);
 		assert_eq!(replacement.replaced, ["impl fixture::Tools[kick]"]);
 
 		let removal = remove(&ws, &["impl crate::Tools[#allow]"], &RemoveOptions::default());
@@ -476,7 +520,10 @@ impl Tools {
 
 		let replacement = rscode::edit::replace(&resolver, &path("crate::Tools::os"), "pub fn os() -> u8 { 0 }", &all_variants).unwrap();
 
-		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs").matches("pub fn os() -> u8 { 0 }").count(), 2);
+		assert_eq!(
+			edited(&dir, &replacement.edits, "src/lib.rs").matches("pub fn os() -> u8 { 0 }").count(),
+			2
+		);
 
 		let removal = remove(&ws, &["crate::Tools::os"], &RemoveOptions::default());
 
@@ -518,7 +565,10 @@ impl Config {
 		let dir = TempDir::with_files("remove-unconditional-impl", &[("src/lib.rs", lib)]);
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
-		let all_variants = ReplaceOptions { all_variants: true, ..ReplaceOptions::default() };
+		let all_variants = ReplaceOptions {
+			all_variants: true,
+			..ReplaceOptions::default()
+		};
 
 		match rscode::edit::remove(&resolver, &paths(&["impl crate::Config"]), &RemoveOptions::default()) {
 			Err(Error::Ambiguous { candidates, .. }) => assert_eq!(
@@ -531,6 +581,7 @@ impl Config {
 				]
 				.map(native)
 			),
+
 			other => panic!("{other:?}"),
 		}
 
@@ -636,8 +687,7 @@ pub enum Trailing {
 	#[test]
 	fn removes_inline_modules() {
 		let lib = "mod inline {\n\tpub fn f() {}\n\n\tmod deeper;\n}\n\npub fn g() {}\n";
-		let dir =
-			TempDir::with_files("remove-inline", &[("src/lib.rs", lib), ("src/inline/deeper.rs", "pub fn d() {}\n")]);
+		let dir = TempDir::with_files("remove-inline", &[("src/lib.rs", lib), ("src/inline/deeper.rs", "pub fn d() {}\n")]);
 		let ws = load(&dir);
 		let removal = remove(&ws, &["crate::inline", "crate::inline::f"], &RemoveOptions::default());
 
@@ -656,7 +706,11 @@ pub enum Trailing {
 		let removal = remove(&ws, &["crate::inline"], &RemoveOptions::default());
 
 		assert_eq!(dir.relative(removal.edits.deletions()), ["src/inline/deeper.rs"]);
-		assert!(removal.warnings.iter().all(|warning| !warning.contains("directory")), "{:?}", removal.warnings);
+		assert!(
+			removal.warnings.iter().all(|warning| !warning.contains("directory")),
+			"{:?}",
+			removal.warnings
+		);
 	}
 
 	#[test]
@@ -669,7 +723,11 @@ pub enum Trailing {
 
 		assert_eq!(dir.relative(removal.edits.deletions()), ["src/nested"]);
 		assert!(!edited(&dir, &removal.edits, "src/lib.rs").contains("mod nested"));
-		assert!(removal.warnings.iter().all(|warning| warning.contains("references")), "{:?}", removal.warnings);
+		assert!(
+			removal.warnings.iter().all(|warning| warning.contains("references")),
+			"{:?}",
+			removal.warnings
+		);
 
 		// a non-`mod.rs` file and the directory of its children
 		let removal = remove(&ws, &["crate::shapes"], &RemoveOptions::default());
@@ -687,13 +745,16 @@ pub enum Trailing {
 		let removal = remove(&ws, &["crate::placed"], &RemoveOptions::default());
 
 		assert_eq!(dir.relative(removal.edits.deletions()), ["src/custom/placed.rs"]);
-		assert!(removal.warnings.iter().all(|warning| !warning.contains("directory")), "{:?}", removal.warnings);
+		assert!(
+			removal.warnings.iter().all(|warning| !warning.contains("directory")),
+			"{:?}",
+			removal.warnings
+		);
 
 		// a directory with other files: only the module files go
 		let removal = remove(&ws, &["crate::docs"], &RemoveOptions::default());
 
-		let kept =
-			"the directory `src/docs` is not deleted: it has files that are not part of the module `edit_ops::docs`";
+		let kept = "the directory `src/docs` is not deleted: it has files that are not part of the module `edit_ops::docs`";
 
 		assert_eq!(dir.relative(removal.edits.deletions()), ["src/docs/mod.rs"]);
 		assert!(removal.warnings.contains(&native(kept)), "{:?}", removal.warnings);
@@ -707,7 +768,10 @@ pub enum Trailing {
 		assert!(removal.warnings.contains(&kept), "{:?}", removal.warnings);
 
 		// or none at all
-		let options = RemoveOptions { keep_files: true, ..RemoveOptions::default() };
+		let options = RemoveOptions {
+			keep_files: true,
+			..RemoveOptions::default()
+		};
 		let removal = remove(&ws, &["crate::nested", "crate::shapes"], &options);
 
 		assert!(removal.edits.deletions().is_empty());
@@ -718,8 +782,13 @@ pub enum Trailing {
 	fn applies_removals_and_still_compiles() {
 		let dir = TempDir::fixture("remove-apply");
 		let ws = load_fixture(&dir, true);
-		let targets =
-			["crate::nested", "crate::shapes::Kind::Square", "crate::placed", "crate::extra", "crate::util::zeta"];
+		let targets = [
+			"crate::nested",
+			"crate::shapes::Kind::Square",
+			"crate::placed",
+			"crate::extra",
+			"crate::util::zeta",
+		];
 		let removal = remove(&ws, &targets, &RemoveOptions::default());
 
 		// `util.rs` is loaded by both crates, and both remove `zeta`
@@ -787,14 +856,24 @@ use self::gone as g;
 ";
 
 	fn prune(ws: &Workspace, targets: &[&str]) -> rscode::edit::Removal {
-		remove(ws, targets, &RemoveOptions { prune_imports: true, ..RemoveOptions::default() })
+		remove(
+			ws,
+			targets,
+			&RemoveOptions {
+				prune_imports: true,
+				..RemoveOptions::default()
+			},
+		)
 	}
 
 	#[test]
 	fn prunes_imports_of_removed_items() {
 		let app = "use fixture::gone::A;\nuse fixture::kept::K;\n\nfn main() {}\n";
 		let dir = TempDir::with_files("remove-prune", &[("src/lib.rs", IMPORTS), ("src/main.rs", app)]);
-		let ws = load_specs(&dir, [spec(&dir, "fixture", "src/lib.rs"), bin_spec(&dir, "app", "src/main.rs", "fixture")]);
+		let ws = load_specs(
+			&dir,
+			[spec(&dir, "fixture", "src/lib.rs"), bin_spec(&dir, "app", "src/main.rs", "fixture")],
+		);
 
 		// whole `use` items (named, group, glob, and renamed imports), also in other crates
 		let removal = prune(&ws, &["crate::gone"]);
@@ -832,10 +911,7 @@ use self::gone as g;
 		// a nested group whose leaves all go
 		let removal = prune(&ws, &["crate::other"]);
 
-		assert!(
-			edited(&dir, &removal.edits, "src/lib.rs")
-				.ends_with("\nuse crate::{kept::{K as K3, L}};\npub use gone::*;\nuse self::gone as g;\n")
-		);
+		assert!(edited(&dir, &removal.edits, "src/lib.rs").ends_with("\nuse crate::{kept::{K as K3, L}};\npub use gone::*;\nuse self::gone as g;\n"));
 
 		// a leaf of a nested group
 		let removal = prune(&ws, &["crate::kept::L"]);
@@ -853,8 +929,7 @@ use self::gone as g;
 
 	#[test]
 	fn prunes_imports_through_removed_modules() {
-		let lib =
-			"pub mod a {\n\tpub use crate::b::Thing;\n}\n\npub mod b {\n\tpub struct Thing;\n}\n\nuse a::Thing;\n";
+		let lib = "pub mod a {\n\tpub use crate::b::Thing;\n}\n\npub mod b {\n\tpub struct Thing;\n}\n\nuse a::Thing;\n";
 		let dir = TempDir::with_files("remove-prune-through", &[("src/lib.rs", lib)]);
 		let ws = load(&dir);
 
@@ -868,7 +943,10 @@ use self::gone as g;
 	fn keeps_imports_of_crates_whose_root_file_is_emptied() {
 		let files = [("src/lib.rs", "pub fn a() {}\n"), ("src/main.rs", "use fixture as f;\n\nfn main() {}\n")];
 		let dir = TempDir::with_files("remove-emptied-root", &files);
-		let ws = load_specs(&dir, [spec(&dir, "fixture", "src/lib.rs"), bin_spec(&dir, "app", "src/main.rs", "fixture")]);
+		let ws = load_specs(
+			&dir,
+			[spec(&dir, "fixture", "src/lib.rs"), bin_spec(&dir, "app", "src/main.rs", "fixture")],
+		);
 		let removal = prune(&ws, &["crate::a"]);
 
 		assert_eq!(changes(&dir, &removal.edits), BTreeMap::from([("src/lib.rs".to_owned(), String::new())]));
@@ -888,7 +966,10 @@ use self::gone as g;
 		assert!(!edited(&dir, &removal.edits, "src/lib.rs").contains("extra"));
 
 		// only those that may be active (no features are enabled)
-		let options = RemoveOptions { active_only: true, ..RemoveOptions::default() };
+		let options = RemoveOptions {
+			active_only: true,
+			..RemoveOptions::default()
+		};
 		let removal = remove(&ws, &["crate::extra"], &options);
 		let lib = edited(&dir, &removal.edits, "src/lib.rs");
 
@@ -919,7 +1000,10 @@ use self::gone as g;
 			rscode::edit::remove(&resolver, &paths(&["crate::a", "crate::nope"]), &options),
 			Err(Error::NotFound(path)) if path == "crate::nope"
 		));
-		assert!(matches!(rscode::edit::remove(&resolver, &paths(&["crate"]), &options), Err(Error::Unsupported(_))));
+		assert!(matches!(
+			rscode::edit::remove(&resolver, &paths(&["crate"]), &options),
+			Err(Error::Unsupported(_))
+		));
 	}
 
 	#[test]
@@ -927,8 +1011,11 @@ use self::gone as g;
 		let dir = TempDir::fixture("remove-dangling");
 		let ws = load_fixture(&dir, true);
 		let removal = remove(&ws, &["crate::util::double"], &RemoveOptions::default());
-		let dangling: Vec<(String, LineCol)> =
-			removal.dangling.iter().map(|reference| (dir.relative_path(&reference.path), reference.start)).collect();
+		let dangling: Vec<(String, LineCol)> = removal
+			.dangling
+			.iter()
+			.map(|reference| (dir.relative_path(&reference.path), reference.start))
+			.collect();
 
 		assert_eq!(dangling, [("src/lib.rs".to_owned(), at(22, 8)), ("src/main.rs".to_owned(), at(4, 22))]);
 
@@ -1107,12 +1194,27 @@ pub fn last() {}
 	#[test]
 	fn already_satisfied_moves_preserve_every_byte() {
 		let cases = [
-			("move-noop-adjacent", "pub fn a() {} pub fn b() {}", "crate::a", InsertPosition::Before("crate::b".to_owned())),
-			("move-noop-after", "pub fn a() {} pub fn b() {}", "crate::b", InsertPosition::After("crate::a".to_owned())),
+			(
+				"move-noop-adjacent",
+				"pub fn a() {} pub fn b() {}",
+				"crate::a",
+				InsertPosition::Before("crate::b".to_owned()),
+			),
+			(
+				"move-noop-after",
+				"pub fn a() {} pub fn b() {}",
+				"crate::b",
+				InsertPosition::After("crate::a".to_owned()),
+			),
 			("move-noop-start", "pub fn a() {}\npub fn b() {}\n", "crate::a", InsertPosition::Start),
 			("move-noop-last", "pub fn a() {}\npub fn b() {}\n", "crate::b", InsertPosition::End),
 			("move-noop-eof", "pub fn only() {}", "crate::only", InsertPosition::End),
-			("move-noop-unindented", "pub mod m {\nfn only() {}\n}\n", "crate::m::only", InsertPosition::End),
+			(
+				"move-noop-unindented",
+				"pub mod m {\nfn only() {}\n}\n",
+				"crate::m::only",
+				InsertPosition::End,
+			),
 		];
 
 		for (name, lib, target, position) in cases {
@@ -1268,12 +1370,7 @@ pub fn after() {}
 mod replace {
 	use super::*;
 
-	fn replace(
-		ws: &Workspace,
-		target: &str,
-		source: &str,
-		options: &ReplaceOptions,
-	) -> Result<rscode::edit::Replacement, Error> {
+	fn replace(ws: &Workspace, target: &str, source: &str, options: &ReplaceOptions) -> Result<rscode::edit::Replacement, Error> {
 		rscode::edit::replace(&Resolver::new(ws), &path(target), source, options)
 	}
 
@@ -1366,15 +1463,26 @@ pub mod out;
 			let replacement = replace(&ws, "crate::add", source, &ReplaceOptions::default()).unwrap();
 			let edited = edited(&dir, &replacement.edits, "src/lib.rs");
 
-			assert_eq!(edited.replace("\t\n", "\n").replace("right + left\n\n}", "right + left\n}"), expected, "{source}");
+			assert_eq!(
+				edited.replace("\t\n", "\n").replace("right + left\n\n}", "right + left\n}"),
+				expected,
+				"{source}"
+			);
 		}
 
 		// comments that merely look like one stay
-		for comment in ["// add (fn)", "// Adapted from serde (MIT) src/de.rs:120-140", "// see a::b (fnord) x.rs:1"] {
+		for comment in [
+			"// add (fn)",
+			"// Adapted from serde (MIT) src/de.rs:120-140",
+			"// see a::b (fnord) x.rs:1",
+		] {
 			let source = format!("{comment}\n/// Adds.\npub fn add(left: i32, right: i32) -> i32 {{\n\tright + left\n}}\n");
 			let replacement = replace(&ws, "crate::add", &source, &ReplaceOptions::default()).unwrap();
 
-			assert!(edited(&dir, &replacement.edits, "src/lib.rs").contains(&format!("{comment}\n/// Adds.")), "{comment}");
+			assert!(
+				edited(&dir, &replacement.edits, "src/lib.rs").contains(&format!("{comment}\n/// Adds.")),
+				"{comment}"
+			);
 		}
 
 		// a view of several items has a header above each
@@ -1383,7 +1491,10 @@ pub mod out;
 		let options = InsertOptions::default();
 		let insertion = rscode::edit::insert(&Resolver::new(&ws), Some(&path("crate::out")), source, &options).unwrap();
 
-		assert_eq!(edited(&dir, &insertion.edits, "src/out.rs"), "pub fn o() {}\n\npub struct S;\n\npub struct T;\n");
+		assert_eq!(
+			edited(&dir, &insertion.edits, "src/out.rs"),
+			"pub fn o() {}\n\npub struct S;\n\npub struct T;\n"
+		);
 	}
 
 	#[test]
@@ -1415,8 +1526,7 @@ pub mod out;
 		let lib = "pub fn a() {\r\n\tlet x = 1;\r\n}\r\n";
 		let dir = TempDir::with_files("replace-crlf", &[("src/lib.rs", lib)]);
 		let ws = load(&dir);
-		let replacement =
-			replace(&ws, "crate::a", "pub fn a() {\n\tlet y = 2;\n}\n", &ReplaceOptions::default()).unwrap();
+		let replacement = replace(&ws, "crate::a", "pub fn a() {\n\tlet y = 2;\n}\n", &ReplaceOptions::default()).unwrap();
 
 		assert_eq!(edited(&dir, &replacement.edits, "src/lib.rs"), "pub fn a() {\r\n\tlet y = 2;\r\n}\r\n");
 	}
@@ -1439,12 +1549,14 @@ pub mod out;
 			"the source contains no module items"
 		);
 
-		let options = ReplaceOptions { allow_kind_change: true, ..ReplaceOptions::default() };
+		let options = ReplaceOptions {
+			allow_kind_change: true,
+			..ReplaceOptions::default()
+		};
 		let replacement = replace(&ws, "crate::add", "pub struct Add;\n\npub fn sum() {}", &options).unwrap();
 
 		assert!(
-			edited(&dir, &replacement.edits, "src/lib.rs")
-				.contains("// Attached to `add`.\npub struct Add;\n\npub fn sum() {}\n\npub struct S;")
+			edited(&dir, &replacement.edits, "src/lib.rs").contains("// Attached to `add`.\npub struct Add;\n\npub fn sum() {}\n\npub struct S;")
 		);
 		assert_eq!(
 			replacement.warnings,
@@ -1496,12 +1608,19 @@ pub mod out;
 					.map(native)
 				);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
-		assert!(rscode::edit::replaces_all_variants(&Resolver::new(&ws), &ItemPath::parse("crate::v").unwrap()));
+		assert!(rscode::edit::replaces_all_variants(
+			&Resolver::new(&ws),
+			&ItemPath::parse("crate::v").unwrap()
+		));
 
-		let options = ReplaceOptions { all_variants: true, ..ReplaceOptions::default() };
+		let options = ReplaceOptions {
+			all_variants: true,
+			..ReplaceOptions::default()
+		};
 		let replacement = replace(&ws, "crate::v", "#[cfg(any())]\npub fn v() -> u8 {\n\t3\n}", &options).unwrap();
 		let lib = edited(&dir, &replacement.edits, "src/lib.rs");
 
@@ -1517,30 +1636,28 @@ pub mod out;
 		let replacement = replace(&ws, "crate::v", source, &options).unwrap();
 		let lib = edited(&dir, &replacement.edits, "src/lib.rs");
 
-		assert!(lib.contains("#[cfg(feature = \"x\")]\n/// Three.\npub fn v() -> u8 {\n\t3\n}\n\n#[cfg(not(feature = \"x\"))]\n/// Three."), "{lib}");
+		assert!(
+			lib.contains("#[cfg(feature = \"x\")]\n/// Three.\npub fn v() -> u8 {\n\t3\n}\n\n#[cfg(not(feature = \"x\"))]\n/// Three."),
+			"{lib}"
+		);
 		assert_eq!(lib.matches("pub fn v() -> u8 {\n\t3\n}").count(), 2, "{lib}");
-		assert_eq!(replacement.warnings, ["replaced 2 `cfg` variants of `crate::v` with the same source, with their own `cfg`s"]);
+		assert_eq!(
+			replacement.warnings,
+			["replaced 2 `cfg` variants of `crate::v` with the same source, with their own `cfg`s"]
+		);
 	}
 
 	#[test]
 	fn keeps_code_after_trailing_comments() {
 		let dir = dir("replace-trailing");
 		let ws = load(&dir);
-		let replacement =
-			replace(&ws, "crate::One", "pub struct One; // the first", &ReplaceOptions::default()).unwrap();
+		let replacement = replace(&ws, "crate::One", "pub struct One; // the first", &ReplaceOptions::default()).unwrap();
 
-		assert!(
-			edited(&dir, &replacement.edits, "src/lib.rs")
-				.contains("\npub struct One; // the first\npub struct Two;\n")
-		);
+		assert!(edited(&dir, &replacement.edits, "src/lib.rs").contains("\npub struct One; // the first\npub struct Two;\n"));
 
-		let replacement =
-			replace(&ws, "crate::Two", "pub struct Two; // the second", &ReplaceOptions::default()).unwrap();
+		let replacement = replace(&ws, "crate::Two", "pub struct Two; // the second", &ReplaceOptions::default()).unwrap();
 
-		assert!(
-			edited(&dir, &replacement.edits, "src/lib.rs")
-				.contains("\npub struct One; pub struct Two; // the second\n")
-		);
+		assert!(edited(&dir, &replacement.edits, "src/lib.rs").contains("\npub struct One; pub struct Two; // the second\n"));
 	}
 
 	#[test]
@@ -1550,8 +1667,7 @@ pub mod out;
 		let replacement = replace(&ws, "crate::out", "pub mod out {}", &ReplaceOptions::default()).unwrap();
 
 		assert!(edited(&dir, &replacement.edits, "src/lib.rs").ends_with("\npub mod out {}\n"));
-		let kept =
-			"only the declaration of the module `fixture::out` is replaced; its file `src/out.rs` is left as it is";
+		let kept = "only the declaration of the module `fixture::out` is replaced; its file `src/out.rs` is left as it is";
 
 		assert_eq!(replacement.warnings, [native(kept)]);
 	}
@@ -1565,7 +1681,10 @@ pub mod out;
 			replace(&ws, "crate::nope", "fn nope() {}", &ReplaceOptions::default()),
 			Err(Error::NotFound(_))
 		));
-		assert!(matches!(replace(&ws, "crate", "fn x() {}", &ReplaceOptions::default()), Err(Error::Unsupported(_))));
+		assert!(matches!(
+			replace(&ws, "crate", "fn x() {}", &ReplaceOptions::default()),
+			Err(Error::Unsupported(_))
+		));
 	}
 
 	#[test]
@@ -1579,7 +1698,9 @@ pub mod out;
 		let method = "/// Creates a circle.\npub fn new(radius: f64) -> Self {\n    let radius = Radius(radius.abs());\n\n    Self { radius }\n}\n";
 
 		edits.extend(
-			rscode::edit::replace(&resolver, &path("<crate::shapes::Circle>::new"), method, &options).unwrap().edits,
+			rscode::edit::replace(&resolver, &path("<crate::shapes::Circle>::new"), method, &options)
+				.unwrap()
+				.edits,
 		);
 		edits.extend(
 			rscode::edit::replace(&resolver, &path("crate::shapes::Kind::Square"), "Square { side: f64 }", &options)
@@ -1604,7 +1725,10 @@ pub mod out;
 			"\t/// Creates a circle.\n\tpub fn new(radius: f64) -> Self {\n\t\tlet radius = Radius(radius.abs());\n\n\t\tSelf { radius }\n\t}\n"
 		));
 		assert!(dir.read("src/shapes.rs").contains("\tRound,\n\tSquare { side: f64 },\n\tTriangle,\n"));
-		assert!(dir.read("src/util.rs").starts_with("pub(crate) fn double(value: i32) -> i32 {\n\tvalue + value\n}\n"));
+		assert!(
+			dir.read("src/util.rs")
+				.starts_with("pub(crate) fn double(value: i32) -> i32 {\n\tvalue + value\n}\n")
+		);
 		cargo_check(&dir);
 	}
 }
@@ -1713,7 +1837,12 @@ mod inner;
 
 	/// The text of an item as views show it in full.
 	fn view(ws: &Workspace, target: &str, line_numbers: bool) -> String {
-		let views = View::new().mode(ViewMode::Full).line_numbers(line_numbers).item_path(path(target)).run(ws).unwrap();
+		let views = View::new()
+			.mode(ViewMode::Full)
+			.line_numbers(line_numbers)
+			.item_path(path(target))
+			.run(ws)
+			.unwrap();
 
 		views[0].text.clone()
 	}
@@ -1731,7 +1860,10 @@ mod inner;
 
 		plan(
 			"crate::shapes::Circle::new",
-			text("let radius = Radius(radius);\n\n\tSelf { radius }", "Self {\n\t\tradius: Radius(radius.abs()),\n\t}"),
+			text(
+				"let radius = Radius(radius);\n\n\tSelf { radius }",
+				"Self {\n\t\tradius: Radius(radius.abs()),\n\t}",
+			),
 		);
 		plan(
 			"crate::shapes::Circle",
@@ -1764,9 +1896,79 @@ mod inner;
 		assert_eq!(dir.relative(&applied.written), ["src/lib.rs", "src/shapes.rs"]);
 		assert!(shapes.starts_with("//! Shapes, round ones.\n\npub mod round;"), "{shapes}");
 		assert!(shapes.contains("\t\tSelf {\n\t\t\tradius: Radius(radius.abs()),\n\t\t}\n\t}"), "{shapes}");
-		assert!(shapes.contains("/// A circle,\n/// round.\n#[derive(Debug, Clone, Copy)]\n#[must_use]\npub struct"), "{shapes}");
+		assert!(
+			shapes.contains("/// A circle,\n/// round.\n#[derive(Debug, Clone, Copy)]\n#[must_use]\npub struct"),
+			"{shapes}"
+		);
 		assert!(dir.read("src/lib.rs").contains("\"simple\"") && dir.read("src/lib.rs").contains("pub(crate) fn unit()"));
 		cargo_check(&dir);
+	}
+
+	#[test]
+	fn replace_all_stays_in_one_item_and_uses_original_nonoverlapping_matches() {
+		let options = EditItemOptions {
+			replace_all: true,
+			..Default::default()
+		};
+		for (old, new, body, expected) in [
+			("old()", "old(); old()", "old(); old();", "old(); old(); old(); old();"),
+			("aa", "b", "let _ = \"aaaaa\";", "let _ = \"bba\";"),
+			("é", "界", "let _ = \"éé\";", "let _ = \"界界\";"),
+			("old();", "", "old(); old();", " "),
+			("old()", "old()", "old(); old();", "old(); old();"),
+		] {
+			let source = format!("fn target() {{ {body} }}\nfn sibling() {{ {body} }}\n");
+			let dir = crate_dir("replace-all-matches", &source);
+			let ws = load(&dir);
+			assert!(edit(&ws, "crate::target", text(old, new)).is_err());
+			let plan = edit_with(&ws, "crate::target", text(old, new), &options).unwrap();
+			assert_eq!(
+				super::edited(&dir, &plan.edits, "src/lib.rs"),
+				format!("fn target() {{ {expected} }}\nfn sibling() {{ {body} }}\n")
+			);
+		}
+	}
+
+	#[test]
+	fn replace_all_preserves_numbered_views_indentation_and_crlf() {
+		let source = "mod nested {\r\n\tfn target() {\r\n\t\told();\r\n\t\told();\r\n\t}\r\n}\r\n";
+		let dir = crate_dir("replace-all-views", source);
+		let ws = load(&dir);
+		let options = EditItemOptions {
+			replace_all: true,
+			..Default::default()
+		};
+		let numbered = view(&ws, "crate::nested::target", true);
+		let old = numbered.lines().find(|line| line.contains("old();")).unwrap();
+		let plan = edit_with(
+			&ws,
+			"crate::nested::target",
+			text(old, &old.replace("old();", "new();\n\tmore();")),
+			&options,
+		)
+		.unwrap();
+		assert_eq!(
+			super::edited(&dir, &plan.edits, "src/lib.rs"),
+			source.replace("old();", "new();\r\n\t\tmore();")
+		);
+		// Empty and absent patterns remain failures, even with replace_all.
+		assert!(edit_with(&ws, "crate::nested::target", text("", "new()"), &options).is_err());
+		assert!(edit_with(&ws, "crate::nested::target", text("missing()", "new()"), &options).is_err());
+	}
+
+	#[test]
+	fn replace_all_does_not_resolve_ambiguous_cfg_items() {
+		let source = "#[cfg(feature = \"a\")]\nfn target() { old(); old(); }\n#[cfg(not(feature = \"a\"))]\nfn target() { old(); old(); }\n";
+		let dir = crate_dir("replace-all-cfg", source);
+		let ws = load(&dir);
+		let mut options = EditItemOptions {
+			replace_all: true,
+			..Default::default()
+		};
+		assert!(edit_with(&ws, "crate::target", text("old()", "new()"), &options).is_err());
+		options.all_variants = true;
+		let plan = edit_with(&ws, "crate::target", text("old()", "new()"), &options).unwrap();
+		assert_eq!(super::edited(&dir, &plan.edits, "src/lib.rs"), source.replace("old()", "new()"));
 	}
 
 	#[test]
@@ -1787,7 +1989,10 @@ mod inner;
 		let edited = |result: Result<Replacement, Error>, file: &str| edited(&dir, &result.unwrap().edits, file);
 
 		// removed by path or by exact text, with their line when nothing else is on it
-		assert_eq!(edited(attributes("crate::Shape", &[], &["derive"]), "src/lib.rs"), LIB.replace("#[derive(Debug, Clone)]\n", ""));
+		assert_eq!(
+			edited(attributes("crate::Shape", &[], &["derive"]), "src/lib.rs"),
+			LIB.replace("#[derive(Debug, Clone)]\n", "")
+		);
 		assert_eq!(
 			edited(attributes("crate::Shape::name", &[], &["#[allow( unused )]"]), "src/lib.rs"),
 			LIB.replace(" #[allow(unused)]", "")
@@ -1827,7 +2032,10 @@ mod inner;
 		// the traits of a `derive` join the item's `derive`, but those that it derives already
 		let plan = attributes("crate::Shape", &["derive(Clone, PartialEq)"], &[]).unwrap();
 
-		assert_eq!(super::edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("(Debug, Clone)", "(Debug, Clone, PartialEq)"));
+		assert_eq!(
+			super::edited(&dir, &plan.edits, "src/lib.rs"),
+			LIB.replace("(Debug, Clone)", "(Debug, Clone, PartialEq)")
+		);
 		assert_eq!(plan.notes, ["`fixture::Shape` already derives `Clone`"]);
 
 		let plan = attributes("crate::Shape", &["#[derive(Debug)]"], &[]).unwrap();
@@ -1885,8 +2093,14 @@ mod inner;
 			LIB.replace("/// Shapes.\n", "/// A shape.\n///\n/// With sides.\n")
 		);
 		assert_eq!(edited(doc("crate::Shape", ""), "src/lib.rs"), LIB.replace("/// Shapes.\n", ""));
-		assert_eq!(edited(doc("crate::Kind", "/// Kinds."), "src/lib.rs"), LIB.replace("pub enum Kind", "/// Kinds.\npub enum Kind"));
-		assert_eq!(edited(doc("crate::Kind::A", "The first."), "src/lib.rs"), LIB.replace("\tA,", "\t/// The first.\n\tA,"));
+		assert_eq!(
+			edited(doc("crate::Kind", "/// Kinds."), "src/lib.rs"),
+			LIB.replace("pub enum Kind", "/// Kinds.\npub enum Kind")
+		);
+		assert_eq!(
+			edited(doc("crate::Kind::A", "The first."), "src/lib.rs"),
+			LIB.replace("\tA,", "\t/// The first.\n\tA,")
+		);
 
 		// the lines of an item that new docs start
 		let span = |plan: Replacement| (plan.spans[0].start, plan.spans[0].end);
@@ -1895,9 +2109,15 @@ mod inner;
 		assert_eq!(span(doc("crate::Kind::A", "The first.")), (44, 45));
 
 		// the docs of a module with a file are its inner docs
-		assert_eq!(edited(doc("crate::inner", "Inner, changed."), "src/inner.rs"), INNER.replace("Inner docs.", "Inner, changed."));
+		assert_eq!(
+			edited(doc("crate::inner", "Inner, changed."), "src/inner.rs"),
+			INNER.replace("Inner docs.", "Inner, changed.")
+		);
 		assert_eq!(edited(doc("crate::inner", ""), "src/inner.rs"), "pub fn f() {}\n");
-		assert_eq!(edited(doc("crate", "The crate."), "src/lib.rs"), LIB.replace("The fixture.", "The crate."));
+		assert_eq!(
+			edited(doc("crate", "The crate."), "src/lib.rs"),
+			LIB.replace("The fixture.", "The crate.")
+		);
 
 		// the same docs again change nothing
 		let plan = doc("crate::Shape", "Shapes.");
@@ -1927,10 +2147,22 @@ mod inner;
 			edited(visibility("crate::Shape::triangle", "pub(crate)"), "src/lib.rs"),
 			LIB.replace("pub fn triangle", "pub(crate) fn triangle")
 		);
-		assert_eq!(edited(visibility("crate::Shape::name", "pub"), "src/lib.rs"), LIB.replace("\tfn name", "\tpub fn name"));
-		assert_eq!(edited(visibility("crate::Shape", "private"), "src/lib.rs"), LIB.replace("pub struct Shape", "struct Shape"));
-		assert_eq!(edited(visibility("crate::inner", "crate"), "src/lib.rs"), LIB.replace("mod inner;", "pub(crate) mod inner;"));
-		assert_eq!(edited(visibility("use crate::fmt", "pub"), "src/lib.rs"), LIB.replace("use std::fmt;", "pub use std::fmt;"));
+		assert_eq!(
+			edited(visibility("crate::Shape::name", "pub"), "src/lib.rs"),
+			LIB.replace("\tfn name", "\tpub fn name")
+		);
+		assert_eq!(
+			edited(visibility("crate::Shape", "private"), "src/lib.rs"),
+			LIB.replace("pub struct Shape", "struct Shape")
+		);
+		assert_eq!(
+			edited(visibility("crate::inner", "crate"), "src/lib.rs"),
+			LIB.replace("mod inner;", "pub(crate) mod inner;")
+		);
+		assert_eq!(
+			edited(visibility("use crate::fmt", "pub"), "src/lib.rs"),
+			LIB.replace("use std::fmt;", "pub use std::fmt;")
+		);
 
 		let unchanged = visibility("crate::Shape", " pub ").unwrap();
 
@@ -2078,7 +2310,10 @@ mod inner;
 				 #[cfg(not(feature = \"a\"))] has the text to replace"
 			)]
 		);
-		assert!(matches!(edit(&ws, "crate::variant", text("-> u8", "-> u16")), Err(Error::Ambiguous { .. })));
+		assert!(matches!(
+			edit(&ws, "crate::variant", text("-> u8", "-> u16")),
+			Err(Error::Ambiguous { .. })
+		));
 		assert_eq!(
 			message(edit(&ws, "crate::variant", text("3", "30"))),
 			"`old` not found in any of the 2 items that `crate::variant` names"
@@ -2208,7 +2443,12 @@ mod inner;
 
 		assert!(viewed.contains("\tlet sides = 3;\n\n\tSelf { sides }\n}"), "{viewed}");
 
-		let plan = edit(&ws, triangle, text("\tlet sides = 3;\n\n\tSelf { sides }", "\tSelf {\n\t\tsides: 3,\n\t}")).unwrap();
+		let plan = edit(
+			&ws,
+			triangle,
+			text("\tlet sides = 3;\n\n\tSelf { sides }", "\tSelf {\n\t\tsides: 3,\n\t}"),
+		)
+		.unwrap();
 
 		assert_eq!(
 			edited(&dir, &plan.edits, "src/lib.rs"),
@@ -2229,7 +2469,10 @@ mod inner;
 		// which of several occurrences, by the line numbers
 		let plan = edit(&ws, triangle, text("  18 │ }", "  18 │ } // triangle")).unwrap();
 
-		assert_eq!(edited(&dir, &plan.edits, "src/lib.rs"), LIB.replace("{ sides }\n\t}", "{ sides }\n\t} // triangle"));
+		assert_eq!(
+			edited(&dir, &plan.edits, "src/lib.rs"),
+			LIB.replace("{ sides }\n\t}", "{ sides }\n\t} // triangle")
+		);
 		assert!(matches!(edit(&ws, triangle, text("}", "")), Err(Error::TextMismatch { lines, .. }) if lines == [17, 18]));
 
 		// a whole view (with a line break after it), whose string keeps its continuation line
@@ -2254,7 +2497,10 @@ mod inner;
 		};
 		let triangle = native("`fixture::Shape::triangle` (src/lib.rs:13-18)");
 
-		assert_eq!(mismatch("sides"), (format!("`old` occurs 2 times in {triangle}, at lines 15, 17"), vec![15, 17]));
+		assert_eq!(
+			mismatch("sides"),
+			(format!("`old` occurs 2 times in {triangle}, at lines 15, 17"), vec![15, 17])
+		);
 		assert_eq!(
 			mismatch("let sides = 3;\n\n    Self { sides }").0,
 			format!(
@@ -2262,7 +2508,10 @@ mod inner;
 				 tabs, `old` with spaces)"
 			)
 		);
-		assert_eq!(mismatch("let sides = 6;").0, format!("`old` not found in {triangle}; the closest line is 15: `let sides = 3;`"));
+		assert_eq!(
+			mismatch("let sides = 6;").0,
+			format!("`old` not found in {triangle}; the closest line is 15: `let sides = 3;`")
+		);
 		assert_eq!(
 			mismatch("let sides = 3;\nSelf").0,
 			format!("`old` not found in {triangle}; its first line is at line 15, but what follows differs")
@@ -2289,12 +2538,7 @@ mod inner;
 mod insert {
 	use super::*;
 
-	fn insert(
-		ws: &Workspace,
-		parent: &str,
-		source: &str,
-		options: &InsertOptions,
-	) -> Result<rscode::edit::Insertion, Error> {
+	fn insert(ws: &Workspace, parent: &str, source: &str, options: &InsertOptions) -> Result<rscode::edit::Insertion, Error> {
 		rscode::edit::insert(&Resolver::new(ws), Some(&path(parent)), source, options)
 	}
 
@@ -2365,7 +2609,10 @@ pub mod out;
 		let insertion = insert(&ws, "crate::out", "pub struct O;", &at_position(InsertPosition::Start)).unwrap();
 
 		assert_eq!(insertion.file, dir.path("src/out.rs"));
-		assert_eq!(edited(&dir, &insertion.edits, "src/out.rs"), "//! Out.\n\npub struct O;\n\npub fn o() {}\n");
+		assert_eq!(
+			edited(&dir, &insertion.edits, "src/out.rs"),
+			"//! Out.\n\npub struct O;\n\npub fn o() {}\n"
+		);
 	}
 
 	#[test]
@@ -2392,7 +2639,10 @@ pub mod out;
 
 		let insertion = insert(&ws, "crate::empty", source, &start).unwrap();
 
-		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("pub mod empty {\n\t//! Added docs.\n\t#![allow(dead_code)]\n\tpub fn added() {}\n}"));
+		assert!(
+			edited(&dir, &insertion.edits, "src/lib.rs")
+				.contains("pub mod empty {\n\t//! Added docs.\n\t#![allow(dead_code)]\n\tpub fn added() {}\n}")
+		);
 
 		for position in [InsertPosition::End, InsertPosition::Before("o".to_owned())] {
 			assert!(matches!(
@@ -2418,22 +2668,15 @@ pub mod out;
 		let ws = load(&dir);
 
 		// by name
-		let insertion =
-			insert(&ws, "crate::util", "pub fn c() {}", &at_position(InsertPosition::Before("b".to_owned()))).unwrap();
+		let insertion = insert(&ws, "crate::util", "pub fn c() {}", &at_position(InsertPosition::Before("b".to_owned()))).unwrap();
 
-		assert!(
-			edited(&dir, &insertion.edits, "src/lib.rs")
-				.contains("\tpub fn a() {}\n\n\tpub fn c() {}\n\n\tpub fn b() {}\n}")
-		);
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("\tpub fn a() {}\n\n\tpub fn c() {}\n\n\tpub fn b() {}\n}"));
 
 		// by path
 		let position = InsertPosition::After("crate::util::a".to_owned());
 		let insertion = insert(&ws, "crate::util", "pub fn c() {\n    todo!()\n}", &at_position(position)).unwrap();
 
-		assert!(
-			edited(&dir, &insertion.edits, "src/lib.rs")
-				.contains("\tpub fn a() {}\n\n\tpub fn c() {\n\t\ttodo!()\n\t}\n\n\tpub fn b() {}\n}")
-		);
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("\tpub fn a() {}\n\n\tpub fn c() {\n\t\ttodo!()\n\t}\n\n\tpub fn b() {}\n}"));
 
 		// at the end and start of inline modules
 		let insertion = insert(&ws, "crate::util", "pub fn z() {}", &InsertOptions::default()).unwrap();
@@ -2442,10 +2685,7 @@ pub mod out;
 
 		let insertion = insert(&ws, "crate::util", "pub fn z() {}", &at_position(InsertPosition::Start)).unwrap();
 
-		assert!(
-			edited(&dir, &insertion.edits, "src/lib.rs")
-				.contains("pub mod util {\n\tpub fn z() {}\n\n\tuse std::fmt;\n")
-		);
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("pub mod util {\n\tpub fn z() {}\n\n\tuse std::fmt;\n"));
 
 		let insertion = insert(&ws, "crate::empty", "pub fn z() {}", &InsertOptions::default()).unwrap();
 
@@ -2456,29 +2696,19 @@ pub mod out;
 	fn inserts_into_impl_blocks_and_traits() {
 		let dir = dir("insert-impl");
 		let ws = load(&dir);
-		let insertion =
-			insert(&ws, "<crate::S>", "pub fn get(&self) -> u8 {\n    1\n}", &InsertOptions::default()).unwrap();
+		let insertion = insert(&ws, "<crate::S>", "pub fn get(&self) -> u8 {\n    1\n}", &InsertOptions::default()).unwrap();
 
-		assert!(
-			edited(&dir, &insertion.edits, "src/lib.rs")
-				.contains("\t\tS\n\t}\n\n\tpub fn get(&self) -> u8 {\n\t\t1\n\t}\n}")
-		);
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("\t\tS\n\t}\n\n\tpub fn get(&self) -> u8 {\n\t\t1\n\t}\n}"));
 		assert_eq!(insertion.inserted, [(ItemKind::AssocFn, Some("get".to_owned()))]);
 
 		let insertion = insert(&ws, "crate::Tr", "fn g(&self) {}", &InsertOptions::default()).unwrap();
 
-		assert!(
-			edited(&dir, &insertion.edits, "src/lib.rs")
-				.contains("pub trait Tr {\n\tfn f(&self);\n\n\tfn g(&self) {}\n}")
-		);
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("pub trait Tr {\n\tfn f(&self);\n\n\tfn g(&self) {}\n}"));
 
 		// an item that the trait does not have
 		let insertion = insert(&ws, "<crate::S as Tr>", "fn h(&self) {}", &InsertOptions::default()).unwrap();
 
-		assert!(
-			edited(&dir, &insertion.edits, "src/lib.rs")
-				.contains("impl Tr for S {\n\tfn f(&self) {}\n\n\tfn h(&self) {}\n}")
-		);
+		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("impl Tr for S {\n\tfn f(&self) {}\n\n\tfn h(&self) {}\n}"));
 		assert_eq!(insertion.warnings, ["the trait `fixture::Tr` has no item named `h`"]);
 	}
 
@@ -2487,9 +2717,13 @@ pub mod out;
 		let lib = "pub struct S;\n\nimpl S {\n  pub fn a() {}\n}\n\nmod m {\n}\n";
 		let dir = TempDir::with_files("insert-style", &[("src/lib.rs", lib)]);
 		let ws = load(&dir);
-		let insertion =
-			insert(&ws, "<crate::S>", "pub fn b() {\n\tif true {\n\t\treturn;\n\t}\n}", &InsertOptions::default())
-				.unwrap();
+		let insertion = insert(
+			&ws,
+			"<crate::S>",
+			"pub fn b() {\n\tif true {\n\t\treturn;\n\t}\n}",
+			&InsertOptions::default(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			edited(&dir, &insertion.edits, "src/lib.rs"),
@@ -2511,6 +2745,7 @@ pub mod out;
 				assert_eq!(name, "a");
 				assert_eq!(collisions, [native("`a`: `fixture::util::a` (fn) at src/lib.rs:6:2")]);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -2523,6 +2758,7 @@ pub mod out;
 					 `fixture::util::b` (fn) at src/lib.rs:8:2"
 				)
 			),
+
 			other => panic!("{other:?}"),
 		}
 
@@ -2547,9 +2783,16 @@ pub mod out;
 		assert!(insert(&ws, "crate::util", "pub struct a {}", &InsertOptions::default()).is_ok());
 		assert!(insert(&ws, "crate::globbed", "pub struct S;", &InsertOptions::default()).is_ok());
 
-		let insertion =
-			insert(&ws, "crate::util", "pub fn a() {}", &InsertOptions { force: true, ..InsertOptions::default() })
-				.unwrap();
+		let insertion = insert(
+			&ws,
+			"crate::util",
+			"pub fn a() {}",
+			&InsertOptions {
+				force: true,
+				..InsertOptions::default()
+			},
+		)
+		.unwrap();
 
 		let collision = native("inserted `a`, which collides with `fixture::util::a` (fn) at src/lib.rs:6:2");
 
@@ -2566,6 +2809,7 @@ pub mod out;
 			Err(Error::Collision { collisions, .. }) => {
 				assert_eq!(collisions, [native("`fmt`: the import of `std::fmt` at src/lib.rs:4:6")])
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -2575,7 +2819,10 @@ pub mod out;
 		}
 
 		// `crate::S` is a unit struct (a type and a value), `crate::util::a` a function
-		assert!(matches!(insert(&ws, "crate::util", "use crate::S as a;", &InsertOptions::default()), Err(Error::Collision { .. })));
+		assert!(matches!(
+			insert(&ws, "crate::util", "use crate::S as a;", &InsertOptions::default()),
+			Err(Error::Collision { .. })
+		));
 		assert!(insert(&ws, "crate::util", "use crate::Tr as a;", &InsertOptions::default()).is_ok());
 	}
 
@@ -2587,7 +2834,10 @@ pub mod out;
 
 		assert_eq!(changes(&dir, &insertion.edits).keys().collect::<Vec<_>>(), ["src/util.rs"]);
 		assert!(edited(&dir, &insertion.edits, "src/util.rs").ends_with("{2}\n\npub(crate) fn one() -> i32 {\n\t1\n}\n"));
-		assert!(matches!(insert(&ws, "crate::util", "fn double() {}", &InsertOptions::default()), Err(Error::Collision { .. })));
+		assert!(matches!(
+			insert(&ws, "crate::util", "fn double() {}", &InsertOptions::default()),
+			Err(Error::Collision { .. })
+		));
 	}
 
 	#[test]
@@ -2638,10 +2888,16 @@ pub mod out;
 				"cannot insert into `crate::util::a`: it is a fn, and items can only be inserted into modules, `impl` blocks, and \
 				 traits"
 			),
+
 			other => panic!("{other:?}"),
 		}
 
-		match insert(&ws, "crate::util", "fn x() {}", &at_position(InsertPosition::Before("crate::S".to_owned()))) {
+		match insert(
+			&ws,
+			"crate::util",
+			"fn x() {}",
+			&at_position(InsertPosition::Before("crate::S".to_owned())),
+		) {
 			Err(Error::Unsupported(message)) => assert_eq!(message, "`crate::S` is not an item of `crate::util`"),
 			other => panic!("{other:?}"),
 		}
@@ -2650,6 +2906,7 @@ pub mod out;
 			Err(error @ Error::NotFound(_)) => {
 				assert_eq!(error.to_string(), "no item found for `zzz` in `crate::util`")
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -2662,6 +2919,7 @@ pub mod out;
 			Err(Error::InvalidSource(message)) => {
 				assert!(message.contains("associated items of an `impl` block at 1:1"), "{message}")
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -2669,6 +2927,7 @@ pub mod out;
 			Err(Error::InvalidSource(message)) => {
 				assert_eq!(message, "the source contains no associated items of an `impl` block")
 			}
+
 			other => panic!("{other:?}"),
 		}
 	}
@@ -2684,15 +2943,18 @@ pub mod out;
 			Err(Error::Ambiguous { candidates, .. }) => {
 				assert_eq!(
 					candidates,
-					["`impl fixture::S[a]` (impl) at src/lib.rs:3:1", "`impl fixture::S[b]` (impl) at src/lib.rs:7:1"]
-						.map(native)
+					[
+						"`impl fixture::S[a]` (impl) at src/lib.rs:3:1",
+						"`impl fixture::S[b]` (impl) at src/lib.rs:7:1"
+					]
+					.map(native)
 				)
 			}
+
 			other => panic!("{other:?}"),
 		}
 
-		let insertion =
-			insert(&ws, "<crate::S>", "pub fn c() {}", &at_position(InsertPosition::After("b".to_owned()))).unwrap();
+		let insertion = insert(&ws, "<crate::S>", "pub fn c() {}", &at_position(InsertPosition::After("b".to_owned()))).unwrap();
 
 		assert!(edited(&dir, &insertion.edits, "src/lib.rs").ends_with("\tpub fn b() {}\n\n\tpub fn c() {}\n}\n"));
 
@@ -2735,12 +2997,18 @@ pub mod m {
 		let insertion = insert(InsertPosition::After("crate::S::b".to_owned())).unwrap();
 
 		assert_eq!(insertion.parent, "impl fixture::S[b]");
-		assert_eq!(edited(&dir, &insertion.edits, "src/lib.rs"), lib.replace("pub fn b() {}\n", "pub fn b() {}\n\n\tpub fn c() {}\n"));
+		assert_eq!(
+			edited(&dir, &insertion.edits, "src/lib.rs"),
+			lib.replace("pub fn b() {}\n", "pub fn b() {}\n\n\tpub fn c() {}\n")
+		);
 
 		let insertion = insert(InsertPosition::Before("m::f".to_owned())).unwrap();
 
 		assert_eq!(insertion.parent, "fixture::m");
-		assert_eq!(edited(&dir, &insertion.edits, "src/lib.rs"), lib.replace("\tpub fn f", "\tpub fn c() {}\n\n\tpub fn f"));
+		assert_eq!(
+			edited(&dir, &insertion.edits, "src/lib.rs"),
+			lib.replace("\tpub fn f", "\tpub fn c() {}\n\n\tpub fn f")
+		);
 
 		// the anchor must name items of one container
 		match insert(InsertPosition::After("crate::S::x".to_owned())) {
@@ -2748,9 +3016,14 @@ pub mod m {
 				assert_eq!(path, "crate::S::x");
 				assert_eq!(
 					candidates,
-					["`impl fixture::S[a]` (impl) at src/lib.rs:3:1", "`impl fixture::S[b]` (impl) at src/lib.rs:10:1"].map(native)
+					[
+						"`impl fixture::S[a]` (impl) at src/lib.rs:3:1",
+						"`impl fixture::S[b]` (impl) at src/lib.rs:10:1"
+					]
+					.map(native)
 				);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -2829,12 +3102,48 @@ mod tail {
 		let cases = [
 			("crate", "mod b;", after("crate::a"), "mod a;\nmod c;", "mod a;\nmod b;\nmod c;"),
 			("crate", "mod b;", before("crate::c"), "mod a;\nmod c;", "mod a;\nmod b;\nmod c;"),
-			("crate", "mod t;\nmod u;", after("crate::spaced"), "mod spaced;\n", "mod spaced;\nmod t;\nmod u;\n"),
-			("crate", "use std::env;", before("use crate::fmt"), "\nuse std::fmt;", "\nuse std::env;\nuse std::fmt;"),
-			("crate", "pub use a::B;", after("use crate::A"), "pub use a::A;\n", "pub use a::A;\npub use a::B;\n"),
-			("crate", "const XX: u8 = 3;", after("crate::X"), "X: u8 = 1;\n", "X: u8 = 1;\nconst XX: u8 = 3;\n"),
-			("crate", "use std::io;", InsertPosition::End, "\tuse std::fmt;\n", "\tuse std::fmt;\n\tuse std::io;\n"),
-			("<crate::S>", "const B: u8 = 2;", after("A"), "= 1;\n\n\tfn f", "= 1;\n\tconst B: u8 = 2;\n\n\tfn f"),
+			(
+				"crate",
+				"mod t;\nmod u;",
+				after("crate::spaced"),
+				"mod spaced;\n",
+				"mod spaced;\nmod t;\nmod u;\n",
+			),
+			(
+				"crate",
+				"use std::env;",
+				before("use crate::fmt"),
+				"\nuse std::fmt;",
+				"\nuse std::env;\nuse std::fmt;",
+			),
+			(
+				"crate",
+				"pub use a::B;",
+				after("use crate::A"),
+				"pub use a::A;\n",
+				"pub use a::A;\npub use a::B;\n",
+			),
+			(
+				"crate",
+				"const XX: u8 = 3;",
+				after("crate::X"),
+				"X: u8 = 1;\n",
+				"X: u8 = 1;\nconst XX: u8 = 3;\n",
+			),
+			(
+				"crate",
+				"use std::io;",
+				InsertPosition::End,
+				"\tuse std::fmt;\n",
+				"\tuse std::fmt;\n\tuse std::io;\n",
+			),
+			(
+				"<crate::S>",
+				"const B: u8 = 2;",
+				after("A"),
+				"= 1;\n\n\tfn f",
+				"= 1;\n\tconst B: u8 = 2;\n\n\tfn f",
+			),
 		];
 
 		for (parent, source, position, old, new) in cases {
@@ -2847,7 +3156,12 @@ mod tail {
 
 		// next to an item with docs, other kinds of items, items with docs, and items of several groups
 		let cases = [
-			("const Z: u8 = 3;", after("crate::Y"), "const Y: u8 = 2;\n", "const Y: u8 = 2;\n\nconst Z: u8 = 3;\n"),
+			(
+				"const Z: u8 = 3;",
+				after("crate::Y"),
+				"const Y: u8 = 2;\n",
+				"const Y: u8 = 2;\n\nconst Z: u8 = 3;\n",
+			),
 			("fn g() {}", after("crate::a"), "mod a;\n", "mod a;\n\nfn g() {}\n\n"),
 			("/// B.\nmod b;", after("crate::a"), "mod a;\n", "mod a;\n\n/// B.\nmod b;\n\n"),
 			("mod b;\nuse b::B;", after("crate::a"), "mod a;\n", "mod a;\n\nmod b;\nuse b::B;\n\n"),
@@ -2870,7 +3184,11 @@ mod tail {
 		let resolver = Resolver::new(&ws);
 		let mut edits = EditSet::new();
 		let insertions = [
-			("crate::util", "pub(crate) fn triple(value: i32) -> i32 {\n    value * 3\n}", InsertPosition::Start),
+			(
+				"crate::util",
+				"pub(crate) fn triple(value: i32) -> i32 {\n    value * 3\n}",
+				InsertPosition::Start,
+			),
 			(
 				"<crate::shapes::Circle>",
 				"/// The diameter.\npub fn diameter(&self) -> f64 {\n    self.radius.0 * 2.0\n}",
@@ -2904,9 +3222,10 @@ mod tail {
 		assert!(dir.read("src/shapes.rs").contains(
 			"\t\tSelf { radius }\n\t}\n\n\t/// The diameter.\n\tpub fn diameter(&self) -> f64 {\n\t\tself.radius.0 * 2.0\n\t}\n\n\t/// The radius."
 		));
-		assert!(dir.read("src/shapes.rs").contains(
-			"\tfn area(&self) -> f64;\n\n\t/// The name.\n\tfn name(&self) -> &'static str {\n\t\t\"shape\"\n\t}\n}"
-		));
+		assert!(
+			dir.read("src/shapes.rs")
+				.contains("\tfn area(&self) -> f64;\n\n\t/// The name.\n\tfn name(&self) -> &'static str {\n\t\t\"shape\"\n\t}\n}")
+		);
 		assert_eq!(
 			dir.read("src/nested/mod.rs"),
 			"//! A module in a `mod.rs` file.\n\npub mod deep;\n\n/// Also nested.\npub struct Also;\n\n/// Something nested.\npub struct Nested;\n"
@@ -2925,7 +3244,10 @@ mod format {
 	}
 
 	fn rustfmt() -> FmtOptions {
-		FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt), ..FmtOptions::default() }
+		FmtOptions {
+			format: FormatOptions::new().formatter(RsFormatter::RustFmt),
+			..FmtOptions::default()
+		}
 	}
 
 	fn sort_only() -> FmtOptions {
@@ -2937,7 +3259,9 @@ mod format {
 
 	/// The files that the formatting processed, and whether they change.
 	fn processed(dir: &TempDir, formatting: &rscode::edit::Formatting) -> Vec<(String, bool)> {
-		(formatting.changes.iter()).map(|change| (dir.relative_path(&change.path), change.is_changed())).collect()
+		(formatting.changes.iter())
+			.map(|change| (dir.relative_path(&change.path), change.is_changed()))
+			.collect()
 	}
 
 	const UTIL: &str = "pub(crate) fn double(value: i32) -> i32 {\n\tvalue * 2\n}\n\n#[allow(dead_code)]\npub(crate)   fn   zeta( )->u8{1}\n\n#[allow(dead_code)]\npub(crate)   fn   alpha( )->u8{2}\n";
@@ -2976,7 +3300,13 @@ mod format {
 		let dir = TempDir::with_files("format-selectors", &[("rustfmt.toml", "hard_tabs = true\n"), ("src/lib.rs", lib)]);
 		let ws = load(&dir);
 
-		for target in ["<Tools>[b]::b", "<crate::Tools>[2]::*", "<Tools>[#allow]::b*", "impl Tools[#allow]", "impl crate::Tools[2]"] {
+		for target in [
+			"<Tools>[b]::b",
+			"<crate::Tools>[2]::*",
+			"<Tools>[#allow]::b*",
+			"impl Tools[#allow]",
+			"impl crate::Tools[2]",
+		] {
 			let formatting = format(&ws, &[target], &rustfmt()).unwrap();
 
 			assert_eq!(
@@ -3010,7 +3340,10 @@ mod format {
 			"/// A radius.\n#[derive(Debug, Clone, Copy)]\npub struct Radius(pub f64);\n"
 		);
 
-		let options = FmtOptions { skip_children: true, ..rustfmt() };
+		let options = FmtOptions {
+			skip_children: true,
+			..rustfmt()
+		};
 		let formatting = format(&ws, &["crate::shapes"], &options).unwrap();
 
 		assert_eq!(processed(&dir, &formatting), [("src/shapes.rs".to_owned(), false)]);
@@ -3030,7 +3363,10 @@ mod format {
 		assert!(position("fn double") < position("fn   zeta"), "{util}");
 
 		// nothing to do without sorting and formatting
-		let options = FmtOptions { format: FormatOptions::new().formatter(RsFormatter::None), ..FmtOptions::default() };
+		let options = FmtOptions {
+			format: FormatOptions::new().formatter(RsFormatter::None),
+			..FmtOptions::default()
+		};
 		let formatting = format(&ws, &["crate::util"], &options).unwrap();
 
 		assert_eq!(processed(&dir, &formatting), [("src/util.rs".to_owned(), false)]);
@@ -3039,7 +3375,8 @@ mod format {
 
 	#[test]
 	fn skips_child_files_but_sorts_inline_children() {
-		let lib = "pub mod m {\n\tpub fn b() {}\n\tpub fn a() {}\n\n\tpub mod inner {\n\t\tpub fn d() {}\n\t\tpub fn c() {}\n\t}\n\n\tpub mod child;\n}\n";
+		let lib =
+			"pub mod m {\n\tpub fn b() {}\n\tpub fn a() {}\n\n\tpub mod inner {\n\t\tpub fn d() {}\n\t\tpub fn c() {}\n\t}\n\n\tpub mod child;\n}\n";
 		let child = "pub fn d() {}\npub fn c() {}\n";
 		let dir = TempDir::with_files("format-sort-children", &[("src/lib.rs", lib), ("src/m/child.rs", child)]);
 		let ws = load(&dir);
@@ -3052,7 +3389,15 @@ mod format {
 		let sorted_child = edited(&dir, &formatting.edits, "src/m/child.rs");
 		assert!(sorted_child.find("fn c").unwrap() < sorted_child.find("fn d").unwrap(), "{sorted_child}");
 
-		let formatting = format(&ws, &["crate::m"], &FmtOptions { skip_children: true, ..sort_only() }).unwrap();
+		let formatting = format(
+			&ws,
+			&["crate::m"],
+			&FmtOptions {
+				skip_children: true,
+				..sort_only()
+			},
+		)
+		.unwrap();
 		let sorted = edited(&dir, &formatting.edits, "src/lib.rs");
 
 		assert!(sorted.find("fn a").unwrap() < sorted.find("fn b").unwrap(), "{sorted}");
@@ -3064,8 +3409,10 @@ mod format {
 	fn formats_with_prettyplease() {
 		let dir = TempDir::fixture("format-prettyplease");
 		let ws = load_fixture(&dir, false);
-		let options =
-			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::PrettyPlease), ..FmtOptions::default() };
+		let options = FmtOptions {
+			format: FormatOptions::new().formatter(RsFormatter::PrettyPlease),
+			..FmtOptions::default()
+		};
 		let formatting = format(&ws, &["crate::util::zeta"], &options).unwrap();
 		let util = edited(&dir, &formatting.edits, "src/util.rs");
 
@@ -3107,8 +3454,7 @@ mod format {
 		let util = edited(&dir, &formatting.edits, "src/util.rs");
 
 		assert!(
-			util.contains("pub(crate) fn zeta() -> u8 {\n\t1\n}")
-				&& util.contains("pub(crate) fn alpha() -> u8 {\n\t2\n}"),
+			util.contains("pub(crate) fn zeta() -> u8 {\n\t1\n}") && util.contains("pub(crate) fn alpha() -> u8 {\n\t2\n}"),
 			"{util}"
 		);
 
@@ -3124,12 +3470,18 @@ mod format {
 		// items of `impl` blocks, and the blocks
 		dir.write(
 			"src/shapes.rs",
-			&dir.read("src/shapes.rs").replace("pub fn new(radius: f64) -> Self {", "pub fn new( radius: f64 )->Self{"),
+			&dir.read("src/shapes.rs")
+				.replace("pub fn new(radius: f64) -> Self {", "pub fn new( radius: f64 )->Self{"),
 		);
 
 		let ws = load_fixture(&dir, false);
 
-		for target in ["<crate::shapes::Circle>::new", "<*Circle>::new", "<crate::shapes::Circle>", "impl *Circle"] {
+		for target in [
+			"<crate::shapes::Circle>::new",
+			"<*Circle>::new",
+			"<crate::shapes::Circle>",
+			"impl *Circle",
+		] {
 			let formatting = format(&ws, &[target], &rustfmt()).unwrap();
 
 			assert!(
@@ -3148,9 +3500,7 @@ mod format {
 		let dir = TempDir::fixture("format-unmatched");
 		let ws = load_fixture(&dir, false);
 
-		assert!(
-			matches!(format(&ws, &["crate::nope"], &rustfmt()), Err(Error::NotFound(path)) if path == "crate::nope")
-		);
+		assert!(matches!(format(&ws, &["crate::nope"], &rustfmt()), Err(Error::NotFound(path)) if path == "crate::nope"));
 
 		let formatting = format(&ws, &["crate::nope*"], &rustfmt()).unwrap();
 
@@ -3168,9 +3518,20 @@ mod format {
 
 		assert_eq!(processed(&dir, &formatting).len(), 3);
 
-		let formatting = format(&ws, &["crate"], &FmtOptions { active_only: true, ..rustfmt() }).unwrap();
+		let formatting = format(
+			&ws,
+			&["crate"],
+			&FmtOptions {
+				active_only: true,
+				..rustfmt()
+			},
+		)
+		.unwrap();
 
-		assert_eq!(processed(&dir, &formatting), [("src/lib.rs".to_owned(), false), ("src/y.rs".to_owned(), true)]);
+		assert_eq!(
+			processed(&dir, &formatting),
+			[("src/lib.rs".to_owned(), false), ("src/y.rs".to_owned(), true)]
+		);
 	}
 
 	#[test]
@@ -3186,12 +3547,17 @@ mod format {
 				assert_eq!(path, dir.path("src/util.rs"));
 				assert!(source.to_string().starts_with("failed to run rustfmt"), "{source}");
 			}
+
 			other => panic!("{other:?}"),
 		}
 
 		// unparsable module files are skipped
 		let lib = "mod broken;\nmod fine;\n";
-		let files = [("src/lib.rs", lib), ("src/broken.rs", "fn broken( {}\n"), ("src/fine.rs", "fn  fine( ) {}\n")];
+		let files = [
+			("src/lib.rs", lib),
+			("src/broken.rs", "fn broken( {}\n"),
+			("src/fine.rs", "fn  fine( ) {}\n"),
+		];
 		let dir = TempDir::with_files("format-broken", &files);
 		let mut ws = Workspace::new(&dir.0);
 
@@ -3199,7 +3565,10 @@ mod format {
 
 		let formatting = format(&ws, &["crate"], &rustfmt()).unwrap();
 
-		assert_eq!(processed(&dir, &formatting), [("src/fine.rs".to_owned(), true), ("src/lib.rs".to_owned(), false)]);
+		assert_eq!(
+			processed(&dir, &formatting),
+			[("src/fine.rs".to_owned(), true), ("src/lib.rs".to_owned(), false)]
+		);
 		assert_eq!(formatting.warnings.len(), 1);
 		assert!(
 			formatting.warnings[0].starts_with("the module `fixture::broken` is not formatted: cannot parse file"),
@@ -3271,7 +3640,11 @@ mod format {
 
 		assert_eq!(
 			processed,
-			[("src/deep.rs".to_owned(), false), ("src/deeper.rs".to_owned(), false), ("src/lib.rs".to_owned(), false)]
+			[
+				("src/deep.rs".to_owned(), false),
+				("src/deeper.rs".to_owned(), false),
+				("src/lib.rs".to_owned(), false)
+			]
 		);
 	}
 
@@ -3279,8 +3652,10 @@ mod format {
 	fn applies_formatting_and_still_compiles() {
 		let dir = TempDir::fixture("format-apply");
 		let ws = load_fixture(&dir, true);
-		let options =
-			FmtOptions { format: FormatOptions::new().sort(Some(SortOptions::new())), ..FmtOptions::default() };
+		let options = FmtOptions {
+			format: FormatOptions::new().sort(Some(SortOptions::new())),
+			..FmtOptions::default()
+		};
 		let formatting = format(&ws, &["crate"], &options).unwrap();
 		let applied = formatting.edits.apply().unwrap();
 
@@ -3316,7 +3691,10 @@ mod create_module {
 
 	/// A crate laid out like `cargo rscode sort` lays it out.
 	const SORTED: &[(&str, &str)] = &[
-		("src/lib.rs", "//! Docs.\n\nextern crate alloc;\n\nmod b;\nmod d;\n\nuse std::fmt;\n\npub fn f() {}\n"),
+		(
+			"src/lib.rs",
+			"//! Docs.\n\nextern crate alloc;\n\nmod b;\nmod d;\n\nuse std::fmt;\n\npub fn f() {}\n",
+		),
 		("src/b.rs", "use std::fmt;\n\npub fn g() {}\n"),
 		("src/d.rs", "//! Docs of d.\n"),
 	];
@@ -3351,7 +3729,11 @@ mod create_module {
 			let creation = create(&ws, parent, "x", "").unwrap();
 			let text = edited(&dir, &creation.edits, file);
 
-			assert_eq!(text, SORTED.iter().find(|(path, _)| *path == file).unwrap().1.replace(old, new), "{parent}");
+			assert_eq!(
+				text,
+				SORTED.iter().find(|(path, _)| *path == file).unwrap().1.replace(old, new),
+				"{parent}"
+			);
 			assert_eq!(rscode::rscode_sort::sort_str(&text).unwrap(), text, "{parent}");
 		}
 
@@ -3388,10 +3770,30 @@ mod create_module {
 		// in the directory of the parent's modules: of a `mod.rs` file, of a file of another name, of a module loaded
 		// with `#[path]`, and of an inline module, whose declaration goes inside of its braces
 		for (parent, file, declared, layout) in [
-			("crate::nested", "src/nested/x.rs", "src/nested/mod.rs", "pub mod deep;\nmod x;\n\n/// Something"),
-			("crate::shapes", "src/shapes/x.rs", "src/shapes.rs", "pub mod round;\nmod x;\n\nuse round::Radius;"),
-			("crate::placed", "src/custom/x.rs", "src/custom/placed.rs", "mod x;\n\n/// A module loaded with `#[path]`."),
-			("crate::inline", "src/inline/x.rs", "src/lib.rs", "mod inline {\n\tmod x;\n\n\t/// A function"),
+			(
+				"crate::nested",
+				"src/nested/x.rs",
+				"src/nested/mod.rs",
+				"pub mod deep;\nmod x;\n\n/// Something",
+			),
+			(
+				"crate::shapes",
+				"src/shapes/x.rs",
+				"src/shapes.rs",
+				"pub mod round;\nmod x;\n\nuse round::Radius;",
+			),
+			(
+				"crate::placed",
+				"src/custom/x.rs",
+				"src/custom/placed.rs",
+				"mod x;\n\n/// A module loaded with `#[path]`.",
+			),
+			(
+				"crate::inline",
+				"src/inline/x.rs",
+				"src/lib.rs",
+				"mod inline {\n\tmod x;\n\n\t/// A function",
+			),
 		] {
 			let creation = create(&ws, parent, "x", "").unwrap();
 
@@ -3436,6 +3838,7 @@ mod create_module {
 					"{collisions:?}"
 				);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -3446,6 +3849,7 @@ mod create_module {
 					assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
 					assert!(source.to_string().contains("exists already"), "{source}");
 				}
+
 				other => panic!("{other:?}"),
 			}
 		}
@@ -3459,13 +3863,18 @@ mod create_module {
 			Err(Error::Unsupported(message)) => {
 				assert!(message.starts_with("`café` is not an ASCII name"), "{message}");
 			}
+
 			other => panic!("{other:?}"),
 		}
 
 		match create(&ws, "crate", "x", "fn x( {}") {
 			Err(Error::InvalidSource(message)) => {
-				assert!(message.starts_with("the source does not parse as the file of a module at 1:"), "{message}")
+				assert!(
+					message.starts_with("the source does not parse as the file of a module at 1:"),
+					"{message}"
+				)
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -3491,7 +3900,12 @@ mod create_module {
 		let mut edits = EditSet::new();
 
 		let modules = [
-			("crate", "render", "/// Draws.\npub fn draw() -> u8 {\n    super::util::double(1) as u8\n}", "pub"),
+			(
+				"crate",
+				"render",
+				"/// Draws.\npub fn draw() -> u8 {\n    super::util::double(1) as u8\n}",
+				"pub",
+			),
 			("crate::nested", "extra", "#![allow(dead_code)]\n\nstruct Extra;", ""),
 			("crate::inline", "inner_child", "", "pub(crate)"),
 		];
@@ -3506,7 +3920,10 @@ mod create_module {
 			dir.relative(&applied.created),
 			["src/inline/inner_child.rs", "src/nested/extra.rs", "src/render.rs"]
 		);
-		assert_eq!(dir.read("src/render.rs"), "/// Draws.\npub fn draw() -> u8 {\n\tsuper::util::double(1) as u8\n}\n");
+		assert_eq!(
+			dir.read("src/render.rs"),
+			"/// Draws.\npub fn draw() -> u8 {\n\tsuper::util::double(1) as u8\n}\n"
+		);
 		cargo_check(&dir);
 	}
 }
@@ -3568,7 +3985,10 @@ mod inline {
 }
 ",
 		),
-		("src/a.rs", "pub struct A;\n\npub struct B;\n\npub struct C;\n\npub struct Z;\n\nfn g() {}\n"),
+		(
+			"src/a.rs",
+			"pub struct A;\n\npub struct B;\n\npub struct C;\n\npub struct Z;\n\nfn g() {}\n",
+		),
 	];
 
 	#[test]
@@ -3577,15 +3997,30 @@ mod inline {
 		let ws = load(&dir);
 		let lib = ITEMS[0].1;
 		let cases: &[(&[&str], &str, &str, &[&str])] = &[
-			(&["std::env"], "use crate::a::B;\n", "use crate::a::B;\nuse std::env;\n", &["+ std::env 6"]),
-			(&["use std::io::Write;"], "use std::io;\n", "use std::io;\nuse std::io::Write;\n", &["+ std::io::Write 8"]),
+			(
+				&["std::env"],
+				"use crate::a::B;\n",
+				"use crate::a::B;\nuse std::env;\n",
+				&["+ std::env 6"],
+			),
+			(
+				&["use std::io::Write;"],
+				"use std::io;\n",
+				"use std::io;\nuse std::io::Write;\n",
+				&["+ std::io::Write 8"],
+			),
 			(
 				&["crate::a::{B, C}"],
 				"use crate::a::B;\n",
 				"use crate::a::B;\nuse crate::a::C;\n",
 				&["= crate::a::B 5", "+ crate::a::C 6"],
 			),
-			(&["pub use a::Z"], "pub use a::A;\n", "pub use a::A;\npub use a::Z;\n", &["+ pub use a::Z 10"]),
+			(
+				&["pub use a::Z"],
+				"pub use a::A;\n",
+				"pub use a::A;\npub use a::Z;\n",
+				&["+ pub use a::Z 10"],
+			),
 			(
 				&["std::env", "alloc::vec::Vec", "zzz::Z"],
 				"use crate::a::B;\nuse std::fmt;\nuse std::io;\n",
@@ -3604,7 +4039,11 @@ mod inline {
 		}
 
 		// and once written, as `cargo rscode sort` sorts the crate
-		import(&ws, "crate", &["std::env", "alloc::vec::Vec", "zzz::Z", "pub use a::C"]).unwrap().edits.apply().unwrap();
+		import(&ws, "crate", &["std::env", "alloc::vec::Vec", "zzz::Z", "pub use a::C"])
+			.unwrap()
+			.edits
+			.apply()
+			.unwrap();
 		assert_sorted(&dir);
 
 		// what is imported already changes nothing
@@ -3695,7 +4134,10 @@ mod a;
 		let ws = load(&dir);
 		let addition = self::import(&ws, "crate", &["anyhow::Result"]).unwrap();
 
-		assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace("use std", "use anyhow::Result;\nuse std"));
+		assert_eq!(
+			edited(&dir, &addition.edits, "src/lib.rs"),
+			lib.replace("use std", "use anyhow::Result;\nuse std")
+		);
 	}
 
 	/// A bare name that names nothing in the module imports the item of that name.
@@ -3708,7 +4150,10 @@ mod a;
 		assert_eq!(outcomes(&addition), ["+ crate::a::C 14", "+ pub(crate) use crate::a::C as See 17"]);
 		let text = edited(&dir, &addition.edits, "src/lib.rs");
 
-		assert!(text.ends_with("\tuse crate::a::C;\n\tuse std::fmt;\n\n\tpub(crate) use crate::a::C as See;\n}\n"), "{text}");
+		assert!(
+			text.ends_with("\tuse crate::a::C;\n\tuse std::fmt;\n\n\tpub(crate) use crate::a::C as See;\n}\n"),
+			"{text}"
+		);
 
 		// (names of other crates need their paths)
 		match import(&ws, "crate", &["Nope"]) {
@@ -3717,7 +4162,11 @@ mod a;
 		}
 
 		// several items of the name
-		let files = [("src/lib.rs", "mod a;\nmod b;\n"), ("src/a.rs", "pub struct X;\n"), ("src/b.rs", "pub struct X;\n")];
+		let files = [
+			("src/lib.rs", "mod a;\nmod b;\n"),
+			("src/a.rs", "pub struct X;\n"),
+			("src/b.rs", "pub struct X;\n"),
+		];
 		let dir = TempDir::with_files("import-names-ambiguous", &files);
 		let ws = load(&dir);
 
@@ -3726,6 +4175,7 @@ mod a;
 				assert_eq!(path, "X");
 				assert_eq!(candidates.len(), 2, "{candidates:?}");
 			}
+
 			other => panic!("{other:?}"),
 		}
 	}
@@ -3787,6 +4237,7 @@ mod a;
 
 				assert!(collisions[0].starts_with(&expected), "{collisions:?}");
 			}
+
 			other => panic!("{other:?}"),
 		}
 	}
@@ -3838,7 +4289,10 @@ mod private {
 				"`crate::shapes::private::Hidden` is not visible from `crate::util` (`crate::shapes::private` is not): \
 				 make it visible there, or import it by the path of a re-export",
 			),
-			("super::shapes::private", "`super::shapes::private` is not visible from `crate::util`: make it"),
+			(
+				"super::shapes::private",
+				"`super::shapes::private` is not visible from `crate::util`: make it",
+			),
 			(
 				"crate::shapes::Circle::new",
 				"cannot import `crate::shapes::Circle::new`: `crate::shapes::Circle` is a struct",
@@ -3853,7 +4307,13 @@ mod private {
 		}
 
 		// what it can import, paths that macros may make name something, and paths into other crates
-		let imports = ["super::shapes::{Kind::Round, area}", "crate::Square", "crate::shapes::made::T", "std::fs", "x::Y"];
+		let imports = [
+			"super::shapes::{Kind::Round, area}",
+			"crate::Square",
+			"crate::shapes::made::T",
+			"std::fs",
+			"x::Y",
+		];
 		let addition = import(&ws, "crate::util", &imports).unwrap();
 		let added = addition.imports.iter().filter(|import| import.outcome == ImportOutcome::Added);
 
@@ -3911,6 +4371,7 @@ mod private {
 					"{collisions:?}"
 				);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -3955,7 +4416,11 @@ mod a;
 			(&["std::collections::BTreeSet"], "{BTreeMap, HashMap}", "{BTreeMap, BTreeSet, HashMap}"),
 			(&["crate::a::D"], "use crate::a::{B, C};", "use crate::a::{B, C, D};"),
 			(&["std::env", "std::process"], "use std::{fmt, io};", "use std::{env, fmt, io, process};"),
-			(&["std::time::Duration"], "use std::{fmt, io};", "use std::time::Duration;\nuse std::{fmt, io};"),
+			(
+				&["std::time::Duration"],
+				"use std::{fmt, io};",
+				"use std::time::Duration;\nuse std::{fmt, io};",
+			),
 		];
 
 		for &(imports, old, new) in cases {
@@ -4016,7 +4481,11 @@ mod e;
 		for (imports, new) in [(&["std::io"], "use std::{fs, io};"), (&["std::fs::File"], "use std::fs::{self, File};")] {
 			let addition = import(&ws, "crate", imports).unwrap();
 
-			assert_eq!(edited(&dir, &addition.edits, "src/lib.rs"), lib.replace("use std::fs;", new), "{imports:?}");
+			assert_eq!(
+				edited(&dir, &addition.edits, "src/lib.rs"),
+				lib.replace("use std::fs;", new),
+				"{imports:?}"
+			);
 		}
 	}
 
@@ -4156,7 +4625,10 @@ mod real {
 			// removing it (and imports of it) leaves parsable files; a smaller sample, since every removal searches
 			// the crate for references
 			if index % 63 == 0 || data.kind == ItemKind::Module {
-				let options = RemoveOptions { prune_imports: true, ..RemoveOptions::default() };
+				let options = RemoveOptions {
+					prune_imports: true,
+					..RemoveOptions::default()
+				};
 				let removal = rscode::edit::remove(&resolver, std::slice::from_ref(&item_path), &options).unwrap();
 
 				removal.edits.preview().unwrap_or_else(|error| panic!("removing `{item_path}`: {error}"));
@@ -4220,7 +4692,10 @@ mod real {
 					let insertion = rscode::edit::insert(&resolver, Some(&item_path), "fn rscode_inserted() {}", &options)
 						.unwrap_or_else(|error| panic!("inserting into `{item_path}`: {error}"));
 
-					insertion.edits.preview().unwrap_or_else(|error| panic!("inserting into `{item_path}`: {error}"));
+					insertion
+						.edits
+						.preview()
+						.unwrap_or_else(|error| panic!("inserting into `{item_path}`: {error}"));
 				}
 
 				inserted += 1;
@@ -4290,15 +4765,29 @@ pub fn unused() -> RefCell<u8> {
 		let dir = crate_dir("thread-local-load");
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
-		let found = rscode::Find::new().kind(ItemKind::Static).pattern("**").unwrap().run_with(&resolver).unwrap();
+		let found = rscode::Find::new()
+			.kind(ItemKind::Static)
+			.pattern("**")
+			.unwrap()
+			.run_with(&resolver)
+			.unwrap();
 		let statics: Vec<String> = found.iter().map(|found| found.path.to_string()).collect();
 
-		assert_eq!(statics, ["fixture::state::DEPTH", "fixture::state::COUNTER", "fixture::NEVER", "fixture::ONE"]);
+		assert_eq!(
+			statics,
+			["fixture::state::DEPTH", "fixture::state::COUNTER", "fixture::NEVER", "fixture::ONE"]
+		);
 
 		let depth = resolver.resolve_item_path(&path("crate::state::DEPTH"));
 
 		assert_eq!(depth.len(), 1);
-		assert_eq!(ws.item(depth[0]).detail, rscode::model::ItemDetail::Static { mutable: false, thread_local: true });
+		assert_eq!(
+			ws.item(depth[0]).detail,
+			rscode::model::ItemDetail::Static {
+				mutable: false,
+				thread_local: true
+			}
+		);
 		assert_eq!(ws.item(ws.parent(depth[0]).expect("the invocation")).kind, ItemKind::MacroCall);
 
 		let one = resolver.resolve_item_path(&path("crate::ONE"));
@@ -4339,7 +4828,10 @@ pub fn unused() -> RefCell<u8> {
 		let counter = rscode::edit::rename(&resolver, &path("crate::Counter"), "Tally", &options).unwrap();
 		let text = edited(&dir, &counter.edits, "src/lib.rs");
 
-		assert!(text.contains("std::cell::RefCell<Tally> = std::cell::RefCell::new(Tally::new())"), "{text}");
+		assert!(
+			text.contains("std::cell::RefCell<Tally> = std::cell::RefCell::new(Tally::new())"),
+			"{text}"
+		);
 		counter.edits.apply().unwrap();
 		cargo_check(&dir);
 	}
@@ -4441,7 +4933,10 @@ pub fn global() -> u8 {
 		let dir = crate_dir("thread-local-anchor");
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
-		let options = rscode::edit::InsertOptions { position: InsertPosition::Before("DEPTH".to_owned()), force: false };
+		let options = rscode::edit::InsertOptions {
+			position: InsertPosition::Before("DEPTH".to_owned()),
+			force: false,
+		};
 		let insertion = rscode::edit::insert(&resolver, Some(&path("crate::state")), "pub fn f() {}", &options).unwrap();
 
 		assert!(edited(&dir, &insertion.edits, "src/lib.rs").contains("\tpub fn f() {}\n\n\tthread_local! {"));
@@ -4457,8 +4952,10 @@ pub fn global() -> u8 {
 
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
-		let options =
-			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None), ..FmtOptions::default() };
+		let options = FmtOptions {
+			format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None),
+			..FmtOptions::default()
+		};
 		let targets = [pattern("crate::ONE"), pattern("crate::state::*")];
 		let formatting = rscode::edit::format(&resolver, &targets, &options).unwrap();
 
@@ -4466,7 +4963,10 @@ pub fn global() -> u8 {
 
 		// only the invocation in `state` changes (rustfmt indents it with spaces); the rest of the file keeps its tabs
 		let expected = LIB
-			.replace("\tthread_local! {\n\t\t/// The current depth.\n\t\tpub static DEPTH", "    thread_local! {\n        /// The current depth.\n        pub static DEPTH")
+			.replace(
+				"\tthread_local! {\n\t\t/// The current depth.\n\t\tpub static DEPTH",
+				"    thread_local! {\n        /// The current depth.\n        pub static DEPTH",
+			)
 			.replace("\n\t\tpub(crate) static COUNTER", "\n        pub(crate) static COUNTER")
 			.replace("Counter::new())\n\t}\n}", "Counter::new())\n    }\n}");
 
@@ -4523,8 +5023,11 @@ pub fn total() -> f64 {
 	}
 
 	fn paths_of(resolver: &Resolver<'_>, path: &str) -> Vec<String> {
-		let mut paths: Vec<String> =
-			resolver.resolve_item_path(&self::path(path)).iter().map(|&item| resolver.canonical_path(item).to_string()).collect();
+		let mut paths: Vec<String> = resolver
+			.resolve_item_path(&self::path(path))
+			.iter()
+			.map(|&item| resolver.canonical_path(item).to_string())
+			.collect();
 
 		paths.sort();
 		paths
@@ -4607,6 +5110,7 @@ pub fn total() -> f64 {
 						"{candidates:?}"
 					);
 				}
+
 				other => panic!("{other:?}"),
 			}
 		}
@@ -4656,7 +5160,10 @@ pub fn total() -> f64 {
 		let both = remove(&["use crate::Round", "use crate::Block"]);
 		let text = edited(&dir, &both.edits, "src/lib.rs");
 
-		assert!(!text.contains("unused_imports") && !text.contains("Round") && !text.contains("Block"), "{text}");
+		assert!(
+			!text.contains("unused_imports") && !text.contains("Round") && !text.contains("Block"),
+			"{text}"
+		);
 		assert!(text.contains("use shapes::{Shape as _, Square};\nuse util::*;\n"), "{text}");
 
 		both.edits.apply().unwrap();
@@ -4670,30 +5177,47 @@ pub fn total() -> f64 {
 		let resolver = Resolver::new(&ws);
 
 		// an import is replaced as its `use` item, which must import nothing else
-		let replaced =
-			rscode::edit::replace(&resolver, &path("use crate::Circle"), "use crate::shapes::Circle;", &ReplaceOptions::default())
-				.unwrap();
+		let replaced = rscode::edit::replace(
+			&resolver,
+			&path("use crate::Circle"),
+			"use crate::shapes::Circle;",
+			&ReplaceOptions::default(),
+		)
+		.unwrap();
 
 		assert_eq!(replaced.replaced, ["use fixture::Circle"]);
 		assert!(edited(&dir, &replaced.edits, "src/lib.rs").contains("\nuse crate::shapes::Circle;\nuse shapes::{Shape as _, Square};"));
 
-		match rscode::edit::replace(&resolver, &path("use crate::Round"), "use shapes::Circle as Round;", &ReplaceOptions::default()) {
+		match rscode::edit::replace(
+			&resolver,
+			&path("use crate::Round"),
+			"use shapes::Circle as Round;",
+			&ReplaceOptions::default(),
+		) {
 			Err(Error::Unsupported(message)) => assert!(message.contains("is one of the 2 imports of the `use` item"), "{message}"),
 			other => panic!("{other:?}"),
 		}
 
 		// an anchor that is an import stands for its `use` item
-		let options = InsertOptions { position: InsertPosition::After("use crate::Circle".to_owned()), force: false };
+		let options = InsertOptions {
+			position: InsertPosition::After("use crate::Circle".to_owned()),
+			force: false,
+		};
 		let insertion = rscode::edit::insert(&resolver, Some(&path("crate")), "use shapes::Shape;", &options).unwrap();
 
 		let text = edited(&dir, &insertion.edits, "src/lib.rs");
 
 		// (joining the `use` items around it, which are on consecutive lines)
-		assert!(text.contains("use shapes::Circle;\nuse shapes::Shape;\nuse shapes::{Shape as _"), "{text}");
+		assert!(
+			text.contains("use shapes::Circle;\nuse shapes::Shape;\nuse shapes::{Shape as _"),
+			"{text}"
+		);
 
 		// formatting an import formats its `use` item
-		let options =
-			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None), ..FmtOptions::default() };
+		let options = FmtOptions {
+			format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None),
+			..FmtOptions::default()
+		};
 		let formatting = rscode::edit::format(&resolver, &[pattern("use crate::Round")], &options).unwrap();
 
 		assert!(formatting.warnings.is_empty(), "{:?}", formatting.warnings);
@@ -4701,8 +5225,12 @@ pub fn total() -> f64 {
 		// imports are not renamed
 		match rscode::edit::rename(&resolver, &path("use crate::Circle"), "Disk", &RenameOptions::default()) {
 			Err(Error::Unsupported(message)) => {
-				assert!(message.starts_with("`use fixture::Circle` is an import, which cannot be renamed: rename what it imports"), "{message}");
+				assert!(
+					message.starts_with("`use fixture::Circle` is an import, which cannot be renamed: rename what it imports"),
+					"{message}"
+				);
 			}
+
 			other => panic!("{other:?}"),
 		}
 
@@ -4768,11 +5296,17 @@ pub fn make() -> (Qux, Pick) {
 		let resolver = Resolver::new(&ws);
 		let removal = rscode::edit::remove(&resolver, &paths(&["crate::Qux"]), &RemoveOptions::default()).unwrap();
 
-		assert_eq!(removal.removed.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(), ["fixture::Qux"]);
+		assert_eq!(
+			removal.removed.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(),
+			["fixture::Qux"]
+		);
 
 		let removal = rscode::edit::remove(&resolver, &paths(&["use crate::Qux"]), &RemoveOptions::default()).unwrap();
 
-		assert_eq!(removal.removed.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(), ["use fixture::Qux"]);
+		assert_eq!(
+			removal.removed.iter().map(|item| item.path.as_str()).collect::<Vec<_>>(),
+			["use fixture::Qux"]
+		);
 	}
 
 	#[test]
@@ -4781,7 +5315,10 @@ pub fn make() -> (Qux, Pick) {
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
 		let replace = |path: &str, source: &str, all_variants: bool| {
-			let options = ReplaceOptions { all_variants, ..ReplaceOptions::default() };
+			let options = ReplaceOptions {
+				all_variants,
+				..ReplaceOptions::default()
+			};
 
 			rscode::edit::replace(&resolver, &self::path(path), source, &options)
 		};
@@ -4822,7 +5359,11 @@ pub fn make() -> (Qux, Pick) {
 		// a replacement that no longer imports the name
 		let other = replace("use crate::Qux", "use crate::shapes::Circle;", false).unwrap();
 
-		assert!(other.warnings.iter().any(|warning| warning.contains("does not import `Qux`")), "{:?}", other.warnings);
+		assert!(
+			other.warnings.iter().any(|warning| warning.contains("does not import `Qux`")),
+			"{:?}",
+			other.warnings
+		);
 
 		let renamed = replace("use crate::Qux", "use crate::shapes::Circle as Qux;", false).unwrap();
 
@@ -4836,7 +5377,10 @@ pub fn make() -> (Qux, Pick) {
 		let resolver = Resolver::new(&ws);
 
 		// a single name stands for the `use` items that bind it
-		let options = InsertOptions { position: InsertPosition::After("Pick".to_owned()), force: false };
+		let options = InsertOptions {
+			position: InsertPosition::After("Pick".to_owned()),
+			force: false,
+		};
 		let insertion = rscode::edit::insert(&resolver, Some(&path("crate")), "pub struct Anchored;", &options).unwrap();
 		let text = edited(&dir, &insertion.edits, "src/lib.rs");
 
@@ -4942,14 +5486,22 @@ pub fn make() -> (Qux, Pick) {
 		// formatting targets with wildcards select the imports that `Find` finds
 		let dir = TempDir::with_files(
 			"imports-underscore-format",
-			&[("Cargo.toml", MANIFEST), ("src/lib.rs", "use std::fmt::Write   as _;\nuse std::io::Write  ;\n")],
+			&[
+				("Cargo.toml", MANIFEST),
+				("src/lib.rs", "use std::fmt::Write   as _;\nuse std::io::Write  ;\n"),
+			],
 		);
 		let ws = load(&dir);
-		let options =
-			FmtOptions { format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None), ..FmtOptions::default() };
+		let options = FmtOptions {
+			format: FormatOptions::new().formatter(RsFormatter::RustFmt).sort(None),
+			..FmtOptions::default()
+		};
 		let formatting = rscode::edit::format(&Resolver::new(&ws), &[pattern("use *Write*")], &options).unwrap();
 
-		assert_eq!(edited(&dir, &formatting.edits, "src/lib.rs"), "use std::fmt::Write as _;\nuse std::io::Write;\n");
+		assert_eq!(
+			edited(&dir, &formatting.edits, "src/lib.rs"),
+			"use std::fmt::Write as _;\nuse std::io::Write;\n"
+		);
 	}
 
 	/// Imports through removed imports break: they are left dangling, or pruned.
@@ -5009,7 +5561,10 @@ mod unresolved {
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
 		let remove = |target: &str, prune_imports: bool| {
-			let options = RemoveOptions { prune_imports, ..RemoveOptions::default() };
+			let options = RemoveOptions {
+				prune_imports,
+				..RemoveOptions::default()
+			};
 
 			rscode::edit::remove(&resolver, &paths(&[target]), &options).unwrap()
 		};
@@ -5181,7 +5736,10 @@ impl Point {
 			.unwrap();
 
 		assert_eq!(
-			views.iter().map(|view| (view.path.as_str(), view.kind, view.text.as_str())).collect::<Vec<_>>(),
+			views
+				.iter()
+				.map(|view| (view.path.as_str(), view.kind, view.text.as_str()))
+				.collect::<Vec<_>>(),
 			[
 				("fixture::Point.x", ItemKind::Field, "/// The x coordinate.\npub x: i32"),
 				("fixture::Pair.1", ItemKind::Field, "pub u16"),
@@ -5190,7 +5748,9 @@ impl Point {
 
 		// `Point::y` is the method; the field is `Point.y`
 		let named = |text: &str| -> Vec<String> {
-			(resolver.resolve_item_path(&path(text)).into_iter()).map(|item| resolver.canonical_path(item).to_string()).collect()
+			(resolver.resolve_item_path(&path(text)).into_iter())
+				.map(|item| resolver.canonical_path(item).to_string())
+				.collect()
 		};
 
 		assert_eq!(named("crate::Point::y"), ["fixture::Point::y"]);
@@ -5229,15 +5789,16 @@ impl Point {
 
 		// only a field replaces a field, of the same form
 		let resolver = Resolver::new(&ws);
-		let replace = |path: &str, source: &str| {
-			match rscode::edit::replace(&resolver, &super::path(path), source, &ReplaceOptions::default()) {
-				Err(Error::InvalidSource(message)) => message,
-				other => panic!("{other:?}"),
-			}
+		let replace = |path: &str, source: &str| match rscode::edit::replace(&resolver, &super::path(path), source, &ReplaceOptions::default()) {
+			Err(Error::InvalidSource(message)) => message,
+			other => panic!("{other:?}"),
 		};
 
 		replace("crate::Point.x", "fn x() {}");
-		assert_eq!(replace("crate::Point.x", "u8"), "`fixture::Point.x` is a named field: write it as `name: Type`");
+		assert_eq!(
+			replace("crate::Point.x", "u8"),
+			"`fixture::Point.x` is a named field: write it as `name: Type`"
+		);
 		assert_eq!(
 			replace("crate::Pair.0", "a: u8"),
 			"`fixture::Pair.0` is a field of a tuple struct or variant: write it as a type alone (`pub u8`), without a name"
@@ -5262,7 +5823,11 @@ impl Point {
 			["the uses of removed fields (field accesses, struct literals, and patterns) are not searched for: check them"]
 		);
 		assert_eq!(
-			removal.removed.iter().map(|removed| (removed.path.as_str(), removed.kind)).collect::<Vec<_>>(),
+			removal
+				.removed
+				.iter()
+				.map(|removed| (removed.path.as_str(), removed.kind))
+				.collect::<Vec<_>>(),
 			[
 				("fixture::Point.y", ItemKind::Field),
 				("fixture::Pair.0", ItemKind::Field),
@@ -5286,7 +5851,13 @@ impl Point {
 	fn applies_field_edits_and_still_compiles() {
 		let dir = TempDir::with_files(
 			"fields-apply",
-			&[("Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"), ("src/lib.rs", LIB)],
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", LIB),
+			],
 		);
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
@@ -5294,7 +5865,11 @@ impl Point {
 			.unwrap()
 			.edits;
 
-		edits.extend(rscode::edit::remove(&resolver, &paths(&["crate::Pair.0"]), &RemoveOptions::default()).unwrap().edits);
+		edits.extend(
+			rscode::edit::remove(&resolver, &paths(&["crate::Pair.0"]), &RemoveOptions::default())
+				.unwrap()
+				.edits,
+		);
 		edits.apply().unwrap();
 
 		assert!(dir.read("src/lib.rs").contains("\tpub x: i64,\n") && dir.read("src/lib.rs").contains("Pair(pub u16);"));
@@ -5330,9 +5905,7 @@ pub fn first() -> u8 {
 		let dir = TempDir::with_files("macro-calls", &[("src/lib.rs", LIB)]);
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
-		let found = |find: rscode::Find| -> Vec<String> {
-			find.run_with(&resolver).unwrap().into_iter().map(|found| found.path).collect()
-		};
+		let found = |find: rscode::Find| -> Vec<String> { find.run_with(&resolver).unwrap().into_iter().map(|found| found.path).collect() };
 		let both = ["fixture::commands![1]", "fixture::commands![2]"];
 
 		// found by patterns with `!`, or by their kind, but not by other patterns
@@ -5341,18 +5914,31 @@ pub fn first() -> u8 {
 		assert_eq!(found(rscode::Find::new().pattern("commands![2]").unwrap()), both[1..]);
 		assert_eq!(
 			found(rscode::Find::new().pattern("**").unwrap()),
-			["fixture", "fixture::commands", "fixture::SAY", "fixture::HELP", "fixture::QUIT", "fixture::first"]
+			[
+				"fixture",
+				"fixture::commands",
+				"fixture::SAY",
+				"fixture::HELP",
+				"fixture::QUIT",
+				"fixture::first"
+			]
 		);
 
 		// a path with `!` that names nothing suggests the invocations, not the macro's definition
 		let suggestions = rscode::query::suggest(&resolver, &path("crate::m::commands!"));
 
 		assert_eq!((suggestions.similar, suggestions.named), (both.map(str::to_owned).to_vec(), 2));
-		assert_eq!(rscode::query::suggest(&resolver, &path("crate::m::commands")).similar, ["fixture::commands"]);
+		assert_eq!(
+			rscode::query::suggest(&resolver, &path("crate::m::commands")).similar,
+			["fixture::commands"]
+		);
 
 		let views = rscode::View::new().path("crate::commands![2]").unwrap().run_with(&resolver).unwrap();
 
-		assert_eq!((views[0].kind, views[0].text.as_str()), (ItemKind::MacroCall, "commands! {\n\tstatic QUIT = 3;\n}"));
+		assert_eq!(
+			(views[0].kind, views[0].text.as_str()),
+			(ItemKind::MacroCall, "commands! {\n\tstatic QUIT = 3;\n}")
+		);
 
 		// a path naming several is ambiguous, with copyable candidates
 		let source = "commands! {\n\tstatic QUIT = 4;\n}";
@@ -5366,6 +5952,7 @@ pub fn first() -> u8 {
 				]
 				.map(native)
 			),
+
 			other => panic!("{other:?}"),
 		}
 
@@ -5375,6 +5962,7 @@ pub fn first() -> u8 {
 				candidates,
 				["`fixture::commands![1]` at src/lib.rs:5:1", "`fixture::commands![2]` at src/lib.rs:10:1"].map(native)
 			),
+
 			other => panic!("{other:?}"),
 		}
 
@@ -5391,7 +5979,10 @@ pub fn first() -> u8 {
 		assert_eq!(removal.removed[0].path, "fixture::commands![1]");
 
 		// next to an invocation, without a parent
-		let options = InsertOptions { position: InsertPosition::After("crate::commands![2]".to_owned()), force: false };
+		let options = InsertOptions {
+			position: InsertPosition::After("crate::commands![2]".to_owned()),
+			force: false,
+		};
 		let insertion = rscode::edit::insert(&resolver, None, "pub fn second() {}", &options).unwrap();
 
 		assert_eq!(
@@ -5452,7 +6043,11 @@ m! { static B = 3; }
 		let root = ws.crates()[0].root_module();
 		let say = rscode::model::PathRef {
 			leading_colon: false,
-			segments: vec![rscode::model::PathSegmentRef { name: "SAY".into(), range: Default::default(), has_arguments: false }],
+			segments: vec![rscode::model::PathSegmentRef {
+				name: "SAY".into(),
+				range: Default::default(),
+				has_arguments: false,
+			}],
 		};
 
 		assert!(resolver.resolve_path(root, &say, rscode::resolve::Namespace::Value).is_empty());
@@ -5465,17 +6060,24 @@ m! { static B = 3; }
 		};
 
 		assert_eq!(replaced("crate::QUIT", "static QUIT = 4"), LIB.replace("QUIT = 3", "QUIT = 4"));
-		assert_eq!(replaced("crate::HELP", "/// Help.\nstatic HELP = 5;"), LIB.replace("static HELP = 2", "/// Help.\n\tstatic HELP = 5"));
+		assert_eq!(
+			replaced("crate::HELP", "/// Help.\nstatic HELP = 5;"),
+			LIB.replace("static HELP = 2", "/// Help.\n\tstatic HELP = 5")
+		);
 
 		// not anchors: new items would go after the invocation, not into it
 		for (parent, anchor) in [(None, "crate::SAY"), (Some(path("crate")), "SAY")] {
-			let options = InsertOptions { position: InsertPosition::After(anchor.to_owned()), force: false };
+			let options = InsertOptions {
+				position: InsertPosition::After(anchor.to_owned()),
+				force: false,
+			};
 
 			match rscode::edit::insert(&resolver, parent.as_ref(), "static NEW = 5;", &options) {
 				Err(Error::Unsupported(message)) => assert!(
 					message.starts_with(&format!("`{anchor}` is an entry of the macro invocation `fixture::commands![1]`")),
 					"{message}"
 				),
+
 				other => panic!("{other:?}"),
 			}
 		}
@@ -5489,11 +6091,18 @@ m! { static B = 3; }
 
 		assert_eq!(edited(&dir, &removal.edits, "src/lib.rs"), LIB.replace("\tstatic HELP = 2;\n", ""));
 		assert_eq!(removal.warnings.len(), 1, "{:?}", removal.warnings);
-		assert!(removal.warnings[0].starts_with("the uses of removed entries of macro invocations"), "{:?}", removal.warnings);
+		assert!(
+			removal.warnings[0].starts_with("the uses of removed entries of macro invocations"),
+			"{:?}",
+			removal.warnings
+		);
 
 		let removal = rscode::edit::remove(&resolver, &paths(&["crate::QUIT"]), &RemoveOptions::default()).unwrap();
 
-		assert_eq!(edited(&dir, &removal.edits, "src/lib.rs"), LIB.replace("commands! {\n\tstatic QUIT = 3;\n}\n\n", ""));
+		assert_eq!(
+			edited(&dir, &removal.edits, "src/lib.rs"),
+			LIB.replace("commands! {\n\tstatic QUIT = 3;\n}\n\n", "")
+		);
 
 		match rscode::edit::rename(&resolver, &path("crate::SAY"), "TALK", &rscode::edit::RenameOptions::default()) {
 			Err(Error::Unsupported(message)) => assert!(message.contains("is a static declared by a macro invocation"), "{message}"),
@@ -5519,7 +6128,13 @@ m! { static B = 3; }
 	fn applies_macro_call_edits_and_still_compiles() {
 		let dir = TempDir::with_files(
 			"macro-calls-apply",
-			&[("Cargo.toml", "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n"), ("src/lib.rs", LIB)],
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
+				),
+				("src/lib.rs", LIB),
+			],
 		);
 		let ws = load(&dir);
 		let resolver = Resolver::new(&ws);
@@ -5529,7 +6144,11 @@ m! { static B = 3; }
 			.edits;
 
 		// an entry without its `;`, which the macro needs
-		edits.extend(rscode::edit::replace(&resolver, &path("crate::HELP"), "static HELP = 7", &ReplaceOptions::default()).unwrap().edits);
+		edits.extend(
+			rscode::edit::replace(&resolver, &path("crate::HELP"), "static HELP = 7", &ReplaceOptions::default())
+				.unwrap()
+				.edits,
+		);
 		edits.apply().unwrap();
 
 		assert!(dir.read("src/lib.rs").contains("\tstatic HELP = 7;\n}\n") && dir.read("src/lib.rs").contains("\tstatic STOP = 5;\n}\n"));

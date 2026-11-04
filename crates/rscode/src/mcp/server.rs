@@ -170,9 +170,9 @@ impl Server {
 		.await
 	}
 
-	/// Edit an item in place, sending only the change: replace exact text in it (`old` must occur once; copy it from
-	/// view_items), and/or set its visibility, doc comment, or attributes. Use this rather than replace_item for small
-	/// changes.
+	/// Edit an item in place, sending only the change: replace exact text in it (`old` must occur once, or use
+	/// `replace_all` for every occurrence within that item; copy it from view_items), and/or set its visibility,
+	/// doc comment, or attributes. Use this rather than replace_item for small changes.
 	#[tool(annotations(title = "Edit an item", read_only_hint = false, destructive_hint = true, open_world_hint = false))]
 	async fn edit_item(&self, Parameters(params): Parameters<EditItemParams>, context: RequestContext<RoleServer>) -> CallToolResult {
 		let target = self.target(&params.selection, false);

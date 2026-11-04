@@ -138,6 +138,11 @@ changed text (or a new visibility, doc comment, or attribute), `add_import` and 
 lines, and views number their lines only when they are not consecutive and outline a module's imports as `use ...;`.
 Tool schemas expose every accepted selection parameter, and parameter errors list unknown and missing names together.
 
+`edit_item` requires each `old` text to occur exactly once by default. Set `replace_all: true` (CLI: `edit --replace-all`)
+to replace all non-overlapping occurrences **within the selected item**, including each sequential `edits` replacement.
+Missing or empty text still fails; inserted text is not scanned again. This does not select sibling items or additional
+`cfg` variants (`all_variants` remains separate). Numbered-view gutters do not restrict all-occurrence replacement.
+
 Claude Code:
 
 ```sh

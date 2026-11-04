@@ -328,9 +328,10 @@ fn edit() -> Command {
 		.about("Edit an item in place: text inside it, its attributes, doc comment, or visibility")
 		.long_about(
 			"Edit an item in place, giving only the change: exact text to replace inside it (`--old` must occur once in \
-			 the item, as written in the file or as `view` prints it, even with `-n` line numbers), attributes to add \
-			 or remove, a new doc comment, or a new visibility. The new text gets the indentation of the item's lines; \
-			 nothing else is re-indented. Out-of-line modules and crate roots are edited in their own files.",
+			 the item, or use `--replace-all` for every non-overlapping occurrence), as written in the file or as \
+			 `view` prints it, even with `-n` line numbers; attributes to add or remove, a new doc comment, or a new \
+			 visibility. The new text gets the indentation of the item's lines; nothing else is re-indented. \
+			 Out-of-line modules and crate roots are edited in their own files.",
 		)
 		.arg(item_path("path", "PATH", "The item to edit"))
 		.arg(
@@ -377,6 +378,10 @@ fn edit() -> Command {
 			"remove-attr",
 			"ATTR",
 			"Remove an attribute by its path (`derive`) or exact text (`#[allow(dead_code)]`) (repeatable)",
+		))
+		.arg(flag(
+			"replace-all",
+			"Replace every non-overlapping occurrence of each old text within the selected item",
 		))
 		.arg(flag("all-variants", "Edit every `cfg` variant instead of failing when there are several"))
 		.arg(flag(

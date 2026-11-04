@@ -167,6 +167,10 @@ impl Derive {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct EditItemOptions {
+	/// Replace all non-overlapping occurrences of each old text within the selected item, rather than requiring
+	/// exactly one. Replacements are sequential; missing text still fails. This does not select more items or cfg variants.
+	pub replace_all: bool,
+
 	/// Edit every `cfg` variant rather than failing when the path names several (see
 	/// [`replaces_all_variants`](super::replaces_all_variants)).
 	pub all_variants: bool,
@@ -181,7 +185,7 @@ pub struct EditItemOptions {
 #[serde(default, rename_all = "kebab-case")]
 pub struct ItemEdit {
 	/// Exact text to replace, in order: the [`TextReplacement::old`] text of each must occur exactly once in the item
-	/// as the replacements before it left it.
+	/// (or at least once with [`EditItemOptions::replace_all`]) as the replacements before it left it.
 	pub replacements: Vec<TextReplacement>,
 
 	/// Attributes to remove: an attribute path (`derive`, `allow`, `serde`), of which the item must have one attribute
@@ -1240,7 +1244,7 @@ fn plan_item<'ws>(
 	for (index, replacement) in checked.replacements.iter().enumerate() {
 		let name = old_name(index, checked.replacements.len(), &replacement.old);
 
-		replace_text(plan.regions.text(), replacement, &name, &place).map_err(|error| PlanFailure {
+		replace_text(plan.regions.text(), replacement, options.replace_all, &name, &place).map_err(|error| PlanFailure {
 			error,
 			replacement: Some(index),
 		})?;
@@ -1402,7 +1406,7 @@ fn remove_attribute(regions: &mut Regions<'_>, text: &str, pattern: &AttributePa
 
 /// Replaces text in the region of an item (see [`TextReplacement`]). `name`: how to call `old` in messages; `place`:
 /// the item and its lines.
-fn replace_text(region: &mut Region<'_>, replacement: &TextReplacement, name: &str, place: &str) -> Result<(), Error> {
+fn replace_text(region: &mut Region<'_>, replacement: &TextReplacement, replace_all: bool, name: &str, place: &str) -> Result<(), Error> {
 	// without line numbers first, when it has them (and as given if that fails, in case they were text)
 	let mut attempts: Vec<(String, String, Option<usize>)> = (strip_gutters(&replacement.old, &replacement.new).into_iter())
 		.chain([(replacement.old.clone(), replacement.new.clone(), None)])
@@ -1437,7 +1441,7 @@ fn replace_text(region: &mut Region<'_>, replacement: &TextReplacement, name: &s
 	let mut failure = None;
 
 	for (old, new, line) in &attempts {
-		match try_replace(region, old, new, *line, name, place) {
+		match try_replace(region, old, new, *line, replace_all, name, place) {
 			Ok(()) => return Ok(()),
 
 			// (the first failure tells about the text as it was meant)
@@ -1708,12 +1712,12 @@ fn trim_line_ends<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 	lines.map(str::trim_end).collect::<Vec<_>>().join("\n")
 }
 
-/// Replaces `old` with `new` in a region, where `old` occurs exactly once, as views print the region or as written in
+/// Replaces `old` with `new` in a region, where `old` occurs exactly once (or at least once with `replace_all`), as views print the region or as written in
 /// the file (with its line breaks). What occurs in both forms at the same place occurs once, as printed (so that the
 /// lines of `new` after the first get the indentation that the view removed); what occurs in each form at a different
 /// place occurs several times. Where it occurs several times, `line` (from the line numbers of a numbered view) may
 /// tell which one is meant.
-fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize>, name: &str, place: &str) -> Result<(), Error> {
+fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize>, replace_all: bool, name: &str, place: &str) -> Result<(), Error> {
 	let line_ending = region.line_ending;
 	let printed = PrintedText::new(&region.prefix, &region.text, &multiline_strings(&region.text));
 	let old = old.replace("\r\n", "\n");
@@ -1738,7 +1742,7 @@ fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize
 	found.sort_by_key(|occurrence| occurrence.range.start);
 
 	// the one at the line of the line numbers
-	if let Some(line) = line.filter(|_| found.len() > 1) {
+	if let Some(line) = line.filter(|_| !replace_all && found.len() > 1) {
 		let at: Vec<Occurrence> = (found.iter().copied())
 			.filter(|occurrence| region.line_of(occurrence.range.start) == line)
 			.collect();
@@ -1746,6 +1750,30 @@ fn try_replace(region: &mut Region<'_>, old: &str, new: &str, line: Option<usize
 		if at.len() == 1 {
 			found = at;
 		}
+	}
+
+	if replace_all && !found.is_empty() {
+		// Match the original text, left to right, without rescanning inserted text. Printed/raw matches share
+		// source offsets, so deduplication above and non-overlap here keep each source span to one replacement.
+		let mut end = 0;
+		let changes: Vec<_> = found
+			.iter()
+			.filter_map(|occurrence| {
+				if occurrence.range.start < end {
+					return None;
+				}
+				end = occurrence.range.end;
+				let text = match occurrence.printed {
+					Some((start, end)) => reindented(&printed, start, end, new, line_ending),
+					None => new.replace("\r\n", "\n").replace('\n', line_ending),
+				};
+				Some((occurrence.range, text))
+			})
+			.collect();
+		for (range, text) in changes.into_iter().rev() {
+			region.text.replace_range(range.as_range(), &text);
+		}
+		return Ok(());
 	}
 
 	let (range, new) = match found[..] {
@@ -1912,7 +1940,7 @@ mod tests {
 		let replace = |old: &str, new: &str| {
 			let mut region = Region::item(&file, range);
 
-			try_replace(&mut region, old, new, None, "`old`", "`f`").map(|()| region.text)
+			try_replace(&mut region, old, new, None, false, "`old`", "`f`").map(|()| region.text)
 		};
 
 		// as written: line breaks become the file's
@@ -2162,7 +2190,7 @@ mod tests {
 				new: new.to_owned(),
 			};
 
-			replace_text(&mut region, &replacement, "`old`", "`h`").map(|()| region.text)
+			replace_text(&mut region, &replacement, false, "`old`", "`h`").map(|()| region.text)
 		};
 
 		// the closing braces of the `if` and the `for` as views print them are those of the `for` and `h` as written
