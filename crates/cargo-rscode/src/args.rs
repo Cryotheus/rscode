@@ -187,6 +187,7 @@ impl EditArgs {
 			add_attributes: matches._values_of("add-attr"),
 			remove_attributes: matches._values_of("remove-attr"),
 			options: EditItemOptions {
+				replace_all: matches.flag("replace-all"),
 				all_variants: matches.flag("all-variants"),
 				allow_kind_change: matches.flag("allow-kind-change"),
 			},

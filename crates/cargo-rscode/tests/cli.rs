@@ -50,7 +50,11 @@ impl Run {
 fn command(dir: &Path, args: &[&str]) -> Command {
 	let mut command = Command::new(BIN);
 
-	command.args(args).current_dir(dir).env("CARGO_TERM_COLOR", "never").env_remove("COMPLETE");
+	command
+		.args(args)
+		.current_dir(dir)
+		.env("CARGO_TERM_COLOR", "never")
+		.env_remove("COMPLETE");
 	command
 }
 
@@ -101,7 +105,11 @@ fn complete(dir: &Path, words: &[&str]) -> Vec<String> {
 	let run = completion(dir, words).success();
 	let mut seen = BTreeSet::new();
 
-	run.stdout.lines().filter(|line| !line.is_empty() && seen.insert(*line)).map(str::to_owned).collect()
+	run.stdout
+		.lines()
+		.filter(|line| !line.is_empty() && seen.insert(*line))
+		.map(str::to_owned)
+		.collect()
 }
 
 /// The script `COMPLETE=<shell> cargo-rscode` prints.
@@ -117,7 +125,10 @@ fn registration(shell: &str) -> Run {
 fn has_bash() -> bool {
 	let script = format!("(( BASH_VERSINFO[0] >= 4 )) && {} --version", sh_quote(BIN));
 
-	Command::new("bash").args(["-c", &script]).output().is_ok_and(|output| output.status.success())
+	Command::new("bash")
+		.args(["-c", &script])
+		.output()
+		.is_ok_and(|output| output.status.success())
 }
 
 fn sh_quote(text: &str) -> String {
@@ -143,7 +154,13 @@ for reply in "${{COMPREPLY[@]}}"; do printf '[%s]\n' "$reply"; done
 		line = sh_quote(line),
 		words = words.join(" "),
 	);
-	let output = Command::new("bash").arg("-c").arg(program).current_dir(dir).env_remove("COMPLETE").output().unwrap();
+	let output = Command::new("bash")
+		.arg("-c")
+		.arg(program)
+		.current_dir(dir)
+		.env_remove("COMPLETE")
+		.output()
+		.unwrap();
 
 	assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 
@@ -160,7 +177,13 @@ fn run_into_closed_pipe(dir: &Path, args: &[&str]) -> Option<i32> {
 
 	drop(reader);
 
-	command(dir, args).stdout(writer).stderr(Stdio::null()).stdin(Stdio::null()).status().unwrap().code()
+	command(dir, args)
+		.stdout(writer)
+		.stderr(Stdio::null())
+		.stdin(Stdio::null())
+		.status()
+		.unwrap()
+		.code()
 }
 
 /// A copy of the fixture in the temporary directory, removed when dropped.
@@ -202,9 +225,7 @@ impl TempCopy {
 
 /// A workspace whose root package `a` has the member `b`, which calls `a::foo`.
 fn two_packages(name: &str) -> TempCopy {
-	let package = |name: &str, dependencies: &str| {
-		format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}")
-	};
+	let package = |name: &str, dependencies: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}");
 
 	TempCopy::with_files(
 		name,
@@ -332,7 +353,11 @@ fn errors_exit_with_1() {
 	let packages = run(&fixture(), &["view", "x", "-p"]);
 
 	assert_eq!(packages.code, Some(1));
-	assert!(packages.stderr.contains("Possible packages/workspace members:\n    demo\n"), "{}", packages.stderr);
+	assert!(
+		packages.stderr.contains("Possible packages/workspace members:\n    demo\n"),
+		"{}",
+		packages.stderr
+	);
 
 	let bins = run(&fixture(), &["view", "x", "--bin"]);
 
@@ -347,7 +372,11 @@ fn errors_exit_with_1() {
 	let anchor = run(&fixture(), &["insert", "crate", "--anchor", "crate::add"]);
 
 	assert_eq!(anchor.code, Some(1));
-	assert!(anchor.stderr.contains("`--anchor` needs `--position before` or `--position after`"), "{}", anchor.stderr);
+	assert!(
+		anchor.stderr.contains("`--anchor` needs `--position before` or `--position after`"),
+		"{}",
+		anchor.stderr
+	);
 
 	let source = run(&fixture(), &["replace", "crate::add", "missing.rs"]);
 
@@ -365,12 +394,15 @@ fn runs_as_a_cargo_subcommand() {
 		.or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
 		.unwrap_or_default();
 	let path = std::env::var_os("PATH").unwrap_or_default();
-	let path = std::env::join_paths([bin_dir, cargo_home.join("bin")].into_iter().chain(std::env::split_paths(&path)))
-		.unwrap();
+	let path = std::env::join_paths([bin_dir, cargo_home.join("bin")].into_iter().chain(std::env::split_paths(&path))).unwrap();
 	let cargo = |args: &[&str]| {
 		let mut command = Command::new(env!("CARGO"));
 
-		command.args(args).current_dir(fixture()).env("PATH", &path).env("CARGO_TERM_COLOR", "never");
+		command
+			.args(args)
+			.current_dir(fixture())
+			.env("PATH", &path)
+			.env("CARGO_TERM_COLOR", "never");
 		finish(command, None)
 	};
 
@@ -478,7 +510,10 @@ fn bash_completes_item_paths() {
 
 	let words = ["cargo-rscode", "view", "crate", "::", "shapes", "::"];
 
-	assert_eq!(bash_completion(&dir, "cargo-rscode view crate::shapes::", &words), ["Circle", "Kind", "Shape"]);
+	assert_eq!(
+		bash_completion(&dir, "cargo-rscode view crate::shapes::", &words),
+		["Circle", "Kind", "Shape"]
+	);
 
 	let words = ["cargo-rscode", "find", "x", "--from", "=", "crate", "::", "u"];
 
@@ -497,12 +532,24 @@ fn registers_completion_scripts() {
 
 	let zsh = registration("zsh").success();
 
-	assert!(zsh.stdout.contains("compdef _clap_dynamic_completer_cargo_rscode cargo-rscode"), "{}", zsh.stdout);
-	assert!(zsh.stdout.contains("_cargo-rscode() { _clap_dynamic_completer_cargo_rscode \"$@\" }"), "{}", zsh.stdout);
+	assert!(
+		zsh.stdout.contains("compdef _clap_dynamic_completer_cargo_rscode cargo-rscode"),
+		"{}",
+		zsh.stdout
+	);
+	assert!(
+		zsh.stdout.contains("_cargo-rscode() { _clap_dynamic_completer_cargo_rscode \"$@\" }"),
+		"{}",
+		zsh.stdout
+	);
 
 	let fish = registration("fish").success();
 
-	assert!(fish.stdout.contains("--command cargo --condition __cargo_rscode_args "), "{}", fish.stdout);
+	assert!(
+		fish.stdout.contains("--command cargo --condition __cargo_rscode_args "),
+		"{}",
+		fish.stdout
+	);
 
 	let unknown = registration("tcsh");
 
@@ -521,7 +568,8 @@ fn names_imports_by_use_paths() {
 	let view = run(&fixture(), &["view", "use demo::Circle"]).success();
 
 	assert!(
-		view.stdout.starts_with(&format!("// {}", native("use demo::Circle (import) src/lib.rs:6"))),
+		view.stdout
+			.starts_with(&format!("// {}", native("use demo::Circle (import) src/lib.rs:6"))),
 		"{}",
 		view.stdout
 	);
@@ -535,23 +583,43 @@ fn names_imports_by_use_paths() {
 	let ambiguous = run(&fixture(), &["remove", "--bin", "demo", "crate::Shape", "--dry-run"]);
 
 	assert_ne!(ambiguous.code, Some(0), "{ambiguous:#?}");
-	assert!(ambiguous.stderr.contains(&native("`use demo::Shape` (import) at src/main.rs:1:5")), "{ambiguous:#?}");
-	assert!(ambiguous.stderr.contains(&native("`demo::shapes::Shape` (trait) at src/shapes.rs")), "{ambiguous:#?}");
-	assert!(ambiguous.stderr.contains("hint: the path names an item through a private import"), "{ambiguous:#?}");
+	assert!(
+		ambiguous.stderr.contains(&native("`use demo::Shape` (import) at src/main.rs:1:5")),
+		"{ambiguous:#?}"
+	);
+	assert!(
+		ambiguous.stderr.contains(&native("`demo::shapes::Shape` (trait) at src/shapes.rs")),
+		"{ambiguous:#?}"
+	);
+	assert!(
+		ambiguous.stderr.contains("hint: the path names an item through a private import"),
+		"{ambiguous:#?}"
+	);
 
 	// unquoted, the shell splits the path
 	let split = run(&fixture(), &["view", "use", "demo::Circle"]);
 
-	assert!(split.stderr.contains("expected a path after `use` (quote the whole path, `use` included)"), "{split:#?}");
+	assert!(
+		split
+			.stderr
+			.contains("expected a path after `use` (quote the whole path, `use` included)"),
+		"{split:#?}"
+	);
 
 	let split_pattern = run(&fixture(), &["find", "use", "Circle"]);
 
-	assert!(split_pattern.stderr.contains("expected a pattern after `use` (quote the whole pattern"), "{split_pattern:#?}");
+	assert!(
+		split_pattern.stderr.contains("expected a pattern after `use` (quote the whole pattern"),
+		"{split_pattern:#?}"
+	);
 
 	// an import's own text is not the path of the import
 	let pasted = run(&fixture(), &["remove", "--bin", "demo", "use demo::shapes::Shape", "--dry-run"]);
 
-	assert!(pasted.stderr.contains("hint: a `use` path names the imports of the module"), "{pasted:#?}");
+	assert!(
+		pasted.stderr.contains("hint: a `use` path names the imports of the module"),
+		"{pasted:#?}"
+	);
 }
 
 /// Underscore imports are found by what they import (only by `use` patterns with wildcards or without an anchor), and a
@@ -617,13 +685,25 @@ fn finds_items() {
 	let imports = run(&fixture(), &["find", "Circle", "--imports", "--show", "kind"]).success();
 
 	assert!(imports.lines().contains(&"demo::shapes::Circle  struct"), "{}", imports.stdout);
-	assert!(imports.lines().contains(&"use demo::Circle  import  -> demo::shapes::Circle"), "{}", imports.stdout);
+	assert!(
+		imports.lines().contains(&"use demo::Circle  import  -> demo::shapes::Circle"),
+		"{}",
+		imports.stdout
+	);
 
 	// asking for the kind is asking for imports
 	let only_imports = run(&fixture(), &["find", "*", "-k", "import", "--show", "kind"]).success();
 
-	assert!(only_imports.lines().contains(&"use demo::Circle  import  -> demo::shapes::Circle"), "{}", only_imports.stdout);
-	assert!(only_imports.lines().iter().all(|line| line.contains("  import")), "{}", only_imports.stdout);
+	assert!(
+		only_imports.lines().contains(&"use demo::Circle  import  -> demo::shapes::Circle"),
+		"{}",
+		only_imports.stdout
+	);
+	assert!(
+		only_imports.lines().iter().all(|line| line.contains("  import")),
+		"{}",
+		only_imports.stdout
+	);
 
 	let methods = run(&fixture(), &["find", "--starts-with", "ar", "-k", "assoc-fn", "--show", "location"]).success();
 
@@ -681,9 +761,7 @@ fn finds_usable_paths() {
 
 #[test]
 fn finds_as_json_and_file_lines() {
-	let json: Value =
-		serde_json::from_str(&run(&fixture(), &["find", "crate::add", "--message-format", "json"]).success().stdout)
-			.unwrap();
+	let json: Value = serde_json::from_str(&run(&fixture(), &["find", "crate::add", "--message-format", "json"]).success().stdout).unwrap();
 	let found = json.as_array().unwrap();
 
 	assert_eq!(found.len(), 1, "{json}");
@@ -699,10 +777,16 @@ fn finds_as_json_and_file_lines() {
 	let lines = run(&fixture(), &["find", "crate::add", "crate::twice", "--message-format", "file-lines"]).success();
 	let lib = serde_json::to_string(&native("src/lib.rs")).unwrap();
 
-	assert_eq!(lines.stdout, format!("[{{\"file\":{lib},\"range\":[8,11]}},{{\"file\":{lib},\"range\":[25,28]}}]\n"));
+	assert_eq!(
+		lines.stdout,
+		format!("[{{\"file\":{lib},\"range\":[8,11]}},{{\"file\":{lib},\"range\":[25,28]}}]\n")
+	);
 
 	let absolute = run(&fixture(), &["find", "crate::add", "--absolute-paths"]).success();
-	let printed = absolute.stdout.strip_prefix("demo::add  fn  ").and_then(|rest| rest.strip_suffix(":8:1\n"));
+	let printed = absolute
+		.stdout
+		.strip_prefix("demo::add  fn  ")
+		.and_then(|rest| rest.strip_suffix(":8:1\n"));
 	let printed = Path::new(printed.unwrap_or_else(|| panic!("{}", absolute.stdout)));
 
 	// compared canonicalized, which on Windows gives verbatim paths (`\\?\C:\...`), not how they are printed
@@ -730,12 +814,19 @@ fn views_items() {
 	let no_docs = run(&fixture(), &["view", "crate::add", "--no-docs"]).success();
 
 	assert!(!no_docs.stdout.contains("Adds two numbers"), "{}", no_docs.stdout);
-	assert!(no_docs.stdout.contains("pub fn add(left: i32, right: i32) -> i32 {"), "{}", no_docs.stdout);
+	assert!(
+		no_docs.stdout.contains("pub fn add(left: i32, right: i32) -> i32 {"),
+		"{}",
+		no_docs.stdout
+	);
 
 	let numbered = run(&fixture(), &["view", "crate::twice", "-n"]).success();
 
 	assert!(
-		numbered.lines().iter().any(|line| line.trim_start().starts_with("26 │ pub fn twice(value: i32) -> i32 {")),
+		numbered
+			.lines()
+			.iter()
+			.any(|line| line.trim_start().starts_with("26 │ pub fn twice(value: i32) -> i32 {")),
 		"{}",
 		numbered.stdout
 	);
@@ -745,9 +836,7 @@ fn views_items() {
 	assert!(variants.stdout.contains("[cfg: feature = \"extra\"] [inactive]\n"), "{}", variants.stdout);
 	assert!(variants.stdout.contains("\"plain\""), "{}", variants.stdout);
 
-	let json: Value =
-		serde_json::from_str(&run(&fixture(), &["view", "crate::add", "--message-format", "json"]).success().stdout)
-			.unwrap();
+	let json: Value = serde_json::from_str(&run(&fixture(), &["view", "crate::add", "--message-format", "json"]).success().stdout).unwrap();
 
 	assert_eq!(json[0]["path"], "demo::add");
 	assert_eq!(json[0]["file"], native("src/lib.rs"));
@@ -763,7 +852,10 @@ fn views_items() {
 
 	assert_eq!(
 		radius.stdout,
-		format!("// {}\npub radius: f64\n", native("demo::shapes::Circle.radius (field) src/shapes.rs:6-6"))
+		format!(
+			"// {}\npub radius: f64\n",
+			native("demo::shapes::Circle.radius (field) src/shapes.rs:6-6")
+		)
 	);
 }
 
@@ -772,7 +864,9 @@ fn views_outlines_and_impls() {
 	let shapes = run(&fixture(), &["view", "crate::shapes"]).success();
 
 	assert!(
-		shapes.stdout.starts_with(&format!("// {}\n", native("demo::shapes (mod) src/lib.rs:3-3"))),
+		shapes
+			.stdout
+			.starts_with(&format!("// {}\n", native("demo::shapes (mod) src/lib.rs:3-3"))),
 		"{}",
 		shapes.stdout
 	);
@@ -879,7 +973,10 @@ fn checks_formatting() {
 fn check_results_survive_a_closed_stdout() {
 	// `cargo rscode fmt --check | head -n 3` under `set -o pipefail` must still fail when files would change
 	assert_eq!(run_into_closed_pipe(&fixture(), &["fmt", "--check", "crate::util::alpha"]), Some(1));
-	assert_eq!(run_into_closed_pipe(&fixture(), &["fmt", "--check", "--emit", "json", "crate::util::alpha"]), Some(1));
+	assert_eq!(
+		run_into_closed_pipe(&fixture(), &["fmt", "--check", "--emit", "json", "crate::util::alpha"]),
+		Some(1)
+	);
 	assert_eq!(run_into_closed_pipe(&fixture(), &["sort", "--check", "crate::util"]), Some(1));
 	assert_eq!(run_into_closed_pipe(&fixture(), &["fmt", "--check", "--no-sort", "crate::add"]), Some(0));
 
@@ -909,7 +1006,10 @@ fn sorts_items() {
 	let copy = TempCopy::new("sort");
 
 	assert_eq!(run(copy.path(), &["sort", "--check", "crate::util"]).code, Some(1));
-	assert_eq!(run(copy.path(), &["sort", "crate::util"]).success().stdout, native("sorted src/util.rs\n"));
+	assert_eq!(
+		run(copy.path(), &["sort", "crate::util"]).success().stdout,
+		native("sorted src/util.rs\n")
+	);
 
 	let util = copy.read("src/util.rs");
 	let position = |text: &str| util.find(text).unwrap_or_else(|| panic!("{text}: {util}"));
@@ -926,7 +1026,10 @@ fn skip_children_sorts_inline_modules_but_not_child_files() {
 	let copy = TempCopy::with_files(
 		"sort-skip-children",
 		&[
-			("Cargo.toml", "[package]\nname = \"skip-children\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+			(
+				"Cargo.toml",
+				"[package]\nname = \"skip-children\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+			),
 			(
 				"src/lib.rs",
 				"pub mod m {\n\tpub fn b() {}\n\tpub fn a() {}\n\n\tpub mod inline {\n\t\tpub fn d() {}\n\t\tpub fn c() {}\n\t}\n\n\tpub mod child;\n}\n",
@@ -956,11 +1059,17 @@ fn previews_renames() {
 		"{}",
 		rename.stdout
 	);
-	assert!(rename.stderr.contains("would rename 1 item, update 1 reference in 2 files"), "{}", rename.stderr);
+	assert!(
+		rename.stderr.contains("would rename 1 item, update 1 reference in 2 files"),
+		"{}",
+		rename.stderr
+	);
 	assert_eq!(read_fixture("src/lib.rs"), lib);
 
 	let json: Value = serde_json::from_str(
-		&run(&fixture(), &["rename", "crate::add", "sum", "-n", "--message-format", "json"]).success().stdout,
+		&run(&fixture(), &["rename", "crate::add", "sum", "-n", "--message-format", "json"])
+			.success()
+			.stdout,
 	)
 	.unwrap();
 
@@ -979,15 +1088,25 @@ fn previews_renames() {
 fn diffs_are_relative_to_the_workspace_root() {
 	let workspace = two_packages("diff-root");
 	let rename = run(&workspace.path().join("b"), &["rename", "::a::foo", "foo2", "--dry-run"]).success();
-	let mut headers: Vec<&str> =
-		rename.stdout.lines().filter(|line| line.starts_with("--- ") || line.starts_with("+++ ")).collect();
+	let mut headers: Vec<&str> = rename
+		.stdout
+		.lines()
+		.filter(|line| line.starts_with("--- ") || line.starts_with("+++ "))
+		.collect();
 
 	headers.sort();
 
-	assert_eq!(headers, ["+++ b/b/src/lib.rs", "+++ b/src/lib.rs", "--- a/b/src/lib.rs", "--- a/src/lib.rs"]);
+	assert_eq!(
+		headers,
+		["+++ b/b/src/lib.rs", "+++ b/src/lib.rs", "--- a/b/src/lib.rs", "--- a/src/lib.rs"]
+	);
 
 	// so `patch -p1` applies it in the workspace root
-	if Command::new("patch").arg("--version").output().is_ok_and(|output| output.status.success()) {
+	if Command::new("patch")
+		.arg("--version")
+		.output()
+		.is_ok_and(|output| output.status.success())
+	{
 		let mut patch = Command::new("patch");
 
 		patch.args(["-p1", "--dry-run", "--batch"]).current_dir(workspace.path());
@@ -1004,7 +1123,11 @@ fn errors_name_the_options_that_get_past_them() {
 
 	assert_eq!(collision.code, Some(1));
 	assert!(collision.stderr.contains("collides with existing names:\n"), "{}", collision.stderr);
-	assert!(collision.stderr.ends_with("hint: pass `--force` to proceed anyway\n"), "{}", collision.stderr);
+	assert!(
+		collision.stderr.ends_with("hint: pass `--force` to proceed anyway\n"),
+		"{}",
+		collision.stderr
+	);
 
 	let source = "pub fn extra() -> &'static str {\n\t\"x\"\n}\n";
 	let variants = run_with_stdin(&fixture(), &["replace", "crate::extra", "--dry-run"], source);
@@ -1017,7 +1140,10 @@ fn errors_name_the_options_that_get_past_them() {
 		"impls",
 		&[
 			("Cargo.toml", "[package]\nname = \"impls\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
-			("src/lib.rs", "pub struct W<T>(T);\n\nimpl W<u8> {\n\tfn get() {}\n}\n\nimpl W<u16> {\n\tfn get() {}\n}"),
+			(
+				"src/lib.rs",
+				"pub struct W<T>(T);\n\nimpl W<u8> {\n\tfn get() {}\n}\n\nimpl W<u16> {\n\tfn get() {}\n}",
+			),
 		],
 	);
 	let args = ["replace", "crate::W::get", "--dry-run", "--all-variants"];
@@ -1035,8 +1161,16 @@ fn errors_name_the_options_that_get_past_them() {
 	let crates = run_with_stdin(&fixture(), &["insert", "crate", "--dry-run"], "pub fn q() {}\n");
 
 	assert_eq!(crates.code, Some(1));
-	assert!(crates.stderr.contains(&native("`demo` (lib crate root) at src/lib.rs:1:1")), "{}", crates.stderr);
-	assert!(crates.stderr.contains(&native("`demo` (bin crate root) at src/main.rs:1:1")), "{}", crates.stderr);
+	assert!(
+		crates.stderr.contains(&native("`demo` (lib crate root) at src/lib.rs:1:1")),
+		"{}",
+		crates.stderr
+	);
+	assert!(
+		crates.stderr.contains(&native("`demo` (bin crate root) at src/main.rs:1:1")),
+		"{}",
+		crates.stderr
+	);
 	assert!(crates.stderr.contains("select one with `--lib` or `--bin NAME`"), "{}", crates.stderr);
 
 	let lib = run_with_stdin(&fixture(), &["insert", "crate", "--dry-run", "--lib"], "pub fn q() {}\n").success();
@@ -1049,7 +1183,9 @@ fn errors_name_the_options_that_get_past_them() {
 
 	assert!(member.stdout.contains("pub fn foo() {}"), "{}", member.stdout);
 	assert!(
-		member.stderr.contains("note: found in workspace member `a`, which is not selected by default"),
+		member
+			.stderr
+			.contains("note: found in workspace member `a`, which is not selected by default"),
 		"{}",
 		member.stderr
 	);
@@ -1057,7 +1193,11 @@ fn errors_name_the_options_that_get_past_them() {
 	let member = run(&workspace.path().join("b"), &["view", "::a::foo", "-p", "b"]);
 
 	assert_eq!(member.code, Some(1));
-	assert!(member.stderr.contains("`a` is a workspace member that is not selected"), "{}", member.stderr);
+	assert!(
+		member.stderr.contains("`a` is a workspace member that is not selected"),
+		"{}",
+		member.stderr
+	);
 	assert!(member.stderr.contains("pass `-p a` or `--workspace`"), "{}", member.stderr);
 
 	let found = run(workspace.path(), &["find", "bar"]).success();
@@ -1073,7 +1213,12 @@ fn errors_name_the_options_that_get_past_them() {
 	let found = run(workspace.path(), &["find", "foo"]).success();
 
 	assert!(found.stderr.contains("the workspace member `b` is not selected"), "{}", found.stderr);
-	assert!(run(workspace.path(), &["view", "::b::bar", "-p", "b"]).success().stdout.contains("a::foo();"));
+	assert!(
+		run(workspace.path(), &["view", "::b::bar", "-p", "b"])
+			.success()
+			.stdout
+			.contains("a::foo();")
+	);
 
 	// an edit of what one member has, and suggestions for what names nothing
 	let rename = run(workspace.path(), &["rename", "crate::bar", "baz", "--dry-run"]).success();
@@ -1101,9 +1246,8 @@ fn errors_name_the_options_that_get_past_them() {
 /// `--all-features`.
 #[test]
 fn all_selects_every_member_with_every_feature() {
-	let package = |name: &str, extra: &str| {
-		format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nextra = []\n{extra}")
-	};
+	let package =
+		|name: &str, extra: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\nextra = []\n{extra}");
 	let gated = "#[cfg(feature = \"extra\")]\npub fn gated() {}\n";
 	let workspace = TempCopy::with_files(
 		"all-workspace",
@@ -1120,7 +1264,10 @@ fn all_selects_every_member_with_every_feature() {
 
 	let found = run(workspace.path(), &["find", "--active-only", "gated", "--all"]).success();
 
-	assert_eq!(found.lines(), [native("b::gated  fn  b/src/lib.rs:1:1"), native("a::gated  fn  src/lib.rs:1:1")]);
+	assert_eq!(
+		found.lines(),
+		[native("b::gated  fn  b/src/lib.rs:1:1"), native("a::gated  fn  src/lib.rs:1:1")]
+	);
 	assert!(!found.stderr.contains("not selected"), "{}", found.stderr);
 
 	let single = TempCopy::with_files("all-single", &[("Cargo.toml", &package("a", "")), ("src/lib.rs", gated)]);
@@ -1133,15 +1280,17 @@ fn all_selects_every_member_with_every_feature() {
 	let refused = run(single.path(), &["find", "gated", "--all", "--workspace"]);
 
 	assert_eq!(refused.code, Some(2));
-	assert!(refused.stderr.contains("the argument '--all' cannot be used with '--workspace'"), "{}", refused.stderr);
+	assert!(
+		refused.stderr.contains("the argument '--all' cannot be used with '--workspace'"),
+		"{}",
+		refused.stderr
+	);
 }
 
 /// Searching the members that are not selected leaves the other paths of a command naming what they named.
 #[test]
 fn searches_members_for_one_path_only() {
-	let package = |name: &str, dependencies: &str| {
-		format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}")
-	};
+	let package = |name: &str, dependencies: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{dependencies}");
 	let workspace = TempCopy::with_files(
 		"members",
 		&[
@@ -1154,7 +1303,10 @@ fn searches_members_for_one_path_only() {
 			("app/src/main.rs", "mod cmd;\n\nfn main() {\n\tcmd::run();\n}\n"),
 			("app/src/cmd.rs", "pub fn run() {}\n"),
 			("liba/Cargo.toml", &package("liba", "")),
-			("liba/src/lib.rs", "pub struct Widget;\n\nimpl Widget {\n\tpub fn draw(&self) {}\n}\n\npub fn only_in_a() {}\n"),
+			(
+				"liba/src/lib.rs",
+				"pub struct Widget;\n\nimpl Widget {\n\tpub fn draw(&self) {}\n}\n\npub fn only_in_a() {}\n",
+			),
 			("libb/Cargo.toml", &package("libb", "")),
 			(
 				"libb/src/lib.rs",
@@ -1181,7 +1333,11 @@ fn searches_members_for_one_path_only() {
 
 	let refs = run(dir, &["refs", "crate::cmd", "crate::only_in_b"]).success();
 
-	assert!(refs.stdout.contains("cmd::run();") && !refs.stdout.contains("cmd::go();"), "{}", refs.stdout);
+	assert!(
+		refs.stdout.contains("cmd::run();") && !refs.stdout.contains("cmd::go();"),
+		"{}",
+		refs.stdout
+	);
 
 	let import = run(dir, &["import", "crate::cmd", "only_in_a", "--dry-run"]).success();
 
@@ -1192,7 +1348,9 @@ fn searches_members_for_one_path_only() {
 
 	assert_eq!(import.code, Some(1));
 	assert!(
-		import.stderr.contains("crates of several packages (`app`, `libb`): start it with the name of one of these crates"),
+		import
+			.stderr
+			.contains("crates of several packages (`app`, `libb`): start it with the name of one of these crates"),
 		"{}",
 		import.stderr
 	);
@@ -1200,7 +1358,11 @@ fn searches_members_for_one_path_only() {
 	let import = run(dir, &["import", "app::cmd", "only_in_b", "--dry-run"]);
 
 	assert_eq!(import.code, Some(1));
-	assert!(import.stderr.contains("its crate `libb` is not a dependency of `app`"), "{}", import.stderr);
+	assert!(
+		import.stderr.contains("its crate `libb` is not a dependency of `app`"),
+		"{}",
+		import.stderr
+	);
 
 	// the binary and the library of a member load one file: its items are not ambiguous
 	let rename = run(dir, &["rename", "crate::util::shared", "common", "--dry-run"]).success();
@@ -1224,7 +1386,9 @@ fn searches_members_for_one_path_only() {
 
 	assert_eq!(missing.code, Some(1));
 	assert!(
-		missing.stderr.contains("`liba` is selected, but the target options (like `--lib` and `--bin`) leave out"),
+		missing
+			.stderr
+			.contains("`liba` is selected, but the target options (like `--lib` and `--bin`) leave out"),
 		"{}",
 		missing.stderr
 	);
@@ -1253,8 +1417,16 @@ fn removes_items() {
 	let dry = run(&fixture(), &["remove", "crate::twice", "--dry-run"]).success();
 
 	assert!(dry.stdout.contains("-pub fn twice(value: i32) -> i32 {"), "{}", dry.stdout);
-	assert!(dry.stderr.contains(&native("warning: dangling reference at src/main.rs:7:")), "{}", dry.stderr);
-	assert!(dry.stderr.contains(&native("would remove demo::twice (fn) src/lib.rs:25:1")), "{}", dry.stderr);
+	assert!(
+		dry.stderr.contains(&native("warning: dangling reference at src/main.rs:7:")),
+		"{}",
+		dry.stderr
+	);
+	assert!(
+		dry.stderr.contains(&native("would remove demo::twice (fn) src/lib.rs:25:1")),
+		"{}",
+		dry.stderr
+	);
 
 	let copy = TempCopy::new("remove");
 	let removed = run(copy.path(), &["remove", "crate::util::zeta"]).success();
@@ -1285,7 +1457,10 @@ fn replaces_items() {
 
 	let lib = copy.read("src/lib.rs");
 
-	assert!(lib.contains("/// Adds.\npub fn add(left: i32, right: i32) -> i32 {\n\tright + left\n}\n"), "{lib}");
+	assert!(
+		lib.contains("/// Adds.\npub fn add(left: i32, right: i32) -> i32 {\n\tright + left\n}\n"),
+		"{lib}"
+	);
 	assert!(!lib.contains("Adds two numbers"), "{lib}");
 
 	// from a file, formatted afterwards
@@ -1294,7 +1469,10 @@ fn replaces_items() {
 	let formatted = run(copy.path(), &["replace", "crate::twice", "new.rs", "--fmt"]).success();
 
 	assert_eq!(formatted.stdout, native("replaced demo::twice\nformatted src/lib.rs\n"));
-	assert!(copy.read("src/lib.rs").ends_with("pub fn twice(value: i32) -> i32 {\n\tutil::double(value)\n}\n"));
+	assert!(
+		copy.read("src/lib.rs")
+			.ends_with("pub fn twice(value: i32) -> i32 {\n\tutil::double(value)\n}\n")
+	);
 	cargo_check(copy.path());
 
 	let wrong_kind = run_with_stdin(copy.path(), &["replace", "crate::add"], "pub struct Add;");
@@ -1304,7 +1482,11 @@ fn replaces_items() {
 
 #[test]
 fn edits_items() {
-	let dry = run(&fixture(), &["edit", "crate::add", "--old", "left + right", "--new", "right + left", "--dry-run"]).success();
+	let dry = run(
+		&fixture(),
+		&["edit", "crate::add", "--old", "left + right", "--new", "right + left", "--dry-run"],
+	)
+	.success();
 
 	assert!(dry.stdout.contains("-\tleft + right\n+\tright + left\n"), "{}", dry.stdout);
 	assert_eq!(dry.stderr, native("would edit demo::add (src/lib.rs:8-11)\n"));
@@ -1318,7 +1500,16 @@ fn edits_items() {
 	// the doc comment, attributes, and visibility
 	let json = run(
 		copy.path(),
-		&["edit", "crate::twice", "--doc", "Twice.", "--add-attr", "must_use", "--message-format", "json"],
+		&[
+			"edit",
+			"crate::twice",
+			"--doc",
+			"Twice.",
+			"--add-attr",
+			"must_use",
+			"--message-format",
+			"json",
+		],
 	)
 	.success();
 
@@ -1333,7 +1524,11 @@ fn edits_items() {
 
 	let variant = run(copy.path(), &["edit", "crate::extra", "--old-file", "old.txt", "--new-file", "new.txt"]).success();
 
-	assert!(variant.stderr.contains("note: of the 2 items that `crate::extra` names, only"), "{}", variant.stderr);
+	assert!(
+		variant.stderr.contains("note: of the 2 items that `crate::extra` names, only"),
+		"{}",
+		variant.stderr
+	);
 	assert!(copy.read("src/lib.rs").contains("\t\"simple\"\n"));
 	cargo_check(copy.path());
 
@@ -1341,7 +1536,13 @@ fn edits_items() {
 
 	assert_eq!(missing.code, Some(1));
 	assert!(missing.stderr.contains("the closest line is 10: `right + left`"), "{}", missing.stderr);
-	assert!(missing.stderr.contains("hint: copy `--old` exactly from the output of `cargo rscode view`"), "{}", missing.stderr);
+	assert!(
+		missing
+			.stderr
+			.contains("hint: copy `--old` exactly from the output of `cargo rscode view`"),
+		"{}",
+		missing.stderr
+	);
 
 	let split = run(copy.path(), &["edit", "crate::add", "--old", "}", "--new", "}\n\npub fn sub() {}"]);
 
@@ -1355,20 +1556,45 @@ fn edits_items() {
 }
 
 #[test]
+fn edit_replace_all_is_scoped() {
+	let copy = TempCopy::new("edit-replace-all");
+	std::fs::write(copy.path().join("src/lib.rs"), "fn target() { old(); old(); }\nfn sibling() { old(); }\n").unwrap();
+	let args = ["edit", "crate::target", "--old", "old()", "--new", "new()", "--replace-all"];
+	let before = copy.read("src/lib.rs");
+	run(copy.path(), &[args.as_slice(), &["--dry-run"]].concat()).success();
+	assert_eq!(copy.read("src/lib.rs"), before);
+	run(copy.path(), &args).success();
+	assert_eq!(copy.read("src/lib.rs"), "fn target() { new(); new(); }\nfn sibling() { old(); }\n");
+}
+
+#[test]
 fn inserts_items() {
 	let copy = TempCopy::new("insert");
-	let first =
-		run_with_stdin(copy.path(), &["insert", "crate::util", "--position", "start"], "pub(crate) fn first() {}\n")
-			.success();
+	let first = run_with_stdin(
+		copy.path(),
+		&["insert", "crate::util", "--position", "start"],
+		"pub(crate) fn first() {}\n",
+	)
+	.success();
 
 	assert_eq!(first.stdout, native("inserted fn first into crate::util (src/util.rs)\n"));
 	assert!(copy.read("src/util.rs").starts_with("pub(crate) fn first() {}\n\npub(crate) fn zeta()"));
 
 	let method = "pub fn unit() -> Self {\n\tSelf::new(1.0)\n}\n";
-	let args = ["insert", "<crate::shapes::Circle>", "--position", "after", "--anchor", "<crate::shapes::Circle>::new"];
+	let args = [
+		"insert",
+		"<crate::shapes::Circle>",
+		"--position",
+		"after",
+		"--anchor",
+		"<crate::shapes::Circle>::new",
+	];
 
 	run_with_stdin(copy.path(), &args, method).success();
-	assert!(copy.read("src/shapes.rs").contains("\tpub fn unit() -> Self {\n\t\tSelf::new(1.0)\n\t}\n}"));
+	assert!(
+		copy.read("src/shapes.rs")
+			.contains("\tpub fn unit() -> Self {\n\t\tSelf::new(1.0)\n\t}\n}")
+	);
 
 	// with `--after`, the sibling's container is the parent
 	let half = "pub fn half()->Self{Self::new(0.5)}";
@@ -1378,12 +1604,17 @@ fn inserts_items() {
 		after.stdout,
 		native("inserted assoc-fn half into impl demo::shapes::Circle (src/shapes.rs)\nformatted src/shapes.rs\n")
 	);
-	assert!(copy.read("src/shapes.rs").contains("\t}\n\n\tpub fn half() -> Self {\n\t\tSelf::new(0.5)\n\t}\n}"));
+	assert!(
+		copy.read("src/shapes.rs")
+			.contains("\t}\n\n\tpub fn half() -> Self {\n\t\tSelf::new(0.5)\n\t}\n}")
+	);
 
-	let last =
-		run_with_stdin(copy.path(), &["insert", "crate::util", "--fmt"], "pub(crate) fn last()->u8{3}").success();
+	let last = run_with_stdin(copy.path(), &["insert", "crate::util", "--fmt"], "pub(crate) fn last()->u8{3}").success();
 
-	assert_eq!(last.stdout, native("inserted fn last into crate::util (src/util.rs)\nformatted src/util.rs\n"));
+	assert_eq!(
+		last.stdout,
+		native("inserted fn last into crate::util (src/util.rs)\nformatted src/util.rs\n")
+	);
 	assert!(copy.read("src/util.rs").ends_with("pub(crate) fn last() -> u8 {\n\t3\n}\n"));
 	cargo_check(copy.path());
 
@@ -1391,7 +1622,11 @@ fn inserts_items() {
 	let zero = run_with_stdin(copy.path(), &["insert", "crate::util", "--before", "first"], "pub(crate) fn zero() {}\n").success();
 
 	assert_eq!(zero.stdout, native("inserted fn zero into crate::util (src/util.rs)\n"));
-	assert!(copy.read("src/util.rs").starts_with("pub(crate) fn zero() {}\n"), "{}", copy.read("src/util.rs"));
+	assert!(
+		copy.read("src/util.rs").starts_with("pub(crate) fn zero() {}\n"),
+		"{}",
+		copy.read("src/util.rs")
+	);
 
 	let taken = run_with_stdin(copy.path(), &["insert", "crate::util"], "pub(crate) fn first() {}\n");
 
@@ -1412,7 +1647,10 @@ fn inserts_into_impls_of_unloaded_types() {
 
 	let inserted = run_with_stdin(copy.path(), &["insert", "--after", "<Vec<u8> as Tr>::f", "--lib"], "fn g(&self) {}").success();
 
-	assert_eq!(inserted.stdout, native("inserted assoc-fn g into demo::<impl Tr for Vec<u8>> (src/lib.rs)\n"));
+	assert_eq!(
+		inserted.stdout,
+		native("inserted assoc-fn g into demo::<impl Tr for Vec<u8>> (src/lib.rs)\n")
+	);
 	assert!(copy.read("src/lib.rs").ends_with("\tfn f(&self) {}\n\n\tfn g(&self) {}\n}\n"));
 
 	let args = ["insert", "--after", "<Vec<u8> as Tr>::g", "--lib", "--fmt"];
@@ -1445,9 +1683,15 @@ fn creates_modules() {
 	let args = ["create-module", "crate", "render", "-", "--lib", "--vis", "pub"];
 	let created = run_with_stdin(copy.path(), &args, "pub fn draw() {}\n").success();
 
-	assert_eq!(created.stdout, native("created src/render.rs; inserted `pub mod render;` into crate (src/lib.rs:3)\n"));
+	assert_eq!(
+		created.stdout,
+		native("created src/render.rs; inserted `pub mod render;` into crate (src/lib.rs:3)\n")
+	);
 	assert_eq!(copy.read("src/render.rs"), "pub fn draw() {}\n");
-	assert_eq!(copy.read("src/lib.rs"), lib.replace("pub mod shapes;\n", "pub mod render;\npub mod shapes;\n"));
+	assert_eq!(
+		copy.read("src/lib.rs"),
+		lib.replace("pub mod shapes;\n", "pub mod render;\npub mod shapes;\n")
+	);
 
 	// without a source, the file is empty
 	let args = ["create-module", "crate::shapes", "round", "--lib", "--message-format", "json"];
@@ -1478,8 +1722,14 @@ fn imports() {
 
 	let imported = run(copy.path(), &["import", "crate", "std::{fmt, io}", "--lib"]).success();
 
-	assert_eq!(imported.stdout, native("imported `std::fmt` (src/lib.rs:6)\nimported `std::io` (src/lib.rs:7)\n"));
-	assert_eq!(copy.read("src/lib.rs"), lib.replace("mod util;\n", "mod util;\n\nuse std::fmt;\nuse std::io;\n"));
+	assert_eq!(
+		imported.stdout,
+		native("imported `std::fmt` (src/lib.rs:6)\nimported `std::io` (src/lib.rs:7)\n")
+	);
+	assert_eq!(
+		copy.read("src/lib.rs"),
+		lib.replace("mod util;\n", "mod util;\n\nuse std::fmt;\nuse std::io;\n")
+	);
 
 	let again = run(copy.path(), &["import", "crate", "use std::fmt;", "--lib"]).success();
 
@@ -1502,7 +1752,11 @@ fn imports() {
 
 	assert_eq!(unknown.code, Some(1));
 	assert!(unknown.stderr.starts_with("error: no item found for `HashSet`"), "{}", unknown.stderr);
-	assert!(unknown.stderr.contains("hint: name an item of another crate by its path"), "{}", unknown.stderr);
+	assert!(
+		unknown.stderr.contains("hint: name an item of another crate by its path"),
+		"{}",
+		unknown.stderr
+	);
 
 	let taken = run(copy.path(), &["import", "crate", "other::add", "--lib"]);
 
@@ -1530,7 +1784,10 @@ fn formats_edited_items_by_their_canonical_paths() {
 		"{inserted:#?}"
 	);
 	assert_eq!(inserted.stderr, "");
-	assert!(copy.read("src/shapes.rs").contains("\tpub fn unit() -> Self {\n\t\tSelf::new(1.0)\n\t}\n"));
+	assert!(
+		copy.read("src/shapes.rs")
+			.contains("\tpub fn unit() -> Self {\n\t\tSelf::new(1.0)\n\t}\n")
+	);
 
 	// `Circle` names `crate::Circle` (paths are presumed absolute), not every `Circle`
 	let new = "pub fn new(radius:f64)->Self{Self{radius}}";
@@ -1541,7 +1798,10 @@ fn formats_edited_items_by_their_canonical_paths() {
 		native("replaced demo::shapes::Circle::new\nformatted src/shapes.rs\n"),
 		"{replaced:#?}"
 	);
-	assert!(copy.read("src/shapes.rs").contains("\tpub fn new(radius: f64) -> Self {\n\t\tSelf { radius }\n\t}\n"));
+	assert!(
+		copy.read("src/shapes.rs")
+			.contains("\tpub fn new(radius: f64) -> Self {\n\t\tSelf { radius }\n\t}\n")
+	);
 	assert_eq!(copy.read("src/other.rs"), other);
 
 	// a replacement with another name cannot be formatted by the replaced item's path: a warning says so
@@ -1549,7 +1809,11 @@ fn formats_edited_items_by_their_canonical_paths() {
 	let renamed = run_with_stdin(copy.path(), &args, "pub const TWICE:i32=2;").success();
 
 	assert_eq!(renamed.stdout, "replaced demo::twice\n", "{renamed:#?}");
-	assert!(renamed.stderr.contains("warning: `demo::twice` is gone after the edit"), "{}", renamed.stderr);
+	assert!(
+		renamed.stderr.contains("warning: `demo::twice` is gone after the edit"),
+		"{}",
+		renamed.stderr
+	);
 	assert_eq!(copy.read("src/other.rs"), other);
 }
 
@@ -1571,7 +1835,10 @@ fn formats_items_inserted_into_impl_blocks_with_selectors() {
 		native("inserted assoc-fn n into impl demo::tools::Tools[b] (src/tools.rs)\nformatted src/tools.rs\n")
 	);
 	assert_eq!(inserted.stderr, "");
-	assert_eq!(copy.read("src/tools.rs"), tools.replace("b() {}\n", "b() {}\n\n\tpub fn n() -> u8 {\n\t\t1\n\t}\n"));
+	assert_eq!(
+		copy.read("src/tools.rs"),
+		tools.replace("b() {}\n", "b() {}\n\n\tpub fn n() -> u8 {\n\t\t1\n\t}\n")
+	);
 	cargo_check(copy.path());
 }
 
@@ -1581,12 +1848,18 @@ fn completes_item_paths() {
 
 	assert_eq!(complete(&dir, &["cargo-rscode", "view", "crate::sh"]), ["crate::shapes"]);
 	assert_eq!(complete(&dir, &["cargo-rscode", "view", "crate::shapes::Ci"]), ["crate::shapes::Circle"]);
-	assert_eq!(complete(&dir, &["cargo-rscode", "view", "demo::shapes::Circle::n"]), ["demo::shapes::Circle::new"]);
+	assert_eq!(
+		complete(&dir, &["cargo-rscode", "view", "demo::shapes::Circle::n"]),
+		["demo::shapes::Circle::new"]
+	);
 	assert_eq!(
 		complete(&dir, &["cargo-rscode", "view", "crate::shapes::Kind::"]),
 		["crate::shapes::Kind::Round", "crate::shapes::Kind::Square"]
 	);
-	assert_eq!(complete(&dir, &["cargo-rscode", "find", "x", "--from", "crate::"]), ["crate::shapes", "crate::util"]);
+	assert_eq!(
+		complete(&dir, &["cargo-rscode", "find", "x", "--from", "crate::"]),
+		["crate::shapes", "crate::util"]
+	);
 	assert_eq!(complete(&dir, &["cargo", "rscode", "rename", "crate::tw"]), ["crate::twice"]);
 
 	// below a re-export (`pub use shapes::Circle;`)
@@ -1633,7 +1906,10 @@ mod mcp {
 		let outcome = |index: usize| {
 			let result = &responses[index]["result"];
 
-			(result["isError"] == true, result["content"][0]["text"].as_str().unwrap_or_default().to_owned())
+			(
+				result["isError"] == true,
+				result["content"][0]["text"].as_str().unwrap_or_default().to_owned(),
+			)
 		};
 		let (failed, message) = outcome(0);
 
@@ -1763,7 +2039,12 @@ mod mcp {
 		let responses = exchange(&fixture(), &args, &[("tools/list", json!({}))]);
 		let tools = responses[0]["result"]["tools"].as_array().cloned();
 
-		tools.unwrap_or_default().iter().filter_map(|tool| tool["name"].as_str()).map(str::to_owned).collect()
+		tools
+			.unwrap_or_default()
+			.iter()
+			.filter_map(|tool| tool["name"].as_str())
+			.map(str::to_owned)
+			.collect()
 	}
 
 	#[test]

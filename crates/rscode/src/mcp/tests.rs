@@ -602,6 +602,8 @@ fn schemas_say_only_what_a_call_needs() {
 		edit_item["properties"]["packages"],
 		json!({ "type": "array", "items": { "type": "string" } })
 	);
+	assert_eq!(edit_item["properties"]["replace_all"]["type"], "boolean");
+	assert!(!edit_item["required"].as_array().unwrap().contains(&json!("replace_all")));
 	assert_eq!(edit_item["properties"]["vis"]["type"], "string");
 	assert!(edit_item["properties"]["vis"].get("default").is_none(), "{edit_item}");
 	assert!(edit_item["properties"]["edits"]["items"].get("description").is_none(), "{edit_item}");
@@ -1258,6 +1260,49 @@ mod end_to_end {
 		client.close().await.unwrap();
 	}
 
+	#[tokio::test]
+	async fn replace_all_is_item_scoped_and_sequential() {
+		let fixture = Fixture::with_files(
+			"replace-all",
+			&[
+				(
+					"Cargo.toml",
+					"[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[workspace]\n",
+				),
+				("src/lib.rs", "fn target() { old(); old(); }\nfn sibling() { old(); }\n"),
+			],
+		);
+		let mut client = Client::connect(fixture.options()).await;
+		let before = fixture.read("src/lib.rs");
+		let arguments =
+			json!({"path": "crate::target", "old": "old()", "new": "middle()", "edits": [{"old": "middle()", "new": "new()"}], "replace_all": true});
+		let mut preview = arguments.clone();
+		preview["dry_run"] = json!(true);
+		let (failed, text) = client.call("edit_item", preview).await;
+		assert!(!failed, "{text}");
+		assert_eq!(fixture.read("src/lib.rs"), before);
+		let (failed, text) = client.call("edit_item", arguments).await;
+		assert!(!failed, "{text}");
+		assert_eq!(fixture.read("src/lib.rs"), "fn target() { new(); new(); }\nfn sibling() { old(); }\n");
+		let before = fixture.read("src/lib.rs");
+		let (failed, text) = client.call("edit_item", json!({"path": "crate::target", "old": "new()", "new": "intermediate()", "edits": [{"old": "missing()", "new": "unused()"}], "replace_all": true})).await;
+		assert!(failed && text.contains("not found"), "{text}");
+		assert_eq!(
+			fixture.read("src/lib.rs"),
+			before,
+			"failed later edit must not partially write replace_all"
+		);
+		let (failed, text) = client
+			.call(
+				"edit_item",
+				json!({"path": "crate::target", "old": "missing()", "new": "new()", "replace_all": true}),
+			)
+			.await;
+		assert!(failed && text.contains("not found"), "{text}");
+		assert_eq!(fixture.read("src/lib.rs"), before);
+		client.close().await.unwrap();
+	}
+
 	/// On a server that exposes directories, the first editing call of a connection that works on the server's own
 	/// workspace for want of `attached`, while nothing has been attached on the connection, notes it: a caller whose
 	/// server restarted, losing the source it made the default, sees where its edits go now.
@@ -1449,6 +1494,8 @@ mod end_to_end {
 					"[package]\nname = \"format_scope\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[workspace]\n",
 				),
 				("src/lib.rs", original),
+				// Keep the expected spaces independent of a host/user rustfmt configuration.
+				("rustfmt.toml", "hard_tabs = false\n"),
 			],
 		);
 		let mut client = Client::connect(fixture.options()).await;
