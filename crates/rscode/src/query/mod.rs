@@ -1,11 +1,12 @@
-//! Read-only operations: finding and viewing items, finding their references, and suggesting what paths that name
-//! nothing may have meant.
+//! Read-only operations: finding and viewing items, finding their references, searching the files' text, and
+//! suggesting what paths that name nothing may have meant.
 
 mod find;
 mod outline;
 mod references;
 mod snippet;
 mod suggest;
+mod text;
 mod view;
 
 pub use find::Find;
@@ -20,6 +21,10 @@ pub(crate) use snippet::PrintedText;
 pub(crate) use snippet::multiline_strings;
 pub use suggest::Suggestions;
 pub use suggest::suggest;
+pub use text::SearchTextOptions;
+pub use text::TextMatch;
+pub use text::TextReport;
+pub use text::search_text;
 pub use view::ItemView;
 pub use view::LineNumbers;
 pub use view::View;

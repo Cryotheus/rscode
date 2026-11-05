@@ -126,7 +126,8 @@ is separated from its neighbours by a blank line; code under `#[rustfmt::skip]` 
 ## MCP server (for AI agents)
 
 `cargo rscode mcp` serves the same operations as tools over stdio: `workspace_info`, `find_items`, `view_items`,
-`find_references`, and the editing tools `rename_item`, `move_item`, `remove_items`, `replace_item`, `edit_item`,
+`find_references`, `search_text` (a regex over the loaded crates' source, line by line, each match with the item it is
+in), and the editing tools `rename_item`, `move_item`, `remove_items`, `replace_item`, `edit_item`,
 `insert_items`, `create_module`, `add_import`, and `format_items` (`--read-only` leaves them out). `format_items`
 formats by default and only sorts when `sort: true`; a missing target defaults to `crate`. The workspace is reloaded
 for every call, so edits made by other tools are always seen, and editing tools support `dry_run` to return a diff instead of
