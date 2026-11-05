@@ -491,6 +491,16 @@ pub struct RustFmtOptions {
 }
 
 impl RustFmtOptions {
+	/// The indentation unit rustfmt indents with when its configuration sets one: a tab for `hard_tabs = true`, else
+	/// `tab_spaces` spaces (rustfmt's default, 4, when only `hard_tabs = false` is set); `None` when neither key is
+	/// configured.
+	///
+	/// `--config` overrides in [`RustFmtOptions::config`] go over the configuration file, which is found like rustfmt
+	/// finds it (see [`RustFmtOptions::config_path`]), and read every time.
+	pub fn indent_unit_in_effect(&self) -> Option<String> {
+		config::indent_unit(self)
+	}
+
 	/// The style edition rustfmt formats with, given these options (it decides how rustfmt orders `use` items).
 	///
 	/// That is (highest precedence first) a `style_edition` in [`RustFmtOptions::config`], the
