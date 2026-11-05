@@ -639,9 +639,15 @@ fn insert_before(lexed: &Lexed<'_>, sibling: TextRange, new: Inserted<'_>) -> (T
 /// (blank lines already there stay). An empty braced body gets the items on their own lines, with the closing brace
 /// on its own line.
 pub(crate) fn insertion(text: &str, placement: Placement, source: &str, indent: &str, spacing: Spacing) -> TextEdit {
+	insertion_or(text, placement, source, indent, spacing, None)
+}
+
+/// [`insertion`], with `fallback` as the indentation unit when nothing in `text` is indented (see [`reindent_or`]).
+pub(crate) fn insertion_or(text: &str, placement: Placement, source: &str, indent: &str, spacing: Spacing, fallback: Option<&str>) -> TextEdit {
 	let lexed = Lexed::new(text);
 	let line_ending = line_ending(text);
-	let item = format!("{indent}{}", reindent_with(source, indent, line_ending, detected_indent_unit(&lexed).as_deref()));
+	let unit = detected_indent_unit(&lexed);
+	let item = format!("{indent}{}", reindent_with(source, indent, line_ending, unit.as_deref().or(fallback)));
 
 	laid_out_insertion(&lexed, placement, &item, indent, line_ending, spacing)
 }
@@ -997,7 +1003,15 @@ fn quoted_len(bytes: &[u8], open: usize) -> usize {
 /// Lines that start inside of a string literal are kept exactly as they are, since their whitespace is part of the
 /// string.
 pub(crate) fn reindent(source: &str, indent: &str, text: &str) -> String {
-	reindent_with(source, indent, line_ending(text), detected_indent_unit(&Lexed::new(text)).as_deref())
+	reindent_or(source, indent, text, None)
+}
+
+/// [`reindent`], with `fallback` as the indentation unit when nothing in `text` is indented (such as the unit
+/// rustfmt's configuration sets); with no fallback either, the source's own indentation is kept.
+pub(crate) fn reindent_or(source: &str, indent: &str, text: &str, fallback: Option<&str>) -> String {
+	let unit = detected_indent_unit(&Lexed::new(text));
+
+	reindent_with(source, indent, line_ending(text), unit.as_deref().or(fallback))
 }
 
 /// [`reindent`] with the line break and indentation unit of the text; with no `unit` (the text shows no indentation

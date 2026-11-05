@@ -2735,6 +2735,26 @@ pub mod out;
 		assert!(edited(&dir, &insertion.edits, "src/lib.rs").ends_with("mod m {\n  fn c() {}\n}\n"));
 	}
 
+	/// When nothing in the file is indented, the indentation rustfmt's configuration sets is the style, over the
+	/// source's own.
+	#[test]
+	fn follows_rustfmt_configuration_when_the_file_shows_no_style() {
+		let lib = "mod a;\n\nuse std::fmt;\n";
+		let source = "pub fn b() {\n    if true {\n        return;\n    }\n}";
+
+		for (config, indented) in [
+			("hard_tabs = true\n", "pub fn b() {\n\tif true {\n\t\treturn;\n\t}\n}"),
+			("tab_spaces = 2\n", "pub fn b() {\n  if true {\n    return;\n  }\n}"),
+		] {
+			let files = [("rustfmt.toml", config), ("src/lib.rs", lib), ("src/a.rs", "")];
+			let dir = TempDir::with_files("insert-configured-style", &files);
+			let ws = load(&dir);
+			let insertion = insert(&ws, "crate", source, &InsertOptions::default()).unwrap();
+
+			assert_eq!(edited(&dir, &insertion.edits, "src/lib.rs"), format!("{lib}\n{indented}\n"), "{config}");
+		}
+	}
+
 	#[test]
 	fn refuses_collisions_unless_forced() {
 		let dir = dir("insert-collisions");
@@ -3749,10 +3769,13 @@ mod create_module {
 	}
 
 	/// When nothing in the parent's file is indented (a crate root of `mod` and `use` lines), it shows no indentation
-	/// style, so the new file keeps the source's own: hard tabs stay tabs, and spaces stay spaces.
+	/// style, so without one set by rustfmt's configuration the new file keeps the source's own: hard tabs stay tabs, and
+	/// spaces stay spaces.
 	#[test]
 	fn keeps_the_sources_indentation_when_the_parent_shows_none() {
-		let dir = TempDir::with_files("create-unindented", SORTED);
+		// (a rustfmt configuration without an indentation style, so that none of an ancestor directory counts)
+		let files: Vec<(&str, &str)> = SORTED.iter().copied().chain([("rustfmt.toml", "max_width = 120\n")]).collect();
+		let dir = TempDir::with_files("create-unindented", &files);
 		let ws = load(&dir);
 
 		for (name, source) in [
@@ -3762,6 +3785,27 @@ mod create_module {
 			let creation = create(&ws, "crate", name, source).unwrap();
 
 			assert_eq!(changes(&dir, &creation.edits)[&*format!("src/{name}.rs")], source, "{name}");
+		}
+	}
+
+	/// When nothing in the parent's file is indented, the indentation rustfmt's configuration sets (`hard_tabs`,
+	/// `tab_spaces`) is the new file's, over the source's own.
+	#[test]
+	fn follows_rustfmt_configuration_when_the_parent_shows_no_style() {
+		let spaces = "pub fn f() {\n    if true {\n        todo!()\n    }\n}\n";
+		let tabs = "pub fn f() {\n\tif true {\n\t\ttodo!()\n\t}\n}\n";
+
+		for (config, source, expected) in [
+			("hard_tabs = true\n", spaces, tabs),
+			("tab_spaces = 2\n", tabs, "pub fn f() {\n  if true {\n    todo!()\n  }\n}\n"),
+			("hard_tabs = false # spaces\n", tabs, spaces),
+		] {
+			let files: Vec<(&str, &str)> = SORTED.iter().copied().chain([("rustfmt.toml", config)]).collect();
+			let dir = TempDir::with_files("create-configured", &files);
+			let ws = load(&dir);
+			let creation = create(&ws, "crate", "configured", source).unwrap();
+
+			assert_eq!(changes(&dir, &creation.edits)["src/configured.rs"], expected, "{config}");
 		}
 	}
 

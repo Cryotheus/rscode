@@ -46,6 +46,7 @@ use serde::Serialize;
 use smol_str::SmolStr;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub use create::CreateModuleOptions;
@@ -547,6 +548,18 @@ fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 	imports.iter().find(|(use_item, _)| *use_item == item).map_or(item, |&(_, import)| import)
 }
 
+/// The indentation unit rustfmt's configuration sets for a file at `path` (`hard_tabs`, `tab_spaces`), found like
+/// rustfmt finds it from the file's directory; `None` when it sets none. New code goes into a file that shows no
+/// indentation style of its own (nothing in it is indented) with this unit.
+fn configured_indent_unit(path: &Path) -> Option<String> {
+	let rustfmt = rscode_fmt::RustFmtOptions {
+		config_path: Some(path.parent()?.to_path_buf()),
+		..rscode_fmt::RustFmtOptions::default()
+	};
+
+	rustfmt.indent_unit_in_effect()
+}
+
 /// Plans inserting the items in `source` into the container named by `parent`: a module (`crate` for the crate
 /// root), an `impl` block (`<Type as Trait>` / `<Type>`), a `trait`, or an `extern` block's module.
 /// Items must be valid for the container (e.g. associated items for `impl`s).
@@ -613,7 +626,8 @@ pub fn insert(resolver: &Resolver<'_>, parent: Option<&ItemPath>, source: &str, 
 	let text = target.file.text();
 	let indent = trivia::body_indent(text, target.body);
 	let spacing = order::spacing(resolver.workspace(), &target, placement, &parsed.text);
-	let edit = trivia::insertion(text, placement, &parsed.text, &indent, spacing);
+	let fallback = configured_indent_unit(target.file.path());
+	let edit = trivia::insertion_or(text, placement, &parsed.text, &indent, spacing, fallback.as_deref());
 	let mut edits = EditSet::new();
 
 	edits.replace(target.file, edit.range, edit.replacement);

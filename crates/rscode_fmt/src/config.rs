@@ -33,6 +33,34 @@ fn in_directory(directory: &Path) -> Option<PathBuf> {
 	FILE_NAMES.iter().map(|name| directory.join(name)).find(|path| path.is_file())
 }
 
+/// See [`RustFmtOptions::indent_unit_in_effect`].
+pub(crate) fn indent_unit(options: &RustFmtOptions) -> Option<String> {
+	let configured = config_file(options.config_path.as_deref()).and_then(|path| std::fs::read_to_string(path).ok());
+
+	// `--config` overrides over the configuration file, key by key
+	let value = |key: &str| {
+		let overridden = options.config.iter().rev().find(|(name, _)| name == key);
+
+		match overridden {
+			Some((_, value)) => Some(value.trim().to_owned()),
+			None => configured.as_deref().and_then(|text| toml_bare(text, key)).map(str::to_owned),
+		}
+	};
+
+	let hard_tabs = value("hard_tabs").and_then(|value| value.parse::<bool>().ok());
+	let tab_spaces = value("tab_spaces")
+		.and_then(|value| value.parse::<usize>().ok())
+		.filter(|&spaces| spaces > 0);
+
+	match (hard_tabs, tab_spaces) {
+		(Some(true), _) => Some("\t".to_owned()),
+		(None, None) => None,
+
+		// rustfmt's default `tab_spaces` is 4
+		(Some(false) | None, spaces) => Some(" ".repeat(spaces.unwrap_or(4))),
+	}
+}
+
 /// Whether rustfmt's `newline_style` is `Auto`, its default: set to it or to nothing, by a `--config` override or else
 /// by the configuration file.
 pub(crate) fn newline_style_is_auto(options: &RustFmtOptions) -> bool {
@@ -91,6 +119,24 @@ pub(crate) fn style_edition(options: &RustFmtOptions) -> Edition {
 /// The string value of a top-level key of a TOML document (`key = "value"` or `key = 'value'`), which is all that
 /// rustfmt's configuration files have for the keys of interest.
 fn toml_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+	let value = toml_value(text, key)?;
+	let quote = value.chars().next().filter(|&quote| quote == '"' || quote == '\'')?;
+	let value = &value[1..];
+
+	value.find(quote).map(|end| &value[..end])
+}
+
+/// The bare (unquoted) value of a top-level key of a TOML document, such as a boolean or an integer, without a
+/// trailing comment.
+fn toml_bare<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+	let value = toml_value(text, key)?;
+	let value = value.split_once('#').map_or(value, |(value, _)| value).trim();
+
+	(!value.is_empty()).then_some(value)
+}
+
+/// What follows the `=` of the first top-level `key` of a TOML document, with leading whitespace removed.
+fn toml_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 	for line in text.lines() {
 		let line = line.trim();
 
@@ -109,11 +155,7 @@ fn toml_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 			continue;
 		}
 
-		let value = value.trim_start();
-		let quote = value.chars().next().filter(|&quote| quote == '"' || quote == '\'')?;
-		let value = &value[1..];
-
-		return value.find(quote).map(|end| &value[..end]);
+		return Some(value.trim_start());
 	}
 
 	None
@@ -218,6 +260,44 @@ mod tests {
 	}
 
 	#[test]
+	fn indent_unit_follows_hard_tabs_and_tab_spaces() {
+		let tree = Tree::new("indent");
+		let nested = "project/src/nested";
+
+		// without configuration (unless the user has some), none
+		if !user_directories().any(|directory| in_directory(&directory).is_some()) {
+			assert_eq!(indent_unit(&tree.options(nested, None)), None);
+		}
+
+		tree.write("project/rustfmt.toml", "max_width = 120\n");
+
+		assert_eq!(indent_unit(&tree.options(nested, None)), None);
+
+		tree.write("project/rustfmt.toml", "hard_tabs = true # tabs\n");
+
+		assert_eq!(indent_unit(&tree.options(nested, None)).as_deref(), Some("\t"));
+
+		tree.write("project/rustfmt.toml", "hard_tabs = false\n");
+
+		assert_eq!(indent_unit(&tree.options(nested, None)).as_deref(), Some("    "));
+
+		tree.write("project/rustfmt.toml", "tab_spaces = 2\n");
+
+		assert_eq!(indent_unit(&tree.options(nested, None)).as_deref(), Some("  "));
+
+		tree.write("project/rustfmt.toml", "tab_spaces = 2\nhard_tabs = true\n");
+
+		assert_eq!(indent_unit(&tree.options(nested, None)).as_deref(), Some("\t"));
+
+		// `--config` overrides over the file, key by key
+		let mut options = tree.options(nested, None);
+
+		options.config.push(("hard_tabs".to_owned(), "false".to_owned()));
+
+		assert_eq!(indent_unit(&options).as_deref(), Some("  "));
+	}
+
+	#[test]
 	fn newline_style_is_auto_unless_configured() {
 		let tree = Tree::new("newline");
 		let nested = "project/src/nested";
@@ -261,5 +341,9 @@ mod tests {
 		assert_eq!(toml_string(text, "edition"), None);
 		assert_eq!(toml_string("style_edition=\"2015\"", "style_edition"), Some("2015"));
 		assert_eq!(toml_string("style_edition = \"2015", "style_edition"), None);
+		assert_eq!(toml_bare(text, "max_width"), Some("100"));
+		assert_eq!(toml_bare("hard_tabs=true# tabs", "hard_tabs"), Some("true"));
+		assert_eq!(toml_bare("hard_tabs = # none", "hard_tabs"), None);
+		assert_eq!(toml_bare(text, "edition"), None);
 	}
 }

@@ -63,7 +63,9 @@ pub struct ModuleCreation {
 ///
 /// The file goes where rustc looks for it: `name.rs` in the directory of the parent's child modules (as for an inline
 /// parent, or one loaded with `#[path]`), or `name/mod.rs` when the parent's other modules are in `mod.rs` files.
-/// The source is laid out with the indentation style and line breaks of the parent's file, and ends with a line break.
+/// The source is laid out with the indentation style and line breaks of the parent's file (when nothing in that file is
+/// indented, with the indentation rustfmt's configuration sets: `hard_tabs`, `tab_spaces`; without one, the source's
+/// own indentation is kept), and ends with a line break.
 /// The declaration goes where `cargo rscode sort` would put it: among the parent's `mod` declarations, in order (on
 /// consecutive lines, like theirs), or else where `mod` declarations go (after `extern crate` items, before `use`
 /// items).
@@ -114,7 +116,9 @@ pub fn create_module(
 
 	let file = module_file(ws, &target, parent, &name.bare)?;
 	let text = target.file.text();
-	let contents = file_contents(source, text)?;
+	// (from the parent's directory: the new file's may not exist yet)
+	let fallback = super::configured_indent_unit(target.file.path());
+	let contents = file_contents(source, text, fallback.as_deref())?;
 
 	// where sorting puts it, laid out like sorting lays it out
 	let style_edition = order::style_edition(ws, &target);
@@ -166,9 +170,11 @@ fn declaration(name: &NewName, vis: &str) -> Result<String, Error> {
 }
 
 /// The text of the new file: `source` laid out with the indentation style and line breaks of `parent_text` (the
-/// parent's file), ending with a line break (empty for empty source). Fails when it does not parse as a file.
-fn file_contents(source: &str, parent_text: &str) -> Result<String, Error> {
-	let mut text = trivia::reindent(source, "", parent_text);
+/// parent's file), ending with a line break (empty for empty source). When nothing in the parent's file is indented,
+/// `fallback` (the unit rustfmt's configuration sets) is the indentation unit, or else the source's own is kept. Fails
+/// when it does not parse as a file.
+fn file_contents(source: &str, parent_text: &str, fallback: Option<&str>) -> Result<String, Error> {
+	let mut text = trivia::reindent_or(source, "", parent_text, fallback);
 
 	if !text.is_empty() {
 		text.push_str(trivia::line_ending(parent_text));
