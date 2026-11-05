@@ -7,8 +7,9 @@
 //! |---|---|
 //! | `workspace_info` | packages (with features), crates, and load problems |
 //! | `find_items` | items whose paths match a glob pattern (`*`, `**`), one line each, with locations and `cfg`s |
-//! | `view_items` | the source (or an outline) of items by path, numbered where its lines are not consecutive |
+//! | `view_items` | the source (or an outline) of items by path, numbered with the file's line numbers where its lines are not consecutive |
 //! | `find_references` | the references to an item, by file, with the item and line of code of each |
+//! | `search_text` | the lines of the selected crates' files that match a regex, by file, with the item each is in |
 //! | `rename_item` | renames an item and updates the references to it across the workspace |
 //! | `move_item` | moves an item before or after a sibling, or to the start or end of its existing container |
 //! | `remove_items` | removes items with their attached comments (and out-of-line module files) |

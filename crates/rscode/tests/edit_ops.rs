@@ -2867,10 +2867,10 @@ pub mod out;
 		let ws = load(&dir);
 		let insertion = insert(&ws, "crate", "pub fn b() {\n\ttodo!()\n}\n", &InsertOptions::default()).unwrap();
 
-		// nothing is indented in the file, so indentation is 4 spaces
+		// nothing is indented in the file, so the source's own indentation is kept
 		assert_eq!(
 			edited(&dir, &insertion.edits, "src/lib.rs"),
-			"//! Docs.\r\n\r\npub fn a() {}\r\n\r\npub fn b() {\r\n    todo!()\r\n}\r\n"
+			"//! Docs.\r\n\r\npub fn a() {}\r\n\r\npub fn b() {\r\n\ttodo!()\r\n}\r\n"
 		);
 	}
 
@@ -3746,6 +3746,23 @@ mod create_module {
 
 		edits.apply().unwrap();
 		assert_sorted(&dir);
+	}
+
+	/// When nothing in the parent's file is indented (a crate root of `mod` and `use` lines), it shows no indentation
+	/// style, so the new file keeps the source's own: hard tabs stay tabs, and spaces stay spaces.
+	#[test]
+	fn keeps_the_sources_indentation_when_the_parent_shows_none() {
+		let dir = TempDir::with_files("create-unindented", SORTED);
+		let ws = load(&dir);
+
+		for (name, source) in [
+			("tabs", "pub fn f() {\n\tif true {\n\t\ttodo!()\n\t}\n}\n"),
+			("spaces", "pub fn f() {\n  if true {\n    todo!()\n  }\n}\n"),
+		] {
+			let creation = create(&ws, "crate", name, source).unwrap();
+
+			assert_eq!(changes(&dir, &creation.edits)[&*format!("src/{name}.rs")], source, "{name}");
+		}
 	}
 
 	#[test]

@@ -14,6 +14,7 @@ use super::params::ReferencesParams;
 use super::params::RemoveParams;
 use super::params::RenameParams;
 use super::params::ReplaceParams;
+use super::params::SearchTextParams;
 use super::params::Selection;
 use super::params::UseParams;
 use super::params::ViewParams;
@@ -91,7 +92,9 @@ format what they wrote. Code outside of the edited items is kept as it is. For s
 `old`/`new` text, visibility, docs, attributes) rather than replace_item. JSON strings must escape hard tabs as `\t`.
 
 Every call reads the files again, so other tools' changes are seen. Lines are 1-based. Typically: workspace_info, \
-find_items, view_items, then edit.";
+find_items, view_items, then edit. To find text without knowing item paths (call sites, strings, a regex across \
+crates), use search_text rather than a generic file search: it names the item of each match. For file:line \
+citations, view_items with `line_numbers` numbers lines as the file does.";
 
 /// Appended to [`INSTRUCTIONS`] for read-only servers.
 const READ_ONLY_INSTRUCTIONS: &str = "\n\nThis server is read-only: the editing tools are disabled.";
@@ -303,9 +306,20 @@ impl Server {
 			.await
 	}
 
+	/// Search the loaded crates' source for a regex, line by line, when you do not know item paths: each matching line
+	/// as `line:col in item: code`, grouped by file. `within` limits it to items whose paths match a glob.
+	#[tool(annotations(title = "Search text", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+	async fn search_text(&self, Parameters(params): Parameters<SearchTextParams>) -> CallToolResult {
+		let target = self.target(&params.selection, false);
+
+		self.query("search_text", target, move |target| tools::search_text(&target.load, &params))
+			.await
+	}
+
 	/// Show items by path, in full or outlined (the default for modules: bodies elided, and runs of private `use`
 	/// items shown as `use ...;` unless `imports`). Each starts with a header `// path (kind) file:line-endline`; lines are
-	/// numbered when they are not consecutive.
+	/// numbered with the file's line numbers (for citing as file:line) when they are not consecutive, or with
+	/// `line_numbers`.
 	#[tool(annotations(title = "View items", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
 	async fn view_items(&self, Parameters(params): Parameters<ViewParams>) -> CallToolResult {
 		let target = self.target(&params.selection, false);

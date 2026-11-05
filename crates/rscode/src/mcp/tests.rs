@@ -27,7 +27,7 @@ const EDIT_TOOLS: [&str; 9] = [
 	"replace_item",
 ];
 
-const QUERY_TOOLS: [&str; 4] = ["find_items", "find_references", "view_items", "workspace_info"];
+const QUERY_TOOLS: [&str; 5] = ["find_items", "find_references", "search_text", "view_items", "workspace_info"];
 
 /// Parameters every non-source tool accepts as part of its selection.
 const SELECTION: [&str; 6] = ["workspace", "features", "all_features", "all_targets", "lib", "bin"];
@@ -572,6 +572,7 @@ fn required_parameters() {
 		("remove_items", vec!["paths"]),
 		("rename_item", vec!["new_name", "path"]),
 		("replace_item", vec!["path", "source"]),
+		("search_text", vec!["pattern"]),
 		("view_items", vec!["paths"]),
 		("workspace_info", vec![]),
 	];
@@ -2407,6 +2408,76 @@ mod end_to_end {
 
 		assert!(failed);
 		assert_contains(&text, &["no item found for `crate::nope`", "hint: search with `find_items`"]);
+		client.close().await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn search_text() {
+		let fixture = Fixture::new("search-text");
+		let mut client = Client::connect(fixture.options()).await;
+
+		// one line per matching line, at its first match, in the innermost item relative to the file's module
+		let (failed, text) = client.call("search_text", json!({ "pattern": "radius" })).await;
+
+		assert!(!failed, "{text}");
+		assert_eq!(
+			text,
+			native(
+				"4 matching lines in 1 file\nsrc/shapes.rs (demo::shapes)\n  3:6 in Circle.radius: pub radius: f64,\n  7:13 in \
+				 Circle::new: pub fn new(radius: f64) -> Self {\n  8:10 in Circle::new: Self { radius }\n  12:14 in \
+				 Circle::area: 3.0 * self.radius * self.radius\n"
+			)
+		);
+
+		let (_, text) = client.call("search_text", json!({ "pattern": "radius", "limit": 1, "offset": 2 })).await;
+
+		assert_contains(
+			&text,
+			&[
+				"4 matching lines in 1 file; showing 3-3",
+				&native("src/shapes.rs (demo::shapes)\n  8:10 in Circle::new: Self { radius }\n"),
+			],
+		);
+		assert!(!text.contains("12:14"), "{text}");
+
+		let (_, text) = client.call("search_text", json!({ "pattern": "radius", "limit": 0 })).await;
+
+		assert!(text.starts_with("4 matching lines in 1 file"), "{text}");
+		assert!(!text.contains("src/shapes.rs"), "{text}");
+
+		// `within` keeps the matches in the items its glob matches, and in their descendants
+		let (_, text) = client.call("search_text", json!({ "pattern": "radius", "within": "Circle::*" })).await;
+
+		assert_contains(&text, &["3 matching lines in 1 file", "7:13 in Circle::new", "12:14 in Circle::area"]);
+		assert!(!text.contains("3:6"), "{text}");
+
+		let (_, text) = client
+			.call("search_text", json!({ "pattern": "radius", "within": "crate::shapes" }))
+			.await;
+
+		assert!(text.starts_with("4 matching lines"), "{text}");
+
+		// matches outside of every item are in their module
+		let (_, text) = client.call("search_text", json!({ "pattern": "CIRCLE;", "ignore_case": true })).await;
+
+		assert_eq!(
+			text,
+			native("1 matching line in 1 file\nsrc/lib.rs (demo)\n  5:17: pub use shapes::Circle;\n")
+		);
+
+		let (failed, text) = client.call("search_text", json!({ "pattern": "CIRCLE;" })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(&text, &["no matches of `CIRCLE;` in 2 files"]);
+
+		let (failed, text) = client.call("search_text", json!({ "pattern": "add(" })).await;
+
+		assert!(failed);
+		assert!(text.starts_with("invalid regex `add(`:\n"), "{text}");
+
+		let (failed, text) = client.call("search_text", json!({ "pattern": "x", "within": "a::<" })).await;
+
+		assert!(failed, "{text}");
 		client.close().await.unwrap();
 	}
 

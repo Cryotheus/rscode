@@ -817,13 +817,30 @@ fn parse_path_pattern(text: &str, options: MatchOptions, nested: bool) -> Result
 			return Err(ONLY_QUALIFIER_ARGUMENTS.to_owned());
 		}
 
-		let (self_ty, trait_pattern) = match split_word(inside, "as") {
-			Some((self_text, trait_text)) => (
-				parse_nested(self_text, options, "a type pattern after `<`")?,
-				Some(parse_nested(trait_text, options, "a trait pattern after `as`")?),
-			),
+		// `<impl Type>` and `<impl Trait for Type>`, as the `impl` pseudo-segments of canonical paths are written, are
+		// `<Type>` and `<Type as Trait>`
+		let (self_ty, trait_pattern) = match strip_word(inside.trim_start(), "impl") {
+			Some(header) if split_word(header, "as").is_some() => {
+				return Err("`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`".to_owned());
+			}
 
-			None => (parse_nested(inside, options, "a type pattern after `<`")?, None),
+			Some(header) => match split_word(header, "for") {
+				Some((trait_text, self_text)) => (
+					parse_nested(self_text, options, "a type pattern after `for`")?,
+					Some(parse_nested(trait_text, options, "a trait pattern after `impl`")?),
+				),
+
+				None => (parse_nested(header, options, "a type pattern after `impl`")?, None),
+			},
+
+			None => match split_word(inside, "as") {
+				Some((self_text, trait_text)) => (
+					parse_nested(self_text, options, "a type pattern after `<`")?,
+					Some(parse_nested(trait_text, options, "a trait pattern after `as`")?),
+				),
+
+				None => (parse_nested(inside, options, "a type pattern after `<`")?, None),
+			},
 		};
 		let mut segments = Vec::new();
 
@@ -1540,6 +1557,11 @@ mod tests {
 		assert_eq!(pattern("impl Foo"), pattern("<Foo>"));
 		assert_eq!(pattern("impl * for crate::**"), pattern("<crate::** as *>"));
 		assert_eq!(pattern("<*>::new").qualifier.unwrap().1, None);
+
+		// `impl` pseudo-segments, as canonical paths display them
+		assert_eq!(pattern("<impl Foo>::new"), pattern("<Foo>::new"));
+		assert_eq!(pattern("< impl Display for Foo >::fmt"), p);
+		assert_eq!(pattern("<impl Tr for Vec<u8>>::m"), pattern("<Vec<u8> as Tr>::m"));
 		assert!(!pattern("Foo::new").is_qualified());
 
 		// fields
@@ -1853,7 +1875,8 @@ mod tests {
 			("**r#Self", "`r#Self` is not a valid identifier"),
 			("<Foo>::", "expected a segment after `::`"),
 			("<crate as X>", "expected a pattern with at least one segment, found `crate`"),
-			("<impl X as Y>", "`impl` cannot appear inside of a qualifier"),
+			("<impl X as Y>", "`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`"),
+			("<<impl X>>", "nested qualified patterns are not supported"),
 			("impl for Foo", "expected a trait pattern after `impl`"),
 			("impl Foo for", "expected a type pattern after `for`"),
 			("a b", "' ' is not allowed in identifier patterns (only identifier characters and `*`)"),

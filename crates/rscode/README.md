@@ -14,7 +14,9 @@ configuration, and marked inactive where it disables them.
   the paths an item is usable by from elsewhere.
 - **Find:** `Find` searches with glob-like patterns (no regex): `*Error`, `crate::shapes::*`, `**::Circle`,
   `<Circle as Shape>::*`.
-- **View:** `View` shows exact source, or outlines with bodies elided.
+- **Search text:** `query::search_text` searches the source of the loaded crates for a regex, line by line, and
+  tells which item each match is in; `query::find_references` finds the references to an item.
+- **View:** `View` shows exact source, or outlines with bodies elided, optionally numbered with the file's lines.
 - **Edit:** `edit::rename`, `edit::remove`, `edit::move_item`, `edit::replace`, `edit::insert`, and `edit::format`
   plan changes as an `EditSet`. It can be previewed as new file contents or a diff, or applied all at once. Every
   edited file must still parse before anything is written, and text outside of the edits, comments included, is

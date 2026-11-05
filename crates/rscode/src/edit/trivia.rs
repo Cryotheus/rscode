@@ -503,6 +503,11 @@ pub(crate) fn indent_unit(text: &str) -> String {
 }
 
 fn indent_unit_in(lexed: &Lexed<'_>) -> String {
+	detected_indent_unit(lexed).unwrap_or_else(|| "    ".to_owned())
+}
+
+/// The [`indent_unit`] of a text, or `None` when nothing in it is indented, so that it shows no style.
+fn detected_indent_unit(lexed: &Lexed<'_>) -> Option<String> {
 	let mut tab_lines = 0_usize;
 	let mut space_lines = 0_usize;
 	let mut min_spaces: Option<usize> = None;
@@ -538,9 +543,9 @@ fn indent_unit_in(lexed: &Lexed<'_>) -> String {
 	}
 
 	match min_spaces {
-		Some(spaces) if space_lines >= tab_lines => " ".repeat(spaces.clamp(1, 8)),
-		_ if tab_lines > 0 => "\t".to_owned(),
-		_ => "    ".to_owned(),
+		Some(spaces) if space_lines >= tab_lines => Some(" ".repeat(spaces.clamp(1, 8))),
+		_ if tab_lines > 0 => Some("\t".to_owned()),
+		_ => None,
 	}
 }
 
@@ -636,7 +641,7 @@ fn insert_before(lexed: &Lexed<'_>, sibling: TextRange, new: Inserted<'_>) -> (T
 pub(crate) fn insertion(text: &str, placement: Placement, source: &str, indent: &str, spacing: Spacing) -> TextEdit {
 	let lexed = Lexed::new(text);
 	let line_ending = line_ending(text);
-	let item = format!("{indent}{}", reindent_with(source, indent, line_ending, &indent_unit_in(&lexed)));
+	let item = format!("{indent}{}", reindent_with(source, indent, line_ending, detected_indent_unit(&lexed).as_deref()));
 
 	laid_out_insertion(&lexed, placement, &item, indent, line_ending, spacing)
 }
@@ -985,16 +990,19 @@ fn quoted_len(bytes: &[u8], open: usize) -> usize {
 /// - the common indentation of the lines is removed (if the first line has none while all others do, as when the
 ///   first line was copied from the middle of a line, the others' common indentation is removed);
 /// - every line but the first is indented with `indent` (the first line goes where the caller puts it);
-/// - indentation within the source is converted to the [`indent_unit`] of `text` (e.g. 4 spaces to a tab);
+/// - indentation within the source is converted to the [`indent_unit`] of `text` (e.g. 4 spaces to a tab), unless
+///   nothing in `text` is indented, when the source's own indentation is kept;
 /// - line breaks become those of `text` ([`line_ending`]).
 ///
 /// Lines that start inside of a string literal are kept exactly as they are, since their whitespace is part of the
 /// string.
 pub(crate) fn reindent(source: &str, indent: &str, text: &str) -> String {
-	reindent_with(source, indent, line_ending(text), &indent_unit(text))
+	reindent_with(source, indent, line_ending(text), detected_indent_unit(&Lexed::new(text)).as_deref())
 }
 
-fn reindent_with(source: &str, indent: &str, line_ending: &str, unit: &str) -> String {
+/// [`reindent`] with the line break and indentation unit of the text; with no `unit` (the text shows no indentation
+/// style), the source's own indentation is kept.
+fn reindent_with(source: &str, indent: &str, line_ending: &str, unit: Option<&str>) -> String {
 	let source = source.strip_prefix('\u{feff}').unwrap_or(source);
 	let lines = source_lines(source);
 	let is_blank = |line: &SourceLine<'_>| !line.verbatim && line.text.trim().is_empty();
@@ -1043,7 +1051,7 @@ fn reindent_with(source: &str, indent: &str, line_ending: &str, unit: &str) -> S
 			text.push_str(indent);
 		}
 
-		text.push_str(&convert_indent(&line[..line.len() - content.len()], &source_unit, unit));
+		text.push_str(&convert_indent(&line[..line.len() - content.len()], &source_unit, unit.unwrap_or(&source_unit)));
 		text.push_str(content);
 	}
 
