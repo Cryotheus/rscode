@@ -14,6 +14,7 @@ use super::params::ReferencesParams;
 use super::params::RemoveParams;
 use super::params::RenameParams;
 use super::params::ReplaceParams;
+use super::params::SearchTextParams;
 use super::params::ViewParams;
 use super::render;
 use super::render::Page;
@@ -45,12 +46,14 @@ use crate::model::CrateId;
 use crate::model::UnloadedMember;
 use crate::query;
 use crate::query::ItemView;
+use crate::query::SearchTextOptions;
 use crate::query::ViewOptions;
 use crate::query::shown_item;
 use crate::rscode_fmt::FormatOptions;
 use crate::rscode_fmt::RsFormatter;
 use crate::workspace::LoadOptions;
 use crate::workspace::load_workspace;
+use regex::RegexBuilder;
 use smol_str::SmolStr;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -672,6 +675,63 @@ pub(crate) fn remove(load: &LoadOptions, params: &RemoveParams, permit: &Permit<
 		finish(root, &plan.edits, params.dry_run, permit, &mut text)?;
 		Ok(text)
 	})
+}
+
+/// `search_text`: when nothing matches and the call names no packages, the workspace members it did not select are
+/// searched too (see [`retry`]).
+pub(crate) fn search_text(load: &LoadOptions, params: &SearchTextParams) -> Output {
+	let regex = RegexBuilder::new(&params.pattern)
+		.case_insensitive(params.ignore_case)
+		.build()
+		.map_err(|error| format!("invalid regex `{}`:\n{error}", params.pattern))?;
+	let within = (params.within.as_deref().map(str::trim))
+		.filter(|within| !within.is_empty())
+		.map(|within| PathPattern::parse(within, MatchOptions::default()))
+		.transpose()
+		.map_err(|error| describe(&error.into()))?;
+	let options = SearchTextOptions { within };
+	let workspace = self::load(load)?;
+	let resolver = Resolver::new(&workspace);
+	let report = query::search_text(&resolver, &regex, &options).map_err(|error| describe(&error))?;
+	let widening = (report.matches.is_empty() && !params.selection.names_packages())
+		.then(|| load.widened(&workspace, None))
+		.flatten();
+
+	let Some(widening) = widening else {
+		return Ok(text_found(&workspace, params, &report));
+	};
+
+	let wider = self::load(&widening.options)?;
+	let searched = widening.searched(&wider);
+
+	// (`lib` or `bin` left out the crates of every member to search)
+	if searched.is_empty() {
+		return Ok(text_found(&workspace, params, &report));
+	}
+
+	let resolver = Resolver::new(&wider);
+	let report = query::search_text(&resolver, &regex, &options).map_err(|error| describe(&error))?;
+	let crates = report.matches.iter().map(|found| ItemId::crate_root(found.krate));
+	let members = retry::members_of(&wider, crates, &searched);
+	let note = match members.is_empty() {
+		true => retry::note(&searched, false),
+		false => retry::note(&members, true),
+	};
+
+	Ok(format!("note: {note}\n") + &text_found(&wider, params, &report))
+}
+
+/// The text of `search_text`: the matching lines of `params`' page, and notes.
+fn text_found(workspace: &Workspace, params: &SearchTextParams, report: &query::TextReport) -> String {
+	let page = Page {
+		offset: params.offset,
+		limit: params.limit,
+		total: report.matches.len(),
+	};
+	let mut text = render::text_matches(workspace.root(), &params.pattern, report, page);
+
+	text.push_str(&render::load_errors_note(workspace));
+	text
 }
 
 /// `rename_item`

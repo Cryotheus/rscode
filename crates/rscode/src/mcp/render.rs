@@ -21,6 +21,8 @@ use crate::query::FindMatch;
 use crate::query::FoundReference;
 use crate::query::ItemView;
 use crate::query::ReferenceReport;
+use crate::query::TextMatch;
+use crate::query::TextReport;
 use crate::resolve::Reference;
 use crate::resolve::ReferenceKind;
 use crate::source::LineCol;
@@ -833,6 +835,49 @@ pub(crate) fn truncate(text: String, max_chars: usize, hint: &str) -> String {
 	)
 }
 
+/// The lines of `search_text` (those of `page`): a summary line, then each file once (with its module) followed by
+/// one line per matching line: `line:column` of its first match, the item it is in (relative to the file's module),
+/// and the line. Then the notes of the search.
+pub(crate) fn text_matches(root: &Path, pattern: &str, report: &TextReport, page: Page) -> String {
+	let mut out = String::new();
+
+	if report.matches.is_empty() {
+		writeln!(out, "no matches of `{pattern}` in {}", count(report.searched, "file", "files")).unwrap();
+	} else {
+		let shown: Vec<&TextMatch> = report.matches.iter().skip(page.offset).take(page.limit).collect();
+		let counted = format!(
+			"{} in {}",
+			count(page.total, "matching line", "matching lines"),
+			count(report.files(), "file", "files")
+		);
+
+		out.push_str(&paged(counted, shown.len(), page));
+		out.push('\n');
+
+		let mut file: Option<(&Path, &str)> = None;
+
+		for found in shown {
+			if file.is_none_or(|(path, module)| path != found.path || module != found.module) {
+				writeln!(out, "{} ({})", display(root, &found.path), found.module).unwrap();
+				file = Some((&found.path, &found.module));
+			}
+
+			let at = format!("{}:{}", found.start.line, found.start.column);
+
+			match &found.local_item {
+				Some(item) => writeln!(out, "  {at} in {item}: {}", found.line).unwrap(),
+				None => writeln!(out, "  {at}: {}", found.line).unwrap(),
+			}
+		}
+	}
+
+	for note in &report.notes {
+		writeln!(out, "note: {note}").unwrap();
+	}
+
+	out
+}
+
 /// How to get less output from a tool, in terms of its own parameters.
 pub(crate) fn truncation_hint(tool: &str) -> &'static str {
 	match tool {
@@ -840,6 +885,7 @@ pub(crate) fn truncation_hint(tool: &str) -> &'static str {
 		"find_items" => "narrow the request: a more specific `pattern`, `kinds`, or a smaller `limit` (or an `offset`)",
 		"view_items" => "narrow the request: fewer or more specific `paths`, or `mode` `outline`",
 		"find_references" => "narrow the request: a smaller `limit` (or an `offset`)",
+		"search_text" => "narrow the request: a more specific `pattern`, `within`, or a smaller `limit` (or an `offset`)",
 		"remove_items" => "narrow the request: fewer `paths`; without `dry_run`, the edit is written and only summarized",
 
 		"format_items" => {

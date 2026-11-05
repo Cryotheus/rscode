@@ -22,8 +22,8 @@ use serde::Serialize;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 
-/// The longest line of code shown for a reference, in characters: longer lines are cut around the reference.
-const MAX_LINE_CHARS: usize = 100;
+/// The longest line of code shown for a reference or a text match, in characters: longer lines are cut around it.
+pub(super) const MAX_LINE_CHARS: usize = 100;
 
 /// Options for [`find_references`].
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -65,7 +65,7 @@ pub struct FoundReference {
 
 /// The modules of each crate by their own file (see [`ModuleInfo::file`](crate::model::ModuleInfo::file)), to find
 /// the module that a reference's file belongs to.
-struct ModuleFiles<'ws> {
+pub(super) struct ModuleFiles<'ws> {
 	ws: &'ws Workspace,
 
 	/// The modules whose own file each file is, per crate, computed when first needed.
@@ -73,12 +73,30 @@ struct ModuleFiles<'ws> {
 }
 
 impl<'ws> ModuleFiles<'ws> {
-	fn new(ws: &'ws Workspace) -> Self {
+	pub(super) fn new(ws: &'ws Workspace) -> Self {
 		Self { ws, crates: HashMap::new() }
 	}
 
+	/// The module whose own file is `file` of `krate`, and the innermost item below it whose range contains `offset`
+	/// (the module itself when none does). Of several modules from the file (`#[path]` attributes loading it several
+	/// times), the one with an item containing the offset; the crate root when the file is no module's own file.
+	pub(super) fn containing(&mut self, krate: CrateId, file: FileId, offset: usize) -> (ItemId, ItemId) {
+		let ws = self.ws;
+		let candidates = self.of(krate, file);
+
+		(candidates.iter())
+			.map(|&module| (module, innermost(ws, module, offset)))
+			.find(|(module, item)| item != module)
+			.or_else(|| candidates.first().map(|&module| (module, module)))
+			.unwrap_or_else(|| {
+				let root = ItemId::crate_root(krate);
+
+				(root, root)
+			})
+	}
+
 	/// The modules of `krate` whose own file is `file` (one, unless `#[path]` attributes load it several times).
-	fn of(&mut self, krate: CrateId, file: FileId) -> &[ItemId] {
+	pub(super) fn of(&mut self, krate: CrateId, file: FileId) -> &[ItemId] {
 		let ws = self.ws;
 		let files = self.crates.entry(krate).or_insert_with(|| {
 			let mut files: HashMap<FileId, Vec<ItemId>> = HashMap::new();
@@ -265,7 +283,7 @@ fn is_transparent(data: &ItemData) -> bool {
 }
 
 /// The line of code of `range`, trimmed, and cut around the range when it is longer than [`MAX_LINE_CHARS`].
-fn line_of(source: &SourceFile, range: TextRange) -> String {
+pub(super) fn line_of(source: &SourceFile, range: TextRange) -> String {
 	let text = source.text();
 	let index = source.line_index();
 	let line = source.line_col(range.start).line;
@@ -292,41 +310,57 @@ fn line_of(source: &SourceFile, range: TextRange) -> String {
 /// A reference with the module whose file it is in, the item it is in, and its line.
 fn locate(resolver: &Resolver<'_>, modules: &mut ModuleFiles<'_>, reference: Reference) -> FoundReference {
 	let ws = resolver.workspace();
-	let offset = reference.range.start;
-	let candidates = modules.of(reference.krate, reference.file);
-
-	// (with several modules from the file, the one with an item containing the reference)
-	let (module, mut item) = (candidates.iter())
-		.map(|&module| (module, innermost(ws, module, offset)))
-		.find(|(module, item)| item != module)
-		.or_else(|| candidates.first().map(|&module| (module, module)))
-		.unwrap_or_else(|| {
-			let root = ItemId::crate_root(reference.krate);
-
-			(root, root)
-		});
-
-	while item != module && is_transparent(ws.item(item)) {
-		item = ws.parent(item).unwrap_or(module);
-	}
-
-	let module_path = resolver.canonical_path(module);
-	let (item, local_item) = match item == module {
-		true => (None, None),
-
-		false => {
-			let path = resolver.canonical_path(item);
-
-			(Some(path.to_string()), Some(relative(&path, &module_path)))
-		}
-	};
+	let (module, item) = modules.containing(reference.krate, reference.file, reference.range.start);
+	let place = Place::new(resolver, module, item);
 
 	FoundReference {
-		module: module_path.to_string(),
-		item,
-		local_item,
+		module: place.module,
+		item: place.item,
+		local_item: place.local_item,
 		line: line_of(ws.krate(reference.krate).file(reference.file), reference.range),
 		reference,
+	}
+}
+
+/// Where something in a file is, by path: the module whose file it is, and the item it is in.
+pub(super) struct Place {
+	/// The canonical path of the module whose own file it is.
+	pub(super) module: String,
+
+	/// The canonical path of the innermost item it is in, below the module (`None` at the module's top level).
+	pub(super) item: Option<String>,
+
+	/// [`Place::item`] relative to [`Place::module`] when it is below it, or else its canonical path (see
+	/// [`relative`]).
+	pub(super) local_item: Option<String>,
+}
+
+impl Place {
+	/// The place of something in `item`, below `module` (see [`ModuleFiles::containing`]), described by what
+	/// [transparent](is_transparent) items are in.
+	pub(super) fn new(resolver: &Resolver<'_>, module: ItemId, mut item: ItemId) -> Self {
+		let ws = resolver.workspace();
+
+		while item != module && is_transparent(ws.item(item)) {
+			item = ws.parent(item).unwrap_or(module);
+		}
+
+		let module_path = resolver.canonical_path(module);
+		let (item, local_item) = match item == module {
+			true => (None, None),
+
+			false => {
+				let path = resolver.canonical_path(item);
+
+				(Some(path.to_string()), Some(relative(&path, &module_path)))
+			}
+		};
+
+		Self {
+			module: module_path.to_string(),
+			item,
+			local_item,
+		}
 	}
 }
 

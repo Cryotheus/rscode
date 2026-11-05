@@ -697,6 +697,34 @@ impl ReplaceParams {
 	}
 }
 
+/// Parameters of `search_text`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct SearchTextParams {
+	/// Regular expression (Rust regex syntax), matched against each line: `^` and `$` match at its start and end.
+	pub(crate) pattern: String,
+
+	/// Match case-insensitively.
+	#[serde(default)]
+	pub(crate) ignore_case: bool,
+
+	/// Only matches inside of items whose paths match this glob (like find_items' `pattern`: `Type::*`,
+	/// `crate::m::**`), or inside of their descendants.
+	#[serde(default)]
+	pub(crate) within: Option<String>,
+
+	/// Most matching lines to list (0 only counts them).
+	#[serde(default = "default_find_limit")]
+	pub(crate) limit: usize,
+
+	/// Matching lines to skip, to page.
+	#[serde(default)]
+	pub(crate) offset: usize,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
+}
+
 /// What to load: an attached source instead of the server's own workspace, which of its packages, and with which
 /// features. Accepted by every tool but the tools about sources.
 #[derive(Debug, Default, Clone, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -869,7 +897,8 @@ pub(crate) struct ViewParams {
 	#[serde(default = "yes")]
 	pub(crate) docs: bool,
 
-	/// Number the lines: true always, false never; by default only when the lines shown are not consecutive.
+	/// Number the lines with the file's own line numbers, for citing as file:line: true always, false never; by default
+	/// only when the lines shown are not consecutive.
 	#[serde(default)]
 	pub(crate) line_numbers: Option<bool>,
 

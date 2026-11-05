@@ -63,7 +63,8 @@ before anything is written, and `--dry-run`/`--check` print a diff instead of wr
 
 ## MCP server
 
-`cargo rscode mcp` offers the tools `workspace_info`, `find_items`, `view_items`, `find_references`, and the editing
+`cargo rscode mcp` offers the tools `workspace_info`, `find_items`, `view_items`, `find_references`, `search_text`
+(regex text search, each match with the item it is in), and the editing
 tools `rename_item`, `remove_items`, `move_item`, `replace_item`, `edit_item`, `insert_items`, `create_module`,
 `add_import`, and `format_items`. With `--read-only`, the editing tools are not offered. The workspace is reloaded for
 every call, so changes made by other tools are always seen. `edit_item` and `add_import` send only what changes, which
