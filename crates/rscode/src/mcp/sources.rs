@@ -454,6 +454,7 @@ fn list_or_none(items: &[String]) -> String {
 pub(crate) fn load_options(own: &LoadOptions, manifest: &Path) -> LoadOptions {
 	LoadOptions {
 		manifest_path: Some(manifest.to_path_buf()),
+		rustflags: own.rustflags.clone(),
 		target: own.target.clone(),
 		cfgs: own.cfgs.clone(),
 		exact_features: own.exact_features,
@@ -707,6 +708,17 @@ mod tests {
 		let error = scope.check(&tree.path("project"), &edits).unwrap_err();
 
 		assert!(error.contains("link.rs, which is not in a directory exposed for writing"), "{error}");
+	}
+
+	#[test]
+	fn attached_sources_keep_the_servers_rustflags() {
+		let own = LoadOptions {
+			rustflags: Some(vec!["--cfg".to_owned(), "probe".to_owned()]),
+			..LoadOptions::default()
+		};
+		let attached = load_options(&own, Path::new("attached/Cargo.toml"));
+
+		assert_eq!(attached.rustflags, own.rustflags);
 	}
 
 	#[test]

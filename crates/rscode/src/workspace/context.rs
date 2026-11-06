@@ -105,6 +105,23 @@ pub(super) fn global_context(options: &LoadOptions, output: Box<dyn Write + Send
 	// both of the shell's streams (status and warnings on stderr, and stdout) go to `output`
 	let mut gctx = GlobalContext::new(Shell::from_write(output), cwd, home);
 
+	if let Some(flags) = &options.rustflags {
+		let separator = '\x1f';
+		if let Some(flag) = flags.iter().find(|flag| flag.contains(separator)) {
+			return Err(Error::Cargo(format!(
+				"rustflag `{flag}` holds U+001F, which separates CARGO_ENCODED_RUSTFLAGS"
+			)));
+		}
+
+		let mut env: cargo::util::data_structures::HashMap<String, String> = (std::env::vars())
+			.filter(|(name, _)| !name.eq_ignore_ascii_case("RUSTFLAGS") && !name.eq_ignore_ascii_case("CARGO_ENCODED_RUSTFLAGS"))
+			.collect();
+		if !flags.is_empty() {
+			env.insert("CARGO_ENCODED_RUSTFLAGS".to_owned(), flags.join("\x1f"));
+		}
+		gctx.set_env(env);
+	}
+
 	// rscode never accesses the network, so cargo always runs offline
 	gctx.configure(0, options.silent, None, options.frozen, options.locked, true, &None, &[], &options.config)
 		.map_err(cargo_error)?;
@@ -215,4 +232,50 @@ pub(super) fn workspace<'gctx>(gctx: &'gctx GlobalContext, manifest_path: Option
 	let manifest = root_manifest(manifest_path, gctx).map_err(cargo_error)?;
 
 	Workspace::new(&manifest, gctx).map_err(cargo_error)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn context(rustflags: Option<Vec<String>>) -> GlobalContext {
+		global_context(
+			&LoadOptions {
+				rustflags,
+				..LoadOptions::default()
+			},
+			Box::new(Vec::new()),
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn rustflags_override_the_cargo_context_environment() {
+		let flags = context(Some(vec!["--cfg".to_owned(), "rscode_probe".to_owned()]));
+
+		assert_eq!(flags.get_env("CARGO_ENCODED_RUSTFLAGS").unwrap(), "--cfg\x1frscode_probe");
+		assert!(flags.get_env("RUSTFLAGS").is_err());
+	}
+
+	#[test]
+	fn empty_rustflags_clear_process_flags_without_overriding_cargo_configuration() {
+		let flags = context(Some(Vec::new()));
+
+		assert!(flags.get_env("CARGO_ENCODED_RUSTFLAGS").is_err());
+		assert!(flags.get_env("RUSTFLAGS").is_err());
+	}
+
+	#[test]
+	fn rustflags_reject_the_encoded_separator() {
+		let error = global_context(
+			&LoadOptions {
+				rustflags: Some(vec!["bad\x1fflag".to_owned()]),
+				..LoadOptions::default()
+			},
+			Box::new(Vec::new()),
+		)
+		.unwrap_err();
+
+		assert!(error.to_string().contains("U+001F"), "{error}");
+	}
 }
