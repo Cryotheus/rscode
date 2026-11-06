@@ -1,0 +1,4 @@
+# A virtual workspace whose packages are named with `-`s and `_`s, which package specs may spell either way.
+[workspace]
+resolver = "3"
+members = ["hyphen-name", "under_score"]

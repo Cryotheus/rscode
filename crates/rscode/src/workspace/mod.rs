@@ -45,8 +45,11 @@ pub struct LoadOptions {
 
 	/// `-p/--package` specs: `name`, `name@version`, or glob patterns (`app-*`).
 	///
-	/// Without `-p` and `--workspace`, cargo's default applies: the package of the manifest (for `--manifest-path` or
-	/// the current directory), or the workspace's `default-members`, or all members of a virtual workspace.
+	/// Unlike cargo, which requires a package's own spelling, a name may spell its package's `-`s as `_`s, and the other
+	/// way around (so `senpo-core` selects the package `senpo_core`).
+	///
+	/// Without `-p` and `--workspace`, cargo's default applies: the package of the manifest (for `--manifest-path` or the
+	/// current directory), or the workspace's `default-members`, or all members of a virtual workspace.
 	pub packages: Vec<String>,
 
 	/// `--workspace`

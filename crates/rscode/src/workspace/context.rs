@@ -5,6 +5,7 @@ use super::cargo_error;
 use crate::Error;
 use cargo::GlobalContext;
 use cargo::ops::Packages;
+use cargo::util::closest;
 use cargo::util::command_prelude::root_manifest;
 use cargo::util::interning::InternedString;
 use cargo::workspace::Dependency;
@@ -16,6 +17,7 @@ use cargo::workspace::Workspace;
 use cargo_util_terminal::Shell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Display;
 use std::io::Write;
 use std::path::Path;
 
@@ -112,10 +114,15 @@ pub(super) fn global_context(options: &LoadOptions, output: Box<dyn Write + Send
 
 /// Selects packages like cargo's `-p`, `--workspace`, and `--exclude` flags do.
 pub(super) fn select_packages<'ws>(ws: &'ws Workspace<'_>, options: &LoadOptions) -> Result<Selection<'ws>, Error> {
-	let packages = Packages::from_flags(options.workspace, options.exclude.clone(), options.packages.clone()).map_err(cargo_error)?;
+	let exclude = spelled_like_members(ws, &options.exclude);
+	let packages = spelled_like_members(ws, &options.packages);
+	let packages = Packages::from_flags(options.workspace, exclude, packages).map_err(cargo_error)?;
 
-	// cargo's own validation: errors for empty selections and unmatched patterns, warnings for unknown `--exclude`s
-	let specs = packages.to_package_id_specs(ws).map_err(cargo_error)?;
+	// cargo's own validation: errors for empty selections, unmatched patterns, and unknown packages, warnings for
+	// unknown `--exclude`s
+	let specs = packages
+		.to_package_id_specs(ws)
+		.map_err(|error| unknown_packages_error(ws, &options.packages, error))?;
 
 	let members: Vec<&Package> = match &packages {
 		// `get_packages` would fail for unknown `--exclude`s, which cargo only warns about
@@ -124,7 +131,9 @@ pub(super) fn select_packages<'ws>(ws: &'ws Workspace<'_>, options: &LoadOptions
 			.filter(|member| specs.iter().any(|spec| spec.matches(member.package_id())))
 			.collect(),
 
-		_ => packages.get_packages(ws).map_err(cargo_error)?,
+		_ => packages
+			.get_packages(ws)
+			.map_err(|error| unknown_packages_error(ws, &options.packages, error))?,
 	};
 
 	// cargo errors out above already; features cannot be resolved for nothing
@@ -135,6 +144,68 @@ pub(super) fn select_packages<'ws>(ws: &'ws Workspace<'_>, options: &LoadOptions
 	let specs = members.iter().map(|member| member.package_id().to_spec()).collect();
 
 	Ok(Selection { packages, members, specs })
+}
+
+/// The specs, with package names spelled like the workspace members they name.
+///
+/// cargo matches package names exactly, while rustc turns the `-`s of a package name into `_`s in the names of its
+/// crates, so `-p senpo-core` for the package `senpo_core` (and the other way around) is an easy mistake that says
+/// nothing about what was meant.
+fn spelled_like_members(ws: &Workspace<'_>, specs: &[String]) -> Vec<String> {
+	// a name, or a name with a version (`name@1.0`): other specs (URLs and glob patterns) are left alone
+	let spelling = |spec: &str| -> Option<String> {
+		let (name, version) = match spec.split_once('@') {
+			Some((name, version)) => (name, Some(version)),
+			None => (spec, None),
+		};
+
+		if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+			return None;
+		}
+
+		let folded = name.replace('_', "-");
+		let mut members = ws.members().filter(|member| member.name().as_str().replace('_', "-") == folded);
+		let member = members.next()?;
+
+		// both spellings name a member, so the spec has to say which
+		if members.next().is_some() || member.name().as_str() == name {
+			return None;
+		}
+
+		Some(match version {
+			Some(version) => format!("{}@{version}", member.name()),
+			None => member.name().to_string(),
+		})
+	};
+
+	specs.iter().map(|spec| spelling(spec).unwrap_or_else(|| spec.clone())).collect()
+}
+
+/// cargo's error for package specs that name no workspace member, with the members there are to choose from.
+fn unknown_packages_error(ws: &Workspace<'_>, specs: &[String], error: impl Display) -> Error {
+	let message = format!("{error:#}");
+
+	if !message.contains("not found in workspace") {
+		return Error::Cargo(message);
+	}
+
+	let members: Vec<&str> = ws.members().map(|member| member.name().as_str()).collect();
+	let mut message = format!("{message}\nnote: the workspace members are {}", members.join(", "));
+
+	for spec in specs {
+		let Ok(spec) = PackageIdSpec::parse(spec) else { continue };
+
+		// cargo complained about specs that name no member; a member with the spec's name does have another problem
+		if ws.members().any(|member| member.name().as_str() == spec.name()) {
+			continue;
+		}
+
+		if let Some(name) = closest(spec.name(), members.iter().copied(), |name| *name) {
+			message.push_str(&format!("\nhelp: did you mean `{name}`?"));
+		}
+	}
+
+	Error::Cargo(message)
 }
 
 /// Loads the workspace of the manifest at `manifest_path`, or of the nearest `Cargo.toml` from the current directory
