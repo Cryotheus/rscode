@@ -298,6 +298,16 @@ impl Server {
 		self.query("find_items", target, move |target| tools::find(&target.load, &params)).await
 	}
 
+	/// Find the references to an item in every crate of the workspace (for trait items, also of their impls), by file:
+	/// `line:col in item: code`. Method calls, macro contents, and doc links only on request.
+	#[tool(annotations(title = "Find references", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
+	async fn find_references(&self, Parameters(params): Parameters<ReferencesParams>) -> CallToolResult {
+		let target = self.target(&params.selection, true);
+
+		self.query("find_references", target, move |target| tools::references(&target.load, &params))
+			.await
+	}
+
 	/// Find the items containing a 1-based source `line`, and the nearest items before and after it. Every item includes
 	/// its canonical path, kind, and actual `file:start-end` line range.
 	#[tool(annotations(
@@ -310,16 +320,6 @@ impl Server {
 		let target = self.target(&params.selection, false);
 
 		self.query("items_at_line", target, move |target| tools::items_at_line(&target.load, &params))
-			.await
-	}
-
-	/// Find the references to an item in every crate of the workspace (for trait items, also of their impls), by file:
-	/// `line:col in item: code`. Method calls, macro contents, and doc links only on request.
-	#[tool(annotations(title = "Find references", read_only_hint = true, idempotent_hint = true, open_world_hint = false))]
-	async fn find_references(&self, Parameters(params): Parameters<ReferencesParams>) -> CallToolResult {
-		let target = self.target(&params.selection, true);
-
-		self.query("find_references", target, move |target| tools::references(&target.load, &params))
 			.await
 	}
 

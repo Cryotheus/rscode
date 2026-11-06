@@ -116,6 +116,15 @@ pub(crate) fn style_edition(options: &RustFmtOptions) -> Edition {
 	options.edition.unwrap_or_default()
 }
 
+/// The bare (unquoted) value of a top-level key of a TOML document, such as a boolean or an integer, without a
+/// trailing comment.
+fn toml_bare<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+	let value = toml_value(text, key)?;
+	let value = value.split_once('#').map_or(value, |(value, _)| value).trim();
+
+	(!value.is_empty()).then_some(value)
+}
+
 /// The string value of a top-level key of a TOML document (`key = "value"` or `key = 'value'`), which is all that
 /// rustfmt's configuration files have for the keys of interest.
 fn toml_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
@@ -124,15 +133,6 @@ fn toml_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 	let value = &value[1..];
 
 	value.find(quote).map(|end| &value[..end])
-}
-
-/// The bare (unquoted) value of a top-level key of a TOML document, such as a boolean or an integer, without a
-/// trailing comment.
-fn toml_bare<'a>(text: &'a str, key: &str) -> Option<&'a str> {
-	let value = toml_value(text, key)?;
-	let value = value.split_once('#').map_or(value, |(value, _)| value).trim();
-
-	(!value.is_empty()).then_some(value)
 }
 
 /// What follows the `=` of the first top-level `key` of a TOML document, with leading whitespace removed.

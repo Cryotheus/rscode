@@ -679,6 +679,7 @@ impl<'a> Parser<'a> {
 
 			match self.eat_keyword("for") {
 				true => (self.parse_nested("a type after `for`")?, Some(first)),
+
 				false if self.peek().is_some_and(|token| token.is_word("as")) => {
 					return Err("`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`".to_owned());
 				}
@@ -1650,7 +1651,10 @@ mod tests {
 		assert_eq!(parse("<impl Foo>::new"), parse("<Foo>::new"));
 		assert_eq!(parse("< impl Display for Foo >::fmt"), parse("<Foo as Display>::fmt"));
 		assert_eq!(parse("<impl Tr for Vec<u8>>::m"), parse("<Vec<u8> as Tr>::m"));
-		assert_eq!(parse_error("<impl Foo as Display>"), "`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`");
+		assert_eq!(
+			parse_error("<impl Foo as Display>"),
+			"`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`"
+		);
 		assert_eq!(parse_error("<impl>::new"), "expected a type after `impl`");
 		assert_eq!(
 			parse("<crate::a::Foo as ::std::fmt::Display>::r#fmt"),

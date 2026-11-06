@@ -351,125 +351,6 @@ pub(crate) fn find(load: &LoadOptions, params: &FindParams) -> Output {
 	Ok(note + &found_text(&wider, &resolver, params, found))
 }
 
-/// `items_at_line`.
-pub(crate) fn items_at_line(load: &LoadOptions, params: &ItemsAtLineParams) -> Output {
-	let requested = params.file.trim();
-
-	if requested.is_empty() {
-		return Err("`file` is empty: give a Rust source file relative to the workspace root or an absolute path".to_owned());
-	}
-	if params.line == 0 {
-		return Err("`line` is 1-based: give 1 or greater".to_owned());
-	}
-
-	let workspace = self::load(load)?;
-	let root = workspace.root();
-	let input = std::path::PathBuf::from(requested);
-	let absolute = if input.is_absolute() { input.clone() } else { root.join(&input) };
-	let canonical = std::fs::canonicalize(&absolute).ok();
-	let mut files = BTreeSet::new();
-
-	for krate in workspace.crates().iter().filter(|krate| krate.is_selected()) {
-		for source in krate.files() {
-			let same = source.path() == absolute
-				|| workspace.display_path(source.path()) == input
-				|| canonical
-					.as_ref()
-					.is_some_and(|path| std::fs::canonicalize(source.path()).ok().as_ref() == Some(path));
-
-			if same {
-				files.insert(source.path().to_path_buf());
-			}
-		}
-	}
-
-	let file = match files.len() {
-		0 => {
-			return Err(format!(
-				"`{requested}` is not a loaded file of the selected crates; select its package or target (`packages`, `workspace`, `all_targets`, `lib`, or `bin`)"
-			));
-		}
-
-		1 => files.into_iter().next().unwrap(),
-
-		_ => {
-			let paths = files
-				.iter()
-				.map(|path| workspace.display_path(path).display().to_string())
-				.collect::<Vec<_>>()
-				.join(", ");
-			return Err(format!("`{requested}` matches several loaded files: {paths}; give an absolute path"));
-		}
-	};
-
-	let source = workspace
-		.crates()
-		.iter()
-		.filter(|krate| krate.is_selected())
-		.flat_map(|krate| krate.files())
-		.find(|source| source.path() == file)
-		.expect("the matched loaded file exists");
-	let lines = source.line_index().line_count();
-
-	if params.line > lines {
-		return Err(format!(
-			"`line` {} is past the end of {} ({} lines)",
-			params.line,
-			workspace.display_path(&file).display(),
-			lines
-		));
-	}
-
-	let resolver = Resolver::new(&workspace);
-	let mut found: Vec<FindMatch> = Find::new()
-		.active_only(params.active_only)
-		.imports(true)
-		.run_with(&resolver)
-		.map_err(|error| describe(&error))?
-		.into_iter()
-		.filter(|found| {
-			let found_file = if found.file.is_absolute() {
-				found.file.clone()
-			} else {
-				root.join(&found.file)
-			};
-			found_file == file
-		})
-		.collect();
-
-	found.sort_by_key(|found| (found.start, std::cmp::Reverse(found.end), found.path.clone()));
-	let last_line = |found: &FindMatch| {
-		if found.end.column == 1 && found.end.line > found.start.line {
-			found.end.line - 1
-		} else {
-			found.end.line
-		}
-	};
-	let containing: Vec<FindMatch> = found
-		.iter()
-		.filter(|found| found.start.line <= params.line && params.line <= last_line(found))
-		.cloned()
-		.collect();
-	let mut before: Vec<FindMatch> = found
-		.iter()
-		.filter(|found| last_line(found) < params.line)
-		.rev()
-		.take(params.context)
-		.cloned()
-		.collect();
-	before.reverse();
-	let after: Vec<FindMatch> = found
-		.iter()
-		.filter(|found| found.start.line > params.line)
-		.take(params.context)
-		.cloned()
-		.collect();
-
-	let mut text = render::items_at_line(root, workspace.display_path(&file), params.line, &containing, &before, &after);
-	text.push_str(&render::load_errors_note(&workspace));
-	Ok(text)
-}
-
 /// Appends the diff for a dry run, or writes the edits.
 fn finish(root: &Path, edits: &EditSet, dry_run: bool, permit: &Permit<'_>, text: &mut String) -> Result<(), String> {
 	match dry_run {
@@ -686,6 +567,125 @@ fn inserted_targets(plan: &Insertion, parent: Option<&ItemPath>) -> Result<Vec<(
 	Ok(named.chain(imports).collect())
 }
 
+/// `items_at_line`.
+pub(crate) fn items_at_line(load: &LoadOptions, params: &ItemsAtLineParams) -> Output {
+	let requested = params.file.trim();
+
+	if requested.is_empty() {
+		return Err("`file` is empty: give a Rust source file relative to the workspace root or an absolute path".to_owned());
+	}
+	if params.line == 0 {
+		return Err("`line` is 1-based: give 1 or greater".to_owned());
+	}
+
+	let workspace = self::load(load)?;
+	let root = workspace.root();
+	let input = std::path::PathBuf::from(requested);
+	let absolute = if input.is_absolute() { input.clone() } else { root.join(&input) };
+	let canonical = std::fs::canonicalize(&absolute).ok();
+	let mut files = BTreeSet::new();
+
+	for krate in workspace.crates().iter().filter(|krate| krate.is_selected()) {
+		for source in krate.files() {
+			let same = source.path() == absolute
+				|| workspace.display_path(source.path()) == input
+				|| canonical
+					.as_ref()
+					.is_some_and(|path| std::fs::canonicalize(source.path()).ok().as_ref() == Some(path));
+
+			if same {
+				files.insert(source.path().to_path_buf());
+			}
+		}
+	}
+
+	let file = match files.len() {
+		0 => {
+			return Err(format!(
+				"`{requested}` is not a loaded file of the selected crates; select its package or target (`packages`, `workspace`, `all_targets`, `lib`, or `bin`)"
+			));
+		}
+
+		1 => files.into_iter().next().unwrap(),
+
+		_ => {
+			let paths = files
+				.iter()
+				.map(|path| workspace.display_path(path).display().to_string())
+				.collect::<Vec<_>>()
+				.join(", ");
+			return Err(format!("`{requested}` matches several loaded files: {paths}; give an absolute path"));
+		}
+	};
+
+	let source = workspace
+		.crates()
+		.iter()
+		.filter(|krate| krate.is_selected())
+		.flat_map(|krate| krate.files())
+		.find(|source| source.path() == file)
+		.expect("the matched loaded file exists");
+	let lines = source.line_index().line_count();
+
+	if params.line > lines {
+		return Err(format!(
+			"`line` {} is past the end of {} ({} lines)",
+			params.line,
+			workspace.display_path(&file).display(),
+			lines
+		));
+	}
+
+	let resolver = Resolver::new(&workspace);
+	let mut found: Vec<FindMatch> = Find::new()
+		.active_only(params.active_only)
+		.imports(true)
+		.run_with(&resolver)
+		.map_err(|error| describe(&error))?
+		.into_iter()
+		.filter(|found| {
+			let found_file = if found.file.is_absolute() {
+				found.file.clone()
+			} else {
+				root.join(&found.file)
+			};
+			found_file == file
+		})
+		.collect();
+
+	found.sort_by_key(|found| (found.start, std::cmp::Reverse(found.end), found.path.clone()));
+	let last_line = |found: &FindMatch| {
+		if found.end.column == 1 && found.end.line > found.start.line {
+			found.end.line - 1
+		} else {
+			found.end.line
+		}
+	};
+	let containing: Vec<FindMatch> = found
+		.iter()
+		.filter(|found| found.start.line <= params.line && params.line <= last_line(found))
+		.cloned()
+		.collect();
+	let mut before: Vec<FindMatch> = found
+		.iter()
+		.filter(|found| last_line(found) < params.line)
+		.rev()
+		.take(params.context)
+		.cloned()
+		.collect();
+	before.reverse();
+	let after: Vec<FindMatch> = found
+		.iter()
+		.filter(|found| found.start.line > params.line)
+		.take(params.context)
+		.cloned()
+		.collect();
+
+	let mut text = render::items_at_line(root, workspace.display_path(&file), params.line, &containing, &before, &after);
+	text.push_str(&render::load_errors_note(&workspace));
+	Ok(text)
+}
+
 /// Loads the workspace, with a hint when there is no `Cargo.toml` to load it from.
 pub(super) fn load(options: &LoadOptions) -> Result<Workspace, String> {
 	load_workspace(options).map_err(|error| {
@@ -797,63 +797,6 @@ pub(crate) fn remove(load: &LoadOptions, params: &RemoveParams, permit: &Permit<
 	})
 }
 
-/// `search_text`: when nothing matches and the call names no packages, the workspace members it did not select are
-/// searched too (see [`retry`]).
-pub(crate) fn search_text(load: &LoadOptions, params: &SearchTextParams) -> Output {
-	let regex = RegexBuilder::new(&params.pattern)
-		.case_insensitive(params.ignore_case)
-		.build()
-		.map_err(|error| format!("invalid regex `{}`:\n{error}", params.pattern))?;
-	let within = (params.within.as_deref().map(str::trim))
-		.filter(|within| !within.is_empty())
-		.map(|within| PathPattern::parse(within, MatchOptions::default()))
-		.transpose()
-		.map_err(|error| describe(&error.into()))?;
-	let options = SearchTextOptions { within };
-	let workspace = self::load(load)?;
-	let resolver = Resolver::new(&workspace);
-	let report = query::search_text(&resolver, &regex, &options).map_err(|error| describe(&error))?;
-	let widening = (report.matches.is_empty() && !params.selection.names_packages())
-		.then(|| load.widened(&workspace, None))
-		.flatten();
-
-	let Some(widening) = widening else {
-		return Ok(text_found(&workspace, params, &report));
-	};
-
-	let wider = self::load(&widening.options)?;
-	let searched = widening.searched(&wider);
-
-	// (`lib` or `bin` left out the crates of every member to search)
-	if searched.is_empty() {
-		return Ok(text_found(&workspace, params, &report));
-	}
-
-	let resolver = Resolver::new(&wider);
-	let report = query::search_text(&resolver, &regex, &options).map_err(|error| describe(&error))?;
-	let crates = report.matches.iter().map(|found| ItemId::crate_root(found.krate));
-	let members = retry::members_of(&wider, crates, &searched);
-	let note = match members.is_empty() {
-		true => retry::note(&searched, false),
-		false => retry::note(&members, true),
-	};
-
-	Ok(format!("note: {note}\n") + &text_found(&wider, params, &report))
-}
-
-/// The text of `search_text`: the matching lines of `params`' page, and notes.
-fn text_found(workspace: &Workspace, params: &SearchTextParams, report: &query::TextReport) -> String {
-	let page = Page {
-		offset: params.offset,
-		limit: params.limit,
-		total: report.matches.len(),
-	};
-	let mut text = render::text_matches(workspace.root(), &params.pattern, report, page);
-
-	text.push_str(&render::load_errors_note(workspace));
-	text
-}
-
 /// `rename_item`
 pub(crate) fn rename(load: &LoadOptions, params: &RenameParams, permit: &Permit<'_>) -> Output {
 	let path = parse_path(&params.path)?;
@@ -934,6 +877,50 @@ fn search(resolver: &Resolver<'_>, find: &Find, params: &FindParams, selected: &
 	Ok((found, from))
 }
 
+/// `search_text`: when nothing matches and the call names no packages, the workspace members it did not select are
+/// searched too (see [`retry`]).
+pub(crate) fn search_text(load: &LoadOptions, params: &SearchTextParams) -> Output {
+	let regex = RegexBuilder::new(&params.pattern)
+		.case_insensitive(params.ignore_case)
+		.build()
+		.map_err(|error| format!("invalid regex `{}`:\n{error}", params.pattern))?;
+	let within = (params.within.as_deref().map(str::trim))
+		.filter(|within| !within.is_empty())
+		.map(|within| PathPattern::parse(within, MatchOptions::default()))
+		.transpose()
+		.map_err(|error| describe(&error.into()))?;
+	let options = SearchTextOptions { within };
+	let workspace = self::load(load)?;
+	let resolver = Resolver::new(&workspace);
+	let report = query::search_text(&resolver, &regex, &options).map_err(|error| describe(&error))?;
+	let widening = (report.matches.is_empty() && !params.selection.names_packages())
+		.then(|| load.widened(&workspace, None))
+		.flatten();
+
+	let Some(widening) = widening else {
+		return Ok(text_found(&workspace, params, &report));
+	};
+
+	let wider = self::load(&widening.options)?;
+	let searched = widening.searched(&wider);
+
+	// (`lib` or `bin` left out the crates of every member to search)
+	if searched.is_empty() {
+		return Ok(text_found(&workspace, params, &report));
+	}
+
+	let resolver = Resolver::new(&wider);
+	let report = query::search_text(&resolver, &regex, &options).map_err(|error| describe(&error))?;
+	let crates = report.matches.iter().map(|found| ItemId::crate_root(found.krate));
+	let members = retry::members_of(&wider, crates, &searched);
+	let note = match members.is_empty() {
+		true => retry::note(&searched, false),
+		false => retry::note(&members, true),
+	};
+
+	Ok(format!("note: {note}\n") + &text_found(&wider, params, &report))
+}
+
 /// How to pick one of the several crates that the items `path` names are in, if they are: by target (see
 /// [`SELECT_ONE_CRATE`]) when they are crates of one package, or else by crate name or package.
 fn select_one_crate(resolver: &Resolver<'_>, path: &ItemPath) -> Option<String> {
@@ -958,6 +945,19 @@ fn select_one_crate(resolver: &Resolver<'_>, path: &ItemPath) -> Option<String> 
 			))
 		}
 	}
+}
+
+/// The text of `search_text`: the matching lines of `params`' page, and notes.
+fn text_found(workspace: &Workspace, params: &SearchTextParams, report: &query::TextReport) -> String {
+	let page = Page {
+		offset: params.offset,
+		limit: params.limit,
+		total: report.matches.len(),
+	};
+	let mut text = render::text_matches(workspace.root(), &params.pattern, report, page);
+
+	text.push_str(&render::load_errors_note(workspace));
+	text
 }
 
 fn try_format_written(load: &LoadOptions, permit: &Permit<'_>, targets: &[(String, ItemPath)]) -> Result<String, String> {

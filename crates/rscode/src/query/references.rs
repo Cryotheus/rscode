@@ -114,6 +114,48 @@ impl<'ws> ModuleFiles<'ws> {
 	}
 }
 
+/// Where something in a file is, by path: the module whose file it is, and the item it is in.
+pub(super) struct Place {
+	/// The canonical path of the module whose own file it is.
+	pub(super) module: String,
+
+	/// The canonical path of the innermost item it is in, below the module (`None` at the module's top level).
+	pub(super) item: Option<String>,
+
+	/// [`Place::item`] relative to [`Place::module`] when it is below it, or else its canonical path (see
+	/// [`relative`]).
+	pub(super) local_item: Option<String>,
+}
+
+impl Place {
+	/// The place of something in `item`, below `module` (see [`ModuleFiles::containing`]), described by what
+	/// [transparent](is_transparent) items are in.
+	pub(super) fn new(resolver: &Resolver<'_>, module: ItemId, mut item: ItemId) -> Self {
+		let ws = resolver.workspace();
+
+		while item != module && is_transparent(ws.item(item)) {
+			item = ws.parent(item).unwrap_or(module);
+		}
+
+		let module_path = resolver.canonical_path(module);
+		let (item, local_item) = match item == module {
+			true => (None, None),
+
+			false => {
+				let path = resolver.canonical_path(item);
+
+				(Some(path.to_string()), Some(relative(&path, &module_path)))
+			}
+		};
+
+		Self {
+			module: module_path.to_string(),
+			item,
+			local_item,
+		}
+	}
+}
+
 /// The references found by [`find_references`].
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ReferenceReport {
@@ -319,48 +361,6 @@ fn locate(resolver: &Resolver<'_>, modules: &mut ModuleFiles<'_>, reference: Ref
 		local_item: place.local_item,
 		line: line_of(ws.krate(reference.krate).file(reference.file), reference.range),
 		reference,
-	}
-}
-
-/// Where something in a file is, by path: the module whose file it is, and the item it is in.
-pub(super) struct Place {
-	/// The canonical path of the module whose own file it is.
-	pub(super) module: String,
-
-	/// The canonical path of the innermost item it is in, below the module (`None` at the module's top level).
-	pub(super) item: Option<String>,
-
-	/// [`Place::item`] relative to [`Place::module`] when it is below it, or else its canonical path (see
-	/// [`relative`]).
-	pub(super) local_item: Option<String>,
-}
-
-impl Place {
-	/// The place of something in `item`, below `module` (see [`ModuleFiles::containing`]), described by what
-	/// [transparent](is_transparent) items are in.
-	pub(super) fn new(resolver: &Resolver<'_>, module: ItemId, mut item: ItemId) -> Self {
-		let ws = resolver.workspace();
-
-		while item != module && is_transparent(ws.item(item)) {
-			item = ws.parent(item).unwrap_or(module);
-		}
-
-		let module_path = resolver.canonical_path(module);
-		let (item, local_item) = match item == module {
-			true => (None, None),
-
-			false => {
-				let path = resolver.canonical_path(item);
-
-				(Some(path.to_string()), Some(relative(&path, &module_path)))
-			}
-		};
-
-		Self {
-			module: module_path.to_string(),
-			item,
-			local_item,
-		}
 	}
 }
 

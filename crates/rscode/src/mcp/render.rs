@@ -216,34 +216,6 @@ pub(crate) fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String 
 	columns.join("  ")
 }
 
-/// Items containing a source line and the nearest items before and after it.
-pub(crate) fn items_at_line(root: &Path, file: &Path, line: usize, containing: &[FindMatch], before: &[FindMatch], after: &[FindMatch]) -> String {
-	let mut out = format!("{}:{line}\n", display(root, file));
-
-	if containing.is_empty() {
-		out.push_str("containing: none\n");
-	} else {
-		out.push_str("containing (outermost to innermost):\n");
-		for found in containing {
-			writeln!(out, "  {}", find_line(root, found, false)).unwrap();
-		}
-	}
-
-	if before.is_empty() && after.is_empty() {
-		out.push_str("nearby: none\n");
-	} else {
-		out.push_str("nearby:\n");
-		for found in before {
-			writeln!(out, "  before: {}", find_line(root, found, false)).unwrap();
-		}
-		for found in after {
-			writeln!(out, "  after: {}", find_line(root, found, false)).unwrap();
-		}
-	}
-
-	out
-}
-
 fn find_summary(pattern: &str, shown: usize, page: Page) -> String {
 	if page.total == 0 {
 		let mut summary = format!("no items match `{pattern}`");
@@ -383,6 +355,34 @@ pub(crate) fn item_edit(root: &Path, plan: &Replacement, dry_run: bool) -> Strin
 	}
 
 	warnings(&mut out, &plan.warnings);
+	out
+}
+
+/// Items containing a source line and the nearest items before and after it.
+pub(crate) fn items_at_line(root: &Path, file: &Path, line: usize, containing: &[FindMatch], before: &[FindMatch], after: &[FindMatch]) -> String {
+	let mut out = format!("{}:{line}\n", display(root, file));
+
+	if containing.is_empty() {
+		out.push_str("containing: none\n");
+	} else {
+		out.push_str("containing (outermost to innermost):\n");
+		for found in containing {
+			writeln!(out, "  {}", find_line(root, found, false)).unwrap();
+		}
+	}
+
+	if before.is_empty() && after.is_empty() {
+		out.push_str("nearby: none\n");
+	} else {
+		out.push_str("nearby:\n");
+		for found in before {
+			writeln!(out, "  before: {}", find_line(root, found, false)).unwrap();
+		}
+		for found in after {
+			writeln!(out, "  after: {}", find_line(root, found, false)).unwrap();
+		}
+	}
+
 	out
 }
 
@@ -841,28 +841,6 @@ fn selection(load: &LoadOptions) -> String {
 	parts.join("; ")
 }
 
-/// Cuts text longer than `max_chars` characters (at a line break when there is one near the limit) and says what
-/// was cut, and how to get less output from the tool (see [`truncation_hint`]).
-pub(crate) fn truncate(text: String, max_chars: usize, hint: &str) -> String {
-	let Some((limit, _)) = text.char_indices().nth(max_chars) else {
-		return text;
-	};
-
-	// prefer cutting after a whole line, unless that loses too much
-	let cut = match text[..limit].rfind('\n') {
-		Some(line_end) if line_end + 1 >= limit / 2 => line_end + 1,
-		_ => limit,
-	};
-	let rest = &text[cut..];
-
-	format!(
-		"{}\n[output truncated: {} ({}) not shown; {hint}]\n",
-		&text[..cut],
-		count(rest.lines().count(), "more line", "more lines"),
-		count(rest.chars().count(), "character", "characters"),
-	)
-}
-
 /// The lines of `search_text` (those of `page`): a summary line, then each file once (with its module) followed by
 /// one line per matching line: `line:column` of its first match, the item it is in (relative to the file's module),
 /// and the line. Then the notes of the search.
@@ -904,6 +882,28 @@ pub(crate) fn text_matches(root: &Path, pattern: &str, report: &TextReport, page
 	}
 
 	out
+}
+
+/// Cuts text longer than `max_chars` characters (at a line break when there is one near the limit) and says what
+/// was cut, and how to get less output from the tool (see [`truncation_hint`]).
+pub(crate) fn truncate(text: String, max_chars: usize, hint: &str) -> String {
+	let Some((limit, _)) = text.char_indices().nth(max_chars) else {
+		return text;
+	};
+
+	// prefer cutting after a whole line, unless that loses too much
+	let cut = match text[..limit].rfind('\n') {
+		Some(line_end) if line_end + 1 >= limit / 2 => line_end + 1,
+		_ => limit,
+	};
+	let rest = &text[cut..];
+
+	format!(
+		"{}\n[output truncated: {} ({}) not shown; {hint}]\n",
+		&text[..cut],
+		count(rest.lines().count(), "more line", "more lines"),
+		count(rest.chars().count(), "character", "characters"),
+	)
 }
 
 /// How to get less output from a tool, in terms of its own parameters.

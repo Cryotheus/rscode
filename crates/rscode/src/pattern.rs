@@ -1875,7 +1875,10 @@ mod tests {
 			("**r#Self", "`r#Self` is not a valid identifier"),
 			("<Foo>::", "expected a segment after `::`"),
 			("<crate as X>", "expected a pattern with at least one segment, found `crate`"),
-			("<impl X as Y>", "`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`"),
+			(
+				"<impl X as Y>",
+				"`as` does not go with `impl`: write `<impl Trait for Type>` or `<Type as Trait>`",
+			),
 			("<<impl X>>", "nested qualified patterns are not supported"),
 			("impl for Foo", "expected a trait pattern after `impl`"),
 			("impl Foo for", "expected a type pattern after `for`"),

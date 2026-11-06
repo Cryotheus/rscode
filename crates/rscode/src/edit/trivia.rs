@@ -483,29 +483,6 @@ fn convert_indent<'a>(indentation: &'a str, from: &str, to: &str) -> Cow<'a, str
 	Cow::Owned(format!("{}{rest}", to.repeat(levels)))
 }
 
-/// The largest character boundary at or before `offset`, within the text.
-fn floor_boundary(text: &str, offset: usize) -> usize {
-	let mut offset = offset.min(text.len());
-
-	while !text.is_char_boundary(offset) {
-		offset -= 1;
-	}
-
-	offset
-}
-
-/// One level of indentation in the style of a text: a tab if more lines are indented with tabs than with spaces,
-/// else the smallest indentation in spaces (at most 8), and 4 spaces when nothing is indented.
-///
-/// Only lines that start with code or a comment count (not lines inside of strings or block comments).
-pub(crate) fn indent_unit(text: &str) -> String {
-	indent_unit_in(&Lexed::new(text))
-}
-
-fn indent_unit_in(lexed: &Lexed<'_>) -> String {
-	detected_indent_unit(lexed).unwrap_or_else(|| "    ".to_owned())
-}
-
 /// The [`indent_unit`] of a text, or `None` when nothing in it is indented, so that it shows no style.
 fn detected_indent_unit(lexed: &Lexed<'_>) -> Option<String> {
 	let mut tab_lines = 0_usize;
@@ -547,6 +524,29 @@ fn detected_indent_unit(lexed: &Lexed<'_>) -> Option<String> {
 		_ if tab_lines > 0 => Some("\t".to_owned()),
 		_ => None,
 	}
+}
+
+/// The largest character boundary at or before `offset`, within the text.
+fn floor_boundary(text: &str, offset: usize) -> usize {
+	let mut offset = offset.min(text.len());
+
+	while !text.is_char_boundary(offset) {
+		offset -= 1;
+	}
+
+	offset
+}
+
+/// One level of indentation in the style of a text: a tab if more lines are indented with tabs than with spaces,
+/// else the smallest indentation in spaces (at most 8), and 4 spaces when nothing is indented.
+///
+/// Only lines that start with code or a comment count (not lines inside of strings or block comments).
+pub(crate) fn indent_unit(text: &str) -> String {
+	indent_unit_in(&Lexed::new(text))
+}
+
+fn indent_unit_in(lexed: &Lexed<'_>) -> String {
+	detected_indent_unit(lexed).unwrap_or_else(|| "    ".to_owned())
 }
 
 fn insert_after(lexed: &Lexed<'_>, sibling: TextRange, new: Inserted<'_>) -> (TextRange, String) {
@@ -1065,7 +1065,11 @@ fn reindent_with(source: &str, indent: &str, line_ending: &str, unit: Option<&st
 			text.push_str(indent);
 		}
 
-		text.push_str(&convert_indent(&line[..line.len() - content.len()], &source_unit, unit.unwrap_or(&source_unit)));
+		text.push_str(&convert_indent(
+			&line[..line.len() - content.len()],
+			&source_unit,
+			unit.unwrap_or(&source_unit),
+		));
 		text.push_str(content);
 	}
 

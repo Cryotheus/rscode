@@ -250,18 +250,18 @@ mod tests {
 	}
 
 	#[test]
-	fn rustflags_override_the_cargo_context_environment() {
-		let flags = context(Some(vec!["--cfg".to_owned(), "rscode_probe".to_owned()]));
-
-		assert_eq!(flags.get_env("CARGO_ENCODED_RUSTFLAGS").unwrap(), "--cfg\x1frscode_probe");
-		assert!(flags.get_env("RUSTFLAGS").is_err());
-	}
-
-	#[test]
 	fn empty_rustflags_clear_process_flags_without_overriding_cargo_configuration() {
 		let flags = context(Some(Vec::new()));
 
 		assert!(flags.get_env("CARGO_ENCODED_RUSTFLAGS").is_err());
+		assert!(flags.get_env("RUSTFLAGS").is_err());
+	}
+
+	#[test]
+	fn rustflags_override_the_cargo_context_environment() {
+		let flags = context(Some(vec!["--cfg".to_owned(), "rscode_probe".to_owned()]));
+
+		assert_eq!(flags.get_env("CARGO_ENCODED_RUSTFLAGS").unwrap(), "--cfg\x1frscode_probe");
 		assert!(flags.get_env("RUSTFLAGS").is_err());
 	}
 

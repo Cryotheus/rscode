@@ -263,32 +263,6 @@ pub(crate) struct FindParams {
 	pub(crate) selection: Selection,
 }
 
-/// Parameters of `items_at_line`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[schemars(crate = "rmcp::schemars")]
-pub(crate) struct ItemsAtLineParams {
-	/// Path of a loaded Rust source file, absolute or relative to the workspace root.
-	pub(crate) file: String,
-
-	/// 1-based source line.
-	pub(crate) line: usize,
-
-	/// Nearest items to show before and after the line, in addition to items containing it.
-	#[serde(default = "default_line_context")]
-	pub(crate) context: usize,
-
-	/// Skip items whose cfg is definitely disabled.
-	#[serde(default)]
-	pub(crate) active_only: bool,
-
-	#[serde(flatten)]
-	pub(crate) selection: Selection,
-}
-
-fn default_line_context() -> usize {
-	1
-}
-
 impl FindParams {
 	/// Whether imports are searched: requested explicitly, or by asking for the `import` kind.
 	pub(crate) fn imports(&self, kinds: &[ItemKind]) -> bool {
@@ -466,6 +440,28 @@ impl InsertParams {
 	pub(crate) fn parent(&self) -> Option<&str> {
 		self.parent.as_deref().map(str::trim).filter(|parent| !parent.is_empty())
 	}
+}
+
+/// Parameters of `items_at_line`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct ItemsAtLineParams {
+	/// Path of a loaded Rust source file, absolute or relative to the workspace root.
+	pub(crate) file: String,
+
+	/// 1-based source line.
+	pub(crate) line: usize,
+
+	/// Nearest items to show before and after the line, in addition to items containing it.
+	#[serde(default = "default_line_context")]
+	pub(crate) context: usize,
+
+	/// Skip items whose cfg is definitely disabled.
+	#[serde(default)]
+	pub(crate) active_only: bool,
+
+	#[serde(flatten)]
+	pub(crate) selection: Selection,
 }
 
 /// How much of an item `view_items` shows.
@@ -963,6 +959,10 @@ fn crate_root() -> Vec<String> {
 
 fn default_find_limit() -> usize {
 	DEFAULT_FIND_LIMIT
+}
+
+fn default_line_context() -> usize {
+	1
 }
 
 /// Like [`string_list`], and splits every string at commas and whitespace (`"fn, struct"`), like cargo's

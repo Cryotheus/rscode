@@ -490,6 +490,18 @@ fn collisions(resolver: &Resolver<'_>, target: &Target<'_>, items: &[NewItem]) -
 	collisions
 }
 
+/// The indentation unit rustfmt's configuration sets for a file at `path` (`hard_tabs`, `tab_spaces`), found like
+/// rustfmt finds it from the file's directory; `None` when it sets none. New code goes into a file that shows no
+/// indentation style of its own (nothing in it is indented) with this unit.
+fn configured_indent_unit(path: &Path) -> Option<String> {
+	let rustfmt = rscode_fmt::RustFmtOptions {
+		config_path: Some(path.parent()?.to_path_buf()),
+		..rscode_fmt::RustFmtOptions::default()
+	};
+
+	rustfmt.indent_unit_in_effect()
+}
+
 /// A binding for messages: the item, or the import and what it imports.
 fn describe_binding(resolver: &Resolver<'_>, binding: &Binding) -> String {
 	let ws = resolver.workspace();
@@ -546,18 +558,6 @@ fn following_comma(text: &str, offset: usize) -> Option<usize> {
 /// The item that replacing `item` replaces for the path: the import, when `item` is its `use` item.
 fn import_of(item: ItemId, imports: &[(ItemId, ItemId)]) -> ItemId {
 	imports.iter().find(|(use_item, _)| *use_item == item).map_or(item, |&(_, import)| import)
-}
-
-/// The indentation unit rustfmt's configuration sets for a file at `path` (`hard_tabs`, `tab_spaces`), found like
-/// rustfmt finds it from the file's directory; `None` when it sets none. New code goes into a file that shows no
-/// indentation style of its own (nothing in it is indented) with this unit.
-fn configured_indent_unit(path: &Path) -> Option<String> {
-	let rustfmt = rscode_fmt::RustFmtOptions {
-		config_path: Some(path.parent()?.to_path_buf()),
-		..rscode_fmt::RustFmtOptions::default()
-	};
-
-	rustfmt.indent_unit_in_effect()
 }
 
 /// Plans inserting the items in `source` into the container named by `parent`: a module (`crate` for the crate

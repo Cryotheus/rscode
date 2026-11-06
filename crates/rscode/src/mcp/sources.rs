@@ -655,6 +655,17 @@ mod tests {
 		assert_eq!(age(Duration::from_secs(3 * 3600 + 59)), "180 min");
 	}
 
+	#[test]
+	fn attached_sources_keep_the_servers_rustflags() {
+		let own = LoadOptions {
+			rustflags: Some(vec!["--cfg".to_owned(), "probe".to_owned()]),
+			..LoadOptions::default()
+		};
+		let attached = load_options(&own, Path::new("attached/Cargo.toml"));
+
+		assert_eq!(attached.rustflags, own.rustflags);
+	}
+
 	/// Files that an edit creates (and their new directories) must be in a directory exposed for writing too.
 	#[test]
 	fn created_files_must_be_writable() {
@@ -708,17 +719,6 @@ mod tests {
 		let error = scope.check(&tree.path("project"), &edits).unwrap_err();
 
 		assert!(error.contains("link.rs, which is not in a directory exposed for writing"), "{error}");
-	}
-
-	#[test]
-	fn attached_sources_keep_the_servers_rustflags() {
-		let own = LoadOptions {
-			rustflags: Some(vec!["--cfg".to_owned(), "probe".to_owned()]),
-			..LoadOptions::default()
-		};
-		let attached = load_options(&own, Path::new("attached/Cargo.toml"));
-
-		assert_eq!(attached.rustflags, own.rustflags);
 	}
 
 	#[test]
