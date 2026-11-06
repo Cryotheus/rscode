@@ -234,6 +234,16 @@ fn selects_packages_by_spec() {
 }
 
 #[test]
+fn accepts_either_separator_in_package_names() {
+	let selected = |spec: &str| package_names(&plan(&packages(options("ws_named/Cargo.toml"), &[spec]))).join(" ");
+
+	// a package spec may spell a package's name with `-`s or `_`s, like the name of its crate
+	assert_eq!(selected("hyphen_name"), "hyphen-name");
+	assert_eq!(selected("under-score"), "under_score");
+	assert_eq!(selected("*"), "hyphen-name under_score");
+}
+
+#[test]
 fn selects_workspace_with_excludes() {
 	let workspace = with(virtual_ws(), |options| options.workspace = true);
 	let excluding = |excludes: &[&str]| {
@@ -263,6 +273,15 @@ fn unknown_packages_are_errors() {
 	let message = cargo_error(&packages(virtual_ws(), &["real-core@9.9.9"]));
 
 	assert!(message.contains("real-core@9.9.9"), "{message}");
+
+	let message = cargo_error(&packages(virtual_ws(), &["real_cor"]));
+
+	// the members are what there is to choose from, and the closest one is suggested (`-` and `_` are not the error)
+	assert!(
+		message.contains("note: the workspace members are app, real-core, extra, macros, tool"),
+		"{message}"
+	);
+	assert!(message.contains("help: did you mean `real-core`?"), "{message}");
 
 	let message = cargo_error(&with(virtual_ws(), |options| options.exclude = vec!["app".to_owned()]));
 

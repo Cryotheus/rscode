@@ -734,7 +734,7 @@ pub(crate) struct Selection {
 	/// The attached source to work on (see `attach_source`), instead of the connection-wide default.
 	pub(crate) attached: Option<String>,
 
-	/// Packages to load (cargo package specs).
+	/// Packages to load (cargo package specs). A name may spell a package's `-`s as `_`s, and the other way around.
 	#[serde(deserialize_with = "string_list")]
 	pub(crate) packages: Vec<String>,
 
