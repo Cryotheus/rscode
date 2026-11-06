@@ -9,6 +9,7 @@ use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
+use super::params::ItemsAtLineParams;
 use super::params::MoveParams;
 use super::params::ReferencesParams;
 use super::params::RemoveParams;
@@ -348,6 +349,125 @@ pub(crate) fn find(load: &LoadOptions, params: &FindParams) -> Output {
 	};
 
 	Ok(note + &found_text(&wider, &resolver, params, found))
+}
+
+/// `items_at_line`.
+pub(crate) fn items_at_line(load: &LoadOptions, params: &ItemsAtLineParams) -> Output {
+	let requested = params.file.trim();
+
+	if requested.is_empty() {
+		return Err("`file` is empty: give a Rust source file relative to the workspace root or an absolute path".to_owned());
+	}
+	if params.line == 0 {
+		return Err("`line` is 1-based: give 1 or greater".to_owned());
+	}
+
+	let workspace = self::load(load)?;
+	let root = workspace.root();
+	let input = std::path::PathBuf::from(requested);
+	let absolute = if input.is_absolute() { input.clone() } else { root.join(&input) };
+	let canonical = std::fs::canonicalize(&absolute).ok();
+	let mut files = BTreeSet::new();
+
+	for krate in workspace.crates().iter().filter(|krate| krate.is_selected()) {
+		for source in krate.files() {
+			let same = source.path() == absolute
+				|| workspace.display_path(source.path()) == input
+				|| canonical
+					.as_ref()
+					.is_some_and(|path| std::fs::canonicalize(source.path()).ok().as_ref() == Some(path));
+
+			if same {
+				files.insert(source.path().to_path_buf());
+			}
+		}
+	}
+
+	let file = match files.len() {
+		0 => {
+			return Err(format!(
+				"`{requested}` is not a loaded file of the selected crates; select its package or target (`packages`, `workspace`, `all_targets`, `lib`, or `bin`)"
+			));
+		}
+
+		1 => files.into_iter().next().unwrap(),
+
+		_ => {
+			let paths = files
+				.iter()
+				.map(|path| workspace.display_path(path).display().to_string())
+				.collect::<Vec<_>>()
+				.join(", ");
+			return Err(format!("`{requested}` matches several loaded files: {paths}; give an absolute path"));
+		}
+	};
+
+	let source = workspace
+		.crates()
+		.iter()
+		.filter(|krate| krate.is_selected())
+		.flat_map(|krate| krate.files())
+		.find(|source| source.path() == file)
+		.expect("the matched loaded file exists");
+	let lines = source.line_index().line_count();
+
+	if params.line > lines {
+		return Err(format!(
+			"`line` {} is past the end of {} ({} lines)",
+			params.line,
+			workspace.display_path(&file).display(),
+			lines
+		));
+	}
+
+	let resolver = Resolver::new(&workspace);
+	let mut found: Vec<FindMatch> = Find::new()
+		.active_only(params.active_only)
+		.imports(true)
+		.run_with(&resolver)
+		.map_err(|error| describe(&error))?
+		.into_iter()
+		.filter(|found| {
+			let found_file = if found.file.is_absolute() {
+				found.file.clone()
+			} else {
+				root.join(&found.file)
+			};
+			found_file == file
+		})
+		.collect();
+
+	found.sort_by_key(|found| (found.start, std::cmp::Reverse(found.end), found.path.clone()));
+	let last_line = |found: &FindMatch| {
+		if found.end.column == 1 && found.end.line > found.start.line {
+			found.end.line - 1
+		} else {
+			found.end.line
+		}
+	};
+	let containing: Vec<FindMatch> = found
+		.iter()
+		.filter(|found| found.start.line <= params.line && params.line <= last_line(found))
+		.cloned()
+		.collect();
+	let mut before: Vec<FindMatch> = found
+		.iter()
+		.filter(|found| last_line(found) < params.line)
+		.rev()
+		.take(params.context)
+		.cloned()
+		.collect();
+	before.reverse();
+	let after: Vec<FindMatch> = found
+		.iter()
+		.filter(|found| found.start.line > params.line)
+		.take(params.context)
+		.cloned()
+		.collect();
+
+	let mut text = render::items_at_line(root, workspace.display_path(&file), params.line, &containing, &before, &after);
+	text.push_str(&render::load_errors_note(&workspace));
+	Ok(text)
 }
 
 /// Appends the diff for a dry run, or writes the edits.

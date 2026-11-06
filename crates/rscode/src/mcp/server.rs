@@ -9,6 +9,7 @@ use super::params::EditItemParams;
 use super::params::FindParams;
 use super::params::FormatParams;
 use super::params::InsertParams;
+use super::params::ItemsAtLineParams;
 use super::params::MoveParams;
 use super::params::ReferencesParams;
 use super::params::RemoveParams;
@@ -92,9 +93,10 @@ format what they wrote. Code outside of the edited items is kept as it is. For s
 `old`/`new` text, visibility, docs, attributes) rather than replace_item. JSON strings must escape hard tabs as `\t`.
 
 Every call reads the files again, so other tools' changes are seen. Lines are 1-based. Typically: workspace_info, \
-find_items, view_items, then edit. To find text without knowing item paths (call sites, strings, a regex across \
-crates), use search_text rather than a generic file search: it names the item of each match. For file:line \
-citations, view_items with `line_numbers` numbers lines as the file does.";
+find_items, view_items, then edit. To find the items at or near a known source location, use items_at_line. To find \
+text without knowing item paths (call sites, strings, a regex across crates), use search_text rather than a generic \
+file search: it names the item of each match. For file:line citations, view_items with `line_numbers` numbers lines as \
+the file does.";
 
 /// Appended to [`INSTRUCTIONS`] for read-only servers.
 const READ_ONLY_INSTRUCTIONS: &str = "\n\nThis server is read-only: the editing tools are disabled.";
@@ -294,6 +296,21 @@ impl Server {
 		let target = self.target(&params.selection, false);
 
 		self.query("find_items", target, move |target| tools::find(&target.load, &params)).await
+	}
+
+	/// Find the items containing a 1-based source `line`, and the nearest items before and after it. Every item includes
+	/// its canonical path, kind, and actual `file:start-end` line range.
+	#[tool(annotations(
+		title = "Find items at a source line",
+		read_only_hint = true,
+		idempotent_hint = true,
+		open_world_hint = false
+	))]
+	async fn items_at_line(&self, Parameters(params): Parameters<ItemsAtLineParams>) -> CallToolResult {
+		let target = self.target(&params.selection, false);
+
+		self.query("items_at_line", target, move |target| tools::items_at_line(&target.load, &params))
+			.await
 	}
 
 	/// Find the references to an item in every crate of the workspace (for trait items, also of their impls), by file:

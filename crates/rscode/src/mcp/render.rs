@@ -186,7 +186,7 @@ pub(crate) fn find(root: &Path, pattern: &str, matches: &[FindMatch], page: Page
 }
 
 /// `path  kind  file:line-endline  cfg: …  inactive  -> imported  usable: …`
-fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
+pub(crate) fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
 	let mut columns = vec![
 		found.path.clone(),
 		kind_label(found.kind, found.thread_local, found.entry_macro.as_deref()),
@@ -214,6 +214,34 @@ fn find_line(root: &Path, found: &FindMatch, usable: bool) -> String {
 	}
 
 	columns.join("  ")
+}
+
+/// Items containing a source line and the nearest items before and after it.
+pub(crate) fn items_at_line(root: &Path, file: &Path, line: usize, containing: &[FindMatch], before: &[FindMatch], after: &[FindMatch]) -> String {
+	let mut out = format!("{}:{line}\n", display(root, file));
+
+	if containing.is_empty() {
+		out.push_str("containing: none\n");
+	} else {
+		out.push_str("containing (outermost to innermost):\n");
+		for found in containing {
+			writeln!(out, "  {}", find_line(root, found, false)).unwrap();
+		}
+	}
+
+	if before.is_empty() && after.is_empty() {
+		out.push_str("nearby: none\n");
+	} else {
+		out.push_str("nearby:\n");
+		for found in before {
+			writeln!(out, "  before: {}", find_line(root, found, false)).unwrap();
+		}
+		for found in after {
+			writeln!(out, "  after: {}", find_line(root, found, false)).unwrap();
+		}
+	}
+
+	out
 }
 
 fn find_summary(pattern: &str, shown: usize, page: Page) -> String {
@@ -883,6 +911,7 @@ pub(crate) fn truncation_hint(tool: &str) -> &'static str {
 	match tool {
 		"workspace_info" => "narrow the request: fewer `packages`",
 		"find_items" => "narrow the request: a more specific `pattern`, `kinds`, or a smaller `limit` (or an `offset`)",
+		"items_at_line" => "narrow the request: a smaller `context`",
 		"view_items" => "narrow the request: fewer or more specific `paths`, or `mode` `outline`",
 		"find_references" => "narrow the request: a smaller `limit` (or an `offset`)",
 		"search_text" => "narrow the request: a more specific `pattern`, `within`, or a smaller `limit` (or an `offset`)",

@@ -27,7 +27,14 @@ const EDIT_TOOLS: [&str; 9] = [
 	"replace_item",
 ];
 
-const QUERY_TOOLS: [&str; 5] = ["find_items", "find_references", "search_text", "view_items", "workspace_info"];
+const QUERY_TOOLS: [&str; 6] = [
+	"find_items",
+	"find_references",
+	"items_at_line",
+	"search_text",
+	"view_items",
+	"workspace_info",
+];
 
 /// Parameters every non-source tool accepts as part of its selection.
 const SELECTION: [&str; 6] = ["workspace", "features", "all_features", "all_targets", "lib", "bin"];
@@ -234,6 +241,7 @@ fn enumerations_and_defaults_are_in_the_schemas() {
 	assert_eq!(property("format_items", "sort")["type"], "boolean");
 	assert!(property("format_items", "sort").get("default").is_none());
 	assert_eq!(property("find_items", "limit")["default"], 100);
+	assert_eq!(property("items_at_line", "context")["default"], 1);
 	assert_eq!(property("find_items", "features")["type"], "array");
 	assert_eq!(property("find_items", "bin")["type"], "array");
 
@@ -565,6 +573,7 @@ fn required_parameters() {
 		("create_module", vec!["name", "parent"]),
 		("edit_item", vec!["path"]),
 		("find_items", vec!["pattern"]),
+		("items_at_line", vec!["file", "line"]),
 		("find_references", vec!["path"]),
 		("format_items", vec![]),
 		("insert_items", vec!["source"]),
@@ -2295,6 +2304,67 @@ mod end_to_end {
 		let (_, text) = client.call("find_items", json!({ "pattern": "extra", "all_features": "true" })).await;
 
 		assert!(!text.contains("inactive"), "{text}");
+
+		let (failed, text) = client.call("items_at_line", json!({ "file": "src/lib.rs", "line": 8 })).await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&native("src/lib.rs:8"),
+				"containing (outermost to innermost):",
+				&native("demo::add  fn  src/lib.rs:7-10"),
+			],
+		);
+
+		let (failed, text) = client
+			.call("items_at_line", json!({ "file": "src/shapes.rs", "line": 8, "context": 0 }))
+			.await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&native("impl demo::shapes::Circle  impl  src/shapes.rs:6-14"),
+				&native("demo::shapes::Circle::new  assoc-fn  src/shapes.rs:7-9"),
+				"nearby: none",
+			],
+		);
+
+		let (failed, text) = client
+			.call("items_at_line", json!({ "file": "src/lib.rs", "line": 11, "context": 1 }))
+			.await;
+
+		assert!(!failed, "{text}");
+		assert_contains(
+			&text,
+			&[
+				&native("demo  mod  src/lib.rs:1-17"),
+				&native("before: demo::add  fn  src/lib.rs:7-10"),
+				&native("after: demo::extra  fn  src/lib.rs:12-13"),
+			],
+		);
+
+		let (failed, text) = client.call("items_at_line", json!({ "file": "src/lib.rs", "line": 999 })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["`line` 999 is past the end of", &native("src/lib.rs")]);
+
+		let (failed, text) = client.call("items_at_line", json!({ "file": "src/missing.rs", "line": 1 })).await;
+
+		assert!(failed);
+		assert_contains(
+			&text,
+			&[
+				"is not a loaded file of the selected crates",
+				"`packages`, `workspace`, `all_targets`, `lib`, or `bin`",
+			],
+		);
+
+		let (failed, text) = client.call("items_at_line", json!({ "file": "src/lib.rs", "line": 0 })).await;
+
+		assert!(failed);
+		assert_contains(&text, &["`line` is 1-based: give 1 or greater"]);
 
 		let (failed, text) = client.call("view_items", json!({ "paths": ["crate::add", "crate::nope"] })).await;
 
