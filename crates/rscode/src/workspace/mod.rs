@@ -70,6 +70,11 @@ pub struct LoadOptions {
 	/// `--no-default-features`
 	pub no_default_features: bool,
 
+	/// Arguments Cargo passes to rustc, overriding both `CARGO_ENCODED_RUSTFLAGS` and `RUSTFLAGS` from the process.
+	/// An empty vector clears inherited flags while still allowing Cargo configuration such as `build.rustflags`;
+	/// `None` inherits Cargo's normal environment and configuration.
+	pub rustflags: Option<Vec<String>>,
+
 	/// `--target <triple>`: evaluate `cfg`s (and target-specific dependencies) for this target instead of the host.
 	/// Proc-macro crates are still evaluated for the host, which they are compiled for.
 	pub target: Option<String>,
